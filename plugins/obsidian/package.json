@@ -1,0 +1,13 @@
+{
+  "name": "asp-obsidian",
+  "version": "0.1.0",
+  "description": "Context for Obsidian — the ASP reference thin-client surface.",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build:wasm": "node ../../sdks/typescript/scripts/build-wasm.mjs",
+    "build": "node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "test": "bun test test"
+  }
+}
