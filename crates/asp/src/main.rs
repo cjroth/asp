@@ -6,7 +6,7 @@
 
 mod gitcli;
 mod idstore;
-mod net;
+use asp_core::net;
 
 use anyhow::{anyhow, Context, Result};
 use asp_core::authkeys::{expiry_from_ttl_days, format_date_ymd_utc, parse_ttl, TtlSpec};

@@ -1,0 +1,65 @@
+//! The desktop engine drives real in-process convergence — two managed folders,
+//! one listening, sync through the same `asp-core` net driver + Session as the
+//! CLI. No subprocess, no wasm: the backend links the native engine directly.
+
+use asp_core::Identity;
+use asp_desktop_engine::DesktopEngine;
+use std::time::{Duration, Instant};
+
+fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    cond()
+}
+
+#[test]
+fn two_managed_folders_converge_in_process() {
+    let de = DesktopEngine::new(Identity::from_seed(&[1; 32])).unwrap();
+    let root = tempfile::tempdir().unwrap();
+
+    // Folder A: a note + "allow connections" (a per-folder listen socket).
+    let dir_a = root.path().join("A");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::write(dir_a.join("note.md"), b"hello desktop\n").unwrap();
+    let a = de.add_local_folder(&dir_a).unwrap();
+    let port = de.set_allow_connections(&a.id, true, Some("S")).unwrap().unwrap();
+    let url = format!("ws://127.0.0.1:{port}");
+
+    // Folder B: clone from A through the per-folder listener.
+    let dir_b = root.path().join("B");
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let b = de.clone_remote(&dir_b, &url, Some("S")).unwrap();
+    assert_eq!(std::fs::read(dir_b.join("note.md")).unwrap(), b"hello desktop\n");
+    assert!(!b.vault_id.is_empty(), "B adopted A's vault id");
+
+    // B authors a reply; sync pushes it to A, whose listener materializes it.
+    std::fs::write(dir_b.join("reply.md"), b"hi back\n").unwrap();
+    de.sync(&b.id, &url, Some("S")).unwrap();
+    let got = wait_until(Duration::from_secs(8), || dir_a.join("reply.md").exists());
+    assert!(got, "A's listener received and materialized B's file");
+    assert_eq!(std::fs::read(dir_a.join("reply.md")).unwrap(), b"hi back\n");
+
+    // Status surfaces real engine state.
+    let st = de.status(&a.id).unwrap();
+    assert!(st.rows >= 2);
+    assert_eq!(st.listening_port, Some(port));
+}
+
+#[test]
+fn list_and_authorize() {
+    let de = DesktopEngine::new(Identity::from_seed(&[2; 32])).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("V");
+    std::fs::create_dir_all(&dir).unwrap();
+    let v = de.add_local_folder(&dir).unwrap();
+    assert_eq!(de.list_vaults().len(), 1);
+    let peer = Identity::from_seed(&[9; 32]).to_ssh_string();
+    de.authorize(&v.id, &peer).unwrap();
+    assert_eq!(de.list_authorized(&v.id).unwrap().len(), 1);
+    assert!(!de.identity_ssh().is_empty());
+}

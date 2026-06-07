@@ -1,0 +1,21 @@
+[package]
+name = "asp-desktop-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Context Desktop engine — multi-vault manager linking asp-core natively (no Tauri dep; builds/tests on plain Linux)"
+
+[lib]
+name = "asp_desktop_engine"
+path = "src/lib.rs"
+
+[dependencies]
+asp-core = { path = "../../crates/asp-core" }
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

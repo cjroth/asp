@@ -1,0 +1,29 @@
+[package]
+name = "context-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Context Desktop — a background app for syncing context folders (Tauri shell over asp-desktop-engine)"
+
+# Standalone of the cargo workspace: links system webkit via Tauri, built with the
+# Tauri toolchain (`bun run tauri build`), not `cargo --workspace`.
+[workspace]
+
+[lib]
+name = "context_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+asp-desktop-engine = { path = "../engine" }
+asp-core = { path = "../../crates/asp-core" }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

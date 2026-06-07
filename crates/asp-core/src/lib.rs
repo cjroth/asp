@@ -33,6 +33,8 @@ pub mod engine;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gitexport;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod net;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod sqlite;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tls;

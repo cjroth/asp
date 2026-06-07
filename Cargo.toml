@@ -4,11 +4,17 @@ members = [
     "crates/asp-core",
     "crates/asp",
     "crates/asp-wasm",
+    "desktop/engine",
     "tests/e2e",
 ]
 default-members = [
     "crates/asp-core",
     "crates/asp",
+]
+# The Tauri shell links system webkit and is built with the Tauri toolchain, not
+# plain `cargo --workspace`; keep it out of the workspace build/test graph.
+exclude = [
+    "desktop/src-tauri",
 ]
 
 [workspace.package]

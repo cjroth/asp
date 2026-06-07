@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Context Desktop",
+  "version": "0.1.0",
+  "identifier": "com.asp.context-desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "bun run dev:web",
+    "beforeBuildCommand": "bun run build:web"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Context Desktop",
+        "width": 1000,
+        "height": 700,
+        "minWidth": 760,
+        "minHeight": 520
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all"
+  }
+}

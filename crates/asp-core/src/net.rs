@@ -11,9 +11,9 @@
 //! `files` table never interleaves between connection tasks.
 
 use anyhow::{anyhow, Context, Result};
-use asp_core::AdmitCtx;
-use asp_core::session::Step;
-use asp_core::{Engine, Msg, NodeId, Role, Session};
+use crate::AdmitCtx;
+use crate::session::Step;
+use crate::{Engine, Msg, NodeId, Role, Session};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -210,7 +210,10 @@ pub async fn serve(
 }
 
 /// Build the WS upgrade callback that applies AUTH_KEY admission at the HTTP
-/// layer. Fresh per connection (the callback is `FnOnce`).
+/// layer. Fresh per connection (the callback is `FnOnce`). The `ErrorResponse`
+/// (401 path) is a full `http::Response` fixed by the tungstenite callback
+/// signature, so it can't be boxed.
+#[allow(clippy::result_large_err)]
 fn upgrade_callback(
     auth: Arc<AuthOpts>,
     state: Arc<StdMutex<bool>>,
@@ -332,7 +335,7 @@ pub async fn connect(
     if secure {
         // wss://: TLS at the transport layer; trust is the ed25519 handshake, so
         // we accept any cert and bind the channel to the observed cert fingerprint.
-        let connector = TlsConnector::from(asp_core::tls::client_config_accept_any());
+        let connector = TlsConnector::from(crate::tls::client_config_accept_any());
         let server_name = rustls::pki_types::ServerName::try_from(host.clone())
             .map_err(|_| anyhow!("invalid server name {host}"))?;
         let tls_stream = connector.connect(server_name, tcp).await.context("tls connect")?;
@@ -341,7 +344,7 @@ pub async fn connect(
             .1
             .peer_certificates()
             .and_then(|c| c.first())
-            .map(|c| asp_core::tls::cert_fingerprint(c.as_ref()).to_vec());
+            .map(|c| crate::tls::cert_fingerprint(c.as_ref()).to_vec());
         let (ws, _resp) = client_async(request, tls_stream).await.context("wss client handshake")?;
         let session = {
             let eng = engine.lock().unwrap();

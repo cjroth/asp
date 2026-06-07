@@ -49,3 +49,5 @@ jobs:
         run: cd sdks/typescript && bun run build:wasm
       - name: SDK conformance (wasm == native) + parity (SDK ⇄ real asp)
         run: cd sdks/typescript && bun test
+      - name: Obsidian plugin (path filter + plugin ⇄ real asp parity)
+        run: cd plugins/obsidian && bun test
