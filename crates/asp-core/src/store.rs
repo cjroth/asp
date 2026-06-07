@@ -425,3 +425,37 @@ impl Store {
             .optional()?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blob_and_log_roundtrip_with_counters() {
+        let s = Store::open_memory().unwrap();
+        let h = s.put_blob(b"hi").unwrap();
+        assert_eq!(s.get_blob(&h).unwrap().as_deref(), Some(&b"hi"[..]));
+        assert!(s.has_blob(&h).unwrap());
+        // Counters derive from the durable log.
+        assert_eq!(s.next_lamport(0).unwrap(), 1);
+        assert_eq!(s.next_seq("aa").unwrap(), 0);
+    }
+
+    #[test]
+    fn embeddings_api_roundtrip_and_model_versioned() {
+        // §Embeddings: v1 ships the *substrate* (table + API), never populated by
+        // the engine. The storage shape is content-addressed and model-versioned
+        // so a later embedder re-embeds without touching the log.
+        let s = Store::open_memory().unwrap();
+        let ch = crate::oid::content_hash(b"some note body");
+        assert!(s.get_embedding(&ch, "m1").unwrap().is_none());
+        s.put_embedding(&ch, "m1", &[1, 2, 3, 4]).unwrap();
+        s.put_embedding(&ch, "m2", &[9, 9]).unwrap(); // re-embed under a new model
+        assert_eq!(s.get_embedding(&ch, "m1").unwrap().as_deref(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(s.get_embedding(&ch, "m2").unwrap().as_deref(), Some(&[9, 9][..]));
+        // Re-embedding the same (content, model) overwrites, log untouched.
+        s.put_embedding(&ch, "m1", &[5, 6]).unwrap();
+        assert_eq!(s.get_embedding(&ch, "m1").unwrap().as_deref(), Some(&[5, 6][..]));
+        assert_eq!(s.row_count().unwrap(), 0, "embeddings never write the log");
+    }
+}

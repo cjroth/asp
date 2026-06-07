@@ -44,6 +44,12 @@ struct Cli {
     /// Log filter (e.g. info, debug).
     #[arg(long = "log", global = true, env = "ASP_LOG")]
     log: Option<String>,
+    /// Opt-in debug log target (§Testing). Off by default; a side channel that
+    /// never affects convergence. v1 enables verbose row-level local logging (the
+    /// local source of the debug stream); shipping to a central collector URL is
+    /// post-v1.
+    #[arg(long = "debug", global = true, env = "ASP_DEBUG")]
+    debug: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -165,7 +171,16 @@ fn seed_authorized_keys(cli: &Cli, engine: &Engine) -> Result<()> {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let filter = cli.log.clone().unwrap_or_else(|| "info".into());
+    // `--debug` opts into verbose row-level logging (the local source of the
+    // opt-in debug log); it is a side channel that never affects convergence.
+    let filter = if cli.debug.is_some() {
+        "asp=debug,asp_core=debug".to_string()
+    } else {
+        cli.log.clone().unwrap_or_else(|| "info".into())
+    };
+    if let Some(target) = &cli.debug {
+        eprintln!("debug log enabled (target: {target}) — side channel, off the sync path");
+    }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .with_target(false)
@@ -432,7 +447,7 @@ async fn run_watch_loop(
 ) -> Result<()> {
     use std::collections::HashMap;
     let conns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let (auth, vid, root, site, debounce) = {
+    let (auth, _vid, root, site, debounce) = {
         let e = engine.lock().unwrap();
         let auth = auth_opts(cli, &e);
         let vid = VaultConfig::new(&e.store).vault_id()?.unwrap_or_default();

@@ -307,6 +307,23 @@ mod tests {
     }
 
     #[test]
+    fn reclass_boundary_changes_merge_class_and_keeps_content() {
+        // §The merge model: a `reclass` row seeds the new representation from the
+        // file's current content and changes how *later* rows merge, without
+        // retro-reinterpreting older rows.
+        let s = Store::open_memory().unwrap();
+        let h0 = s.put_blob(b"line\n").unwrap();
+        let create = mkrow("aa", 1, 0, "f1", Kind::Create, None, None, Some(&h0), Some("a.txt"));
+        let mut reclass = mkrow("aa", 2, 1, "f1", Kind::Reclass, Some(&create.id), Some(&h0), Some(&h0), None);
+        reclass.merge_class = MergeClass::Code;
+        let reclass = reclass.seal();
+        let files = compute_files(&s, &[create, reclass]).unwrap();
+        let f = files.iter().find(|f| f.file_id == "f1").unwrap();
+        assert_eq!(f.merge_class, MergeClass::Code, "reclass switched the routing class");
+        assert_eq!(f.result_hash.as_deref(), Some(h0.as_str()), "content carried across the boundary");
+    }
+
+    #[test]
     fn delete_remove_wins_over_concurrent_edit() {
         let s = Store::open_memory().unwrap();
         let h0 = s.put_blob(b"v0\n").unwrap();
