@@ -92,7 +92,7 @@ fn build_tree(prefix: &str, files: &BTreeMap<String, Vec<u8>>, git_dir: &Path) -
         let oid = build_tree(&child_prefix, files, git_dir)?;
         entries.push(Entry { mode: TREE_MODE.to_string(), name: name.clone(), oid });
     }
-    entries.sort_by(|a, b| tree_sort_key(a).cmp(&tree_sort_key(b)));
+    entries.sort_by_key(tree_sort_key);
     let mut payload = Vec::new();
     for e in &entries {
         payload.extend_from_slice(e.mode.as_bytes());

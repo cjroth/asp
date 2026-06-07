@@ -198,6 +198,10 @@ pub async fn serve(
     }
 }
 
+// `ErrorResponse` (the 401 path) is intentionally a full http::Response; the
+// tungstenite upgrade-callback signature fixes the Err type, so boxing it is not
+// possible here.
+#[allow(clippy::result_large_err)]
 async fn accept_one(
     tcp: TcpStream,
     engine: EngineRef,

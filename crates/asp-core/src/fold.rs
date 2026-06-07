@@ -47,8 +47,8 @@ pub fn fold_order(rows: &[LogRow]) -> Vec<LogRow> {
 
     // Min-heap (Reverse) of ready rows by tiebreak key.
     let mut ready: BinaryHeap<Reverse<(OrderKey, usize)>> = BinaryHeap::new();
-    for i in 0..rows.len() {
-        if indeg[i] == 0 {
+    for (i, &d) in indeg.iter().enumerate() {
+        if d == 0 {
             ready.push(Reverse((key(i), i)));
         }
     }
