@@ -66,11 +66,13 @@ impl Session {
     pub fn new(
         role: Role,
         engine: &Engine,
-        vault_id: String,
         advertised_binding: Vec<u8>,
         observed_binding: Option<Vec<u8>>,
         admit: AdmitCtx,
     ) -> Session {
+        // Read the current vault id from config so a hub that *adopted* a vault
+        // advertises it to later peers (and a fresh clone advertises empty).
+        let vault_id = engine.store.get_config("vault_id").ok().flatten().unwrap_or_default();
         Session {
             role,
             our_node: engine.identity.node_id(),
@@ -128,7 +130,13 @@ impl Session {
                 if proto != PROTO {
                     return Ok(vec![Step::Closed(format!("proto mismatch: {proto} != {PROTO}"))]);
                 }
-                if vault_id != self.vault_id {
+                // Vault matching, with clone adoption: a fresh node (empty
+                // vault_id) adopts the peer's; an empty peer vault_id means the
+                // peer is cloning from us. Two populated, differing ids never sync.
+                if self.vault_id.is_empty() && !vault_id.is_empty() {
+                    self.vault_id = vault_id.clone();
+                    engine.store.set_config("vault_id", &vault_id)?;
+                } else if !vault_id.is_empty() && !self.vault_id.is_empty() && vault_id != self.vault_id {
                     return Ok(vec![Step::Closed("different vault".into())]);
                 }
                 let peer = NodeId::from_hex(&node_id)
@@ -280,8 +288,8 @@ mod tests {
 
         let mkctx = || AdmitCtx { no_tofu: false, auth_key_ok: false, auth_key_configured: false, default_ttl_days: 90, now_unix: 1_700_000_000 };
 
-        let mut la = Session::new(Role::Listener, &a, vid.clone(), Vec::new(), None, mkctx());
-        let mut cb = Session::new(Role::Connector, &b, vid.clone(), Vec::new(), None, mkctx());
+        let mut la = Session::new(Role::Listener, &a, Vec::new(), None, mkctx());
+        let mut cb = Session::new(Role::Connector, &b, Vec::new(), None, mkctx());
 
         // Message pump: `to_a` feeds the listener (A), `to_b` feeds connector (B).
         let mut to_a: Vec<Msg> = cb.start().into_iter().filter_map(send_of).collect();

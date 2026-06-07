@@ -354,32 +354,77 @@ impl Engine {
     /// any divergence (§Capture: startup reconciliation). Disk is ground truth at
     /// boot. Returns authored rows to push.
     pub fn reconcile_startup(&self) -> AspResult<Vec<WireRow>> {
-        let mut authored = Vec::new();
+        self.capture_rescan()
+    }
+
+    /// Capture the current on-disk state against the materialized `files`,
+    /// authoring create/edit/delete rows — and inferring **renames** by pairing a
+    /// disappeared path with an appeared path of identical, non-trivial content
+    /// (host-signal-free fallback; conservative to avoid empty/template matches,
+    /// §Renames). Returns authored rows to push. Used by the `watch` debounce
+    /// flush and by startup reconciliation.
+    pub fn capture_rescan(&self) -> AspResult<Vec<WireRow>> {
         let on_disk = self.scan_disk()?;
         let live: BTreeMap<String, FileRow> =
             self.store.live_files()?.into_iter().map(|f| (f.path.clone(), f)).collect();
 
-        // New or changed files on disk.
-        for (rel, bytes) in &on_disk {
-            let changed = match live.get(rel) {
-                Some(f) => {
-                    let h = crate::oid::content_hash(bytes);
-                    f.result_hash.as_deref() != Some(h.as_str())
+        let mut disappeared: Vec<String> = Vec::new();
+        let mut changed: Vec<String> = Vec::new();
+        for (path, f) in &live {
+            match on_disk.get(path) {
+                None => disappeared.push(path.clone()),
+                Some(bytes) => {
+                    if f.result_hash.as_deref() != Some(crate::oid::content_hash(bytes).as_str()) {
+                        changed.push(path.clone());
+                    }
                 }
-                None => true,
-            };
-            if changed {
-                if let Some(wr) = self.record_write(rel, bytes)? {
+            }
+        }
+        let mut appeared: Vec<String> =
+            on_disk.keys().filter(|p| !live.contains_key(*p)).cloned().collect();
+
+        // Index appeared paths by content hash for rename inference (unique,
+        // non-trivial content only).
+        let mut by_hash: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for a in &appeared {
+            if let Some(bytes) = on_disk.get(a) {
+                if bytes.len() > 8 {
+                    by_hash.entry(crate::oid::content_hash(bytes)).or_default().push(a.clone());
+                }
+            }
+        }
+
+        let mut authored = Vec::new();
+        let mut consumed_appeared: std::collections::HashSet<String> = Default::default();
+        let mut still_disappeared = Vec::new();
+        for d in disappeared {
+            let dh = live.get(&d).and_then(|f| f.result_hash.clone());
+            let matched = dh
+                .as_ref()
+                .and_then(|h| by_hash.get(h))
+                .and_then(|cands| cands.iter().find(|c| !consumed_appeared.contains(*c)).cloned());
+            match matched {
+                Some(a) => {
+                    consumed_appeared.insert(a.clone());
+                    if let Some(wr) = self.record_rename(&d, &a)? {
+                        authored.push(wr);
+                    }
+                }
+                None => still_disappeared.push(d),
+            }
+        }
+        appeared.retain(|a| !consumed_appeared.contains(a));
+
+        for path in changed.iter().chain(appeared.iter()) {
+            if let Some(bytes) = on_disk.get(path) {
+                if let Some(wr) = self.record_write(path, bytes)? {
                     authored.push(wr);
                 }
             }
         }
-        // Files removed from disk while we were off.
-        for (rel, _f) in &live {
-            if !on_disk.contains_key(rel) {
-                if let Some(wr) = self.record_remove(rel)? {
-                    authored.push(wr);
-                }
+        for d in still_disappeared {
+            if let Some(wr) = self.record_remove(&d)? {
+                authored.push(wr);
             }
         }
         Ok(authored)
