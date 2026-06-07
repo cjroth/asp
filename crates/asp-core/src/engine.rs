@@ -10,7 +10,7 @@ use crate::error::{AspError, AspResult};
 use crate::fold::compute_files;
 use crate::gitexport;
 use crate::identity::Identity;
-use crate::log::{Kind, LogRow, MergeClass};
+use crate::log::{Kind, LogRow};
 use crate::order::NodeId;
 use crate::session::SessionVault;
 use crate::sqlite::SqliteStore;

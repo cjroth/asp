@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/asp-core",
     "crates/asp",
+    "crates/asp-wasm",
     "tests/e2e",
 ]
 default-members = [

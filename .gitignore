@@ -1,3 +1,11 @@
 /target
 Cargo.lock
 *.asp-tmp-*
+# Generated wasm packages (rebuild with `bun run build:wasm`)
+crates/asp-wasm/pkg
+crates/asp-wasm/pkg-web
+# JS deps + build output
+node_modules
+**/node_modules
+dist
+plugins/obsidian/main.js

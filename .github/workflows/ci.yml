@@ -33,3 +33,19 @@ jobs:
         run: cargo test --workspace
       - name: Clippy (no warnings)
         run: rustup component add clippy && cargo clippy --workspace -- -D warnings
+
+  sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust + wasm target
+        run: rustup toolchain install stable --profile minimal && rustup target add wasm32-unknown-unknown
+      - uses: oven-sh/setup-bun@v2
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build native asp binary (for the parity e2e)
+        run: cargo build -p asp
+      - name: Build the one engine to wasm
+        run: cd sdks/typescript && bun run build:wasm
+      - name: SDK conformance (wasm == native) + parity (SDK ⇄ real asp)
+        run: cd sdks/typescript && bun test
