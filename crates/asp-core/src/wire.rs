@@ -58,6 +58,10 @@ pub enum Msg {
     Rows { rows: Vec<WireRow> },
     /// Optimistic real-time push of a single new row.
     Push { row: Box<WireRow> },
+    /// The listener refused admission (or another fatal handshake error). Sent
+    /// before close so the connector learns it was rejected rather than silently
+    /// seeing the socket drop.
+    Denied { reason: String },
     /// Graceful close.
     Bye,
 }

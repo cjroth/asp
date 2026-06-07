@@ -170,7 +170,11 @@ impl Session {
                 match self.role {
                     Role::Listener => {
                         if let Err(e) = engine.admit(&peer, &self.admit) {
-                            return Ok(vec![Step::Closed(format!("admission denied: {e}"))]);
+                            let reason = format!("admission denied: {e}");
+                            return Ok(vec![
+                                Step::Send(Msg::Denied { reason: reason.clone() }),
+                                Step::Closed(reason),
+                            ]);
                         }
                     }
                     Role::Connector => {
@@ -224,6 +228,7 @@ impl Session {
                 let integrated = self.integrate_batch(engine, vec![*row])?;
                 Ok(vec![Step::Integrated(integrated)])
             }
+            Msg::Denied { reason } => Ok(vec![Step::Closed(format!("denied by peer: {reason}"))]),
             Msg::Bye => Ok(vec![Step::Closed("bye".into())]),
         }
     }

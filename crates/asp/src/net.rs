@@ -131,7 +131,15 @@ where
                                         fanout(&conns, conn_id, &Msg::Push { row: Box::new(wr) }).await;
                                     }
                                 }
-                                Step::Closed(reason) => { tracing::info!(reason, "closing"); closing = true; }
+                                Step::Closed(reason) => {
+                                    if reason.contains("denied") {
+                                        let _ = sink.send(Message::Close(None)).await;
+                                        conns.lock().await.remove(&conn_id);
+                                        return Err(anyhow!("{reason}"));
+                                    }
+                                    tracing::info!(reason, "closing");
+                                    closing = true;
+                                }
                             }
                         }
                         if closing { break Ok(()); }
@@ -151,6 +159,10 @@ where
         }
     };
     conns.lock().await.remove(&conn_id);
+    // A one-shot that ended without ever authenticating was rejected/unreachable.
+    if oneshot && result.is_ok() && !session.authed() {
+        return Err(anyhow!("handshake did not complete (rejected or vault mismatch)"));
+    }
     result
 }
 

@@ -74,7 +74,9 @@ impl Store {
     }
 
     fn init(conn: Connection) -> AspResult<Store> {
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        )?;
         conn.execute_batch(SCHEMA)?;
         Ok(Store { conn })
     }
