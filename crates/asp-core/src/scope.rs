@@ -1,0 +1,211 @@
+//! Scope / ignore matching (§Surfaces, `asp scope`). A hand-rolled gitignore-
+//! style matcher (the core carries no `regex` dep where a small differentially-
+//! tested equivalent will do, §Implementation). Always ignores the engine's own
+//! `.asp/` directory so the store never tries to version itself.
+
+/// The engine's private directory, never versioned.
+pub const PRIVATE_DIR: &str = ".asp";
+
+/// A compiled set of ignore patterns.
+#[derive(Clone, Default)]
+pub struct Scope {
+    patterns: Vec<Pattern>,
+}
+
+#[derive(Clone)]
+struct Pattern {
+    /// Glob with `*` (any run within a segment) and `**` (any number of segments).
+    glob: String,
+    /// Anchored to the root (leading `/`).
+    anchored: bool,
+    /// Directory-only (trailing `/`).
+    dir_only: bool,
+    /// Negation (`!`).
+    negate: bool,
+}
+
+impl Scope {
+    /// Parse `.aspignore` content. Blank lines and `#` comments are skipped.
+    pub fn parse(content: &str) -> Scope {
+        let mut patterns = Vec::new();
+        for raw in content.lines() {
+            let line = raw.trim_end();
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let mut s = line;
+            let negate = s.starts_with('!');
+            if negate {
+                s = &s[1..];
+            }
+            let anchored = s.starts_with('/');
+            if anchored {
+                s = &s[1..];
+            }
+            let dir_only = s.ends_with('/');
+            if dir_only {
+                s = &s[..s.len() - 1];
+            }
+            patterns.push(Pattern { glob: s.to_string(), anchored, dir_only, negate });
+        }
+        Scope { patterns }
+    }
+
+    /// Should `rel_path` (a forward-slash relative path) be ignored?
+    pub fn ignored(&self, rel_path: &str) -> bool {
+        // The private dir is always out of scope.
+        if rel_path == PRIVATE_DIR || rel_path.starts_with(&format!("{PRIVATE_DIR}/")) {
+            return true;
+        }
+        let mut ignored = false;
+        for p in &self.patterns {
+            if p.matches(rel_path) {
+                ignored = !p.negate;
+            }
+        }
+        ignored
+    }
+}
+
+impl Pattern {
+    fn matches(&self, path: &str) -> bool {
+        if self.anchored {
+            self.match_from(path)
+        } else {
+            // Unanchored: match against the full path or any suffix segment start.
+            if self.match_from(path) {
+                return true;
+            }
+            let mut rest = path;
+            while let Some(i) = rest.find('/') {
+                rest = &rest[i + 1..];
+                if self.match_from(rest) {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+
+    /// Match the glob against `path` from its start. `dir_only` matches a prefix
+    /// directory (so `build/` ignores `build/x`).
+    fn match_from(&self, path: &str) -> bool {
+        if self.dir_only {
+            // Match the glob against the first segment(s), allowing children.
+            if glob_match(&self.glob, path) {
+                return true;
+            }
+            // `glob/` should match `glob/anything`.
+            if let Some(stripped) = path.strip_prefix(&format!("{}/", self.glob)) {
+                let _ = stripped;
+                return true;
+            }
+            // Also match when glob matches a leading prefix ending at a '/'.
+            for (i, c) in path.char_indices() {
+                if c == '/' && glob_match(&self.glob, &path[..i]) {
+                    return true;
+                }
+            }
+            false
+        } else {
+            glob_match(&self.glob, path) || {
+                // A plain file pattern also ignores everything under a matching dir.
+                for (i, c) in path.char_indices() {
+                    if c == '/' && glob_match(&self.glob, &path[..i]) {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Glob with `*` (any chars except `/`) and `**` (any chars incl `/`).
+fn glob_match(pat: &str, text: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    gm(&p, 0, &t, 0)
+}
+
+fn gm(p: &[char], pi: usize, t: &[char], ti: usize) -> bool {
+    if pi == p.len() {
+        return ti == t.len();
+    }
+    if p[pi] == '*' {
+        // `**` — any chars including '/'.
+        if pi + 1 < p.len() && p[pi + 1] == '*' {
+            let mut npi = pi + 2;
+            if npi < p.len() && p[npi] == '/' {
+                npi += 1; // `**/` absorbs the slash optionally
+            }
+            // try consuming 0..=len chars
+            for k in ti..=t.len() {
+                if gm(p, npi, t, k) {
+                    return true;
+                }
+            }
+            return gm(p, npi, t, ti);
+        }
+        // single `*` — any chars except '/'.
+        let mut k = ti;
+        loop {
+            if gm(p, pi + 1, t, k) {
+                return true;
+            }
+            if k == t.len() || t[k] == '/' {
+                return false;
+            }
+            k += 1;
+        }
+    }
+    if p[pi] == '?' {
+        if ti < t.len() && t[ti] != '/' {
+            return gm(p, pi + 1, t, ti + 1);
+        }
+        return false;
+    }
+    if ti < t.len() && p[pi] == t[ti] {
+        return gm(p, pi + 1, t, ti + 1);
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_dir_always_ignored() {
+        let s = Scope::default();
+        assert!(s.ignored(".asp"));
+        assert!(s.ignored(".asp/asp.db"));
+        assert!(!s.ignored("notes/a.md"));
+    }
+
+    #[test]
+    fn basic_patterns() {
+        let s = Scope::parse("*.log\nbuild/\n/secret.txt\n");
+        assert!(s.ignored("a.log"));
+        assert!(s.ignored("deep/b.log"));
+        assert!(s.ignored("build/out"));
+        assert!(s.ignored("nested/build/out"));
+        assert!(s.ignored("secret.txt"));
+        assert!(!s.ignored("deep/secret.txt")); // anchored
+        assert!(!s.ignored("a.md"));
+    }
+
+    #[test]
+    fn negation() {
+        let s = Scope::parse("*.log\n!keep.log\n");
+        assert!(s.ignored("x.log"));
+        assert!(!s.ignored("keep.log"));
+    }
+
+    #[test]
+    fn double_star() {
+        let s = Scope::parse("docs/**/tmp\n");
+        assert!(s.ignored("docs/a/b/tmp"));
+        assert!(s.ignored("docs/tmp"));
+    }
+}
