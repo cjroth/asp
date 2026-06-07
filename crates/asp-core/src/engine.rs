@@ -4,7 +4,7 @@
 //! `fold`/`merge`/`store` core — all convergence logic lives there. The native
 //! driver (the `asp` CLI) supplies file watching, debounce, and sockets.
 
-use crate::authkeys::{expiry_from_ttl_days, AuthKey};
+use crate::authkeys::{decide_admission, expiry_from_ttl_days, AdmitCtx, AdmitDecision, AuthKey};
 use crate::config::VaultConfig;
 use crate::error::{AspError, AspResult};
 use crate::fold::compute_files;
@@ -12,30 +12,20 @@ use crate::gitexport;
 use crate::identity::Identity;
 use crate::log::{Kind, LogRow, MergeClass};
 use crate::order::NodeId;
-use crate::store::{FileRow, Store};
+use crate::session::SessionVault;
+use crate::sqlite::SqliteStore;
+use crate::store::{BlobStore, FileRow};
 use crate::wire::{WireBlob, WireRow};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Per-connection context the listener uses to decide admission.
-#[derive(Clone)]
-pub struct AdmitCtx {
-    pub no_tofu: bool,
-    /// A valid auth key was presented at the WebSocket upgrade.
-    pub auth_key_ok: bool,
-    /// An auth key is configured on this listener (implicitly disables TOFU).
-    pub auth_key_configured: bool,
-    pub default_ttl_days: u64,
-    pub now_unix: u64,
-}
-
 pub struct Engine {
     pub root: PathBuf,
     pub asp_dir: PathBuf,
     pub git_dir: PathBuf,
-    pub store: Store,
+    pub store: SqliteStore,
     pub identity: Identity,
     pub scope: crate::scope::Scope,
 }
@@ -51,25 +41,7 @@ fn random_id() -> String {
     hex::encode(b)
 }
 
-/// Classify a path's merge behavior (§The merge model). Constant per `file_id`
-/// from creation; changes only via an explicit `reclass`.
-pub fn classify(path: &str, bytes: &[u8]) -> MergeClass {
-    if std::str::from_utf8(bytes).is_err() || bytes.contains(&0) {
-        return MergeClass::Binary;
-    }
-    let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    const CODE: &[&str] = &[
-        "rs", "py", "js", "ts", "tsx", "jsx", "go", "c", "h", "cpp", "cc", "hpp", "java", "rb",
-        "sh", "bash", "zsh", "php", "swift", "kt", "scala", "lua", "pl", "r", "sql", "toml", "yaml",
-        "yml", "json", "xml", "html", "css", "scss", "vue", "ex", "exs", "erl", "hs", "ml", "fs",
-        "cs", "dart", "zig", "nim",
-    ];
-    if CODE.contains(&ext.as_str()) {
-        MergeClass::Code
-    } else {
-        MergeClass::Text
-    }
-}
+pub use crate::log::classify;
 
 impl Engine {
     /// Open or create the engine at a vault root, authoring as `identity`.
@@ -77,7 +49,7 @@ impl Engine {
         let asp_dir = root.join(".asp");
         fs::create_dir_all(&asp_dir)?;
         let git_dir = asp_dir.join("git");
-        let store = Store::open(&asp_dir.join("asp.db"))?;
+        let store = SqliteStore::open(&asp_dir.join("asp.db"))?;
         let scope = Self::load_scope(root);
         let eng = Engine { root: root.to_path_buf(), asp_dir, git_dir, store, identity, scope };
         Ok(eng)
@@ -574,40 +546,50 @@ impl Engine {
         self.store.migrate_fill_expiry(exp)
     }
 
-    /// Decide whether to admit `peer` and (if enrolling/TOFU) persist the row.
-    /// Returns Ok(()) on admit, Err(AuthDenied) otherwise.
+    /// Decide whether to admit `peer` and (if enrolling/TOFU) persist the row,
+    /// via the shared `decide_admission` logic (§Security).
     pub fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<()> {
         let peer_hex = peer.to_hex();
-        // Already enrolled and currently valid → admit.
-        if let Some(k) = self.store.authkey_by_node(&peer_hex)? {
-            if k.admissible(ctx.now_unix) {
-                return Ok(());
-            }
-            // Expired: only an auth-key re-enrollment refreshes the TTL.
-            if ctx.auth_key_ok {
+        let existing = self.store.authkey_by_node(&peer_hex)?;
+        match decide_admission(existing.as_ref(), self.store.authkeys_empty()?, ctx) {
+            AdmitDecision::Admit => Ok(()),
+            AdmitDecision::Insert(source) => {
                 let exp = expiry_from_ttl_days(ctx.now_unix, ctx.default_ttl_days);
-                self.store.set_authkey_expiry(&peer_hex, Some(exp), false)?;
-                return Ok(());
+                let line = crate::identity::ssh_pubkey_string(peer, source);
+                let k = AuthKey::from_ssh(&line, Some(exp), false, ctx.now_unix, source).unwrap();
+                self.store.insert_authkey(&k)?;
+                Ok(())
             }
-            return Err(AspError::AuthDenied(format!("key expired: {}", &peer_hex[..12])));
+            AdmitDecision::Deny(why) => Err(AspError::AuthDenied(format!("{why}: {}", &peer_hex[..12]))),
         }
-        // Not enrolled. Auth-key enrollment is the front door for fresh peers.
-        if ctx.auth_key_ok {
-            let exp = expiry_from_ttl_days(ctx.now_unix, ctx.default_ttl_days);
-            let line = crate::identity::ssh_pubkey_string(peer, "enrolled");
-            let k = AuthKey::from_ssh(&line, Some(exp), false, ctx.now_unix, "enroll").unwrap();
-            self.store.insert_authkey(&k)?;
-            return Ok(());
-        }
-        // TOFU — only while the set is empty, no auth key configured, not disabled.
-        if !ctx.no_tofu && !ctx.auth_key_configured && self.store.authkeys_empty()? {
-            let line = crate::identity::ssh_pubkey_string(peer, "tofu");
-            let exp = expiry_from_ttl_days(ctx.now_unix, ctx.default_ttl_days);
-            let k = AuthKey::from_ssh(&line, Some(exp), false, ctx.now_unix, "tofu").unwrap();
-            self.store.insert_authkey(&k)?;
-            return Ok(());
-        }
-        Err(AspError::AuthDenied(format!("not authorized: {}", &peer_hex[..12])))
+    }
+}
+
+/// The native engine drives the *same* sans-IO `Session` as the wasm node.
+impl SessionVault for Engine {
+    fn node_id(&self) -> NodeId {
+        self.identity.node_id()
+    }
+    fn sign(&self, msg: &[u8]) -> Vec<u8> {
+        self.identity.sign(msg)
+    }
+    fn vault_id(&self) -> String {
+        self.store.get_config("vault_id").ok().flatten().unwrap_or_default()
+    }
+    fn adopt_vault_id(&self, vault_id: &str) -> AspResult<()> {
+        self.store.set_config("vault_id", vault_id)
+    }
+    fn version_vector(&self) -> AspResult<BTreeMap<String, i64>> {
+        self.store.version_vector()
+    }
+    fn rows_after_wire(&self, site: &str, after: i64) -> AspResult<Vec<WireRow>> {
+        self.store.rows_after(site, after)?.into_iter().map(|r| self.wire(r)).collect()
+    }
+    fn integrate(&self, wr: &WireRow) -> AspResult<bool> {
+        Engine::integrate(self, wr)
+    }
+    fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<()> {
+        Engine::admit(self, peer, ctx)
     }
 }
 

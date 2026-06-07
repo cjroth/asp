@@ -22,6 +22,7 @@ pub enum AspError {
 
 pub type AspResult<T> = Result<T, AspError>;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl From<rusqlite::Error> for AspError {
     fn from(e: rusqlite::Error) -> Self {
         AspError::Storage(e.to_string())

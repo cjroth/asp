@@ -17,7 +17,7 @@
 use crate::log::{Kind, LogRow, MergeClass};
 use crate::merge::merge3;
 use crate::order::OrderKey;
-use crate::store::{FileRow, Store};
+use crate::store::{BlobStore, FileRow};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -93,7 +93,7 @@ struct FileState {
 
 /// Fold the whole log into the materialized `files` set, writing any merged
 /// blobs back to the store. Pure function of the rows + blobs.
-pub fn compute_files(store: &Store, rows: &[LogRow]) -> crate::error::AspResult<Vec<FileRow>> {
+pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::AspResult<Vec<FileRow>> {
     let ordered = fold_order(rows);
     let mut states: HashMap<String, FileState> = HashMap::new();
 
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn fold_order_is_permutation_invariant() {
-        let s = Store::open_memory().unwrap();
+        let s = crate::store::MemBlobStore::new();
         let hb = s.put_blob(b"hello\n").unwrap();
         let r1 = mkrow("aa", 1, 0, "f1", Kind::Create, None, None, Some(&hb), Some("a.md"));
         let r2 = mkrow("aa", 2, 1, "f1", Kind::Edit, Some(&r1.id), Some(&hb), Some(&s.put_blob(b"hello world\n").unwrap()), None);
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn concurrent_same_path_create_splits_with_suffix() {
-        let s = Store::open_memory().unwrap();
+        let s = crate::store::MemBlobStore::new();
         let ha = s.put_blob(b"from A\n").unwrap();
         let hb = s.put_blob(b"from B\n").unwrap();
         let a = mkrow("aa", 1, 0, "fa", Kind::Create, None, None, Some(&ha), Some("todo.md"));
@@ -311,7 +311,7 @@ mod tests {
         // §The merge model: a `reclass` row seeds the new representation from the
         // file's current content and changes how *later* rows merge, without
         // retro-reinterpreting older rows.
-        let s = Store::open_memory().unwrap();
+        let s = crate::store::MemBlobStore::new();
         let h0 = s.put_blob(b"line\n").unwrap();
         let create = mkrow("aa", 1, 0, "f1", Kind::Create, None, None, Some(&h0), Some("a.txt"));
         let mut reclass = mkrow("aa", 2, 1, "f1", Kind::Reclass, Some(&create.id), Some(&h0), Some(&h0), None);
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn delete_remove_wins_over_concurrent_edit() {
-        let s = Store::open_memory().unwrap();
+        let s = crate::store::MemBlobStore::new();
         let h0 = s.put_blob(b"v0\n").unwrap();
         let create = mkrow("aa", 1, 0, "f1", Kind::Create, None, None, Some(&h0), Some("a.md"));
         // B edits concurrently (parent = create), A deletes concurrently (parent = create).

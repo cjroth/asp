@@ -1,0 +1,383 @@
+//! The wasm-safe in-memory engine (§Implementation: one engine, thin bindings).
+//! A complete **thin node**: it holds a full local working copy in memory, authors
+//! its own rows offline, integrates rows from a full node, and converges via the
+//! *same* `compute_files` fold + `merge3` + `Session` as the native daemon — so a
+//! browser/Obsidian node computes byte-identical state. It has no fs, no sockets,
+//! and no SQLite; persistence and transport are the host's job (the SDK).
+//!
+//! It implements [`SessionVault`], so the identical handshake + catch-up runs
+//! here as on native. Materialization is to an in-memory `path -> bytes` map
+//! (the host renders it to its vault), not to disk.
+
+use crate::authkeys::{decide_admission, expiry_from_ttl_days, AdmitCtx, AdmitDecision, AuthKey};
+use crate::error::{AspError, AspResult};
+use crate::fold::compute_files;
+use crate::identity::Identity;
+use crate::log::{classify, Kind, LogRow};
+use crate::order::NodeId;
+use crate::session::SessionVault;
+use crate::store::{BlobStore, FileRow, MemBlobStore};
+use crate::wire::{WireBlob, WireRow};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+
+fn now_unix() -> i64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        0
+    }
+}
+
+fn random_id() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut b);
+    hex::encode(b)
+}
+
+pub struct MemEngine {
+    identity: Identity,
+    blobs: MemBlobStore,
+    rows: RefCell<Vec<LogRow>>,
+    files: RefCell<Vec<FileRow>>,
+    config: RefCell<BTreeMap<String, String>>,
+    authorized: RefCell<Vec<AuthKey>>,
+}
+
+impl MemEngine {
+    /// Create a fresh in-memory vault authoring as `identity`.
+    pub fn create(identity: Identity, vault_id: &str) -> MemEngine {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("vault_id".to_string(), vault_id.to_string());
+        cfg.insert("tiebreak_key".to_string(), "lamport".to_string());
+        MemEngine {
+            identity,
+            blobs: MemBlobStore::new(),
+            rows: RefCell::new(Vec::new()),
+            files: RefCell::new(Vec::new()),
+            config: RefCell::new(cfg),
+            authorized: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub fn site_id(&self) -> String {
+        self.identity.node_id().to_hex()
+    }
+
+    // ----- counters -----
+
+    fn next_lamport(&self) -> u64 {
+        self.rows.borrow().iter().map(|r| r.lamport).max().unwrap_or(0) + 1
+    }
+
+    fn next_seq(&self) -> u64 {
+        let me = self.site_id();
+        self.rows.borrow().iter().filter(|r| r.site_id == me).map(|r| r.seq as i64).max().map(|m| (m + 1) as u64).unwrap_or(0)
+    }
+
+    fn tip(&self, file_id: &str) -> Option<String> {
+        self.rows
+            .borrow()
+            .iter()
+            .filter(|r| r.file_id == file_id)
+            .max_by(|a, b| {
+                a.lamport.cmp(&b.lamport).then_with(|| a.site_id.cmp(&b.site_id)).then_with(|| a.id.cmp(&b.id))
+            })
+            .map(|r| r.id.clone())
+    }
+
+    fn current_for_path(&self, rel: &str) -> Option<FileRow> {
+        self.files.borrow().iter().find(|f| !f.deleted && f.path == rel).cloned()
+    }
+
+    // ----- capture -----
+
+    /// Author a create/edit for `rel`. Returns the row (with blobs), or None if
+    /// the content is unchanged.
+    pub fn record_write(&self, rel: &str, bytes: &[u8]) -> AspResult<Option<WireRow>> {
+        let result_hash = self.blobs.put_blob(bytes)?;
+        let (lamport, seq, ts) = (self.next_lamport(), self.next_seq(), now_unix());
+        let row = match self.current_for_path(rel) {
+            Some(cur) => {
+                if cur.result_hash.as_deref() == Some(result_hash.as_str()) {
+                    return Ok(None);
+                }
+                LogRow {
+                    id: String::new(),
+                    site_id: self.site_id(),
+                    lamport,
+                    seq,
+                    ts,
+                    file_id: cur.file_id.clone(),
+                    kind: Kind::Edit,
+                    merge_class: cur.merge_class,
+                    parent: self.tip(&cur.file_id),
+                    base_hash: cur.result_hash.clone(),
+                    result_hash: Some(result_hash),
+                    path: None,
+                    sig: vec![],
+                }
+                .seal()
+            }
+            None => LogRow {
+                id: String::new(),
+                site_id: self.site_id(),
+                lamport,
+                seq,
+                ts,
+                file_id: random_id(),
+                kind: Kind::Create,
+                merge_class: classify(rel, bytes),
+                parent: None,
+                base_hash: None,
+                result_hash: Some(result_hash),
+                path: Some(rel.to_string()),
+                sig: vec![],
+            }
+            .seal(),
+        };
+        self.rows.borrow_mut().push(row.clone());
+        self.materialize()?;
+        Ok(Some(self.wire(row)?))
+    }
+
+    pub fn record_remove(&self, rel: &str) -> AspResult<Option<WireRow>> {
+        let Some(cur) = self.current_for_path(rel) else { return Ok(None) };
+        let (lamport, seq, ts) = (self.next_lamport(), self.next_seq(), now_unix());
+        let row = LogRow {
+            id: String::new(),
+            site_id: self.site_id(),
+            lamport,
+            seq,
+            ts,
+            file_id: cur.file_id.clone(),
+            kind: Kind::Delete,
+            merge_class: cur.merge_class,
+            parent: self.tip(&cur.file_id),
+            base_hash: cur.result_hash.clone(),
+            result_hash: None,
+            path: None,
+            sig: vec![],
+        }
+        .seal();
+        self.rows.borrow_mut().push(row.clone());
+        self.materialize()?;
+        Ok(Some(self.wire(row)?))
+    }
+
+    pub fn record_rename(&self, old: &str, new: &str) -> AspResult<Option<WireRow>> {
+        let Some(cur) = self.current_for_path(old) else { return Ok(None) };
+        let (lamport, seq, ts) = (self.next_lamport(), self.next_seq(), now_unix());
+        let row = LogRow {
+            id: String::new(),
+            site_id: self.site_id(),
+            lamport,
+            seq,
+            ts,
+            file_id: cur.file_id.clone(),
+            kind: Kind::Rename,
+            merge_class: cur.merge_class,
+            parent: self.tip(&cur.file_id),
+            base_hash: cur.result_hash.clone(),
+            result_hash: cur.result_hash.clone(),
+            path: Some(new.to_string()),
+            sig: vec![],
+        }
+        .seal();
+        self.rows.borrow_mut().push(row.clone());
+        self.materialize()?;
+        Ok(Some(self.wire(row)?))
+    }
+
+    /// Bring the working set to `desired` (whole-set commit) — used to seed from a
+    /// host's current vault contents. Authors the necessary create/edit/delete
+    /// rows. Returns authored rows.
+    pub fn commit_files(&self, desired: &BTreeMap<String, Vec<u8>>) -> AspResult<Vec<WireRow>> {
+        let mut authored = Vec::new();
+        let current: Vec<String> = self.files.borrow().iter().filter(|f| !f.deleted).map(|f| f.path.clone()).collect();
+        for (path, bytes) in desired {
+            if let Some(wr) = self.record_write(path, bytes)? {
+                authored.push(wr);
+            }
+        }
+        for path in current {
+            if !desired.contains_key(&path) {
+                if let Some(wr) = self.record_remove(&path)? {
+                    authored.push(wr);
+                }
+            }
+        }
+        Ok(authored)
+    }
+
+    pub fn wire(&self, row: LogRow) -> AspResult<WireRow> {
+        let mut blobs = Vec::new();
+        for h in [row.base_hash.clone(), row.result_hash.clone()].into_iter().flatten() {
+            if let Some(bytes) = self.blobs.get_blob(&h)? {
+                if !blobs.iter().any(|b: &WireBlob| b.hash == h) {
+                    blobs.push(WireBlob { hash: h, bytes });
+                }
+            }
+        }
+        Ok(WireRow { row, blobs })
+    }
+
+    // ----- integrate / fold -----
+
+    pub fn integrate(&self, wr: &WireRow) -> AspResult<bool> {
+        if !wr.row.id_valid() {
+            return Err(AspError::Protocol("row id does not match its contents".into()));
+        }
+        for b in &wr.blobs {
+            let h = self.blobs.put_blob(&b.bytes)?;
+            if h != b.hash {
+                return Err(AspError::Protocol("blob hash mismatch".into()));
+            }
+        }
+        let exists = self.rows.borrow().iter().any(|r| r.id == wr.row.id);
+        if exists {
+            return Ok(false);
+        }
+        self.rows.borrow_mut().push(wr.row.clone());
+        self.materialize()?;
+        Ok(true)
+    }
+
+    pub fn materialize(&self) -> AspResult<()> {
+        let rows = self.rows.borrow().clone();
+        let files = compute_files(&self.blobs, &rows)?;
+        *self.files.borrow_mut() = files;
+        Ok(())
+    }
+
+    /// The materialized working tree as `path -> bytes` (what the host renders).
+    pub fn files_map(&self) -> AspResult<BTreeMap<String, Vec<u8>>> {
+        let mut m = BTreeMap::new();
+        for f in self.files.borrow().iter() {
+            if f.deleted {
+                continue;
+            }
+            if let Some(h) = &f.result_hash {
+                m.insert(f.path.clone(), self.blobs.get_blob(h)?.unwrap_or_default());
+            }
+        }
+        Ok(m)
+    }
+
+    pub fn read_file(&self, rel: &str) -> AspResult<Option<Vec<u8>>> {
+        match self.current_for_path(rel).and_then(|f| f.result_hash) {
+            Some(h) => self.blobs.get_blob(&h),
+            None => Ok(None),
+        }
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.rows.borrow().len()
+    }
+
+    // ----- auth -----
+
+    pub fn authorize(&self, ssh_line: &str, expires_at: Option<u64>, never: bool, source: &str) -> AspResult<()> {
+        let k = AuthKey::from_ssh(ssh_line, expires_at, never, now_unix() as u64, source)
+            .ok_or_else(|| AspError::Invalid("not an ssh-ed25519 key line".into()))?;
+        let mut set = self.authorized.borrow_mut();
+        set.retain(|x| x.node_id != k.node_id);
+        set.push(k);
+        Ok(())
+    }
+}
+
+impl SessionVault for MemEngine {
+    fn node_id(&self) -> NodeId {
+        self.identity.node_id()
+    }
+    fn sign(&self, msg: &[u8]) -> Vec<u8> {
+        self.identity.sign(msg)
+    }
+    fn vault_id(&self) -> String {
+        self.config.borrow().get("vault_id").cloned().unwrap_or_default()
+    }
+    fn adopt_vault_id(&self, vault_id: &str) -> AspResult<()> {
+        self.config.borrow_mut().insert("vault_id".to_string(), vault_id.to_string());
+        Ok(())
+    }
+    fn version_vector(&self) -> AspResult<BTreeMap<String, i64>> {
+        let mut vv = BTreeMap::new();
+        for r in self.rows.borrow().iter() {
+            let e = vv.entry(r.site_id.clone()).or_insert(-1i64);
+            if (r.seq as i64) > *e {
+                *e = r.seq as i64;
+            }
+        }
+        Ok(vv)
+    }
+    fn rows_after_wire(&self, site: &str, after: i64) -> AspResult<Vec<WireRow>> {
+        let rows: Vec<LogRow> = self
+            .rows
+            .borrow()
+            .iter()
+            .filter(|r| r.site_id == site && (r.seq as i64) > after)
+            .cloned()
+            .collect();
+        let mut sorted = rows;
+        sorted.sort_by_key(|r| r.seq);
+        sorted.into_iter().map(|r| self.wire(r)).collect()
+    }
+    fn integrate(&self, wr: &WireRow) -> AspResult<bool> {
+        MemEngine::integrate(self, wr)
+    }
+    fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<()> {
+        let peer_hex = peer.to_hex();
+        let set = self.authorized.borrow();
+        let existing = set.iter().find(|k| k.node_id == peer_hex).cloned();
+        let empty = set.is_empty();
+        drop(set);
+        match decide_admission(existing.as_ref(), empty, ctx) {
+            AdmitDecision::Admit => Ok(()),
+            AdmitDecision::Insert(source) => {
+                let exp = expiry_from_ttl_days(ctx.now_unix, ctx.default_ttl_days);
+                let line = crate::identity::ssh_pubkey_string(peer, source);
+                self.authorize(&line, Some(exp), false, source)?;
+                Ok(())
+            }
+            AdmitDecision::Deny(why) => Err(AspError::AuthDenied(format!("{why}: {}", &peer_hex[..12.min(peer_hex.len())]))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mem_engine_authors_folds_and_reads() {
+        let e = MemEngine::create(Identity::from_seed(&[1; 32]), "v1");
+        e.record_write("a.md", b"hello\n").unwrap().unwrap();
+        e.record_write("a.md", b"hello world\n").unwrap().unwrap();
+        assert_eq!(e.read_file("a.md").unwrap().as_deref(), Some(&b"hello world\n"[..]));
+        assert!(e.record_write("a.md", b"hello world\n").unwrap().is_none());
+        e.record_remove("a.md").unwrap();
+        assert!(e.read_file("a.md").unwrap().is_none());
+    }
+
+    /// The wasm-safe MemEngine and a fresh MemEngine converge by exchanging wire
+    /// rows — the in-process analogue of the cross-surface gate.
+    #[test]
+    fn two_mem_engines_converge() {
+        let a = MemEngine::create(Identity::from_seed(&[1; 32]), "v1");
+        let b = MemEngine::create(Identity::from_seed(&[2; 32]), "v1");
+        let r1 = a.record_write("doc.md", b"l1\nl2\nl3\n").unwrap().unwrap();
+        b.integrate(&r1).unwrap();
+        // concurrent disjoint edits
+        let ra = a.record_write("doc.md", b"L1\nl2\nl3\n").unwrap().unwrap();
+        let rb = b.record_write("doc.md", b"l1\nl2\nL3\n").unwrap().unwrap();
+        b.integrate(&ra).unwrap();
+        a.integrate(&rb).unwrap();
+        assert_eq!(a.files_map().unwrap(), b.files_map().unwrap(), "mem engines converge");
+        assert_eq!(a.read_file("doc.md").unwrap().as_deref(), Some(&b"L1\nl2\nL3\n"[..]));
+    }
+}

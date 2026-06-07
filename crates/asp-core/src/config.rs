@@ -6,7 +6,7 @@
 //! their persisted form is here.
 
 use crate::error::{AspError, AspResult};
-use crate::store::Store;
+use crate::sqlite::SqliteStore;
 
 pub const KEY_TIEBREAK: &str = "tiebreak_key";
 pub const KEY_VAULT_ID: &str = "vault_id";
@@ -15,11 +15,11 @@ pub const KEY_DEBOUNCE_MS: &str = "debounce_ms";
 
 /// Typed view over the `config` table.
 pub struct VaultConfig<'a> {
-    store: &'a Store,
+    store: &'a SqliteStore,
 }
 
 impl<'a> VaultConfig<'a> {
-    pub fn new(store: &'a Store) -> Self {
+    pub fn new(store: &'a SqliteStore) -> Self {
         VaultConfig { store }
     }
 

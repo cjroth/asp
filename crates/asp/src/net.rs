@@ -11,7 +11,7 @@
 //! `files` table never interleaves between connection tasks.
 
 use anyhow::{anyhow, Context, Result};
-use asp_core::engine::AdmitCtx;
+use asp_core::AdmitCtx;
 use asp_core::session::Step;
 use asp_core::{Engine, Msg, NodeId, Role, Session};
 use futures_util::{SinkExt, StreamExt};
@@ -121,7 +121,7 @@ where
                         // Lock the engine only for the synchronous protocol step.
                         let steps = {
                             let eng = engine.lock().unwrap();
-                            session.on_msg(&eng, msg)
+                            session.on_msg(&*eng, msg)
                         };
                         let steps = match steps {
                             Ok(s) => s,
@@ -284,7 +284,7 @@ where
     let admit = auth.admit_ctx(auth_key_ok);
     let session = {
         let eng = engine.lock().unwrap();
-        Session::new(Role::Listener, &eng, advertised, None, admit)
+        Session::new(Role::Listener, &*eng, advertised, None, admit)
     };
     run_connection(ws, engine, session, conns, false, None).await
 }
@@ -345,14 +345,14 @@ pub async fn connect(
         let (ws, _resp) = client_async(request, tls_stream).await.context("wss client handshake")?;
         let session = {
             let eng = engine.lock().unwrap();
-            Session::new(Role::Connector, &eng, Vec::new(), observed, auth.admit_ctx(false))
+            Session::new(Role::Connector, &*eng, Vec::new(), observed, auth.admit_ctx(false))
         };
         run_connection(ws, engine, session, conns, oneshot, on_auth).await
     } else {
         let (ws, _resp) = client_async(request, tcp).await.context("ws client handshake")?;
         let session = {
             let eng = engine.lock().unwrap();
-            Session::new(Role::Connector, &eng, Vec::new(), None, auth.admit_ctx(false))
+            Session::new(Role::Connector, &*eng, Vec::new(), None, auth.admit_ctx(false))
         };
         run_connection(ws, engine, session, conns, oneshot, on_auth).await
     }

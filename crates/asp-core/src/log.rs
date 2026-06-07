@@ -71,6 +71,27 @@ impl MergeClass {
     }
 }
 
+/// Classify a path's merge behavior (§The merge model). Constant per `file_id`
+/// from creation; changes only via an explicit `reclass`. Surface-independent
+/// (used identically by the native engine and the wasm node).
+pub fn classify(path: &str, bytes: &[u8]) -> MergeClass {
+    if std::str::from_utf8(bytes).is_err() || bytes.contains(&0) {
+        return MergeClass::Binary;
+    }
+    let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    const CODE: &[&str] = &[
+        "rs", "py", "js", "ts", "tsx", "jsx", "go", "c", "h", "cpp", "cc", "hpp", "java", "rb",
+        "sh", "bash", "zsh", "php", "swift", "kt", "scala", "lua", "pl", "r", "sql", "toml", "yaml",
+        "yml", "json", "xml", "html", "css", "scss", "vue", "ex", "exs", "erl", "hs", "ml", "fs",
+        "cs", "dart", "zig", "nim",
+    ];
+    if CODE.contains(&ext.as_str()) {
+        MergeClass::Code
+    } else {
+        MergeClass::Text
+    }
+}
+
 /// One row of the append-only global log.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LogRow {

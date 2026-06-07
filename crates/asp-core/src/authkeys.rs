@@ -13,6 +13,53 @@ use crate::order::NodeId;
 const SECS_PER_DAY: u64 = 86_400;
 const NEVER: &str = "never";
 
+/// Per-connection context a listener uses to decide admission (§Security).
+#[derive(Clone)]
+pub struct AdmitCtx {
+    pub no_tofu: bool,
+    /// A valid auth key was presented at the WebSocket upgrade.
+    pub auth_key_ok: bool,
+    /// An auth key is configured on this listener (implicitly disables TOFU).
+    pub auth_key_configured: bool,
+    pub default_ttl_days: u64,
+    pub now_unix: u64,
+}
+
+/// The admission decision — pure logic shared by the native and wasm engines.
+pub enum AdmitDecision {
+    /// Already enrolled and currently valid.
+    Admit,
+    /// Insert/refresh the peer's row with `source` and a fresh default TTL.
+    Insert(&'static str),
+    Deny(String),
+}
+
+/// Decide whether to admit `peer` given its existing row (if any) and whether the
+/// admission set is currently empty. The load-bearing trust gate (§Security):
+/// enrolled+valid → admit; auth-key present → enroll/refresh; empty set + TOFU →
+/// trust-on-first-use; otherwise deny.
+pub fn decide_admission(existing: Option<&AuthKey>, set_empty: bool, ctx: &AdmitCtx) -> AdmitDecision {
+    if let Some(k) = existing {
+        if k.admissible(ctx.now_unix) {
+            return AdmitDecision::Admit;
+        }
+        // Expired: only an auth-key re-enrollment refreshes the TTL.
+        if ctx.auth_key_ok {
+            return AdmitDecision::Insert("enroll");
+        }
+        return AdmitDecision::Deny("key expired".into());
+    }
+    // Not enrolled. Auth-key enrollment is the front door for fresh peers.
+    if ctx.auth_key_ok {
+        return AdmitDecision::Insert("enroll");
+    }
+    // TOFU — only while the set is empty, no auth key configured, not disabled.
+    if !ctx.no_tofu && !ctx.auth_key_configured && set_empty {
+        return AdmitDecision::Insert("tofu");
+    }
+    AdmitDecision::Deny("not authorized".into())
+}
+
 /// One admission-set row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthKey {

@@ -10,30 +10,36 @@ rust-version.workspace = true
 name = "asp_core"
 path = "src/lib.rs"
 
+# Always-on / wasm-safe dependencies (the full merge/fold/session engine).
 [dependencies]
 ed25519-dalek.workspace = true
 rand_core.workspace = true
 rand.workspace = true
 sha2.workspace = true
-sha1.workspace = true
 hex.workspace = true
 base64.workspace = true
-rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_bytes.workspace = true
 rmp-serde.workspace = true
-toml.workspace = true
 similar.workspace = true
-flate2.workspace = true
 thiserror.workspace = true
 
-# Native-only TLS for the wss:// transport (§Security). The X.509 layer is not
-# the trust boundary — trust is the ed25519 handshake; TLS adds confidentiality
-# and a channel-binding fingerprint only. Gated out of the wasm SDK surface.
+# Native-only: the SQLite substrate, derived-git encoding (sha1/flate2/toml), and
+# TLS for wss://. Gated out of the wasm SDK surface (trust is the ed25519
+# handshake; the wasm node keeps its log/blobs in memory, not SQLite).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
+sha1.workspace = true
+flate2.workspace = true
+toml.workspace = true
+
+# The wasm build keeps the full merge/fold/session engine; it just needs the JS
+# RNG backend for handshake nonces + random file ids (one engine, §Implementation).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 tempfile.workspace = true

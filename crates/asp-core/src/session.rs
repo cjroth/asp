@@ -10,16 +10,35 @@
 //! advertised channel binding and pins the listener. Then both exchange version
 //! vectors and send exactly the rows the other lacks.
 
-use crate::engine::{AdmitCtx, Engine};
+use crate::authkeys::AdmitCtx;
 use crate::error::{AspError, AspResult};
 use crate::identity::verify_detached;
 use crate::order::NodeId;
 use crate::wire::{transcript, Msg, WireRow, PROTO};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Connector,
     Listener,
+}
+
+/// What the sans-IO `Session` needs from its host engine — implemented by both
+/// the native `Engine` (SQLite, on-disk) and the wasm `MemEngine` (in-memory), so
+/// the *identical* handshake + catch-up + integrate runs on every surface
+/// (§Implementation: one engine, thin bindings). Methods take `&self`; both
+/// engines are interior-mutable.
+pub trait SessionVault {
+    fn node_id(&self) -> NodeId;
+    fn sign(&self, msg: &[u8]) -> Vec<u8>;
+    fn vault_id(&self) -> String;
+    /// A fresh node (empty vault id) adopts the peer's vault id on clone.
+    fn adopt_vault_id(&self, vault_id: &str) -> AspResult<()>;
+    fn version_vector(&self) -> AspResult<BTreeMap<String, i64>>;
+    /// Rows authored by `site` after `seq`, bundled with their blobs.
+    fn rows_after_wire(&self, site: &str, after: i64) -> AspResult<Vec<WireRow>>;
+    fn integrate(&self, wr: &WireRow) -> AspResult<bool>;
+    fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<()>;
 }
 
 /// An effect the driver must perform.
@@ -65,18 +84,17 @@ fn nonce() -> Vec<u8> {
 impl Session {
     pub fn new(
         role: Role,
-        engine: &Engine,
+        vault: &dyn SessionVault,
         advertised_binding: Vec<u8>,
         observed_binding: Option<Vec<u8>>,
         admit: AdmitCtx,
     ) -> Session {
-        // Read the current vault id from config so a hub that *adopted* a vault
-        // advertises it to later peers (and a fresh clone advertises empty).
-        let vault_id = engine.store.get_config("vault_id").ok().flatten().unwrap_or_default();
+        // Read the current vault id so a hub that *adopted* a vault advertises it
+        // to later peers (and a fresh clone advertises empty).
         Session {
             role,
-            our_node: engine.identity.node_id(),
-            vault_id,
+            our_node: vault.node_id(),
+            vault_id: vault.vault_id(),
             our_nonce: nonce(),
             advertised_binding,
             observed_binding,
@@ -124,7 +142,7 @@ impl Session {
         ))
     }
 
-    pub fn on_msg(&mut self, engine: &Engine, msg: Msg) -> AspResult<Vec<Step>> {
+    pub fn on_msg(&mut self, vault: &dyn SessionVault, msg: Msg) -> AspResult<Vec<Step>> {
         match msg {
             Msg::Hello { proto, node_id, nonce, channel_binding, vault_id, is_listener } => {
                 if proto != PROTO {
@@ -135,7 +153,7 @@ impl Session {
                 // peer is cloning from us. Two populated, differing ids never sync.
                 if self.vault_id.is_empty() && !vault_id.is_empty() {
                     self.vault_id = vault_id.clone();
-                    engine.store.set_config("vault_id", &vault_id)?;
+                    vault.adopt_vault_id(&vault_id)?;
                 } else if !vault_id.is_empty() && !self.vault_id.is_empty() && vault_id != self.vault_id {
                     return Ok(vec![Step::Closed("different vault".into())]);
                 }
@@ -150,7 +168,7 @@ impl Session {
                 if !self.sent_auth {
                     if let Some(t) = self.transcript() {
                         self.sent_auth = true;
-                        let sig = engine.identity.sign(&t);
+                        let sig = vault.sign(&t);
                         return Ok(vec![Step::Send(Msg::Auth { sig })]);
                     }
                 }
@@ -169,7 +187,7 @@ impl Session {
                 // Role-specific gate.
                 match self.role {
                     Role::Listener => {
-                        if let Err(e) = engine.admit(&peer, &self.admit) {
+                        if let Err(e) = vault.admit(&peer, &self.admit) {
                             let reason = format!("admission denied: {e}");
                             return Ok(vec![
                                 Step::Send(Msg::Denied { reason: reason.clone() }),
@@ -187,7 +205,7 @@ impl Session {
                 let mut out = vec![Step::Authenticated(peer)];
                 if !self.sent_vector {
                     self.sent_vector = true;
-                    out.push(Step::Send(Msg::Vector { vv: engine.store.version_vector()? }));
+                    out.push(Step::Send(Msg::Vector { vv: vault.version_vector()? }));
                 }
                 Ok(out)
             }
@@ -196,18 +214,16 @@ impl Session {
                     return Ok(vec![Step::Closed("Vector before auth".into())]);
                 }
                 // Send exactly what the peer is missing.
-                let ours = engine.store.version_vector()?;
+                let ours = vault.version_vector()?;
                 let mut rows = Vec::new();
                 for (site, _max) in ours {
                     let peer_seq = vv.get(&site).copied().unwrap_or(-1);
-                    for r in engine.store.rows_after(&site, peer_seq)? {
-                        rows.push(engine.wire(r)?);
-                    }
+                    rows.extend(vault.rows_after_wire(&site, peer_seq)?);
                 }
                 let mut out = Vec::new();
                 if !self.sent_vector {
                     self.sent_vector = true;
-                    out.push(Step::Send(Msg::Vector { vv: engine.store.version_vector()? }));
+                    out.push(Step::Send(Msg::Vector { vv: vault.version_vector()? }));
                 }
                 if !rows.is_empty() {
                     out.push(Step::Send(Msg::Rows { rows }));
@@ -218,14 +234,14 @@ impl Session {
                 if !self.authed {
                     return Ok(vec![Step::Closed("Rows before auth".into())]);
                 }
-                let integrated = self.integrate_batch(engine, rows)?;
+                let integrated = self.integrate_batch(vault, rows)?;
                 Ok(vec![Step::Integrated(integrated)])
             }
             Msg::Push { row } => {
                 if !self.authed {
                     return Ok(vec![Step::Closed("Push before auth".into())]);
                 }
-                let integrated = self.integrate_batch(engine, vec![*row])?;
+                let integrated = self.integrate_batch(vault, vec![*row])?;
                 Ok(vec![Step::Integrated(integrated)])
             }
             Msg::Denied { reason } => Ok(vec![Step::Closed(format!("denied by peer: {reason}"))]),
@@ -233,10 +249,10 @@ impl Session {
         }
     }
 
-    fn integrate_batch(&self, engine: &Engine, rows: Vec<WireRow>) -> AspResult<Vec<WireRow>> {
+    fn integrate_batch(&self, vault: &dyn SessionVault, rows: Vec<WireRow>) -> AspResult<Vec<WireRow>> {
         let mut added = Vec::new();
         for wr in rows {
-            if engine.integrate(&wr)? {
+            if vault.integrate(&wr)? {
                 added.push(wr);
             }
         }
