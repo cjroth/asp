@@ -19,6 +19,8 @@ pub mod order;
 pub mod scope;
 pub mod session;
 pub mod store;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod tls;
 pub mod wire;
 
 pub use authkeys::AuthKey;

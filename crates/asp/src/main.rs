@@ -457,16 +457,28 @@ async fn run_watch_loop(
     };
 
     if listen {
+        // Default transport is wss:// with a persisted self-signed cert; --no-tls
+        // serves plaintext ws:// (behind a TLS-terminating proxy / local).
+        let tls = if cli.no_tls {
+            None
+        } else {
+            let eng = engine.lock().unwrap();
+            let (cert, key) = asp_core::tls::load_or_generate(&eng.asp_dir)?;
+            let fingerprint = asp_core::tls::cert_fingerprint(&cert).to_vec();
+            let config = asp_core::tls::server_config(cert, key)?;
+            Some(net::ServerTls { config, fingerprint })
+        };
+        let scheme = if tls.is_some() { "wss" } else { "ws" };
         let bind = format!("0.0.0.0:{}", port.unwrap_or(9000));
         let (ptx, prx) = tokio::sync::oneshot::channel();
         let (e, a, c) = (engine.clone(), auth.clone(), conns.clone());
         tokio::spawn(async move {
-            if let Err(e) = net::serve(e, &bind, a, c, Some(ptx)).await {
+            if let Err(e) = net::serve(e, &bind, a, c, tls, Some(ptx)).await {
                 tracing::error!("listener stopped: {e}");
             }
         });
         if let Ok(p) = prx.await {
-            println!("listening on ws://0.0.0.0:{p}");
+            println!("listening on {scheme}://0.0.0.0:{p}");
         }
     }
 

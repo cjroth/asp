@@ -28,5 +28,12 @@ similar.workspace = true
 flate2.workspace = true
 thiserror.workspace = true
 
+# Native-only TLS for the wss:// transport (§Security). The X.509 layer is not
+# the trust boundary — trust is the ed25519 handshake; TLS adds confidentiality
+# and a channel-binding fingerprint only. Gated out of the wasm SDK surface.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rustls.workspace = true
+rcgen.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

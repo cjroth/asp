@@ -197,26 +197,36 @@ pub struct Hub {
     child: Child,
     pub port: u16,
     pub dir: PathBuf,
+    secure: bool,
     _home: PathBuf,
     _drain: std::thread::JoinHandle<()>,
 }
 
 impl Hub {
     pub fn start(root: &Path, name: &str, auth_key: Option<&str>, extra: &[&str]) -> Hub {
+        Hub::start_inner(root, name, auth_key, extra, false)
+    }
+
+    /// A `wss://` listener (default transport: self-signed TLS).
+    pub fn start_tls(root: &Path, name: &str, auth_key: Option<&str>) -> Hub {
+        Hub::start_inner(root, name, auth_key, &[], true)
+    }
+
+    fn start_inner(root: &Path, name: &str, auth_key: Option<&str>, extra: &[&str], tls: bool) -> Hub {
         let dir = root.join(name);
         let home = root.join(format!("home-{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&home).unwrap();
         let mut c = Command::new(asp_bin());
-        c.env("ASP_HOME", &home)
-            .env("ASP_LOG", "warn")
-            .arg("--dir")
-            .arg(&dir)
-            .args(["watch", "--listen", "--no-tls", "--port", "0"]);
+        c.env("ASP_HOME", &home).env("ASP_LOG", "warn").arg("--dir").arg(&dir).args(["watch", "--listen", "--port", "0"]);
+        if !tls {
+            c.arg("--no-tls");
+        }
         if let Some(k) = auth_key {
             c.arg("--auth-key").arg(k);
         }
         c.args(extra);
+        let secure = tls;
         c.stdout(Stdio::piped()).stderr(Stdio::null());
         let mut child = c.spawn().expect("spawn hub");
         let stdout = child.stdout.take().unwrap();
@@ -245,11 +255,12 @@ impl Hub {
         });
 
         let port = rx.recv_timeout(Duration::from_secs(20)).expect("hub did not announce a port");
-        Hub { child, port, dir, _home: home, _drain: drain }
+        Hub { child, port, dir, secure, _home: home, _drain: drain }
     }
 
     pub fn url(&self) -> String {
-        format!("ws://127.0.0.1:{}", self.port)
+        let scheme = if self.secure { "wss" } else { "ws" };
+        format!("{scheme}://127.0.0.1:{}", self.port)
     }
 }
 
@@ -261,7 +272,8 @@ impl Drop for Hub {
 }
 
 fn parse_port(line: &str) -> Option<u16> {
-    let marker = "ws://0.0.0.0:";
+    // Scheme-agnostic: matches both "ws://0.0.0.0:PORT" and "wss://0.0.0.0:PORT".
+    let marker = "://0.0.0.0:";
     let idx = line.find(marker)? + marker.len();
     let rest = &line[idx..];
     let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());

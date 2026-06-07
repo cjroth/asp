@@ -21,10 +21,19 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_hdr_async, client_async, WebSocketStream};
+
+/// Server TLS material for a `wss://` listener: the rustls config + the cert
+/// fingerprint it advertises as the channel binding.
+#[derive(Clone)]
+pub struct ServerTls {
+    pub config: std::sync::Arc<rustls::ServerConfig>,
+    pub fingerprint: Vec<u8>,
+}
 
 /// Engine shared across async tasks (locked briefly per sync call).
 pub type EngineRef = Arc<StdMutex<Engine>>;
@@ -173,11 +182,12 @@ pub async fn serve(
     bind: &str,
     auth: AuthOpts,
     conns: Conns,
+    tls: Option<ServerTls>,
     port_tx: Option<tokio::sync::oneshot::Sender<u16>>,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
     let port = listener.local_addr()?.port();
-    tracing::info!(%bind, port, "listening (ws)");
+    tracing::info!(%bind, port, secure = tls.is_some(), "listening");
     if let Some(tx) = port_tx {
         let _ = tx.send(port);
     }
@@ -190,37 +200,31 @@ pub async fn serve(
         let engine = engine.clone();
         let auth = auth.clone();
         let conns = conns.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
-            if let Err(e) = accept_one(tcp, engine, auth, conns).await {
+            if let Err(e) = accept_one(tcp, engine, auth, conns, tls).await {
                 tracing::debug!("accept error: {e}");
             }
         });
     }
 }
 
-// `ErrorResponse` (the 401 path) is intentionally a full http::Response; the
-// tungstenite upgrade-callback signature fixes the Err type, so boxing it is not
-// possible here.
-#[allow(clippy::result_large_err)]
-async fn accept_one(
-    tcp: TcpStream,
-    engine: EngineRef,
+/// Build the WS upgrade callback that applies AUTH_KEY admission at the HTTP
+/// layer. Fresh per connection (the callback is `FnOnce`).
+fn upgrade_callback(
     auth: Arc<AuthOpts>,
-    conns: Conns,
-) -> Result<()> {
-    let auth_state = Arc::new(StdMutex::new(false));
-    let as2 = auth_state.clone();
-    let auth2 = auth.clone();
-    let callback = move |req: &Request, mut resp: Response| -> std::result::Result<Response, ErrorResponse> {
+    state: Arc<StdMutex<bool>>,
+) -> impl FnOnce(&Request, Response) -> std::result::Result<Response, ErrorResponse> {
+    move |req: &Request, mut resp: Response| {
         let presented = extract_auth_key(req);
-        if auth2.auth_keys.is_empty() {
+        if auth.auth_keys.is_empty() {
             return Ok(resp);
         }
         match presented {
             None => Ok(resp),
             Some(k) => {
-                if auth2.auth_keys.iter().any(|x| x == &k) {
-                    *as2.lock().unwrap() = true;
+                if auth.auth_keys.iter().any(|x| x == &k) {
+                    *state.lock().unwrap() = true;
                     if let Some(p) = req.headers().get("sec-websocket-protocol") {
                         if p.to_str().unwrap_or("").starts_with("bearer.") {
                             resp.headers_mut().insert("sec-websocket-protocol", p.clone());
@@ -234,14 +238,53 @@ async fn accept_one(
                 }
             }
         }
-    };
+    }
+}
 
-    let ws = accept_hdr_async(tcp, callback).await.context("ws upgrade")?;
-    let auth_key_ok = *auth_state.lock().unwrap();
+async fn accept_one(
+    tcp: TcpStream,
+    engine: EngineRef,
+    auth: Arc<AuthOpts>,
+    conns: Conns,
+    tls: Option<ServerTls>,
+) -> Result<()> {
+    let auth_state = Arc::new(StdMutex::new(false));
+    // The listener advertises its cert fingerprint as the channel binding (or an
+    // empty marker for plaintext ws:// / behind a TLS terminator).
+    let advertised = tls.as_ref().map(|t| t.fingerprint.clone()).unwrap_or_default();
+    match tls {
+        Some(t) => {
+            let acceptor = TlsAcceptor::from(t.config.clone());
+            let tls_stream = acceptor.accept(tcp).await.context("tls accept")?;
+            let cb = upgrade_callback(auth.clone(), auth_state.clone());
+            let ws = accept_hdr_async(tls_stream, cb).await.context("wss upgrade")?;
+            let ok = *auth_state.lock().unwrap();
+            finish_listener(ws, engine, auth, conns, ok, advertised).await
+        }
+        None => {
+            let cb = upgrade_callback(auth.clone(), auth_state.clone());
+            let ws = accept_hdr_async(tcp, cb).await.context("ws upgrade")?;
+            let ok = *auth_state.lock().unwrap();
+            finish_listener(ws, engine, auth, conns, ok, advertised).await
+        }
+    }
+}
+
+async fn finish_listener<S>(
+    ws: WebSocketStream<S>,
+    engine: EngineRef,
+    auth: Arc<AuthOpts>,
+    conns: Conns,
+    auth_key_ok: bool,
+    advertised: Vec<u8>,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let admit = auth.admit_ctx(auth_key_ok);
     let session = {
         let eng = engine.lock().unwrap();
-        Session::new(Role::Listener, &eng, Vec::new(), None, admit)
+        Session::new(Role::Listener, &eng, advertised, None, admit)
     };
     run_connection(ws, engine, session, conns, false, None).await
 }
@@ -284,17 +327,35 @@ pub async fn connect(
     on_auth: Option<mpsc::UnboundedSender<NodeId>>,
 ) -> Result<()> {
     let (host, port, secure) = parse_ws_url(url)?;
-    if secure {
-        return Err(anyhow!("wss:// is not supported in this build; use ws:// (with --no-tls on the listener)"));
-    }
     let tcp = TcpStream::connect((host.as_str(), port)).await.with_context(|| format!("connecting {host}:{port}"))?;
     let request = build_request(url, auth)?;
-    let (ws, _resp) = client_async(request, tcp).await.context("ws client handshake")?;
-    let session = {
-        let eng = engine.lock().unwrap();
-        Session::new(Role::Connector, &eng, Vec::new(), None, auth.admit_ctx(false))
-    };
-    run_connection(ws, engine, session, conns, oneshot, on_auth).await
+    if secure {
+        // wss://: TLS at the transport layer; trust is the ed25519 handshake, so
+        // we accept any cert and bind the channel to the observed cert fingerprint.
+        let connector = TlsConnector::from(asp_core::tls::client_config_accept_any());
+        let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+            .map_err(|_| anyhow!("invalid server name {host}"))?;
+        let tls_stream = connector.connect(server_name, tcp).await.context("tls connect")?;
+        let observed = tls_stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|c| c.first())
+            .map(|c| asp_core::tls::cert_fingerprint(c.as_ref()).to_vec());
+        let (ws, _resp) = client_async(request, tls_stream).await.context("wss client handshake")?;
+        let session = {
+            let eng = engine.lock().unwrap();
+            Session::new(Role::Connector, &eng, Vec::new(), observed, auth.admit_ctx(false))
+        };
+        run_connection(ws, engine, session, conns, oneshot, on_auth).await
+    } else {
+        let (ws, _resp) = client_async(request, tcp).await.context("ws client handshake")?;
+        let session = {
+            let eng = engine.lock().unwrap();
+            Session::new(Role::Connector, &eng, Vec::new(), None, auth.admit_ctx(false))
+        };
+        run_connection(ws, engine, session, conns, oneshot, on_auth).await
+    }
 }
 
 fn build_request(url: &str, auth: &AuthOpts) -> Result<Request> {
