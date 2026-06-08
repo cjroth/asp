@@ -1,0 +1,14 @@
+# Keep the build context small. NOTE: Cargo.lock is .gitignored but MUST be
+# shipped to Docker for a reproducible build — do not add it here.
+target
+**/target
+node_modules
+**/node_modules
+.git
+dist
+**/dist
+crates/asp-wasm/pkg
+crates/asp-wasm/pkg-web
+plugins/obsidian/main.js
+desktop/src-tauri
+desktop/src

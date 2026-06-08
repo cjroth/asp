@@ -1,0 +1,36 @@
+app = "asp-hub"
+primary_region = "ewr"
+
+[build]
+
+# Startup-time configuration.
+# ASP_AUTHORIZED_KEYS is read directly by `asp watch` and merged into the
+# synced authorized_keys on every start — store actual keys as a Fly secret
+# rather than here, e.g.:
+#   fly secrets set ASP_AUTHORIZED_KEYS="$(asp key)"
+[env]
+  ASP_DIR = "/mnt/workspace/vault"
+  ASP_HOME = "/mnt/workspace/.asp-home"
+  # Fly's [http_service] terminates TLS at the edge and forwards plain
+  # HTTP/WS to internal_port — so the in-container hub binds plain ws and
+  # lets the edge handle TLS. Clients still connect via wss://.
+  ASP_NO_TLS = "true"
+
+[http_service]
+  internal_port = 9000
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+# This hub is stateful: one instance bound to one volume (vault history +
+# node identity). Never scale it past a single replica — a second instance
+# can't share the volume, and a duplicated identity breaks peers' TOFU trust.
+[[mounts]]
+  source = "asp_data"
+  destination = "/mnt/workspace"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512
