@@ -39,6 +39,10 @@ pub trait SessionVault {
     fn rows_after_wire(&self, site: &str, after: i64) -> AspResult<Vec<WireRow>>;
     fn integrate(&self, wr: &WireRow) -> AspResult<bool>;
     fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<()>;
+    /// No authored rows yet — the vault has nothing of its own to lose, so it
+    /// adopts a peer's vault on connect (like `clone`). A freshly-`init`'d folder
+    /// that hasn't committed content is pristine.
+    fn is_pristine(&self) -> bool;
 }
 
 /// An effect the driver must perform.
@@ -89,12 +93,16 @@ impl Session {
         observed_binding: Option<Vec<u8>>,
         admit: AdmitCtx,
     ) -> Session {
-        // Read the current vault id so a hub that *adopted* a vault advertises it
-        // to later peers (and a fresh clone advertises empty).
+        // A pristine vault (no authored rows) advertises an EMPTY vault id so it
+        // adopts the peer's vault on connect — exactly like `clone`. This makes
+        // "init then `watch --peer`" with no local content Just Work, and is how a
+        // fresh hub/relay adopts the first connector's vault. A populated vault
+        // advertises its real id, so two unrelated vaults never silently merge.
+        let vault_id = if vault.is_pristine() { String::new() } else { vault.vault_id() };
         Session {
             role,
             our_node: vault.node_id(),
-            vault_id: vault.vault_id(),
+            vault_id,
             our_nonce: nonce(),
             advertised_binding,
             observed_binding,

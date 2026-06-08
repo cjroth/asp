@@ -141,10 +141,19 @@ where
                                     }
                                 }
                                 Step::Closed(reason) => {
-                                    if reason.contains("denied") {
+                                    // Terminal, actionable closes (admission denied,
+                                    // vault mismatch) are surfaced as errors so the
+                                    // caller can report them and stop retrying — not
+                                    // buried in a log line.
+                                    if reason.contains("denied") || reason.contains("different vault") {
                                         let _ = sink.send(Message::Close(None)).await;
                                         conns.lock().await.remove(&conn_id);
-                                        return Err(anyhow!("{reason}"));
+                                        let hint = if reason.contains("different vault") {
+                                            " (separate vaults — `asp clone <url>` to follow the peer)"
+                                        } else {
+                                            ""
+                                        };
+                                        return Err(anyhow!("{reason}{hint}"));
                                     }
                                     tracing::info!(reason, "closing");
                                     closing = true;

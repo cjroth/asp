@@ -558,6 +558,16 @@ async fn run_watch_loop(
         tokio::spawn(async move {
             loop {
                 if let Err(err) = net::connect(e.clone(), &url, &a, c.clone(), false, None).await {
+                    let msg = err.to_string();
+                    // A vault mismatch is permanent — retrying is futile. Tell the
+                    // operator exactly how to fix it and stop hammering the peer.
+                    if msg.contains("different vault") {
+                        eprintln!(
+                            "error: peer {url} is a DIFFERENT vault — they were created separately and won't merge.\n\
+                             To follow it, clone instead of init: `asp clone {url} <dir>` (this folder's local edits would be replaced)."
+                        );
+                        break;
+                    }
                     tracing::debug!("peer {url} disconnected: {err}");
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;

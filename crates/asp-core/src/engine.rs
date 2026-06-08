@@ -724,6 +724,9 @@ impl SessionVault for Engine {
     fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<()> {
         Engine::admit(self, peer, ctx)
     }
+    fn is_pristine(&self) -> bool {
+        self.store.row_count().map(|c| c == 0).unwrap_or(false)
+    }
 }
 
 /// Parse a restore time argument: a unix-seconds integer or `YYYY-MM-DD`.

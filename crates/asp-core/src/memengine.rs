@@ -330,6 +330,9 @@ impl SessionVault for MemEngine {
     fn integrate(&self, wr: &WireRow) -> AspResult<bool> {
         MemEngine::integrate(self, wr)
     }
+    fn is_pristine(&self) -> bool {
+        self.rows.borrow().is_empty()
+    }
     fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<()> {
         let peer_hex = peer.to_hex();
         let set = self.authorized.borrow();
