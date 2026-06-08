@@ -266,6 +266,14 @@ impl MemEngine {
         Ok(())
     }
 
+    /// The materialized file rows (the fold's output) — surface-independent
+    /// metadata for hosts that render more than `path -> bytes`: `merge_class`,
+    /// `result_hash`, the stable `file_id`, and the `conflict` flag. Callers
+    /// filter `deleted` as needed.
+    pub fn files_detail(&self) -> Vec<FileRow> {
+        self.files.borrow().clone()
+    }
+
     /// The materialized working tree as `path -> bytes` (what the host renders).
     pub fn files_map(&self) -> AspResult<BTreeMap<String, Vec<u8>>> {
         let mut m = BTreeMap::new();

@@ -3,6 +3,7 @@
 // node computes byte-identical state to the native `asp` daemon.
 
 export { normalizePeerUrl, Vault, type SyncOptions } from './vault.ts';
+export type { FileMeta, WasmEngineInstance, WireBlob, WireRow } from './engine-types.ts';
 export {
   contentHash,
   foldFiles,

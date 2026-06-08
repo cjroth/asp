@@ -19,4 +19,11 @@ export {
   WasmEngine,
 } from '#engine';
 
-export type { FeedResult, WasmEngineCtor, WasmEngineInstance } from './engine-types.ts';
+export type {
+  FeedResult,
+  FileMeta,
+  WasmEngineCtor,
+  WasmEngineInstance,
+  WireBlob,
+  WireRow,
+} from './engine-types.ts';

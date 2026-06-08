@@ -14,9 +14,41 @@ export interface WasmEngineInstance {
   commit_files(filesJson: string): void;
   files_json(): string;
   read_file(path: string): Uint8Array | undefined;
+  /** This node's version vector as JSON `{site_id: max_seq}`. */
+  version_vector(): string;
+  /** Wire rows a peer (at `peerVvJson`) is missing, as JSON `WireRow[]`. */
+  rows_after(peerVvJson: string): string;
+  /** Integrate JSON `WireRow[]`; returns the count of newly-integrated rows. */
+  integrate(wireRowsJson: string): number;
+  /** Wrap authored rows in a `Rows` data frame for live push over a connection. */
+  push_frame(wireRowsJson: string): Uint8Array;
+  /** Per-file fold metadata as JSON `FileMeta[]`. */
+  files_detail_json(): string;
   connect_start(): Uint8Array;
   feed(frame: Uint8Array): string;
   free(): void;
+}
+
+/** Per-file fold metadata (`files_detail_json`). */
+export interface FileMeta {
+  file_id: string;
+  path: string;
+  result_hash: string | null;
+  merge_class: 'text' | 'code' | 'binary' | 'dir';
+  deleted: boolean;
+  conflict: boolean;
+}
+
+/** A content blob shipped with a row (`bytes` is a JSON number array). */
+export interface WireBlob {
+  hash: string;
+  bytes: number[];
+}
+
+/** A log row plus the blobs the peer may lack — the catch-up payload unit. */
+export interface WireRow {
+  row: unknown;
+  blobs: WireBlob[];
 }
 
 export type WasmEngineCtor = new (seed: Uint8Array, vaultId: string) => WasmEngineInstance;

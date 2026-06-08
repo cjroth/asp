@@ -1,0 +1,24 @@
+{
+  "name": "asp-sync-demo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ASP — Agent Sync Protocol: an in-browser P2P sync demo. Each node is the real asp-core engine (wasm); sync runs in-page over a simulated network.",
+  "type": "module",
+  "scripts": {
+    "build:wasm": "cd ../sdks/typescript && bun run build:wasm",
+    "build": "node build.mjs production",
+    "dev": "node build.mjs",
+    "serve": "node serve.mjs",
+    "test": "bun test/mesh.test.mjs && bun test/persist.test.mjs && bun test/web-glue.test.mjs && bun test/ui-smoke.tsx",
+    "test:interop": "bun test/wss-interop.test.mjs",
+    "test:e2e": "node build.mjs && node test/e2e.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "playwright": "^1.60.0"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}
