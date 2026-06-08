@@ -47,7 +47,11 @@ jobs:
         run: rustup toolchain install stable --profile minimal && rustup target add wasm32-unknown-unknown
       - uses: oven-sh/setup-bun@v2
       - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+        # Prebuilt binary via a maintained installer — the upstream
+        # `curl … init.sh | sh` script flakes on GitHub release fetches.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
       - name: Build native asp binary (for the parity e2e)
         run: cargo build -p asp
       - name: Build the one engine to wasm
