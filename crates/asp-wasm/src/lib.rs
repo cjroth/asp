@@ -10,7 +10,7 @@ use asp_core::authkeys::AdmitCtx;
 use asp_core::session::Step;
 use asp_core::{
     compute_files, identity::ssh_pubkey_string, merge::merge3, oid, store::MemBlobStore, BlobStore,
-    Identity, LogRow, MemEngine, MergeClass, Msg, Role, Session, SessionVault,
+    FileRow, Identity, LogRow, MemEngine, MergeClass, Msg, Role, Session, SessionVault, WireRow,
 };
 use std::collections::BTreeMap;
 use wasm_bindgen::prelude::*;
@@ -155,6 +155,70 @@ impl WasmEngine {
 
     pub fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, JsError> {
         self.eng.read_file(path).map_err(to_err)
+    }
+
+    /// This node's version vector as JSON `{site_id: max_seq}` — the catch-up
+    /// cursor a peer hands us so we can compute exactly what it lacks.
+    pub fn version_vector(&self) -> Result<String, JsError> {
+        let vv = SessionVault::version_vector(&self.eng).map_err(to_err)?;
+        serde_json::to_string(&vv).map_err(to_err)
+    }
+
+    /// Given a *peer's* version vector (JSON `{site_id: seq}`), return the wire
+    /// rows that peer is missing as a JSON array — the exact anti-entropy /
+    /// catch-up payload. The same op drives live push, gossip forwarding, and
+    /// reconnect (offline → reconnect → version-vector catch-up).
+    pub fn rows_after(&self, peer_vv_json: &str) -> Result<String, JsError> {
+        let peer_vv: std::collections::BTreeMap<String, i64> =
+            serde_json::from_str(peer_vv_json).map_err(to_err)?;
+        let mine = SessionVault::version_vector(&self.eng).map_err(to_err)?;
+        let mut out: Vec<WireRow> = Vec::new();
+        for site in mine.keys() {
+            let after = peer_vv.get(site).copied().unwrap_or(-1);
+            let mut rows = SessionVault::rows_after_wire(&self.eng, site, after).map_err(to_err)?;
+            out.append(&mut rows);
+        }
+        serde_json::to_string(&out).map_err(to_err)
+    }
+
+    /// Integrate a JSON array of wire rows (real Merkle-id check + blob verify +
+    /// `compute_files` fold + `merge3`). Returns how many *new* rows landed.
+    pub fn integrate(&self, wire_rows_json: &str) -> Result<usize, JsError> {
+        let rows: Vec<WireRow> = serde_json::from_str(wire_rows_json).map_err(to_err)?;
+        let mut n = 0;
+        for wr in &rows {
+            if self.eng.integrate(wr).map_err(to_err)? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Per-file fold metadata for rich rendering: a JSON array of
+    /// `{file_id, path, result_hash, merge_class, deleted, conflict}`.
+    pub fn files_detail_json(&self) -> Result<String, JsError> {
+        #[derive(serde::Serialize)]
+        struct FileMeta<'a> {
+            file_id: &'a str,
+            path: &'a str,
+            result_hash: Option<&'a str>,
+            merge_class: &'static str,
+            deleted: bool,
+            conflict: bool,
+        }
+        let detail: Vec<FileRow> = self.eng.files_detail();
+        let metas: Vec<FileMeta> = detail
+            .iter()
+            .map(|f| FileMeta {
+                file_id: &f.file_id,
+                path: &f.path,
+                result_hash: f.result_hash.as_deref(),
+                merge_class: f.merge_class.as_str(),
+                deleted: f.deleted,
+                conflict: f.conflict,
+            })
+            .collect();
+        serde_json::to_string(&metas).map_err(to_err)
     }
 
     /// Begin a connector session; returns the opening `Hello` frame to send.
