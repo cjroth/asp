@@ -1,0 +1,80 @@
+name: release
+
+# Publish the Obsidian plugin on a `v<semver>` tag. The plugin's `main.js` is a
+# single self-contained bundle (the wasm engine is inlined as base64 — see
+# plugins/obsidian/esbuild.config.mjs), so the GitHub Release carries exactly
+# the two files BRAT / the Obsidian community store read by exact name:
+# `main.js` + `manifest.json`. (This mirrors how the csp repo ships its plugin.)
+#
+# Tag → publish:
+#   git tag v0.1.0 && git push origin v0.1.0
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  RUSTUP_MAX_RETRIES: "10"
+
+jobs:
+  release:
+    name: Build plugin + GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + wasm target
+        run: rustup toolchain install stable --profile minimal && rustup target add wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Stamp plugin version from the tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"          # v0.1.0 -> 0.1.0
+          node -e '
+            const fs = require("fs");
+            const v = process.argv[1];
+            for (const f of ["plugins/obsidian/manifest.json", "plugins/obsidian/package.json"]) {
+              const j = JSON.parse(fs.readFileSync(f, "utf8"));
+              j.version = v;
+              fs.writeFileSync(f, JSON.stringify(j, null, 2) + "\n");
+            }
+          ' "$version"
+          echo "Stamped version ${version}"
+
+      - name: Build the one engine to wasm (nodejs + web targets)
+        run: cd sdks/typescript && bun run build:wasm
+
+      - name: Install plugin deps
+        run: cd plugins/obsidian && bun install --frozen-lockfile
+
+      - name: Build the plugin (self-contained main.js)
+        run: cd plugins/obsidian && bun run build
+
+      - name: Stage release files
+        run: |
+          mkdir -p release
+          # BRAT / the community store read these by exact name — do NOT rename.
+          cp plugins/obsidian/main.js release/main.js
+          cp plugins/obsidian/manifest.json release/manifest.json
+          ls -la release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release/*

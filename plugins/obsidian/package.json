@@ -9,5 +9,8 @@
     "build": "node esbuild.config.mjs production",
     "dev": "node esbuild.config.mjs",
     "test": "bun test test"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.5"
   }
 }

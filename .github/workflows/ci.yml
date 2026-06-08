@@ -56,3 +56,7 @@ jobs:
         run: cd sdks/typescript && bun test
       - name: Obsidian plugin (path filter + plugin ⇄ real asp parity)
         run: cd plugins/obsidian && bun test
+      - name: Obsidian plugin builds to a self-contained main.js
+        # The release ships only main.js + manifest.json (the wasm engine is
+        # inlined as base64), so a broken bundle must fail CI, not the tag.
+        run: cd plugins/obsidian && bun install --frozen-lockfile && bun run build

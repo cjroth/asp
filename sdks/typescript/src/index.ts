@@ -6,6 +6,10 @@ export { Vault, type SyncOptions } from './vault.ts';
 export {
   contentHash,
   foldFiles,
+  // Initialize the wasm engine. Node/Bun: a no-op (the nodejs glue loads
+  // synchronously at import). Browser/WebView (Obsidian): the host inlines the
+  // .wasm bytes and `await`s this once before constructing a `Vault`.
+  initEngine as initAsp,
   merge3Bytes,
   merkleIdOf,
   nodeIdHex,
