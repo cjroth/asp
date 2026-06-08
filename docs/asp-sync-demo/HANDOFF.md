@@ -1,12 +1,16 @@
 # ASP Sync Demo — Build Handoff & Engine-Integration Spec
 
-> Status: **planning / pre-implementation.** This doc is the contract between
-> (a) the agent refactoring `asp-wasm` into a single base64-embedded bundle and
-> (b) the agent (future me) that builds the demo UI on top of it.
+> Status: **IMPLEMENTED** — the demo lives in [`demo/`](../../demo/) and the
+> engine bindings landed in `asp-wasm`/`@asp/sdk` (§5). This doc records the
+> design provenance and the integration spec it was built against. The original
+> Claude Design source is preserved under `design-reference/`.
 >
-> Nothing here is built yet. The design source is preserved under
-> `docs/asp-sync-demo/design-reference/` (the original Claude Design handoff
-> bundle), because the working container is ephemeral and `/tmp` will be lost.
+> Built on top of the `main` wasm refactor (the base64-inlined web bundle): the
+> demo's esbuild build inlines `pkg-web` wasm exactly like the Obsidian plugin,
+> and each node is a real `WasmEngine`. Verified headlessly — real-engine
+> convergence (clone / gossip-through-hub / offline catch-up / concurrent merge),
+> the web-target wasm path, and an SSR render of the component tree. See
+> `demo/test/`.
 
 ---
 
