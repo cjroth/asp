@@ -2,7 +2,7 @@
 // one Rust engine (asp-core) compiled to wasm. One engine everywhere: a TS/wasm
 // node computes byte-identical state to the native `asp` daemon.
 
-export { Vault, type SyncOptions } from './vault.ts';
+export { normalizePeerUrl, Vault, type SyncOptions } from './vault.ts';
 export {
   contentHash,
   foldFiles,

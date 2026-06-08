@@ -7,12 +7,12 @@
 // (vault I/O, the event→push path, settings, a status bar).
 
 import { Notice, Plugin, PluginSettingTab, Setting, type EventRef } from 'obsidian';
-import { initAsp, Vault as SdkVault } from '../../../sdks/typescript/src/index.ts';
+import { initAsp, normalizePeerUrl, Vault as SdkVault } from '../../../sdks/typescript/src/index.ts';
 import { Bridge } from './bridge.ts';
 import { type LogEntry, LogBuffer } from './log-buffer.ts';
 import { ObsidianHost } from './obsidian-host.ts';
 import { PathFilter } from './path-filter.ts';
-import { SyncController } from './sync-controller.ts';
+import { type SyncState, SyncController } from './sync-controller.ts';
 
 // The wasm engine bytes, inlined at build time by esbuild (see
 // esbuild.config.mjs). Decoded once and handed to `initAsp` so `main.js` is
@@ -59,6 +59,9 @@ export default class AspPlugin extends Plugin {
   /** In-app trace, visible in settings before a sync ever connects — the only
    * way to read what the plugin is doing on mobile (no dev console there). */
   readonly log = new LogBuffer();
+  /** Last sync state, mirrored to the status bar AND any open settings banner. */
+  syncState: SyncState = 'idle';
+  private readonly stateListeners = new Set<(s: SyncState) => void>();
   private sdk?: SdkVault;
   private bridge?: Bridge;
   private controller?: SyncController;
@@ -96,7 +99,11 @@ export default class AspPlugin extends Plugin {
     this.log.append(`engine ready — device key ${this.deviceKey()}`);
 
     this.statusEl = this.addStatusBarItem();
-    this.controller.subscribe((s) => this.renderStatus(s));
+    this.controller.subscribe((s) => {
+      this.syncState = s;
+      this.renderStatus(s);
+      for (const l of this.stateListeners) l(s);
+    });
     this.renderStatus('idle');
 
     // Obsidian vault events → capture into the engine (debounced), then sync.
@@ -132,18 +139,27 @@ export default class AspPlugin extends Plugin {
     this.sdk?.free();
   }
 
+  /** Subscribe to sync-state changes (the settings banner uses this). Fires
+   * immediately with the current state; returns an unsubscribe. */
+  onSyncState(cb: (s: SyncState) => void): () => void {
+    this.stateListeners.add(cb);
+    cb(this.syncState);
+    return () => this.stateListeners.delete(cb);
+  }
+
   /** Run one sync pass with visible feedback. Never fails silently. Returns
    * whether it converged. */
   private async runSync(): Promise<boolean> {
     if (!this.controller) return false;
-    if (!this.settings.peerUrl) {
+    const peerUrl = normalizePeerUrl(this.settings.peerUrl); // bare host → wss://
+    if (!peerUrl) {
       new Notice('asp: set a Peer URL first');
       this.log.append('sync: no Peer URL set — nothing to connect to', 'error');
       return false;
     }
     try {
       await this.controller.syncOnce({
-        peerUrl: this.settings.peerUrl,
+        peerUrl,
         authKey: this.settings.authKey || undefined,
       });
       new Notice('asp: synced');
@@ -193,9 +209,32 @@ export default class AspPlugin extends Plugin {
   }
 }
 
+const CARD_STYLE: Partial<CSSStyleDeclaration> = {
+  border: '1px solid var(--background-modifier-border)',
+  borderRadius: '8px',
+  background: 'var(--background-secondary)',
+  padding: '10px 12px',
+  margin: '12px 0 0',
+};
+
+/** Map a sync state to the top banner's label + dot colour. */
+function statusInfo(s: SyncState): { label: string; color: string } {
+  switch (s) {
+    case 'connecting':
+      return { label: 'Syncing…', color: 'var(--color-yellow, #d29922)' };
+    case 'connected':
+      return { label: 'In sync', color: 'var(--color-green, #3fb950)' };
+    case 'error':
+      return { label: 'Not connected', color: 'var(--color-red, #f85149)' };
+    default:
+      return { label: 'Not connected', color: 'var(--text-muted, #888)' };
+  }
+}
+
 class AspSettingTab extends PluginSettingTab {
-  /** Live-log subscription, torn down on each re-render and when the tab hides. */
-  private unsub?: () => void;
+  // Subscriptions live only while the tab is open; torn down on hide/re-render.
+  private unsubLog?: () => void;
+  private unsubState?: () => void;
 
   constructor(
     app: AspPlugin['app'],
@@ -205,8 +244,10 @@ class AspSettingTab extends PluginSettingTab {
   }
 
   hide(): void {
-    this.unsub?.();
-    this.unsub = undefined;
+    this.unsubLog?.();
+    this.unsubState?.();
+    this.unsubLog = undefined;
+    this.unsubState = undefined;
   }
 
   display(): void {
@@ -215,50 +256,43 @@ class AspSettingTab extends PluginSettingTab {
     root.empty?.();
     while (root.firstChild) root.removeChild(root.firstChild);
 
+    // Live status at the very top: Not connected / Syncing… / In sync.
+    this.renderStatusBanner(root);
+
     const connected = this.plugin.settings.connectedOnce;
 
-    // ---- Connection details (both stages) -------------------------------
-    new Setting(root)
-      .setName('Peer URL')
-      .setDesc('A full node in listen mode, e.g. wss://hub:9000 (or ws:// behind a TLS proxy).')
-      .addText((t) =>
-        t
-          .setPlaceholder('wss://host:9000')
-          .setValue(this.plugin.settings.peerUrl)
-          .onChange(async (v) => {
-            this.plugin.settings.peerUrl = v.trim();
-            await this.plugin.saveData(this.plugin.settings);
-          }),
-      );
+    // Peer URL — both stages. A bare host is fine; wss:// is assumed.
+    new Setting(root).setName('Peer URL').addText((t) =>
+      t
+        .setPlaceholder('hub:9000  (wss:// assumed)')
+        .setValue(this.plugin.settings.peerUrl)
+        .onChange(async (v) => {
+          this.plugin.settings.peerUrl = v.trim();
+          await this.plugin.saveData(this.plugin.settings);
+        }),
+    );
 
-    new Setting(root)
-      .setName('Auth key')
-      .setDesc('The AUTH_KEY enrollment secret for first connect (optional once enrolled).')
-      .addText((t) =>
+    if (!connected) {
+      // ---- Stage 1: connecting. The auth key is an enrollment secret — it
+      // only matters here, so it's hidden once connected.
+      new Setting(root).setName('Auth key').addText((t) =>
         t.setValue(this.plugin.settings.authKey).onChange(async (v) => {
           this.plugin.settings.authKey = v.trim();
           await this.plugin.saveData(this.plugin.settings);
         }),
       );
-
-    if (!connected) {
-      // ---- Stage 1: not yet connected — just connect. The sync controls
-      // (enable toggle, device key, sync now) appear only after a first
-      // successful connect, so a fresh setup isn't cluttered with options
-      // that don't apply yet.
-      new Setting(root)
-        .setName('Connect')
-        .setDesc('Connect to the peer and sync for the first time. Sync options unlock once connected.')
-        .addButton((b) =>
-          b.setButtonText('Connect').onClick(async () => {
-            b.setButtonText('Connecting…');
-            const ok = await this.plugin.connect();
-            b.setButtonText('Connect');
-            if (ok) this.display(); // reveal stage 2
-          }),
-        );
+      new Setting(root).setName('Connect').addButton((b) =>
+        b.setButtonText('Connect').onClick(async () => {
+          b.setButtonText('Connecting…');
+          const ok = await this.plugin.connect();
+          b.setButtonText('Connect');
+          if (ok) this.display(); // reveal stage 2
+        }),
+      );
     } else {
-      // ---- Stage 2: connected — full sync controls.
+      // ---- Stage 2: connected. No auth key, no manual "Sync now" button —
+      // sync runs automatically on edit, and the command palette still offers
+      // "Sync now".
       new Setting(root).setName('Sync enabled').addToggle((t) =>
         t.setValue(this.plugin.settings.enabled).onChange(async (v) => {
           this.plugin.settings.enabled = v;
@@ -266,32 +300,79 @@ class AspSettingTab extends PluginSettingTab {
           if (v) void this.plugin.syncNow();
         }),
       );
-
-      new Setting(root)
-        .setName('Sync now')
-        .addButton((b) => b.setButtonText('Sync').onClick(() => void this.plugin.syncNow()));
-
-      this.renderDeviceKey(root);
+      this.renderDeviceKeyCard(root);
     }
 
-    // ---- Log (both stages) ----------------------------------------------
-    this.renderLog(root);
+    // Log — both stages, inside a card.
+    this.renderLogCard(root);
   }
 
-  /** The device key rendered in a wrapping, selectable monospace box so the
-   * long ssh-ed25519 string can't overflow the card and shift the settings
-   * screen on mobile (it used to be a single unbroken `setDesc` line). */
-  private renderDeviceKey(root: HTMLElement): void {
-    new Setting(root)
-      .setName('Device key')
-      .setDesc('Authorize this device on the peer with this key.')
-      .addButton((b) =>
-        b.setButtonText('Copy').onClick(() => {
-          void navigator.clipboard?.writeText(this.plugin.deviceKey());
-          new Notice('asp: device key copied');
-        }),
-      );
+  /** A titled, bordered card; returns the body element to fill. */
+  private card(root: HTMLElement, title: string): HTMLElement {
+    const wrap = document.createElement('div');
+    Object.assign(wrap.style, CARD_STYLE);
+    const head = document.createElement('div');
+    head.textContent = title;
+    Object.assign(head.style, {
+      fontSize: '11px',
+      fontWeight: '600',
+      letterSpacing: '0.06em',
+      textTransform: 'uppercase',
+      color: 'var(--text-muted)',
+      marginBottom: '8px',
+    } as Partial<CSSStyleDeclaration>);
+    const body = document.createElement('div');
+    wrap.appendChild(head);
+    wrap.appendChild(body);
+    root.appendChild(wrap);
+    return body;
+  }
 
+  private addButton(parent: HTMLElement, text: string, onClick: () => void): void {
+    const btn = document.createElement('button');
+    btn.textContent = text;
+    btn.addEventListener('click', onClick);
+    parent.appendChild(btn);
+  }
+
+  /** Live connection status, pinned at the top of the tab. */
+  private renderStatusBanner(root: HTMLElement): void {
+    const banner = document.createElement('div');
+    Object.assign(banner.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '8px',
+      padding: '8px 12px',
+      margin: '4px 0',
+      border: '1px solid var(--background-modifier-border)',
+      borderRadius: '8px',
+      background: 'var(--background-secondary)',
+      fontWeight: '600',
+    } as Partial<CSSStyleDeclaration>);
+    const dot = document.createElement('span');
+    Object.assign(dot.style, {
+      width: '10px',
+      height: '10px',
+      borderRadius: '50%',
+      flex: '0 0 auto',
+    } as Partial<CSSStyleDeclaration>);
+    const label = document.createElement('span');
+    banner.appendChild(dot);
+    banner.appendChild(label);
+    root.appendChild(banner);
+
+    // Fires immediately with the current state, then on every change.
+    this.unsubState = this.plugin.onSyncState((s) => {
+      const info = statusInfo(s);
+      dot.style.background = info.color;
+      label.textContent = info.label;
+    });
+  }
+
+  /** Device key in a card: a wrapping, selectable monospace box (so the long
+   * ssh-ed25519 string can't overflow on mobile) + a Copy button. */
+  private renderDeviceKeyCard(root: HTMLElement): void {
+    const body = this.card(root, 'Device key');
     const box = document.createElement('div');
     box.textContent = this.plugin.deviceKey() || '(generated on first load)';
     Object.assign(box.style, {
@@ -302,19 +383,29 @@ class AspSettingTab extends PluginSettingTab {
       overflowWrap: 'anywhere',
       whiteSpace: 'pre-wrap',
       userSelect: 'all',
-      padding: '6px 8px',
-      margin: '0 0 12px',
-      border: '1px solid var(--background-modifier-border)',
-      borderRadius: '6px',
-      background: 'var(--background-secondary)',
     } as Partial<CSSStyleDeclaration>);
-    root.appendChild(box);
+    body.appendChild(box);
+    const actions = document.createElement('div');
+    actions.style.marginTop = '8px';
+    body.appendChild(actions);
+    this.addButton(actions, 'Copy', () => {
+      void navigator.clipboard?.writeText(this.plugin.deviceKey());
+      new Notice('asp: device key copied');
+    });
   }
 
-  /** Always-visible, copyable activity log — the only window into what the
-   * plugin is doing on mobile (no dev console there), and useful for debugging
-   * before a connection is ever made. */
-  private renderLog(root: HTMLElement): void {
+  /** Activity log in a card: Copy-all / Clear + a scrolling pre. The only
+   * window into the plugin on mobile (no dev console), visible before connect. */
+  private renderLogCard(root: HTMLElement): void {
+    const body = this.card(root, 'Log');
+    const actions = document.createElement('div');
+    Object.assign(actions.style, {
+      display: 'flex',
+      gap: '8px',
+      marginBottom: '8px',
+    } as Partial<CSSStyleDeclaration>);
+    body.appendChild(actions);
+
     const pre = document.createElement('pre');
     Object.assign(pre.style, {
       maxHeight: '220px',
@@ -325,11 +416,12 @@ class AspSettingTab extends PluginSettingTab {
       fontSize: '11px',
       lineHeight: '1.45',
       padding: '8px',
-      margin: '4px 0 0',
+      margin: '0',
       border: '1px solid var(--background-modifier-border)',
       borderRadius: '6px',
-      background: 'var(--background-secondary)',
+      background: 'var(--background-primary)',
     } as Partial<CSSStyleDeclaration>);
+    body.appendChild(pre);
 
     const fmt = (e: LogEntry) => `[${e.ts}] ${e.level === 'error' ? 'ERR ' : ''}${e.msg}`;
     const render = () => {
@@ -338,25 +430,16 @@ class AspSettingTab extends PluginSettingTab {
       pre.scrollTop = pre.scrollHeight;
     };
 
-    new Setting(root)
-      .setName('Log')
-      .setDesc('Recent activity. Copy this when reporting an issue.')
-      .addButton((b) =>
-        b.setButtonText('Copy all').onClick(() => {
-          void navigator.clipboard?.writeText(this.plugin.log.toText());
-          new Notice('asp: log copied');
-        }),
-      )
-      .addButton((b) =>
-        b.setButtonText('Clear').onClick(() => {
-          this.plugin.log.clear();
-          render();
-        }),
-      );
+    this.addButton(actions, 'Copy all', () => {
+      void navigator.clipboard?.writeText(this.plugin.log.toText());
+      new Notice('asp: log copied');
+    });
+    this.addButton(actions, 'Clear', () => {
+      this.plugin.log.clear();
+      render();
+    });
 
-    root.appendChild(pre);
     render();
-    // Stream new lines into the open viewer; torn down in hide()/next display().
-    this.unsub = this.plugin.log.subscribe(() => render());
+    this.unsubLog = this.plugin.log.subscribe(() => render());
   }
 }

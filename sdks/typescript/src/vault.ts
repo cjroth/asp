@@ -12,6 +12,21 @@ function toBytes(c: Uint8Array | string): Uint8Array {
   return typeof c === 'string' ? enc.encode(c) : c;
 }
 
+/**
+ * Default the scheme of a peer URL. A bare host (`hub:9000`, `example.com/path`)
+ * is assumed to be a *secure* WebSocket — `wss://`. Explicit `ws://`/`wss://` is
+ * left untouched; `http(s)://` is mapped to the `ws(s)://` equivalent (a common
+ * paste). Empty stays empty so callers can detect "no peer set".
+ */
+export function normalizePeerUrl(url: string): string {
+  const u = url.trim();
+  if (!u) return '';
+  if (/^wss?:\/\//i.test(u)) return u;
+  if (/^https:\/\//i.test(u)) return u.replace(/^https:\/\//i, 'wss://');
+  if (/^http:\/\//i.test(u)) return u.replace(/^http:\/\//i, 'ws://');
+  return `wss://${u.replace(/^\/+/, '')}`;
+}
+
 export interface SyncOptions {
   authKey?: string;
   /** Idle window (ms) after which a one-shot sync is considered converged. */
@@ -81,9 +96,10 @@ export class Vault {
   async sync(url: string, opts: SyncOptions = {}): Promise<void> {
     const idleMs = opts.idleMs ?? 800;
     const timeoutMs = opts.timeoutMs ?? 15000;
+    const base = normalizePeerUrl(url);
     const fullUrl = opts.authKey
-      ? `${url}${url.includes('?') ? '&' : '?'}auth_key=${encodeURIComponent(opts.authKey)}`
-      : url;
+      ? `${base}${base.includes('?') ? '&' : '?'}auth_key=${encodeURIComponent(opts.authKey)}`
+      : base;
 
     const ws = new WebSocket(fullUrl);
     ws.binaryType = 'arraybuffer';
