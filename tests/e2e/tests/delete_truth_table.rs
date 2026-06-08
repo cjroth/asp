@@ -43,6 +43,38 @@ fn delete_dominates_concurrent_edit() {
 }
 
 #[test]
+fn reconnect_does_not_resurrect_a_deleted_file() {
+    // §Capture: bootstrap-before-publish / no resurrection. A delete is a durable
+    // ordered row a reconnecting device LEARNS via catch-up — it never emits a
+    // false-add, and a concurrent local edit can't resurrect it (remove-wins).
+    let root = temp_root();
+    let hub = Hub::start(root.path(), "hub", Some(SECRET), &[]);
+    let url = hub.url();
+
+    let a = Node::new(root.path(), "A");
+    a.init();
+    a.write("doc.md", b"v1\n");
+    a.sync(&url, Some(SECRET));
+    let b = Node::new(root.path(), "B");
+    b.clone_from(&url, Some(SECRET));
+    assert!(b.exists("doc.md"));
+
+    // A deletes and publishes while B is offline.
+    a.remove("doc.md");
+    a.commit();
+    a.sync(&url, Some(SECRET));
+
+    // B, still holding the file, edits it offline — then reconnects.
+    b.write("doc.md", b"v1\nlocal edit\n");
+    b.commit();
+    b.sync(&url, Some(SECRET));
+    a.sync(&url, Some(SECRET));
+
+    assert!(!b.exists("doc.md"), "reconnect learns the delete; the local edit does not resurrect");
+    assert!(!a.exists("doc.md"), "and B's edit does not resurrect it on A either");
+}
+
+#[test]
 fn delete_dominates_concurrent_rename() {
     let root = temp_root();
     let hub = Hub::start(root.path(), "hub", Some(SECRET), &[]);

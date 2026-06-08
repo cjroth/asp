@@ -783,4 +783,32 @@ mod tests {
         let other = Identity::from_seed(&[10; 32]).node_id();
         assert!(e.admit(&other, &ctx).is_err());
     }
+
+    #[test]
+    fn expired_key_denied_then_refreshed() {
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        let peer = Identity::from_seed(&[9; 32]);
+        // A key that expired in 1970.
+        e.authorize(&peer.to_ssh_string(), Some(1000), false, "test").unwrap();
+        let ctx = AdmitCtx { no_tofu: true, auth_key_ok: false, auth_key_configured: true, default_ttl_days: 90, now_unix: 2000 };
+        assert!(e.admit(&peer.node_id(), &ctx).is_err(), "expired key past its time is refused");
+        // Re-authorized with a future expiry → admitted.
+        e.authorize(&peer.to_ssh_string(), Some(10_000), false, "cli").unwrap();
+        let ctx2 = AdmitCtx { now_unix: 5000, ..ctx };
+        e.admit(&peer.node_id(), &ctx2).unwrap();
+    }
+
+    #[test]
+    fn listen_start_migration_is_idempotent() {
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        // A hand-seeded key with unset expiry.
+        e.authorize(&Identity::from_seed(&[9; 32]).to_ssh_string(), None, false, "env").unwrap();
+        assert_eq!(e.migrate_keys(90).unwrap(), 1, "unset row gets a default expiry");
+        assert_eq!(e.migrate_keys(90).unwrap(), 0, "second run is a no-op (idempotent)");
+        // A `never` key is never rewritten by migration.
+        e.authorize(&Identity::from_seed(&[7; 32]).to_ssh_string(), None, true, "cli").unwrap();
+        assert_eq!(e.migrate_keys(90).unwrap(), 0, "never=1 rows are left untouched");
+    }
 }

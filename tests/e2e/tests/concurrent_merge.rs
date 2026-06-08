@@ -18,7 +18,7 @@ fn converge(nodes: &[&Node], url: &str) {
 }
 
 /// Build a base file on A, clone B — both share it.
-fn setup<'a>(root: &'a tempfile::TempDir, hub: &Hub, base_path: &str, base: &[u8]) -> (Node, Node) {
+fn setup(root: &tempfile::TempDir, hub: &Hub, base_path: &str, base: &[u8]) -> (Node, Node) {
     let url = hub.url();
     let a = Node::new(root.path(), "A");
     a.init();

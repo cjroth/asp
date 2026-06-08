@@ -349,4 +349,61 @@ mod tests {
             _ => None,
         }
     }
+
+    /// §Security advertised channel binding: a connector that *observes* a cert
+    /// fingerprint different from the one the listener *advertised* (a live MITM /
+    /// cert substitution) MUST abort with a distinct channel-binding error.
+    #[test]
+    fn channel_binding_mismatch_aborts_connector() {
+        let da = tempdir().unwrap();
+        let db = tempdir().unwrap();
+        let a = Engine::init(da.path(), Identity::from_seed(&[1; 32])).unwrap();
+        let b = Engine::init(db.path(), Identity::from_seed(&[2; 32])).unwrap();
+        let vid = a.store.get_config("vault_id").unwrap().unwrap();
+        b.store.set_config("vault_id", &vid).unwrap();
+        a.authorize(&Identity::from_seed(&[2; 32]).to_ssh_string(), None, true, "t").unwrap();
+        b.authorize(&Identity::from_seed(&[1; 32]).to_ssh_string(), None, true, "t").unwrap();
+        let mkctx = || AdmitCtx { no_tofu: false, auth_key_ok: false, auth_key_configured: false, default_ttl_days: 90, now_unix: 1_700_000_000 };
+
+        // Listener advertises fingerprint [1,2,3]; the connector OBSERVES [9,9,9]
+        // (a MITM re-terminated TLS with a different cert).
+        let mut la = Session::new(Role::Listener, &a, vec![1, 2, 3], None, mkctx());
+        let mut cb = Session::new(Role::Connector, &b, Vec::new(), Some(vec![9, 9, 9]), mkctx());
+
+        let mut to_a: Vec<Msg> = cb.start().into_iter().filter_map(send_of).collect();
+        let mut to_b: Vec<Msg> = la.start().into_iter().filter_map(send_of).collect();
+        let mut aborted = false;
+        for _ in 0..30 {
+            let mut n_to_a = Vec::new();
+            let mut n_to_b = Vec::new();
+            for m in to_a.drain(..) {
+                for s in la.on_msg(&a, m).unwrap() {
+                    if let Some(m) = send_of(s) {
+                        n_to_b.push(m);
+                    }
+                }
+            }
+            for m in to_b.drain(..) {
+                for s in cb.on_msg(&b, m).unwrap() {
+                    // The connector rejects the listener with a *distinct* channel-
+                    // binding error (the live MITM / cert-substitution defense).
+                    if let Step::Closed(reason) = &s {
+                        if reason.contains("channel binding") {
+                            aborted = true;
+                        }
+                    }
+                    if let Some(m) = send_of(s) {
+                        n_to_a.push(m);
+                    }
+                }
+            }
+            to_a = n_to_a;
+            to_b = n_to_b;
+            if to_a.is_empty() && to_b.is_empty() {
+                break;
+            }
+        }
+        assert!(aborted, "connector must abort on a channel-binding mismatch");
+        assert!(!cb.authed(), "and must not authenticate");
+    }
 }

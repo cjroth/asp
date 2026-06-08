@@ -31,8 +31,8 @@ jobs:
         run: cargo build --workspace
       - name: Unit + conformance + multi-process e2e
         run: cargo test --workspace
-      - name: Clippy (no warnings)
-        run: rustup component add clippy && cargo clippy --workspace -- -D warnings
+      - name: Clippy (no warnings, all targets incl. tests)
+        run: rustup component add clippy && cargo clippy --workspace --all-targets -- -D warnings
 
   sdk:
     runs-on: ubuntu-latest

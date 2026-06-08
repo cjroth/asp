@@ -450,3 +450,32 @@ pub async fn clone_bootstrap(engine: EngineRef, url: &str, auth: &AuthOpts) -> R
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::extract_auth_key;
+    use tokio_tungstenite::tungstenite::handshake::server::Request;
+
+    fn req(auth: Option<&str>, uri: &str, subproto: Option<&str>) -> Request {
+        let mut b = Request::builder().uri(uri);
+        if let Some(a) = auth {
+            b = b.header("authorization", a);
+        }
+        if let Some(p) = subproto {
+            b = b.header("sec-websocket-protocol", p);
+        }
+        b.body(()).unwrap()
+    }
+
+    #[test]
+    fn auth_key_extracted_from_all_three_transports() {
+        // Bearer header (preferred).
+        assert_eq!(extract_auth_key(&req(Some("Bearer s3cr3t"), "/", None)).as_deref(), Some("s3cr3t"));
+        // ?auth_key= query (browsers that can't set headers).
+        assert_eq!(extract_auth_key(&req(None, "/?auth_key=qq", None)).as_deref(), Some("qq"));
+        // bearer.<key> subprotocol (the other browser fallback).
+        assert_eq!(extract_auth_key(&req(None, "/", Some("bearer.pp"))).as_deref(), Some("pp"));
+        // Absent entirely → None (already-enrolled peers connect without it).
+        assert_eq!(extract_auth_key(&req(None, "/", None)), None);
+    }
+}

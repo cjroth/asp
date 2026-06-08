@@ -105,3 +105,31 @@ fn auth_list_and_revoke_via_cli() {
     let (_, out2, _) = admin_cmd(root.path(), "hub", &["auth", "list"]);
     assert!(out2.contains("no authorized keys"), "after revoke the set is empty: {out2}");
 }
+
+#[test]
+fn auth_extend_lengthens_expiry() {
+    let root = temp_root();
+    let peer = Node::new(root.path(), "peer");
+    peer.init();
+    let peer_key = peer.key();
+
+    admin_cmd(root.path(), "hub", &["authorize", &peer_key, "--ttl", "30d"]);
+    let exp1 = expiry_of(root.path(), &peer_key);
+
+    let (ok, _, err) = admin_cmd(root.path(), "hub", &["auth", "extend", &peer_key, "1y"]);
+    assert!(ok, "auth extend failed: {err}");
+    let exp2 = expiry_of(root.path(), &peer_key);
+    assert!(exp2 > exp1, "auth extend lengthens the expiry ({exp1} -> {exp2})");
+}
+
+fn expiry_of(root: &std::path::Path, pubkey: &str) -> i64 {
+    let node_hex = asp_core::identity::parse_ssh_pubkey(pubkey).unwrap().to_hex();
+    let (_, out, _) = admin_cmd(root, "hub", &["auth", "list", "--json"]);
+    let arr: serde_json::Value = serde_json::from_str(&out).unwrap();
+    for k in arr.as_array().unwrap() {
+        if k["node_id"].as_str() == Some(node_hex.as_str()) {
+            return k["expires_at"].as_i64().unwrap_or(0);
+        }
+    }
+    panic!("key not found in auth list: {out}");
+}

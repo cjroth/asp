@@ -283,6 +283,7 @@ mod tests {
     use super::*;
     use crate::log::{Kind, MergeClass};
 
+    #[allow(clippy::too_many_arguments)]
     fn mkrow(site: &str, lamport: u64, seq: u64, file_id: &str, kind: Kind, parent: Option<&str>, base: Option<&str>, result: Option<&str>, path: Option<&str>) -> LogRow {
         LogRow {
             id: String::new(),
@@ -350,6 +351,24 @@ mod tests {
         let f = files.iter().find(|f| f.file_id == "f1").unwrap();
         assert_eq!(f.merge_class, MergeClass::Code, "reclass switched the routing class");
         assert_eq!(f.result_hash.as_deref(), Some(h0.as_str()), "content carried across the boundary");
+    }
+
+    #[test]
+    fn equal_counter_same_site_is_total_by_id() {
+        // Two concurrent edits with the SAME (lamport, site_id) but different ids
+        // (a same-site replica race) must still fold to one deterministic result,
+        // broken by content-addressed id — permutation-invariant.
+        let s = crate::store::MemBlobStore::new();
+        let h0 = s.put_blob(b"base\n").unwrap();
+        let create = mkrow("aa", 1, 0, "f1", Kind::Create, None, None, Some(&h0), Some("a.md"));
+        let h1 = s.put_blob(b"one\n").unwrap();
+        let h2 = s.put_blob(b"two\n").unwrap();
+        let e1 = mkrow("aa", 2, 1, "f1", Kind::Edit, Some(&create.id), Some(&h0), Some(&h1), None);
+        let e2 = mkrow("aa", 2, 2, "f1", Kind::Edit, Some(&create.id), Some(&h0), Some(&h2), None);
+        let fwd = compute_files(&s, &[create.clone(), e1.clone(), e2.clone()]).unwrap();
+        let rev = compute_files(&s, &[e2, e1, create]).unwrap();
+        assert_eq!(fwd, rev, "equal-counter same-site rows fold deterministically");
+        assert_eq!(fwd.iter().filter(|f| !f.deleted).count(), 1);
     }
 
     #[test]

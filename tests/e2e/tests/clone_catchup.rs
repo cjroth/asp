@@ -27,6 +27,28 @@ fn clone_full_catchup() {
 }
 
 #[test]
+fn clone_pins_the_listener_as_a_peer() {
+    // §CLI `asp clone`: pin the listener's NodeId and record the source URL as a
+    // peer (git's `origin`).
+    let root = temp_root();
+    let hub = Hub::start(root.path(), "hub", Some(SECRET), &[]);
+    let url = hub.url();
+
+    let a = Node::new(root.path(), "A");
+    a.init();
+    a.write("x.md", b"x\n");
+    a.sync(&url, Some(SECRET));
+
+    let b = Node::new(root.path(), "B");
+    b.clone_from(&url, Some(SECRET));
+    let st = b.status_json();
+    let peers = st["peers"].as_array().expect("peers array");
+    assert_eq!(peers.len(), 1, "clone pinned exactly one peer");
+    assert_eq!(peers[0]["url"].as_str(), Some(url.as_str()), "the source URL is recorded");
+    assert!(peers[0]["node_id"].as_str().unwrap().len() >= 16, "the listener NodeId is pinned");
+}
+
+#[test]
 fn offline_then_reconnect_catchup() {
     let root = temp_root();
     let hub = Hub::start(root.path(), "hub", Some(SECRET), &[]);
