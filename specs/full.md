@@ -105,9 +105,18 @@ not a redesign.
 - **Merges are derived, not synced.** Only genuine edit rows cross the wire. The
   merged state the fold produces is recomputed identically on every node, so it is
   never transmitted.
-- **`site_id` is the device's NodeId.** The authoring device's `site_id` is its
-  ed25519 public key (the same key that authenticates its connections, §*Security*).
-  Identity, admission, and ordering therefore share one notion of "who."
+- **`site_id` is a per-vault authoring identity; the device key is the connection
+  identity.** Connections are authenticated and admitted by the **device key**
+  (`~/.asp/id_ed25519`, §*Security*). Authoring (`site_id`, the version-vector +
+  fold-order axis) uses a **per-vault** id, forked fresh at `init`/`clone` and kept
+  in the never-synced `.asp/site_id`. This is the spec's single-writer requirement
+  (§*Security*) made load-bearing: two **replicas of one vault on the same device**
+  share the device key but must NOT share a `site_id` — if they did, their
+  concurrent edits would collide on `(site_id, seq)` and version-vector catch-up
+  would silently fail to exchange them. With distinct per-vault `site_id`s,
+  reconciliation stays correct. (Where a single device hosts only one replica of a
+  vault, `site_id` and the device key coincide in spirit; the split only matters for
+  same-device replicas.)
 
 ## The merge model (the centerpiece)
 
@@ -595,13 +604,18 @@ queryable, wasm-portable table instead of a side file.
   against `site_id` and drop unsigned/invalid rows) without a schema or capture
   change. Connection-level admission remains the trust gate either way.
 
-- **Single-writer protection.** A `site_id` is the ed25519 key. Reusing it across
-  *different* vaults is fine; the *same key actively writing two replicas of one
-  vault* is the hazard. The Lamport/`seq` counters are durably persisted; `asp clone`
-  / restore MUST fork a fresh `site_id` or warn rather than resume authoring under a
-  possibly-live key. Correctness survives a violation (causal fold + Merkle ids +
-  content-hash tiebreak keep equal-counter same-site replicas total); this protection
-  keeps history clean.
+- **Single-writer protection (per-vault `site_id`, implemented).** The *same id
+  actively writing two replicas of one vault* is the hazard — and because the device
+  connection key is shared across every vault on a machine, two replicas would
+  otherwise author under one `site_id` and **collide on `(site_id, seq)`, silently
+  defeating version-vector catch-up** (the divergent rows are never exchanged). So
+  `init`/`clone` **fork a fresh per-vault `site_id`** (a random id in the never-synced
+  `.asp/site_id`), guaranteeing distinct authoring identities for same-device
+  replicas. The Lamport/`seq` counters are durably persisted (derived from the log).
+  Even under an accidental shared-id violation correctness still survives the *fold*
+  (causal fold + Merkle ids + content-hash tiebreak keep equal-counter same-site rows
+  totally ordered) — but only once both rows are present, which is exactly what the
+  per-vault `site_id` guarantees catch-up will deliver.
 
 - **Transport confidentiality.** Default transport is **`wss://`**: a listener serves
   TLS using a **self-signed certificate it generates and persists** under the
