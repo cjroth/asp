@@ -276,6 +276,13 @@ export default class AspPlugin extends Plugin {
     return this.sdk?.nodeSsh() ?? '';
   }
 
+  /** This device's node id (hex) — the identifier the hub logs as `peer=…` and
+   * lists in `asp auth list`. Lets a user match this device to what they see on
+   * the hub. */
+  peerId(): string {
+    return this.sdk?.nodeId() ?? '';
+  }
+
   private renderStatus(s: string): void {
     if (this.statusEl) this.statusEl.setText?.(`asp: ${s}`) ?? (this.statusEl.textContent = `asp: ${s}`);
   }
@@ -298,6 +305,10 @@ function statusInfo(s: SyncState): { label: string; color: string } {
 class AspSettingTab extends PluginSettingTab {
   // Live status subscription, torn down on hide/re-render.
   private unsubState?: () => void;
+  // Repaints the status row from current state + the enabled toggle. Held so the
+  // toggle can refresh the status immediately (flipping `enabled` doesn't emit a
+  // SyncState change on its own).
+  private applyStatus?: () => void;
 
   constructor(
     app: AspPlugin['app'],
@@ -309,6 +320,7 @@ class AspSettingTab extends PluginSettingTab {
   hide(): void {
     this.unsubState?.();
     this.unsubState = undefined;
+    this.applyStatus = undefined;
   }
 
   display(): void {
@@ -358,9 +370,24 @@ class AspSettingTab extends PluginSettingTab {
         t.setValue(this.plugin.settings.enabled).onChange(async (v) => {
           this.plugin.settings.enabled = v;
           await this.plugin.saveData(this.plugin.settings);
+          this.applyStatus?.(); // off → "Paused" right away (no SyncState change otherwise)
           if (v) void this.plugin.syncNow();
         }),
       );
+
+      // The device's node id — read-only + Copy. Shown above the public key so a
+      // user can match this device to what the hub reports (`peer=…` in logs,
+      // `asp auth list`).
+      new Setting(root)
+        .setName('Peer ID')
+        .setDesc('This device on the hub (matches `asp auth list` / log `peer=…`).')
+        .addText((t) => t.setValue(this.plugin.peerId()).setDisabled(true))
+        .addButton((b) =>
+          b.setButtonText('Copy').onClick(() => {
+            void navigator.clipboard?.writeText(this.plugin.peerId());
+            new Notice('asp: peer id copied');
+          }),
+        );
 
       // The device's public identity — a read-only field (scrolls within the
       // input, so the long key can't overflow on mobile) + Copy.
@@ -401,11 +428,21 @@ class AspSettingTab extends PluginSettingTab {
     setting.controlEl.appendChild(dot);
     setting.controlEl.appendChild(label);
 
-    // Fires immediately with the current state, then on every change.
-    this.unsubState = this.plugin.onSyncState((s) => {
-      const info = statusInfo(s);
+    let cur: SyncState = this.plugin.syncState;
+    const paint = () => {
+      // When the user has turned sync off (after connecting), say so explicitly
+      // instead of leaving the last "In sync" result on screen — that stale
+      // label reads as if sync were still running.
+      const paused = this.plugin.settings.connectedOnce && !this.plugin.settings.enabled;
+      const info = paused ? { label: 'Paused', color: 'var(--text-muted, #888)' } : statusInfo(cur);
       dot.style.background = info.color;
       label.textContent = info.label;
+    };
+    this.applyStatus = paint;
+    // Fires immediately with the current state, then on every change.
+    this.unsubState = this.plugin.onSyncState((s) => {
+      cur = s;
+      paint();
     });
   }
 }
