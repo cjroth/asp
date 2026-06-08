@@ -7,11 +7,22 @@
 // (vault I/O, the event→push path, settings, a status bar).
 
 import { Notice, Plugin, PluginSettingTab, Setting, type EventRef } from 'obsidian';
-import { Vault as SdkVault } from '../../../sdks/typescript/src/index.ts';
+import { initAsp, Vault as SdkVault } from '../../../sdks/typescript/src/index.ts';
 import { Bridge } from './bridge.ts';
 import { ObsidianHost } from './obsidian-host.ts';
 import { PathFilter } from './path-filter.ts';
 import { SyncController } from './sync-controller.ts';
+
+// The wasm engine bytes, inlined at build time by esbuild (see
+// esbuild.config.mjs). Decoded once and handed to `initAsp` so `main.js` is
+// fully self-contained — no sibling .wasm to fetch.
+declare const __ASP_WASM_B64__: string;
+function wasmBytes(): Uint8Array {
+  const bin = atob(__ASP_WASM_B64__);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
 
 interface AspSettings {
   peerUrl: string;
@@ -47,6 +58,10 @@ export default class AspPlugin extends Plugin {
       this.settings.seedHex = randomSeedHex();
       await this.saveData(this.settings);
     }
+
+    // Instantiate the wasm engine from the inlined bytes before any engine use
+    // (the web target loads asynchronously). Idempotent.
+    await initAsp(wasmBytes());
 
     // The one engine, in wasm — a thin node. Empty vault id adopts the peer's.
     this.sdk = new SdkVault(hexToBytes(this.settings.seedHex), '');

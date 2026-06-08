@@ -6,6 +6,12 @@
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
+  "imports": {
+    "#engine": {
+      "browser": "./src/engine-web.ts",
+      "default": "./src/engine-node.ts"
+    }
+  },
   "files": ["src", "README.md"],
   "scripts": {
     "build:wasm": "node scripts/build-wasm.mjs",
