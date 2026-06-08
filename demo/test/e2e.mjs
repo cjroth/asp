@@ -1,6 +1,6 @@
 // Real-browser end-to-end (Playwright/chromium headless): drives the BUILT demo
 // in a real DOM — add/clone nodes, live propagation, offline → reconnect
-// catch-up, OPFS persistence across reload, and the ws:// connect UI wiring.
+// catch-up, OPFS persistence across reload, and the wss:// connect UI wiring.
 // Requires: `node build.mjs` first, and chromium installed (PLAYWRIGHT_BROWSERS_PATH).
 import { spawn } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
@@ -87,13 +87,13 @@ try {
   check('persisted: laptop content survived reload',
     (await panel('laptop').locator('.ed-area textarea').inputValue()) === offlineEdit);
 
-  // 7) ws:// connect UI wiring (no live peer needed)
+  // 7) wss:// connect UI wiring (no live peer needed)
   await page.getByRole('button', { name: 'Add node' }).click();
-  await page.getByRole('button', { name: 'real ws:// peer' }).click();
-  check('Add-node dialog exposes the ws:// peer url field',
-    await page.locator('input[placeholder="ws://127.0.0.1:9000"]').isVisible());
+  await page.getByRole('button', { name: 'real wss:// peer', exact: true }).click();
+  check('Add-node dialog exposes the wss:// peer url field',
+    await page.locator('input[placeholder="wss://127.0.0.1:9000"]').isVisible());
   await page.getByRole('button', { name: 'Cancel' }).click();
-  await panel('laptop').getByRole('button', { name: '⇄' }).click();
+  await panel('laptop').getByRole('button', { name: 'connect to a real wss:// peer' }).click();
   check('per-node connect dialog opens (Bridge to a real peer)',
     await page.locator('text=Bridge').first().isVisible());
   await page.getByRole('button', { name: 'Cancel' }).click();
