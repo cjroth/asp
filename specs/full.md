@@ -373,7 +373,12 @@ config(key TEXT PRIMARY KEY, value TEXT);
   `result_hash=NULL` — that the fold materializes as a real `mkdir`, with **no marker
   file in the vault**. Capture authors one for each empty dir and a `kind='delete'`
   once the folder gains a real file (it's then implied by the file) or is removed —
-  a convergent lifecycle. **Directories are identity-by-path** (the deliberate
+  a convergent lifecycle. A folder left empty *as a side effect* of the same capture
+  pass — its files renamed away or deleted — is a **leftover, not an intentional empty
+  folder**, so no `dir` entity is authored for it and materialize prunes the old tree;
+  otherwise renaming a folder would strand its old, now-empty tree on every node. Only
+  a folder empty *at rest* (e.g. one you explicitly created) is preserved.
+  **Directories are identity-by-path** (the deliberate
   opposite of files, §Renames): same-path directory entities **dedupe** in the fold
   to one `mkdir` with no ` (n)` suffix, so two devices independently creating the
   same folder converge (where two `.keep` files would have *split* under the
@@ -731,15 +736,19 @@ protocol can do may be CLI-inaccessible. Command sketch:
 - `asp init [path]` — create a new scoped vault and this node's SSH-key identity.
 - `asp clone <url> [into]` — bootstrap a new node from a listening peer: authenticate,
   full catch-up, materialize, write local identity/config, **pin the listener's
-  NodeId and record the source URL as a peer** (git's `origin`). `--watch` stays
-  running as the daemon.
-- `asp watch [--listen [addr]]` — **the primary long-running command.** Open the
-  vault, watch the scoped tree (debounced auto-commit, self-write suppression),
-  connect to configured peer(s), run the realtime sync loop. `--listen` additionally
-  accepts inbound peers (relay/hub) and binds `0.0.0.0:9000` by default (unprivileged;
-  not 443). Default transport `wss://`; `--no-tls` serves `ws://`. Emits
-  operator-visible logging (peer connect / handshake outcome with reason / catch-up /
-  integrate / commit) at `INFO`.
+  NodeId and record the source URL as the default peer** (git's `origin`). `--watch`
+  stays running as the daemon.
+- `asp watch [--listen [addr]] [--peer <url>…]` / `asp sync [<url>]` — **`watch` is
+  the primary long-running command.** Open the vault, watch the scoped tree (debounced
+  auto-commit, self-write suppression), connect to peers, run the realtime sync loop.
+  **The saved peer is the default:** with no `--peer`/URL these connect to the peer(s)
+  recorded by `clone` (`origin`), so the URL need not be re-typed. An explicitly
+  supplied `--peer`/URL is **used for this run but only persisted with consent** — on
+  an interactive terminal the CLI asks before saving it (`y` to save, any other key to
+  decline); non-interactively (CI/scripts) it is never silently written. `--listen`
+  additionally accepts inbound peers (relay/hub) and binds `0.0.0.0:9000` by default
+  (unprivileged; not 443). Default transport `wss://`; `--no-tls` serves `ws://`. Emits
+  operator-visible logging at `INFO`.
 - `asp key` — generate / show the node SSH key (OpenSSH format); use an SSH agent if
   available.
 - `asp authorize <pubkey> [--ttl 30d|never]` / `asp revoke <pubkey>` — manage the
@@ -767,8 +776,12 @@ config). Knobs: `--dir`/`ASP_DIR`, `--no-tls`/`ASP_NO_TLS`, `--listen`/`--port`/
 `PORT`, `--log`/`ASP_LOG`, `--debounce`/`ASP_DEBOUNCE`, `--authorized-keys`/
 `ASP_AUTHORIZED_KEYS`, `--auth-key`/`ASP_AUTH_KEY`, `--default-key-ttl`/
 `ASP_DEFAULT_KEY_TTL`, `--no-tofu`/`ASP_NO_TOFU`, and `--debug`/`ASP_DEBUG`
-(§*Testing*). A hosted listener is fully configurable by flags *or* env with no file
-editing, e.g. `asp watch --listen --no-tls --dir /data/vol --authorized-keys "$KEYS"`.
+(§*Testing*). Boolean knobs accept any **boolish** env value
+(`1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`, case-insensitive) — e.g.
+`ASP_NO_TLS=1` and `ASP_NO_TLS=true` are equivalent — so a deploy never crash-loops
+on a `1` where a strict parser wanted `true`. A hosted listener is fully configurable
+by flags *or* env with no file editing, e.g. `asp watch --listen --no-tls --dir
+/data/vol --authorized-keys "$KEYS"`.
 
 ### Context Desktop (native full node, Tauri)
 

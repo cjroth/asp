@@ -24,7 +24,16 @@ struct Cli {
     #[arg(short = 'C', long = "dir", global = true, env = "ASP_DIR")]
     dir: Option<PathBuf>,
     /// Serve plaintext ws:// instead of wss:// (behind a TLS-terminating proxy).
-    #[arg(long = "no-tls", global = true, env = "ASP_NO_TLS")]
+    /// The env var accepts any boolish value (1/true/yes/on, 0/false/no/off).
+    #[arg(
+        long = "no-tls",
+        global = true,
+        env = "ASP_NO_TLS",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true"
+    )]
     no_tls: bool,
     /// AUTH_KEY enrollment secret(s), comma-separated (listener accepts / connector presents).
     #[arg(long = "auth-key", global = true, env = "ASP_AUTH_KEY")]
@@ -36,7 +45,16 @@ struct Cli {
     #[arg(long = "default-key-ttl", global = true, env = "ASP_DEFAULT_KEY_TTL")]
     default_key_ttl: Option<String>,
     /// Disable trust-on-first-use entirely (hardened/internet-exposed listeners).
-    #[arg(long = "no-tofu", global = true, env = "ASP_NO_TOFU")]
+    /// The env var accepts any boolish value (1/true/yes/on, 0/false/no/off).
+    #[arg(
+        long = "no-tofu",
+        global = true,
+        env = "ASP_NO_TOFU",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true"
+    )]
     no_tofu: bool,
     /// Debounce window in milliseconds for the watcher.
     #[arg(long = "debounce", global = true, env = "ASP_DEBOUNCE")]
@@ -70,8 +88,9 @@ enum Cmd {
         #[arg(long = "peer")]
         peers: Vec<String>,
     },
-    /// One-shot: capture local changes, sync with a peer, exit.
-    Sync { url: String },
+    /// One-shot: capture local changes, sync with a peer, exit. With no URL, uses
+    /// the saved peer (from `clone`).
+    Sync { url: Option<String> },
     /// Capture on-disk changes into the log (no network).
     Commit,
     /// Generate / show the node's SSH public key.
@@ -121,6 +140,45 @@ enum AuthCmd {
 
 fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Ask a yes/no question on an interactive terminal. `y`/`yes` → true; any other
+/// key → false. Non-interactive (piped/CI) → false, so a supplied `--peer` never
+/// silently rewrites saved config.
+fn prompt_yes(question: &str) -> bool {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    print!("{question} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// The saved peer URLs for this vault (git's `origin` — local `peers` table).
+fn saved_peer_urls(engine: &Engine) -> Vec<String> {
+    engine.store.peers().map(|ps| ps.into_iter().map(|(u, _)| u).collect()).unwrap_or_default()
+}
+
+/// Resolve the peer URLs for `watch`/`sync`. With no `--peer`, use the saved
+/// peers. With explicit URLs, use them — and offer to save any new one (clone
+/// saves automatically; an explicit URL only persists with consent).
+fn resolve_peers(engine: &Engine, supplied: &[String]) -> Vec<String> {
+    let saved = saved_peer_urls(engine);
+    if supplied.is_empty() {
+        return saved;
+    }
+    for url in supplied {
+        if !saved.contains(url) && prompt_yes(&format!("Save {url} as a peer for this vault?")) {
+            let _ = engine.store.add_peer(url, "", now_unix());
+            println!("saved peer {url}");
+        }
+    }
+    supplied.to_vec()
 }
 
 fn vault_dir(cli: &Cli) -> PathBuf {
@@ -261,9 +319,14 @@ async fn run(cli: Cli) -> Result<()> {
             let engine = open_engine(&cli)?;
             seed_authorized_keys(&cli, &engine)?;
             let auth = auth_opts(&cli, &engine);
-            let vid = VaultConfig::new(&engine.store).vault_id()?.unwrap_or_default();
-            let _ = vid;
-            net::sync_oneshot(Arc::new(Mutex::new(engine)), url, &auth).await
+            // No URL → use the saved peer (clone's `origin`); a supplied URL is
+            // offered for saving, then used for this run.
+            let supplied: Vec<String> = url.clone().into_iter().collect();
+            let peer = resolve_peers(&engine, &supplied)
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("no peer configured — pass a URL or `asp clone` first"))?;
+            net::sync_oneshot(Arc::new(Mutex::new(engine)), &peer, &auth).await
         }
         Cmd::Clone { url, into, watch } => clone_cmd(&cli, url, into.clone(), *watch).await,
         Cmd::Watch { listen, port, peers } => watch_cmd(&cli, *listen, *port, peers.clone()).await,
@@ -418,9 +481,14 @@ async fn clone_cmd(cli: &Cli, url: &str, into: Option<PathBuf>, watch: bool) -> 
     net::clone_bootstrap(engine.clone(), url, &auth).await?;
     let vid = {
         let e = engine.lock().unwrap();
+        // clone always saves the source URL as the default peer (`origin`); pin it
+        // even if the auth channel didn't surface the NodeId in time.
+        if saved_peer_urls(&e).is_empty() {
+            let _ = e.store.add_peer(url, "", now_unix());
+        }
         VaultConfig::new(&e.store).vault_id()?.unwrap_or_default()
     };
-    println!("cloned vault {} into {}", &vid[..8.min(vid.len())], dir.display());
+    println!("cloned vault {} into {} (peer {url})", &vid[..8.min(vid.len())], dir.display());
     if watch {
         return run_watch_loop(cli, engine, false, None, vec![url.to_string()]).await;
     }
@@ -435,7 +503,10 @@ async fn watch_cmd(cli: &Cli, listen: bool, port: Option<u16>, peers: Vec<String
     if filled > 0 {
         tracing::info!(filled, "authorized_keys expiry migration");
     }
-    run_watch_loop(cli, Arc::new(Mutex::new(engine)), listen, port, peers).await
+    // No --peer → connect to the saved peer(s) (clone's `origin`); a supplied
+    // --peer is offered for saving (consent), then used.
+    let resolved = resolve_peers(&engine, &peers);
+    run_watch_loop(cli, Arc::new(Mutex::new(engine)), listen, port, resolved).await
 }
 
 async fn run_watch_loop(

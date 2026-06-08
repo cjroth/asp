@@ -49,6 +49,40 @@ fn rename_keeps_file_and_concurrent_edit_applies() {
 }
 
 #[test]
+fn folder_rename_leaves_no_empty_old_dirs() {
+    // Renaming a folder (moving its files to a new tree) must not leave the old,
+    // now-empty directory tree behind on any node — the vacated folders are
+    // rename leftovers, not intentional empty folders, so they're not preserved
+    // as `dir` entities and materialize prunes them.
+    let root = temp_root();
+    let hub = Hub::start(root.path(), "hub", Some(SECRET), &[]);
+    let url = hub.url();
+
+    let a = Node::new(root.path(), "A");
+    a.init();
+    a.write("proj/note.md", b"this is the note content\n");
+    a.write("proj/sub/deep.md", b"this is the deep content\n");
+    a.sync(&url, Some(SECRET));
+    let b = Node::new(root.path(), "B");
+    b.clone_from(&url, Some(SECRET));
+    assert!(b.exists("proj/note.md") && b.exists("proj/sub/deep.md"));
+
+    // "Rename" the folder by moving its files into a new tree (the old proj/ and
+    // proj/sub/ are left physically empty on A's disk).
+    a.rename("proj/note.md", "renamed/note.md");
+    a.rename("proj/sub/deep.md", "renamed/sub/deep.md");
+    a.commit();
+    a.sync(&url, Some(SECRET));
+    b.sync(&url, Some(SECRET));
+
+    for n in [&a, &b] {
+        assert!(n.exists("renamed/note.md"), "files moved to the new folder");
+        assert!(n.exists("renamed/sub/deep.md"));
+        assert!(!n.dir.join("proj").exists(), "old folder tree is gone (no leftover empty dirs)");
+    }
+}
+
+#[test]
 fn concurrent_same_path_create_splits_with_suffix() {
     let root = temp_root();
     let hub = Hub::start(root.path(), "hub", Some(SECRET), &[]);

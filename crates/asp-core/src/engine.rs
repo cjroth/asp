@@ -379,6 +379,20 @@ impl Engine {
             }
         }
 
+        // Folders that lost files this pass (renamed-away or deleted). Such a
+        // folder is a rename/delete leftover, NOT an intentionally-empty folder —
+        // so we must not preserve it as a `dir` entity (else a folder rename would
+        // leave the old, now-empty tree behind on every node). Materialize prunes
+        // it once its files are gone.
+        let mut vacated: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for d in &disappeared {
+            let mut p: &str = d;
+            while let Some(i) = p.rfind('/') {
+                p = &p[..i];
+                vacated.insert(p.to_string());
+            }
+        }
+
         let mut authored = Vec::new();
         let mut consumed_appeared: std::collections::HashSet<String> = Default::default();
         let mut still_disappeared = Vec::new();
@@ -421,7 +435,7 @@ impl Engine {
         let empty_dirs = self.empty_in_scope_dirs();
         let tracked: std::collections::HashSet<String> = live_dirs.iter().map(|f| f.path.clone()).collect();
         for path in &empty_dirs {
-            if !tracked.contains(path) {
+            if !tracked.contains(path) && !vacated.contains(path) {
                 if let Some(wr) = self.record_dir_create(path)? {
                     authored.push(wr);
                 }
