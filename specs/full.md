@@ -147,9 +147,10 @@ representation** for code (fixed labels like `site:A`/`site:B`, never
 whitespace), and (d) a **deterministic LCA** (criss-cross multi-base broken by
 lowest content-hash). Two nodes with the same rows produce identical merged bytes.
 
-**Routing is data, not code.** `merge_class ∈ {text, code, binary}` is set at file
-creation and is constant for that `file_id`; `payload` is **opaque bytes**. This
-keeps the door open to a future `text-crdt` class without a schema change — only
+**Routing is data, not code.** `merge_class ∈ {text, code, binary, dir}` is set at
+creation and is constant for that `file_id`; `payload` is **opaque bytes** (`dir` is
+the content-free directory entity of §Capture, which never merges). This keeps the
+door open to a future `text-crdt` class without a schema change — only
 the engine interpreting that file's rows changes. A class change (e.g. opting a
 file into the CRDT) is an **explicit boundary row** (`kind='reclass'`) that seeds
 the new representation from the file's current content as a fresh base; the fold is
@@ -264,10 +265,10 @@ log(
   ts          TEXT,               -- authoring wall-clock; for PITR + the post-v1 wall_clock experiment
   file_id     TEXT,               -- STABLE per-file identity (survives renames)
   kind        TEXT,               -- 'create' | 'edit' | 'rename' | 'delete' | 'reclass'
-  merge_class TEXT,               -- 'text' | 'code' | 'binary' (set at create; changes only via 'reclass')
+  merge_class TEXT,               -- 'text' | 'code' | 'binary' | 'dir' (set at create; changes only via 'reclass')
   parent      TEXT,               -- previous log id for this file_id (causal dep; LCA chain)
   base_hash   TEXT,               -- content the diff applies to (NULL on create)
-  result_hash TEXT,               -- resulting content hash (NULL on delete)
+  result_hash TEXT,               -- resulting content hash (NULL on delete; always NULL for 'dir')
   path        TEXT,               -- set by 'create'/'rename'; the file's path as of this row
   payload     BLOB,               -- text/code: line diff | binary: full/keyframe ref
   sig         BLOB,               -- OPTIONAL ed25519 author signature over the row (off by default; §Security)
@@ -362,6 +363,24 @@ config(key TEXT PRIMARY KEY, value TEXT);
   then publish only genuine divergence parented on the synced state. In an explicit
   ordered log a delete is a durable row a reconnecting device *learns* via catch-up,
   so it never emits a false-add — dissolving csp's resurrection class (issue 0012).
+- **Empty directories are first-class entities, not marker files.** The log carries
+  files, and a directory is otherwise just an implicit prefix of file paths — so a
+  bare empty folder would have nothing to sync. csp was forced into a `.gitkeep`-style
+  `<dir>/.keep` sentinel because its substrate was the git object model (a git tree
+  literally cannot encode an empty directory). ASP's event log has no such
+  constraint: a physically-empty in-scope directory is captured as a **content-free
+  directory entity** — a `kind='create'` row with `merge_class='dir'` and
+  `result_hash=NULL` — that the fold materializes as a real `mkdir`, with **no marker
+  file in the vault**. Capture authors one for each empty dir and a `kind='delete'`
+  once the folder gains a real file (it's then implied by the file) or is removed —
+  a convergent lifecycle. **Directories are identity-by-path** (the deliberate
+  opposite of files, §Renames): same-path directory entities **dedupe** in the fold
+  to one `mkdir` with no ` (n)` suffix, so two devices independently creating the
+  same folder converge (where two `.keep` files would have *split* under the
+  `file_id` rule); a real file always wins a contested path; and because each create
+  is a fresh entity, an empty folder can be deleted and recreated without
+  remove-wins blocking it. This is only possible *because* the substrate is an
+  event log rather than git trees.
 
 ## Renames & file identity
 
@@ -896,8 +915,10 @@ convergence, not an in-process shortcut.
 
 - *Sync core:* two-peer create/modify/delete; clone + full catch-up; offline →
   reconnect catch-up via version vectors (sends exactly what's missing); empty
-  directories; large/binary keyframe+diff PITR; bounded/chunked frames on a throttled
-  link.
+  directories replicate as content-free `dir` entities with no marker file, dropped
+  when the folder gains a real file and converging (no ` (n)` split) under concurrent
+  same-folder creation; large/binary keyframe+diff PITR; bounded/chunked frames on a
+  throttled link.
 - *Merge:* disjoint concurrent text edits both survive; same-region text resolves
   deterministically (loser in history); code same-region **conflict surfaced**
   byte-deterministically; binary whole-file LWW; `reclass` boundary seeds a fresh base
@@ -977,6 +998,34 @@ default) to streaming, to a **central debug server**, two things:
   This is the observability layer that makes the 100% e2e goal actionable: when a
   property test or e2e case fails (locally or in CI), the append-only cross-node log is
   the ground truth of every operation, in order, on every node.
+
+## Implementation status (v1)
+
+The v1 spine is built and **CI-green across every surface from one engine**
+(`asp-core`): the SQLite event log, the deterministic causal + Lamport fold, stable
+`file_id` identity with ` (n)` collision resolution, content-free `dir` entities for
+empty folders, 3-way merge (text clean-resolve / code conflict-surface / binary LWW)
+with delete remove-wins and the `reclass` boundary, ed25519 mutual-auth +
+`authorized_keys` admission (expiry / listen-start migration / `AUTH_KEY` enrollment
+over `Bearer`/`?auth_key=`/`bearer.<key>` / TOFU / `--no-tofu`), `wss://` self-signed
+TLS with the advertised cert-fingerprint channel binding (and `--no-tls`),
+version-vector catch-up + optimistic push + relay forward-then-merge, snapshots and
+point-in-time restore, and a stock-git-compatible read-only derived history.
+
+**All four surfaces ship on that one engine and are tested against the real binary:**
+the **`asp` CLI** (native full node, multi-process e2e), the **wasm/TS SDK** (the
+engine compiled to `wasm32`; conformance proves byte-identity to native and parity
+proves SDK⇄real-`asp` convergence), the **Obsidian plugin** (reference thin client,
+bridge/controller converge with the CLI headlessly), and **Context Desktop** (Tauri
+shell over a natively-linked multi-vault engine whose in-process convergence is
+tested). The headline determinism gate is additionally **fuzzed** — hundreds of
+randomized multi-node operation streams in shuffled delivery orders all converge.
+
+Genuinely deferred to post-v1 (or as the spec already scopes them): `fold_cache`
+memoization, keyframe+diff for large binaries, tombstone/blob GC, frame chunking on
+throttled links, the central **debug-log collector** (the local `--debug` source is
+wired), **iroh** QUIC P2P (Phase 2), the `wall_clock` offline re-fold experiment, and
+the Obsidian *mobile* wasm-inlining bundle.
 
 ## Deliberately not doing
 
