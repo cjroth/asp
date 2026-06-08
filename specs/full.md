@@ -749,6 +749,16 @@ protocol can do may be CLI-inaccessible. Command sketch:
   additionally accepts inbound peers (relay/hub) and binds `0.0.0.0:9000` by default
   (unprivileged; not 443). Default transport `wss://`; `--no-tls` serves `ws://`. Emits
   operator-visible logging at `INFO`.
+  **Vault adoption vs. mismatch.** A **pristine** local vault — freshly `init`'d with
+  *zero authored rows* — advertises an empty vault id and **adopts the peer's vault on
+  connect**, exactly like `clone`; so `asp init` then `watch --peer`/`sync` with no
+  local content Just Works (it catches up the peer's state), and a fresh hub adopts its
+  first connector's vault. But once a vault **has its own content** it advertises its
+  real id, so two **separately-`init`'d** vaults never silently merge — `watch`/`sync`
+  to such a peer fails with a clear, actionable error (*"different vault — `asp clone
+  <url>` to follow it"*) and the watch loop stops retrying, rather than looping
+  silently. To bidirectionally sync two devices, one must `clone` the other (sharing
+  the vault id); independently-created vaults are, by design, distinct.
 - `asp key` — generate / show the node SSH key (OpenSSH format); use an SSH agent if
   available.
 - `asp authorize <pubkey> [--ttl 30d|never]` / `asp revoke <pubkey>` — manage the
