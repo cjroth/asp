@@ -4,7 +4,7 @@
 // content-addressed, so re-writing identical bytes authors no row, and we only
 // render host files whose bytes actually changed.
 
-import type { Vault } from '../../../sdks/typescript/src/index.ts';
+import type { EngineVault } from '../../../sdks/typescript/src/index.ts';
 import type { HostVault } from './host.ts';
 import type { Logger } from './log-buffer.ts';
 import { PathFilter } from './path-filter.ts';
@@ -19,7 +19,7 @@ export class Bridge {
   private log: Logger = () => {};
 
   constructor(
-    private vault: Vault,
+    private vault: EngineVault,
     private host: HostVault,
     private filter: PathFilter = new PathFilter(),
   ) {}
@@ -37,17 +37,17 @@ export class Bridge {
     if (this.filter.ignored(path)) return;
     const bytes = await this.host.read(path);
     if (bytes == null) return;
-    this.vault.writeFile(path, bytes); // no-op in the engine if unchanged
+    await this.vault.writeFile(path, bytes); // no-op in the engine if unchanged
   }
 
   async pushDelete(path: string): Promise<void> {
     if (this.filter.ignored(path)) return;
-    this.vault.deleteFile(path);
+    await this.vault.deleteFile(path);
   }
 
   async pushRename(from: string, to: string): Promise<void> {
     if (this.filter.ignored(from) || this.filter.ignored(to)) return;
-    this.vault.renameFile(from, to);
+    await this.vault.renameFile(from, to);
   }
 
   /** Seed the engine from the host's current contents (startup reconcile).
@@ -58,7 +58,7 @@ export class Bridge {
       if (this.filter.ignored(path)) continue;
       const bytes = await this.host.read(path);
       if (bytes != null) {
-        this.vault.writeFile(path, bytes);
+        await this.vault.writeFile(path, bytes);
         n++;
       }
     }
@@ -69,7 +69,7 @@ export class Bridge {
   /** Render the engine's materialized tree back to the host vault. Returns the
    * counts actually changed on disk. */
   async materializeToHost(): Promise<{ written: number; removed: number }> {
-    const files = this.vault.files();
+    const files = await this.vault.files();
     const want = new Set(Object.keys(files));
     let written = 0;
     let removed = 0;
