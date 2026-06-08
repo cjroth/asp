@@ -28,6 +28,8 @@ pub struct Engine {
     pub store: SqliteStore,
     pub identity: Identity,
     pub scope: crate::scope::Scope,
+    /// Per-vault authoring `site_id` (distinct from `identity`, the device key).
+    pub site: String,
 }
 
 fn now_unix() -> u64 {
@@ -41,17 +43,41 @@ fn random_id() -> String {
     hex::encode(b)
 }
 
+/// The per-vault authoring `site_id` (§Security: single-writer protection). It is
+/// **distinct per vault**, fresh at `init`/`clone`, so two replicas of one vault
+/// on the SAME device (sharing the device key) never share a `site_id` — which
+/// would make their concurrent edits collide on `(site_id, seq)` and silently
+/// defeat version-vector catch-up. Persisted in the never-synced `.asp/site_id`;
+/// the device key remains the connection/admission identity.
+fn load_or_create_site_id(asp_dir: &Path) -> AspResult<String> {
+    let path = asp_dir.join("site_id");
+    if let Ok(s) = fs::read_to_string(&path) {
+        let t = s.trim();
+        if t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(t.to_string());
+        }
+    }
+    use rand::RngCore;
+    let mut b = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut b);
+    let id = hex::encode(b);
+    fs::write(&path, &id)?;
+    Ok(id)
+}
+
 pub use crate::log::classify;
 
 impl Engine {
-    /// Open or create the engine at a vault root, authoring as `identity`.
+    /// Open or create the engine at a vault root, authoring as `identity` (the
+    /// device connection key) under a per-vault `site_id`.
     pub fn open(root: &Path, identity: Identity) -> AspResult<Engine> {
         let asp_dir = root.join(".asp");
         fs::create_dir_all(&asp_dir)?;
         let git_dir = asp_dir.join("git");
         let store = SqliteStore::open(&asp_dir.join("asp.db"))?;
         let scope = Self::load_scope(root);
-        let eng = Engine { root: root.to_path_buf(), asp_dir, git_dir, store, identity, scope };
+        let site = load_or_create_site_id(&asp_dir)?;
+        let eng = Engine { root: root.to_path_buf(), asp_dir, git_dir, store, identity, scope, site };
         Ok(eng)
     }
 
@@ -76,8 +102,9 @@ impl Engine {
         self.scope = Self::load_scope(&self.root);
     }
 
+    /// The authoring identity (per-vault, distinct from the device connection key).
     pub fn site_id(&self) -> String {
-        self.identity.node_id().to_hex()
+        self.site.clone()
     }
 
     // ---------------- capture ----------------
