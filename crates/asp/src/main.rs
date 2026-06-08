@@ -556,7 +556,20 @@ async fn run_watch_loop(
     for url in peers {
         let (e, a, c) = (engine.clone(), auth.clone(), conns.clone());
         tokio::spawn(async move {
+            // Reconnect with exponential backoff + full jitter. A flapping or
+            // rejected peer (auth fail, listener overload, network blip) must not
+            // turn into a tight redial storm: every reconnect drives a full
+            // version-vector catch-up on the listener, so a 2s fixed retry from
+            // many peers can saturate the hub and become self-sustaining
+            // (overload → drops → synchronized redials → more overload). Jitter
+            // de-synchronizes peers; the delay resets once a connection has
+            // stayed up long enough to count as healthy.
+            const BASE: std::time::Duration = std::time::Duration::from_secs(1);
+            const MAX: std::time::Duration = std::time::Duration::from_secs(60);
+            const HEALTHY: std::time::Duration = std::time::Duration::from_secs(30);
+            let mut backoff = BASE;
             loop {
+                let started = std::time::Instant::now();
                 if let Err(err) = net::connect(e.clone(), &url, &a, c.clone(), false, None).await {
                     let msg = err.to_string();
                     // A vault mismatch is permanent — retrying is futile. Tell the
@@ -570,7 +583,15 @@ async fn run_watch_loop(
                     }
                     tracing::debug!("peer {url} disconnected: {err}");
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                // A connection that lasted a while was healthy — restart from BASE.
+                // One that dropped almost immediately escalates the delay.
+                if started.elapsed() >= HEALTHY {
+                    backoff = BASE;
+                }
+                // Full jitter: sleep a uniform-random duration in [0, backoff].
+                let delay = backoff.mul_f64(rand::random::<f64>());
+                tokio::time::sleep(delay).await;
+                backoff = (backoff * 2).min(MAX);
             }
         });
     }

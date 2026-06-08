@@ -74,6 +74,28 @@ async fn fanout(conns: &Conns, except: u64, msg: &Msg) {
     }
 }
 
+/// Upper bound on a single WebSocket write. A healthy peer drains within an
+/// RTT; only a stalled/half-dead peer (full TCP send window, never reads) makes
+/// `sink.send().await` hang. Without this cap such a send blocks the connection
+/// task forever, so it never loops back to observe the peer's FIN and never
+/// drops the socket — leaving a `CLOSE_WAIT` zombie until the OS TCP timeout
+/// (potentially hours). Timing the write out lets us tear the connection down
+/// promptly (sending our FIN) instead of leaking it.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Send one frame with a hard write deadline. Returns `Err` on transport error
+/// or timeout so the caller can drop the connection.
+async fn send_framed<Si>(sink: &mut Si, msg: Message) -> Result<()>
+where
+    Si: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    match tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(anyhow!("ws send: {e}")),
+        Err(_) => Err(anyhow!("ws write timed out — peer stalled")),
+    }
+}
+
 async fn run_connection<S>(
     ws: WebSocketStream<S>,
     engine: EngineRef,
@@ -93,7 +115,7 @@ where
 
     for step in session.start() {
         if let Step::Send(m) = step {
-            sink.send(Message::Binary(m.to_bytes()?)).await?;
+            send_framed(&mut sink, Message::Binary(m.to_bytes()?)).await?;
         }
     }
 
@@ -111,7 +133,7 @@ where
             biased;
             outbound = rx.recv() => {
                 if let Some(m) = outbound {
-                    if sink.send(Message::Binary(m.to_bytes()?)).await.is_err() { break Ok(()); }
+                    if send_framed(&mut sink, Message::Binary(m.to_bytes()?)).await.is_err() { break Ok(()); }
                 }
             }
             incoming = stream.next() => {
@@ -130,7 +152,14 @@ where
                         let mut closing = false;
                         for step in steps {
                             match step {
-                                Step::Send(m) => { let _ = sink.send(Message::Binary(m.to_bytes()?)).await; }
+                                Step::Send(m) => {
+                                    // A timed-out/failed write means the peer is gone or
+                                    // stalled; stop rather than block or spin.
+                                    if send_framed(&mut sink, Message::Binary(m.to_bytes()?)).await.is_err() {
+                                        closing = true;
+                                        break;
+                                    }
+                                }
                                 Step::Authenticated(node) => {
                                     tracing::info!(peer = %&node.to_hex()[..12], "handshake ok");
                                     if let Some(s) = &on_auth { if !announced_auth { let _ = s.send(node); announced_auth = true; } }
@@ -146,7 +175,7 @@ where
                                     // caller can report them and stop retrying — not
                                     // buried in a log line.
                                     if reason.contains("denied") || reason.contains("different vault") {
-                                        let _ = sink.send(Message::Close(None)).await;
+                                        let _ = send_framed(&mut sink, Message::Close(None)).await;
                                         conns.lock().await.remove(&conn_id);
                                         let hint = if reason.contains("different vault") {
                                             " (separate vaults — `asp clone <url>` to follow the peer)"
@@ -169,8 +198,8 @@ where
             }
             _ = idle_fut => {
                 if oneshot && session.authed() {
-                    let _ = sink.send(Message::Binary(Msg::Bye.to_bytes()?)).await;
-                    let _ = sink.send(Message::Close(None)).await;
+                    let _ = send_framed(&mut sink, Message::Binary(Msg::Bye.to_bytes()?)).await;
+                    let _ = send_framed(&mut sink, Message::Close(None)).await;
                     break Ok(());
                 }
             }
