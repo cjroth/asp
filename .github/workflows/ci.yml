@@ -11,6 +11,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Harden against transient crates.io flakiness (the "[16] Error in the HTTP2
+  # framing layer" download failures): retry, and force HTTP/1.1.
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  RUSTUP_MAX_RETRIES: "10"
 
 jobs:
   test:
