@@ -8,10 +8,14 @@
     "build:wasm": "cd ../sdks/typescript && bun run build:wasm",
     "build": "node build.mjs production",
     "dev": "node build.mjs",
-    "serve": "node serve.mjs"
+    "serve": "node serve.mjs",
+    "test": "bun test/mesh.test.mjs && bun test/persist.test.mjs && bun test/web-glue.test.mjs && bun test/ui-smoke.tsx",
+    "test:interop": "bun test/wss-interop.test.mjs",
+    "test:e2e": "node build.mjs && node test/e2e.mjs"
   },
   "devDependencies": {
-    "esbuild": "^0.24.0"
+    "esbuild": "^0.24.0",
+    "playwright": "^1.60.0"
   },
   "dependencies": {
     "react": "^18.3.1",

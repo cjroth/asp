@@ -11,6 +11,13 @@
 > convergence (clone / gossip-through-hub / offline catch-up / concurrent merge),
 > the web-target wasm path, and an SSR render of the component tree. See
 > `demo/test/`.
+>
+> Follow-ups landed too: **ws:// interop** (a node bridges to a real
+> `asp watch --listen` peer via the genuine Session — verified against the spawned
+> native binary in `demo/test/wss-interop.test.mjs`), **OPFS persistence** (mesh
+> survives reload; restore replays rows through the real fold), and a real-browser
+> **Playwright e2e** (`demo/test/e2e.mjs`) covering add/clone/edit/propagate,
+> offline→reconnect, and persistence across reload.
 
 ---
 

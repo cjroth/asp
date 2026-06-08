@@ -4,8 +4,9 @@
    ==================================================================== */
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { createNetwork } from '../engine/network.ts';
-import { NetworkMap, NodePanel, NodeStrip, AddNodeDialog } from './components.tsx';
+import { NetworkMap, NodePanel, NodeStrip, AddNodeDialog, ConnectPeerDialog } from './components.tsx';
 import { Settings, TWEAK_DEFAULTS, type Tweaks } from './settings.tsx';
+import { loadState, saveState, clearState } from '../persist.ts';
 
 function EmptyState({ onAdd }: any) {
   return (
@@ -41,8 +42,10 @@ export function App() {
   const [, setTick] = useState(0);
   const rerender = useCallback(() => setTick((x) => x + 1), []);
   const [dialog, setDialog] = useState(false);
+  const [connectFor, setConnectFor] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [toast, setToast] = useState<any>(null);
+  const [loaded, setLoaded] = useState(false);
   const toastTimer = useRef<any>(null);
 
   function buildEngine() {
@@ -66,6 +69,31 @@ export function App() {
   useEffect(() => { document.body.style.backgroundImage = t.blueprint ? '' : 'none'; }, [t.blueprint]);
   useEffect(() => { const id = setTimeout(() => api.clearFresh(), 1200); return () => clearTimeout(id); });
 
+  // Persistence: restore the mesh from OPFS once on load, then autosave
+  // (debounced) on every change. Degrades to a clean session where OPFS is
+  // unavailable (see persist.ts).
+  useEffect(() => {
+    (async () => {
+      try {
+        const s = await loadState();
+        if (s?.nodes?.length) {
+          api.restore(s);
+          if (s.tweaks) setT((prev) => ({ ...prev, ...s.tweaks }));
+          const first = api.getNodes()[0];
+          if (first) setSelected(first.id);
+          rerender();
+        }
+      } finally {
+        setLoaded(true);
+      }
+    })();
+  }, []);
+  useEffect(() => {
+    if (!loaded) return;
+    const id = setTimeout(() => { void saveState({ tweaks: t, ...api.serialize() }); }, 400);
+    return () => clearTimeout(id);
+  });
+
   const snap = api.snapshot();
 
   const statusFor = useCallback((nodeId: string) => {
@@ -85,9 +113,14 @@ export function App() {
   }
   function reset() {
     if (!confirm('Reset the whole mesh? All nodes, logs and vault state are cleared.')) return;
+    void clearState();
     packetsRef.current.length = 0;
     engineRef.current = buildEngine();
     setSelected(null); rerender();
+  }
+  function doConnect(url: string, authKey?: string) {
+    if (connectFor) void api.connectPeer(connectFor, url, authKey);
+    setConnectFor(null);
   }
 
   const nodes = snap.nodes;
@@ -124,7 +157,7 @@ export function App() {
             <div className="canvas layout-focus">
               {(() => {
                 const focusNode = nodes.find((n: any) => n.id === sel) || nodes[0];
-                return <NodePanel key={focusNode.id} snap={focusNode} api={api} status={statusFor(focusNode.id)} extraClass="is-focus" onRemove={removeNode} />;
+                return <NodePanel key={focusNode.id} snap={focusNode} api={api} status={statusFor(focusNode.id)} extraClass="is-focus" onRemove={removeNode} onConnect={setConnectFor} />;
               })()}
               <div className="focus-rail">
                 {nodes.map((n: any) => (
@@ -137,7 +170,7 @@ export function App() {
               style={t.layout === 'columns' ? { gridTemplateColumns: `repeat(${Math.min(nodes.length, 3)}, minmax(0,1fr))` } : undefined}>
               {nodes.map((n: any) => (
                 <NodePanel key={n.id} snap={n} api={api} status={statusFor(n.id)}
-                  onFocus={() => { setSelected(n.id); setTweak('layout', 'focus'); }} onRemove={removeNode} />
+                  onFocus={() => { setSelected(n.id); setTweak('layout', 'focus'); }} onRemove={removeNode} onConnect={setConnectFor} />
               ))}
             </div>
           )}
@@ -145,6 +178,10 @@ export function App() {
       )}
 
       {dialog && <AddNodeDialog snap={snap} onCancel={() => setDialog(false)} onAdd={addNode} />}
+      {connectFor && (() => {
+        const n = nodes.find((x: any) => x.id === connectFor);
+        return n ? <ConnectPeerDialog snap={n} onCancel={() => setConnectFor(null)} onConnect={doConnect} /> : null;
+      })()}
       {toast && <div className="toast-wrap"><div className="toast"><span className="accent">⚠ </span>{toast.msg}</div></div>}
 
       <Settings t={t} set={setTweak} />

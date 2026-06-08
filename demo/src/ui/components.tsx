@@ -301,26 +301,56 @@ export function NetworkMap({ snap, packetsRef, selected, onSelect, statusFor }: 
 /* ==================================================================== */
 export function AddNodeDialog({ snap, onCancel, onAdd }: any) {
   const existing = snap.nodes;
+  const isFirst = existing.length === 0;
   const [remoteId, setRemoteId] = useState<string | null>(existing.length ? existing[existing.length - 1].id : null);
   const [name, setName] = useState('');
-  const isFirst = existing.length === 0;
+  const [source, setSource] = useState<'local' | 'external'>('local');
+  const [url, setUrl] = useState('ws://127.0.0.1:9000');
+  const [authKey, setAuthKey] = useState('');
+  const external = source === 'external';
+
+  function submit() {
+    const base: any = { name: name.trim() || undefined };
+    if (external) onAdd({ ...base, externalUrl: url.trim(), authKey: authKey.trim() || undefined });
+    else onAdd({ ...base, remoteId: isFirst ? null : remoteId });
+  }
 
   return (
     <div className="overlay" onMouseDown={(e) => { if ((e.target as HTMLElement).classList.contains('overlay')) onCancel(); }}>
       <div className="dialog">
         <div className="dialog-head">
-          <span className="eyebrow">{isFirst ? 'asp init' : 'asp clone'}</span>
+          <span className="eyebrow">{external ? 'asp clone <url>' : isFirst ? 'asp init' : 'asp clone'}</span>
           <h3>{isFirst ? 'Create the first node' : 'Add a node to the mesh'}</h3>
-          <p>{isFirst
-            ? "Spins up a vault with this device's ed25519 identity and a few seed files."
-            : 'The new node clones from a remote peer: authenticate, full catch-up, then sync live. Pick which existing node to use as its remote.'}</p>
+          <p>{external
+            ? 'Clone from a real `asp watch --listen` peer (CLI / Obsidian / Desktop) over ws://. Genuine ed25519 handshake + version-vector catch-up — the live interop bridge.'
+            : isFirst
+              ? "Spins up a vault with this device's ed25519 identity and a few seed files."
+              : 'The new node clones from a remote peer: authenticate, full catch-up, then sync live. Pick which existing node to use as its remote.'}</p>
         </div>
         <div className="dialog-body">
+          <div className="field">
+            <label>source</label>
+            <div className="seg" style={{ maxWidth: 240 }}>
+              <button className={!external ? 'on' : ''} onClick={() => setSource('local')}>{isFirst ? 'new vault' : 'in-page peer'}</button>
+              <button className={external ? 'on' : ''} onClick={() => setSource('external')}>real ws:// peer</button>
+            </div>
+          </div>
           <div className="field">
             <label>node name (optional)</label>
             <input type="text" value={name} placeholder={isFirst ? 'laptop' : 'auto'} onChange={(e) => setName(e.target.value)} />
           </div>
-          {!isFirst && (
+          {external ? (
+            <>
+              <div className="field">
+                <label>peer url (ws:// or wss://)</label>
+                <input type="text" value={url} placeholder="ws://127.0.0.1:9000" onChange={(e) => setUrl(e.target.value)} />
+              </div>
+              <div className="field">
+                <label>auth key (AUTH_KEY enrollment secret)</label>
+                <input type="text" value={authKey} placeholder="optional once enrolled" onChange={(e) => setAuthKey(e.target.value)} />
+              </div>
+            </>
+          ) : !isFirst ? (
             <div className="field">
               <label>remote peer (asp clone &lt;url&gt;)</label>
               <div className="remote-opts">
@@ -336,12 +366,12 @@ export function AddNodeDialog({ snap, onCancel, onAdd }: any) {
                 ))}
               </div>
             </div>
-          )}
+          ) : null}
         </div>
         <div className="dialog-foot">
           <button className="btn ghost" onClick={onCancel}>Cancel</button>
-          <button className="btn primary" onClick={() => onAdd({ name: name.trim() || undefined, remoteId: isFirst ? null : remoteId })}>
-            <span className="glyph">+</span>{isFirst ? 'Create node' : 'Clone node'}
+          <button className="btn primary" onClick={submit} disabled={external && !url.trim()}>
+            <span className="glyph">+</span>{external ? 'Clone over ws://' : isFirst ? 'Create node' : 'Clone node'}
           </button>
         </div>
       </div>
@@ -350,8 +380,43 @@ export function AddNodeDialog({ snap, onCancel, onAdd }: any) {
 }
 
 /* ==================================================================== */
-export function NodePanel({ snap, api, status, extraClass, onFocus, onRemove }: any) {
+export function ConnectPeerDialog({ snap, onCancel, onConnect }: any) {
+  const [url, setUrl] = useState(snap.externalUrl || 'ws://127.0.0.1:9000');
+  const [authKey, setAuthKey] = useState('');
+  return (
+    <div className="overlay" onMouseDown={(e) => { if ((e.target as HTMLElement).classList.contains('overlay')) onCancel(); }}>
+      <div className="dialog">
+        <div className="dialog-head">
+          <span className="eyebrow">asp sync &lt;url&gt;</span>
+          <h3>Bridge “{snap.name}” to a real peer</h3>
+          <p>Run a one-shot real sync against an <code>asp watch --listen</code> node (CLI / Obsidian / Desktop):
+            ed25519 handshake, version-vector catch-up, converge. Imported rows propagate through the in-page mesh too.</p>
+        </div>
+        <div className="dialog-body">
+          <div className="field">
+            <label>peer url (ws:// or wss://)</label>
+            <input type="text" value={url} autoFocus placeholder="ws://127.0.0.1:9000" onChange={(e) => setUrl(e.target.value)} />
+          </div>
+          <div className="field">
+            <label>auth key (optional once enrolled)</label>
+            <input type="text" value={authKey} placeholder="AUTH_KEY enrollment secret" onChange={(e) => setAuthKey(e.target.value)} />
+          </div>
+        </div>
+        <div className="dialog-foot">
+          <button className="btn ghost" onClick={onCancel}>Cancel</button>
+          <button className="btn primary" onClick={() => onConnect(url.trim(), authKey.trim() || undefined)} disabled={!url.trim()}>
+            <span className="glyph">⇄</span>Sync now
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ==================================================================== */
+export function NodePanel({ snap, api, status, extraClass, onFocus, onRemove, onConnect }: any) {
   const [editingName, setEditingName] = useState(false);
+  const host = (u: string) => { try { return new URL(u).host; } catch { return u; } };
   return (
     <div className={`node-panel ${snap.online ? '' : 'offline '}${extraClass || ''}`}>
       <div className="np-head">
@@ -369,6 +434,7 @@ export function NodePanel({ snap, api, status, extraClass, onFocus, onRemove }: 
             <button className={`btn tiny ${snap.online ? 'ghost' : 'primary'}`} onClick={() => api.setOnline(snap.id, !snap.online)} title="toggle network link">
               {snap.online ? 'Go offline' : 'Reconnect'}
             </button>
+            {onConnect && <button className="icon-btn" title={snap.externalUrl ? `re-sync ${host(snap.externalUrl)}` : 'connect to a real ws:// peer'} onClick={() => onConnect(snap.id)}>⇄</button>}
             {onFocus && <button className="icon-btn" title="focus" onClick={onFocus}>⤢</button>}
             <button className="icon-btn" title="remove node" onClick={() => onRemove(snap.id)}>✕</button>
           </div>
@@ -377,9 +443,11 @@ export function NodePanel({ snap, api, status, extraClass, onFocus, onRemove }: 
           <span className="chip"><span className="lbl">site</span><span className="val">{snap.site}</span></span>
           {snap.peers.length > 0
             ? <span className="chip peers"><span className="lbl">peers</span><span className="val">{snap.peers.join(', ')}</span></span>
-            : snap.createdRemote
-              ? <span className="chip peers"><span className="lbl">cloned</span><span className="val">← {snap.createdRemote}</span></span>
-              : <span className="chip peers"><span className="lbl">peers</span><span className="val">none</span></span>}
+            : snap.externalUrl
+              ? <span className="chip peers"><span className="lbl">ws</span><span className="val">{host(snap.externalUrl)}</span></span>
+              : snap.createdRemote
+                ? <span className="chip peers"><span className="lbl">cloned</span><span className="val">← {snap.createdRemote}</span></span>
+                : <span className="chip peers"><span className="lbl">peers</span><span className="val">none</span></span>}
         </div>
       </div>
       <div className="np-body">

@@ -32,6 +32,17 @@ function shortHex(n = 4): string {
   crypto.getRandomValues(b);
   return [...b].map((x) => x.toString(16).padStart(2, '0')).join('').slice(0, n);
 }
+function bytesToHex(b: Uint8Array): string {
+  return [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+function hexToBytes(h: string): Uint8Array {
+  const out = new Uint8Array(h.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = Number.parseInt(h.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+function hostOf(url: string): string {
+  try { return new URL(url).host; } catch { return url.replace(/^wss?:\/\//, ''); }
+}
 function baseOf(p: string): string {
   const i = p.lastIndexOf('/');
   return i < 0 ? p : p.slice(i + 1);
@@ -69,6 +80,8 @@ interface FileView {
 
 interface Node {
   id: string;            // full node_id() — unique key + edge endpoint
+  localId: string;       // stable demo id (survives reload; node_id is per-instance)
+  seedHex: string;       // the ed25519 connection seed (persisted for restore + ws auth)
   name: string;
   color: string;
   online: boolean;
@@ -79,6 +92,9 @@ interface Node {
   lines: LogLine[];
   lineSeq: number;
   createdRemote: string | null;
+  externalUrl?: string;  // a real `asp watch --listen` peer this node bridges to
+  authKey?: string;
+  syncing?: boolean;     // a real ws:// sync is in flight
 }
 
 export interface NetworkOpts {
@@ -100,6 +116,7 @@ export function createNetwork(opts: NetworkOpts) {
   const nodes: Node[] = [];
   const edges: { a: string; b: string }[] = [];
   let nodeSeq = 0;
+  let localSeq = 0;
   let packetSeq = 0;
   const debounceTimers: Record<string, ReturnType<typeof setTimeout>> = {};
 
@@ -215,13 +232,18 @@ export function createNetwork(opts: NetworkOpts) {
 
   api.setConfig = (patch: Partial<typeof cfg>) => Object.assign(cfg, patch);
 
-  api.addNode = ({ name, remoteId }: { name?: string; remoteId?: string | null }) => {
+  api.addNode = ({ name, remoteId, externalUrl, authKey }: { name?: string; remoteId?: string | null; externalUrl?: string; authKey?: string }) => {
     const idx = nodeSeq++;
     const remote = remoteId != null ? findNode(remoteId) : null;
-    const vaultId = remote ? remote.eng.vault_id() : `vault-${shortHex(4)}`;
-    const eng = new WasmEngine(randomSeed(), vaultId);
+    // genesis seeds its own vault; a clone (in-page or external) adopts the
+    // peer's vault id — empty string adopts on first real handshake.
+    const vaultId = remote ? remote.eng.vault_id() : externalUrl ? '' : `vault-${shortHex(4)}`;
+    const seed = randomSeed();
+    const eng = new WasmEngine(seed, vaultId);
     const node: Node = {
       id: eng.node_id(),
+      localId: `n${localSeq++}`,
+      seedHex: bytesToHex(seed),
       name: name || NODE_NAMES[idx % NODE_NAMES.length] + (idx >= NODE_NAMES.length ? `-${idx}` : ''),
       color: NODE_COLORS[idx % NODE_COLORS.length],
       online: true,
@@ -240,7 +262,15 @@ export function createNetwork(opts: NetworkOpts) {
       { t: `node ${node.name}`, c: 'hl' }, { t: ` site_id=${node.id.slice(0, 8)} ed25519`, c: 'dim' },
     ]);
 
-    if (!remote) {
+    if (externalUrl) {
+      // clone from a REAL `asp watch --listen` peer over ws:// — the genuine
+      // Session handshake + version-vector catch-up (asp clone <url>).
+      node.createdRemote = hostOf(externalUrl);
+      api.connectPeer(node.id, externalUrl, authKey).then(() => {
+        const first = Object.values(filesView(node)).find((f) => !f.deleted);
+        if (first && !node.openFileId) { node.openFileId = first.file_id; emit(); }
+      });
+    } else if (!remote) {
       // genesis vault: author the seed files (real create rows)
       for (const s of SEED) node.eng.record_write(s.path, enc.encode(s.body));
       const view = filesView(node);
@@ -271,6 +301,169 @@ export function createNetwork(opts: NetworkOpts) {
     }
     emit();
     return node.id;
+  };
+
+  // ---- bridge a node to a REAL peer over ws:// (the genuine Session) --------
+  // A one-shot real sync: open a WebSocket to an `asp watch --listen` node, run
+  // the ed25519 handshake + bidirectional version-vector catch-up via the
+  // engine's own connect_start()/feed(), converge, close. Imported rows are
+  // folded into this node's engine by the Session; we then gossip them through
+  // the in-page mesh so the whole demo converges with the external peer.
+  api.connectPeer = (nodeId: string, url: string, authKey?: string): Promise<boolean> => {
+    const node = findNode(nodeId);
+    if (!node) return Promise.resolve(false);
+    if (node.syncing) { O.onToast('a sync is already in flight', 'warn'); return Promise.resolve(false); }
+    node.externalUrl = url;
+    node.authKey = authKey || undefined;
+    node.syncing = true;
+
+    const idleMs = 900;
+    const timeoutMs = 15000;
+    const fullUrl = authKey ? `${url}${url.includes('?') ? '&' : '?'}auth_key=${encodeURIComponent(authKey)}` : url;
+    const beforeVv = vvOf(node);
+
+    logLine(node, [
+      { t: 'INFO', c: 'lvl' }, { t: ' connect   ', c: 'tag' },
+      { t: `dial ${hostOf(url)}`, c: 'hl' }, { t: ' ws:// real peer · handshake…', c: 'dim' },
+    ]);
+    emit();
+
+    return new Promise<boolean>((resolve) => {
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(fullUrl);
+      } catch (e) {
+        return finish(false, `dial failed: ${String(e)}`);
+      }
+      ws.binaryType = 'arraybuffer';
+      let idle: ReturnType<typeof setTimeout>;
+      let authedLogged = false;
+      let finished = false;
+      const hardStop = setTimeout(() => finish(false, 'sync timed out'), timeoutMs);
+      const resetIdle = () => { clearTimeout(idle); idle = setTimeout(() => finish(true), idleMs); };
+
+      function finish(ok: boolean, err?: string): void {
+        if (finished) return;
+        finished = true;
+        clearTimeout(idle); clearTimeout(hardStop);
+        try { ws.close(); } catch {}
+        node!.syncing = false;
+        if (err) {
+          logLine(node!, [
+            { t: 'WARN', c: 'lvl warn' }, { t: ' connect   ', c: 'tag' },
+            { t: hostOf(url), c: 'hl' }, { t: ` · ${err}`, c: 'dim' },
+          ]);
+          O.onToast(`${node!.name}: ${err}`, 'warn');
+        } else {
+          const imported = (JSON.parse(node!.eng.rows_after(JSON.stringify(beforeVv))) as any[]).length;
+          gossip(node!, 'catchup'); // share the imported rows with in-page peers
+          logLine(node!, [
+            { t: 'INFO', c: 'lvl' }, { t: ' synced    ', c: 'tag' },
+            { t: hostOf(url), c: 'k catchup' }, { t: ` · converged (+${imported} rows)`, c: 'dim' },
+          ]);
+        }
+        emit();
+        resolve(ok && !err);
+      }
+
+      ws.onopen = () => {
+        try { ws.send(node!.eng.connect_start() as any); } catch (e) { return finish(false, `handshake: ${String(e)}`); }
+        resetIdle();
+      };
+      ws.onmessage = (ev: MessageEvent) => {
+        const frame = new Uint8Array(ev.data as ArrayBuffer);
+        let r: any;
+        try { r = JSON.parse(node!.eng.feed(frame)); } catch (e) { return finish(false, `feed: ${String(e)}`); }
+        for (const out of r.out) ws.send(Uint8Array.from(out) as any);
+        if (r.authed && !authedLogged) {
+          authedLogged = true;
+          logLine(node!, [
+            { t: 'INFO', c: 'lvl' }, { t: ' handshake ', c: 'tag' },
+            { t: 'ed25519 mutual-auth ok', c: 'k handshake' }, { t: ' · admitted', c: 'dim' },
+          ]);
+          emit();
+        }
+        if (r.integrated) {
+          logLine(node!, [
+            { t: 'INFO', c: 'lvl' }, { t: ' catch-up  ', c: 'tag' },
+            { t: `← ${hostOf(url)} `, c: 'dim' }, { t: `+${r.integrated} rows`, c: 'k catchup' }, { t: ' folded', c: 'dim' },
+          ]);
+          emit();
+        }
+        if (r.closed) {
+          const denied = String(r.closed).toLowerCase().includes('deni');
+          return finish(!denied, denied ? `denied: ${r.closed}` : undefined);
+        }
+        resetIdle();
+      };
+      ws.onerror = () => finish(false, 'ws error (peer not listening, or mixed-content/cert)');
+      ws.onclose = () => finish(true);
+    });
+  };
+
+  // ---- OPFS persistence: full-state serialize / restore --------------------
+  function localOf(id: string): string | undefined { return findNode(id)?.localId; }
+
+  api.serialize = () => ({
+    nodes: nodes.map((n) => ({
+      localId: n.localId,
+      name: n.name,
+      color: n.color,
+      online: n.online,
+      seedHex: n.seedHex,
+      vaultId: n.eng.vault_id(),
+      openFileId: n.openFileId,
+      createdRemote: n.createdRemote,
+      externalUrl: n.externalUrl,
+      authKey: n.authKey,
+      folders: [...n.folders],
+      rows: JSON.parse(n.eng.rows_after('{}')), // every wire row this node holds
+    })),
+    edges: edges.map((e) => ({ a: localOf(e.a), b: localOf(e.b) })).filter((e) => e.a && e.b),
+  });
+
+  api.restore = (state: any) => {
+    for (const n of nodes) { try { n.eng.free(); } catch {} }
+    nodes.length = 0; edges.length = 0;
+    const idMap: Record<string, string> = {};
+    let maxLocal = -1;
+    for (const sn of state.nodes || []) {
+      // Re-author identity from the persisted seed; integrate the saved rows
+      // (real fold). Note: MemEngine's per-vault authoring site is fresh per
+      // instance, so post-restore edits author under a new site — convergence
+      // (keyed per site in the VV) is preserved.
+      const eng = new WasmEngine(hexToBytes(sn.seedHex), sn.vaultId || '');
+      if (sn.rows && sn.rows.length) { try { eng.integrate(JSON.stringify(sn.rows)); } catch {} }
+      const node: Node = {
+        id: eng.node_id(),
+        localId: sn.localId,
+        seedHex: sn.seedHex,
+        name: sn.name,
+        color: sn.color,
+        online: sn.online !== false,
+        eng,
+        openFileId: sn.openFileId ?? null,
+        staged: {},
+        folders: new Set(sn.folders || []),
+        lines: [],
+        lineSeq: 0,
+        createdRemote: sn.createdRemote ?? null,
+        externalUrl: sn.externalUrl,
+        authKey: sn.authKey,
+      };
+      logLine(node, [
+        { t: 'INFO', c: 'lvl' }, { t: ' restore   ', c: 'tag' },
+        { t: `node ${node.name}`, c: 'hl' }, { t: ` ${node.eng.row_count()} rows from opfs`, c: 'dim' },
+      ]);
+      nodes.push(node);
+      idMap[sn.localId] = node.id;
+      const num = Number(String(sn.localId).replace(/^n/, ''));
+      if (!Number.isNaN(num)) maxLocal = Math.max(maxLocal, num);
+    }
+    localSeq = maxLocal + 1;
+    nodeSeq = nodes.length;
+    for (const e of state.edges || []) if (idMap[e.a] && idMap[e.b]) edges.push({ a: idMap[e.a], b: idMap[e.b] });
+    emit();
   };
 
   api.removeNode = (id: string) => {
@@ -459,11 +652,15 @@ export function createNetwork(opts: NetworkOpts) {
   }
 
   function statusOf(node: Node, inflightByNode: Record<string, boolean>) {
+    if (node.syncing) return { kind: 'syncing', label: 'Syncing', note: 'ws:// handshake' };
     if (!node.online) {
       const queued = queuedFor(node);
       return { kind: 'offline', label: 'Offline', note: queued ? `${queued} queued` : 'isolated' };
     }
-    if (peersOf(node.id).length === 0) return { kind: 'solo', label: 'Solo', note: 'no peers' };
+    if (peersOf(node.id).length === 0) {
+      if (node.externalUrl) return { kind: 'insync', label: 'Linked', note: hostOf(node.externalUrl) };
+      return { kind: 'solo', label: 'Solo', note: 'no peers' };
+    }
     if (inflightByNode[node.id]) return { kind: 'syncing', label: 'Syncing', note: 'frames in flight' };
     let behind = false;
     const myVv = vvOf(node);
@@ -496,6 +693,8 @@ export function createNetwork(opts: NetworkOpts) {
       lines: n.lines,
       staged: n.staged,
       createdRemote: n.createdRemote,
+      externalUrl: n.externalUrl,
+      syncing: !!n.syncing,
       peers: peersOf(n.id).map((pid) => findNode(pid)?.name).filter(Boolean),
       rowCount: n.eng.row_count(),
       sshKey: n.eng.node_ssh(),

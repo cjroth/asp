@@ -44,6 +44,14 @@ bun run serve               # http://localhost:5173
   entropy delivers exactly the missing rows.
 - **file ops** — edit, create, new folder, inline rename, delete (tombstone,
   remove-wins), move (drag → rename row).
+- **bridge to a real peer (ws://)** — a node can clone from / sync with an actual
+  `asp watch --listen` process (CLI / Obsidian / Desktop) over the genuine
+  Session: ed25519 handshake + version-vector catch-up. Use the **⇄** button on a
+  node, or pick *“real ws:// peer”* in the Add-node dialog. (For a public https
+  site, point at a `wss://` peer — browsers block `ws://` from `https://`.)
+- **persistence (OPFS)** — the whole mesh (per-node seed, vault rows, topology,
+  settings) is saved to the Origin Private File System and restored on reload;
+  *Reset* clears it. Restore replays rows through the real fold, not a UI snapshot.
 
 Settings (bottom-right) tune sync latency, commit debounce, layout
 (columns/rows/focus), accent, and the network map/grid — the same knobs as the
@@ -68,10 +76,19 @@ test/                   headless checks (engine convergence, web glue, SSR rende
 ## Tests
 
 ```sh
-bun test/mesh.test.mjs      # real-engine convergence: clone, gossip-via-hub, offline catch-up, concurrent merge
-bun test/web-glue.test.mjs  # the browser path: web-target wasm init from inlined bytes + clone/converge
-bun test/ui-smoke.tsx       # server-render the component tree against the real engine
+bun run test            # headless suite (no browser needed):
+#   mesh        real-engine convergence — clone, gossip-via-hub, offline catch-up, concurrent merge
+#   persist     OPFS serialize → restore → keeps syncing
+#   web-glue    the browser path — web-target wasm init from inlined bytes + clone/converge
+#   ui-smoke    server-render the component tree against the real engine
+
+bun run test:interop    # ws:// interop vs a REAL spawned `asp watch --listen` (needs `cargo build -p asp`)
+bun run test:e2e        # real-browser Playwright: add/clone/edit/propagate, offline→reconnect,
+                        # OPFS persistence across reload, ws:// dialog wiring (needs chromium)
 ```
+
+`test:e2e` needs a Playwright browser (`bunx playwright install chromium`); if it
+installed to a non-default location, set `PLAYWRIGHT_BROWSERS_PATH`.
 
 See `../docs/asp-sync-demo/HANDOFF.md` for the design provenance and the
 engine-integration spec, and `../docs/asp-sync-demo/design-reference/` for the
