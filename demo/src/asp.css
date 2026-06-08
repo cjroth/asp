@@ -133,6 +133,8 @@ body {
 .btn.primary .glyph { color: var(--cyan); }
 .btn.ghost { background: transparent; border-color: var(--line); }
 .btn.ghost:hover { background: var(--panel); }
+.btn.danger { background: var(--red-dim); border-color: var(--red); color: var(--text); }
+.btn.danger:hover { background: color-mix(in oklab, var(--red-dim), var(--red) 22%); }
 .btn.tiny { padding: 4px 8px; font-size: 11px; }
 .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .btn:disabled:hover { background: var(--panel-2); border-color: var(--line-2); transform: none; }
@@ -144,6 +146,31 @@ body {
   cursor: pointer; transition: all .12s; padding: 0; line-height: 1;
 }
 .icon-btn:hover { background: var(--panel-2); color: var(--text); border-color: var(--line); }
+.icon-btn svg { display: block; }
+
+/* right-click context menu (file tree) */
+.ctx-menu {
+  position: fixed; z-index: 80; min-width: 132px; padding: 4px;
+  display: flex; flex-direction: column;
+  background: var(--ink-2); border: 1px solid var(--line-2); border-radius: var(--r);
+  box-shadow: 0 12px 34px oklch(0.1 0.02 248 / 0.55);
+}
+.ctx-menu button {
+  text-align: left; padding: 6px 10px; background: transparent; border: 0; cursor: pointer;
+  color: var(--muted); font-family: var(--mono); font-size: 11.5px; border-radius: var(--r-sm);
+}
+.ctx-menu button:hover { background: var(--panel); color: var(--text); }
+.ctx-menu button.danger:hover { background: var(--red-dim); color: var(--red); }
+
+/* maximize modal — node panel almost full-screen, overlaid */
+.np-max-overlay { z-index: 55; padding: 32px; }
+.np-max { position: relative; width: 100%; height: 100%; display: flex; }
+.np-max .node-panel { flex: 1; min-height: 0; box-shadow: 0 24px 70px oklch(0.1 0.02 248 / 0.6); }
+.np-max-close {
+  position: fixed; top: 16px; right: 16px; z-index: 60; width: 30px; height: 30px;
+  background: var(--panel-2); border: 1px solid var(--line-2); color: var(--text);
+}
+.np-max-close:hover { background: var(--red-dim); border-color: var(--red); color: var(--red); }
 
 /* ====================================================================
    Empty state
@@ -307,17 +334,27 @@ body {
 .status.solo .led { background: var(--muted); }
 @keyframes blink { 0%{opacity:1;} 50%{opacity:0.25;} 100%{opacity:1;} }
 
-/* body grid: tree | editor */
+/* body grid: tree | divider | editor (divider column is draggable) */
 .np-body {
-  display: grid; grid-template-columns: 166px minmax(0,1fr); flex: 1; min-height: 0;
+  display: grid; grid-template-columns: 166px 6px minmax(0,1fr); flex: 1; min-height: 0;
 }
 .np-tree {
-  border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0;
+  display: flex; flex-direction: column; min-height: 0;
   background: color-mix(in oklab, var(--ink), transparent 40%);
 }
+/* draggable splitter — a flush 1px column (so the tree/editor header rules
+   meet it with no gap) with a wider invisible hit area for grabbing */
+.np-divider {
+  position: relative; cursor: col-resize; touch-action: none;
+  background: var(--line); transition: background .12s;
+}
+.np-divider::after { content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 11px; transform: translateX(-50%); }
+.np-divider:hover, body.col-resizing .np-divider { background: var(--cyan); }
+body.col-resizing { cursor: col-resize; user-select: none; }
 .tree-head {
-  display: flex; align-items: center; justify-content: space-between; padding: 6px 6px 6px 9px;
-  border-bottom: 1px solid var(--line); flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: space-between; padding: 0 6px 0 9px;
+  height: 37px; box-sizing: border-box; flex: 0 0 auto;
+  border-bottom: 1px solid var(--line);
 }
 .tree-head .t {
   font-family: var(--mono); font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--ghost);
@@ -350,7 +387,8 @@ body {
 /* editor */
 .np-editor { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .ed-tab {
-  display: flex; align-items: center; gap: 8px; padding: 6px 10px; flex: 0 0 auto;
+  display: flex; align-items: center; gap: 8px; padding: 0 10px; flex: 0 0 auto;
+  height: 37px; box-sizing: border-box;
   border-bottom: 1px solid var(--line); background: color-mix(in oklab, var(--ink), transparent 55%);
   font-family: var(--mono); font-size: 11px; color: var(--muted);
 }
@@ -474,6 +512,10 @@ body {
 .remote-opt.none .ro-id { background: var(--panel-2); color: var(--muted); font-size: 14px; }
 
 .dialog-foot { padding: 12px 18px 16px; display: flex; justify-content: flex-end; gap: 9px; border-top: 1px solid var(--line); }
+
+/* confirmation modal — a slimmer dialog, header rule sits straight above the actions */
+.confirm-dialog { width: 410px; }
+.confirm-dialog .dialog-head { padding-bottom: 16px; }
 
 /* misc helpers */
 .kbd {

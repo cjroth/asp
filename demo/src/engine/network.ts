@@ -346,7 +346,7 @@ export function createNetwork(opts: NetworkOpts) {
 
     logLine(node, [
       { t: 'INFO', c: 'lvl' }, { t: ' watch     ', c: 'tag' },
-      { t: `dial ${hostOf(url)}`, c: 'hl' }, { t: ' ws:// real peer · live · handshake…', c: 'dim' },
+      { t: `dial ${hostOf(url)}`, c: 'hl' }, { t: ' wss:// real peer · live · handshake…', c: 'dim' },
     ]);
     emit();
 
@@ -663,6 +663,49 @@ export function createNetwork(opts: NetworkOpts) {
     const np = (newDir ? `${newDir}/` : '') + baseOf(view.path);
     if (np === view.path) return;
     api.renameFile(nodeId, fileId, np);
+  };
+
+  api.renameFolder = (nodeId: string, oldPath: string, newPath: string) => {
+    const node = findNode(nodeId);
+    if (!node) return;
+    const op = oldPath.trim().replace(/\/+$/, '');
+    const np = newPath.trim().replace(/\/+$/, '');
+    if (!op || !np || op === np) return;
+    // Rename every live file under the folder prefix (file_ids stay stable).
+    for (const f of Object.values(filesView(node))) {
+      if (f.deleted) continue;
+      if (f.path === op || f.path.startsWith(`${op}/`)) {
+        api.renameFile(nodeId, f.file_id, np + f.path.slice(op.length));
+      }
+    }
+    // Carry over local-only folder entries (mkdir'd but empty).
+    const next = new Set<string>();
+    for (const fp of node.folders) next.add(fp === op || fp.startsWith(`${op}/`) ? np + fp.slice(op.length) : fp);
+    node.folders = next;
+    logLine(node, [
+      { t: 'INFO', c: 'lvl' }, { t: ' rename    ', c: 'tag' },
+      { t: 'rename', c: 'k rename' }, { t: ` ${op}/ → ${np}/`, c: 'hl' }, { t: ' · folder', c: 'dim' },
+    ]);
+    emit();
+  };
+
+  api.deleteFolder = (nodeId: string, folderPath: string) => {
+    const node = findNode(nodeId);
+    if (!node) return;
+    const fp = folderPath.trim().replace(/\/+$/, '');
+    if (!fp) return;
+    for (const f of Object.values(filesView(node))) {
+      if (f.deleted) continue;
+      if (f.path === fp || f.path.startsWith(`${fp}/`)) api.deleteFile(nodeId, f.file_id);
+    }
+    const next = new Set<string>();
+    for (const x of node.folders) if (x !== fp && !x.startsWith(`${fp}/`)) next.add(x);
+    node.folders = next;
+    logLine(node, [
+      { t: 'INFO', c: 'lvl' }, { t: ' delete    ', c: 'tag' },
+      { t: 'delete', c: 'k delete' }, { t: ` ${fp}/`, c: 'hl' }, { t: ' · folder', c: 'dim' },
+    ]);
+    emit();
   };
 
   api.deleteFile = (nodeId: string, fileId: string) => {

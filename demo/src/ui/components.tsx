@@ -4,10 +4,36 @@
    per-node snapshot produced by the real-engine network (network.ts).
    ==================================================================== */
 import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
+import { confirmDialog } from './confirm.tsx';
 
 /* ---------- helpers ---------- */
 function baseOf(p: string) { const i = p.lastIndexOf('/'); return i < 0 ? p : p.slice(i + 1); }
 function dirOf(p: string) { const i = p.lastIndexOf('/'); return i < 0 ? '' : p.slice(0, i); }
+
+/* ---------- inline icons (14px stroke glyphs) ---------- */
+const svgProps = { width: 14, height: 14, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const };
+const FolderPlusIcon = () => (
+  <svg {...svgProps}><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /><line x1="12" y1="11" x2="12" y2="17" /><line x1="9" y1="14" x2="15" y2="14" /></svg>
+);
+const RefreshIcon = () => (
+  <svg {...svgProps}><path d="M21 12a9 9 0 1 1-2.64-6.36" /><path d="M21 3v6h-6" /></svg>
+);
+const MaximizeIcon = () => (
+  <svg {...svgProps}><path d="M8 3H4a1 1 0 0 0-1 1v4M16 3h4a1 1 0 0 1 1 1v4M8 21H4a1 1 0 0 1-1-1v-4M16 21h4a1 1 0 0 1 1-1v-4" /></svg>
+);
+const ColumnsIcon = () => (
+  <svg {...svgProps}><rect x="3" y="4" width="5" height="16" rx="1" /><rect x="10" y="4" width="5" height="16" rx="1" /><rect x="17" y="4" width="4" height="16" rx="1" /></svg>
+);
+const CloseIcon = () => (
+  <svg {...svgProps}><path d="M6 6l12 12M18 6L6 18" /></svg>
+);
+/* chevrons pointing outward = expand-all; inward = collapse-all */
+const ExpandAllIcon = () => (
+  <svg {...svgProps}><path d="M7 15l5 5 5-5" /><path d="M7 9l5-5 5 5" /></svg>
+);
+const CollapseAllIcon = () => (
+  <svg {...svgProps}><path d="M7 20l5-5 5 5" /><path d="M7 4l5 5 5-5" /></svg>
+);
 
 function buildTree(files: any, folders: Set<string>) {
   const root: any = { type: 'dir', name: '', path: '', children: {} };
@@ -48,7 +74,7 @@ export function StatusPill({ status }: any) {
 }
 
 /* ==================================================================== */
-function TreeRow({ node, depth, snap, collapsed, toggle, api, dragRef, renaming, setRenaming }: any) {
+function TreeRow({ node, depth, snap, collapsed, toggle, api, dragRef, renaming, setRenaming, openMenu }: any) {
   const [dragOver, setDragOver] = useState(false);
   const isDir = node.type === 'dir';
   const isOpen = snap.openFileId && node.file && node.file.file_id === snap.openFileId;
@@ -63,9 +89,14 @@ function TreeRow({ node, depth, snap, collapsed, toggle, api, dragRef, renaming,
     api.moveFile(snap.id, fid, isDir ? node.path : dirOf(node.path));
   }
   function commitRn(val: string) {
-    if (isDir) { setRenaming(null); return; }
-    const np = (dirOf(node.path) ? `${dirOf(node.path)}/` : '') + val.trim();
-    if (val.trim() && np !== node.path) api.renameFile(snap.id, node.file.file_id, np);
+    const name = val.trim();
+    if (!name) { setRenaming(null); return; }
+    const parent = dirOf(node.path);
+    const np = (parent ? `${parent}/` : '') + name;
+    if (np !== node.path) {
+      if (isDir) api.renameFolder(snap.id, node.path, np);
+      else api.renameFile(snap.id, node.file.file_id, np);
+    }
     setRenaming(null);
   }
 
@@ -80,6 +111,7 @@ function TreeRow({ node, depth, snap, collapsed, toggle, api, dragRef, renaming,
         onDragOver={(e) => { if (dragRef.current) { e.preventDefault(); setDragOver(true); } }}
         onDragLeave={() => setDragOver(false)}
         onDrop={onDrop}
+        onContextMenu={(e) => openMenu(e, node)}
         onClick={() => { if (isDir) toggle(node.path); else api.openFile(snap.id, node.file.file_id); }}
       >
         {isDir ? <span className="twist">{isCollapsed ? '▸' : '▾'}</span> : <span className="twist" />}
@@ -93,7 +125,7 @@ function TreeRow({ node, depth, snap, collapsed, toggle, api, dragRef, renaming,
         {node.file && node.file.collided && <span className="badge-dot" style={{ background: 'var(--amber)' }} title="conflict / path collision — surfaced" />}
       </div>
       {isDir && !isCollapsed && node.sorted.map((c: any) => (
-        <TreeRow key={c.path + c.type} node={c} depth={depth + 1} snap={snap} collapsed={collapsed} toggle={toggle} api={api} dragRef={dragRef} renaming={renaming} setRenaming={setRenaming} />
+        <TreeRow key={c.path + c.type} node={c} depth={depth + 1} snap={snap} collapsed={collapsed} toggle={toggle} api={api} dragRef={dragRef} renaming={renaming} setRenaming={setRenaming} openMenu={openMenu} />
       ))}
     </div>
   );
@@ -102,11 +134,28 @@ function TreeRow({ node, depth, snap, collapsed, toggle, api, dragRef, renaming,
 export function FileTree({ snap, api }: any) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [renaming, setRenaming] = useState<any>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number; node: any } | null>(null);
   const dragRef = useRef<any>(null);
   const tree = buildTree(snap.files, snap.folders);
   const toggle = (path: string) => setCollapsed((s) => { const n = new Set(s); n.has(path) ? n.delete(path) : n.add(path); return n; });
   const liveCount = Object.values<any>(snap.files).filter((f) => !f.deleted).length;
   const [rootOver, setRootOver] = useState(false);
+
+  // Every folder path in the tree, for expand-all / collapse-all.
+  const allDirs: string[] = [];
+  (function walk(node: any) { for (const c of node.sorted) if (c.type === 'dir') { allDirs.push(c.path); walk(c); } })(tree);
+  const allExpanded = allDirs.every((d) => !collapsed.has(d));
+  const toggleAll = () => setCollapsed(allExpanded ? new Set(allDirs) : new Set());
+
+  // Close the context menu on any outside interaction.
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    window.addEventListener('click', close);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('resize', close);
+    return () => { window.removeEventListener('click', close); window.removeEventListener('scroll', close, true); window.removeEventListener('resize', close); };
+  }, [menu]);
 
   function newFile() {
     const name = prompt('New file (path relative to vault root):', 'notes/untitled.md');
@@ -116,9 +165,35 @@ export function FileTree({ snap, api }: any) {
     const name = prompt('New folder (path):', 'archive');
     if (name) api.createFolder(snap.id, dirOf(name), baseOf(name));
   }
-  function renameOpen() { if (snap.openFileId) setRenaming({ id: snap.openFileId }); }
-  function deleteOpen() {
-    if (snap.openFileId) { const f = snap.files[snap.openFileId]; if (f && confirm(`Delete ${f.path} ? (tombstone row, remove-wins)`)) api.deleteFile(snap.id, snap.openFileId); }
+  function openMenu(e: React.MouseEvent, node: any) {
+    e.preventDefault(); e.stopPropagation();
+    setMenu({ x: e.clientX, y: e.clientY, node });
+  }
+  function menuRename() {
+    if (!menu) return;
+    const node = menu.node;
+    setRenaming({ id: node.type === 'dir' ? `d:${node.path}` : node.file.file_id });
+    setMenu(null);
+  }
+  async function menuDelete() {
+    if (!menu) return;
+    const node = menu.node;
+    setMenu(null);
+    if (node.type === 'dir') {
+      const ok = await confirmDialog({
+        title: `Delete folder “${node.path}/”?`,
+        message: <>Everything inside it is tombstoned (remove-wins) and the deletion propagates to every peer.</>,
+        confirmLabel: 'Delete folder', danger: true,
+      });
+      if (ok) api.deleteFolder(snap.id, node.path);
+    } else {
+      const ok = await confirmDialog({
+        title: `Delete “${node.path}”?`,
+        message: <>Writes a tombstone row (remove-wins) and propagates the deletion to every peer.</>,
+        confirmLabel: 'Delete file', danger: true,
+      });
+      if (ok) api.deleteFile(snap.id, node.file.file_id);
+    }
   }
 
   return (
@@ -126,10 +201,13 @@ export function FileTree({ snap, api }: any) {
       <div className="tree-head">
         <span className="t">vault · {liveCount}</span>
         <span className="tools">
+          {allDirs.length > 0 && (
+            <button className="icon-btn" title={allExpanded ? 'Collapse all' : 'Expand all'} onClick={toggleAll}>
+              {allExpanded ? <CollapseAllIcon /> : <ExpandAllIcon />}
+            </button>
+          )}
           <button className="icon-btn" title="New file" onClick={newFile}>＋</button>
-          <button className="icon-btn" title="New folder" onClick={newFolder}>⊞</button>
-          <button className="icon-btn" title="Rename open file" onClick={renameOpen}>✎</button>
-          <button className="icon-btn" title="Delete open file" onClick={deleteOpen}>✕</button>
+          <button className="icon-btn" title="New folder" onClick={newFolder}><FolderPlusIcon /></button>
         </span>
       </div>
       <div className={`tree-scroll${rootOver ? ' dragover' : ''}`}
@@ -139,9 +217,15 @@ export function FileTree({ snap, api }: any) {
         {tree.sorted.length === 0
           ? <div className="tree-empty">empty vault.<br />press ＋ to create a file.</div>
           : tree.sorted.map((c: any) => (
-            <TreeRow key={c.path + c.type} node={c} depth={0} snap={snap} collapsed={collapsed} toggle={toggle} api={api} dragRef={dragRef} renaming={renaming} setRenaming={setRenaming} />
+            <TreeRow key={c.path + c.type} node={c} depth={0} snap={snap} collapsed={collapsed} toggle={toggle} api={api} dragRef={dragRef} renaming={renaming} setRenaming={setRenaming} openMenu={openMenu} />
           ))}
       </div>
+      {menu && (
+        <div className="ctx-menu" style={{ left: menu.x, top: menu.y }} onClick={(e) => e.stopPropagation()} onContextMenu={(e) => e.preventDefault()}>
+          <button onClick={menuRename}>Rename</button>
+          <button className="danger" onClick={menuDelete}>Delete</button>
+        </div>
+      )}
     </div>
   );
 }
@@ -305,7 +389,7 @@ export function AddNodeDialog({ snap, onCancel, onAdd }: any) {
   const [remoteId, setRemoteId] = useState<string | null>(existing.length ? existing[existing.length - 1].id : null);
   const [name, setName] = useState('');
   const [source, setSource] = useState<'local' | 'external'>('local');
-  const [url, setUrl] = useState('ws://127.0.0.1:9000');
+  const [url, setUrl] = useState('wss://127.0.0.1:9000');
   const [authKey, setAuthKey] = useState('');
   const external = source === 'external';
 
@@ -322,7 +406,7 @@ export function AddNodeDialog({ snap, onCancel, onAdd }: any) {
           <span className="eyebrow">{external ? 'asp clone <url>' : isFirst ? 'asp init' : 'asp clone'}</span>
           <h3>{isFirst ? 'Create the first node' : 'Add a node to the mesh'}</h3>
           <p>{external
-            ? 'Clone from a real `asp watch --listen` peer (CLI / Obsidian / Desktop) over ws://. Genuine ed25519 handshake + version-vector catch-up — the live interop bridge.'
+            ? 'Clone from a real `asp watch --listen` peer (CLI / Obsidian / Desktop) over wss://. Genuine ed25519 handshake + version-vector catch-up — the live interop bridge.'
             : isFirst
               ? "Spins up a vault with this device's ed25519 identity and a few seed files."
               : 'The new node clones from a remote peer: authenticate, full catch-up, then sync live. Pick which existing node to use as its remote.'}</p>
@@ -332,7 +416,7 @@ export function AddNodeDialog({ snap, onCancel, onAdd }: any) {
             <label>source</label>
             <div className="seg" style={{ maxWidth: 240 }}>
               <button className={!external ? 'on' : ''} onClick={() => setSource('local')}>{isFirst ? 'new vault' : 'in-page peer'}</button>
-              <button className={external ? 'on' : ''} onClick={() => setSource('external')}>real ws:// peer</button>
+              <button className={external ? 'on' : ''} onClick={() => setSource('external')}>real wss:// peer</button>
             </div>
           </div>
           <div className="field">
@@ -342,8 +426,8 @@ export function AddNodeDialog({ snap, onCancel, onAdd }: any) {
           {external ? (
             <>
               <div className="field">
-                <label>peer url (ws:// or wss://)</label>
-                <input type="text" value={url} placeholder="ws://127.0.0.1:9000" onChange={(e) => setUrl(e.target.value)} />
+                <label>peer url (wss://)</label>
+                <input type="text" value={url} placeholder="wss://127.0.0.1:9000" onChange={(e) => setUrl(e.target.value)} />
               </div>
               <div className="field">
                 <label>auth key (AUTH_KEY enrollment secret)</label>
@@ -371,7 +455,7 @@ export function AddNodeDialog({ snap, onCancel, onAdd }: any) {
         <div className="dialog-foot">
           <button className="btn ghost" onClick={onCancel}>Cancel</button>
           <button className="btn primary" onClick={submit} disabled={external && !url.trim()}>
-            <span className="glyph">+</span>{external ? 'Clone over ws://' : isFirst ? 'Create node' : 'Clone node'}
+            <span className="glyph">+</span>{external ? 'Clone over wss://' : isFirst ? 'Create node' : 'Clone node'}
           </button>
         </div>
       </div>
@@ -381,7 +465,7 @@ export function AddNodeDialog({ snap, onCancel, onAdd }: any) {
 
 /* ==================================================================== */
 export function ConnectPeerDialog({ snap, onCancel, onConnect, onDisconnect }: any) {
-  const [url, setUrl] = useState(snap.externalUrl || 'ws://127.0.0.1:9000');
+  const [url, setUrl] = useState(snap.externalUrl || 'wss://127.0.0.1:9000');
   const [authKey, setAuthKey] = useState('');
   return (
     <div className="overlay" onMouseDown={(e) => { if ((e.target as HTMLElement).classList.contains('overlay')) onCancel(); }}>
@@ -395,8 +479,8 @@ export function ConnectPeerDialog({ snap, onCancel, onConnect, onDisconnect }: a
         </div>
         <div className="dialog-body">
           <div className="field">
-            <label>peer url (ws:// or wss://)</label>
-            <input type="text" value={url} autoFocus placeholder="ws://127.0.0.1:9000" onChange={(e) => setUrl(e.target.value)} />
+            <label>peer url (wss://)</label>
+            <input type="text" value={url} autoFocus placeholder="wss://127.0.0.1:9000" onChange={(e) => setUrl(e.target.value)} />
           </div>
           <div className="field">
             <label>auth key (optional once enrolled)</label>
@@ -416,9 +500,29 @@ export function ConnectPeerDialog({ snap, onCancel, onConnect, onDisconnect }: a
 }
 
 /* ==================================================================== */
-export function NodePanel({ snap, api, status, extraClass, onFocus, onRemove, onConnect }: any) {
+export function NodePanel({ snap, api, status, extraClass, onMaximize, onColumns, onRemove, onConnect }: any) {
   const [editingName, setEditingName] = useState(false);
+  const [treeW, setTreeW] = useState(166);
+  const bodyRef = useRef<HTMLDivElement>(null);
   const host = (u: string) => { try { return new URL(u).host; } catch { return u; } };
+
+  function startResize(e: React.PointerEvent) {
+    e.preventDefault();
+    const onMove = (ev: PointerEvent) => {
+      const rect = bodyRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      setTreeW(Math.min(Math.max(ev.clientX - rect.left, 110), rect.width - 180));
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      document.body.classList.remove('col-resizing');
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    document.body.classList.add('col-resizing');
+  }
+
   return (
     <div className={`node-panel ${snap.online ? '' : 'offline '}${extraClass || ''}`}>
       <div className="np-head">
@@ -436,9 +540,10 @@ export function NodePanel({ snap, api, status, extraClass, onFocus, onRemove, on
             <button className={`btn tiny ${snap.online ? 'ghost' : 'primary'}`} onClick={() => api.setOnline(snap.id, !snap.online)} title="toggle network link">
               {snap.online ? 'Go offline' : 'Reconnect'}
             </button>
-            {onConnect && <button className="icon-btn" title={snap.externalUrl ? `re-sync ${host(snap.externalUrl)}` : 'connect to a real ws:// peer'} onClick={() => onConnect(snap.id)}>⇄</button>}
-            {onFocus && <button className="icon-btn" title="focus" onClick={onFocus}>⤢</button>}
-            <button className="icon-btn" title="remove node" onClick={() => onRemove(snap.id)}>✕</button>
+            {onMaximize && <button className="icon-btn" title="maximize" onClick={() => onMaximize(snap.id)}><MaximizeIcon /></button>}
+            {onColumns && <button className="icon-btn" title="column view" onClick={onColumns}><ColumnsIcon /></button>}
+            {onConnect && <button className="icon-btn" title={snap.externalUrl ? `re-sync ${host(snap.externalUrl)}` : 'connect to a real wss:// peer'} onClick={() => onConnect(snap.id)}><RefreshIcon /></button>}
+            {onRemove && <button className="icon-btn" title="remove node" onClick={() => onRemove(snap.id)}>✕</button>}
           </div>
         </div>
         <div className="np-meta">
@@ -452,11 +557,30 @@ export function NodePanel({ snap, api, status, extraClass, onFocus, onRemove, on
                 : <span className="chip peers"><span className="lbl">peers</span><span className="val">none</span></span>}
         </div>
       </div>
-      <div className="np-body">
+      <div className="np-body" ref={bodyRef} style={{ gridTemplateColumns: `${treeW}px 1px minmax(0,1fr)` }}>
         <FileTree snap={snap} api={api} />
+        <div className="np-divider" onPointerDown={startResize} title="drag to resize" />
         <Editor snap={snap} api={api} />
       </div>
       <EventLog snap={snap} />
+    </div>
+  );
+}
+
+/* ==================================================================== */
+/* Maximize modal — the node panel almost full-screen, overlaid          */
+export function MaxModal({ snap, api, status, onClose, onConnect }: any) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  return (
+    <div className="overlay np-max-overlay" onMouseDown={(e) => { if ((e.target as HTMLElement).classList.contains('np-max-overlay')) onClose(); }}>
+      <div className="np-max">
+        <button className="np-max-close icon-btn" title="close (Esc)" onClick={onClose}><CloseIcon /></button>
+        <NodePanel snap={snap} api={api} status={status} extraClass="is-max" onConnect={onConnect} />
+      </div>
     </div>
   );
 }

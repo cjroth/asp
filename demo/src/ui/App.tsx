@@ -4,8 +4,9 @@
    ==================================================================== */
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { createNetwork } from '../engine/network.ts';
-import { NetworkMap, NodePanel, NodeStrip, AddNodeDialog, ConnectPeerDialog } from './components.tsx';
+import { NetworkMap, NodePanel, NodeStrip, AddNodeDialog, ConnectPeerDialog, MaxModal } from './components.tsx';
 import { Settings, TWEAK_DEFAULTS, type Tweaks } from './settings.tsx';
+import { ConfirmHost, confirmDialog } from './confirm.tsx';
 import { loadState, saveState, clearState } from '../persist.ts';
 
 function EmptyState({ onAdd }: any) {
@@ -44,6 +45,7 @@ export function App() {
   const [dialog, setDialog] = useState(false);
   const [connectFor, setConnectFor] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [maximized, setMaximized] = useState<string | null>(null);
   const [toast, setToast] = useState<any>(null);
   const [loaded, setLoaded] = useState(false);
   const toastTimer = useRef<any>(null);
@@ -107,12 +109,25 @@ export function App() {
   }, [api]);
 
   function addNode(opts: any) { const id = api.addNode(opts); setDialog(false); if (!selected) setSelected(id); }
-  function removeNode(id: string) {
+  async function removeNode(id: string) {
+    const node = api.getNodes().find((n: any) => n.id === id);
+    const ok = await confirmDialog({
+      title: `Remove node “${node?.name ?? id}”?`,
+      message: <>The node leaves the mesh and its in-page vault is discarded. Other nodes keep their copies.</>,
+      confirmLabel: 'Remove node', danger: true,
+    });
+    if (!ok) return;
     api.removeNode(id);
+    if (maximized === id) setMaximized(null);
     if (selected === id) { const left = api.getNodes()[0]; setSelected(left ? left.id : null); }
   }
-  function reset() {
-    if (!confirm('Reset the whole mesh? All nodes, logs and vault state are cleared.')) return;
+  async function reset() {
+    const ok = await confirmDialog({
+      title: 'Reset the whole mesh?',
+      message: <>All nodes, event logs and vault state are cleared. This cannot be undone.</>,
+      confirmLabel: 'Reset everything', danger: true,
+    });
+    if (!ok) return;
     void clearState();
     packetsRef.current.length = 0;
     engineRef.current = buildEngine();
@@ -157,7 +172,7 @@ export function App() {
             <div className="canvas layout-focus">
               {(() => {
                 const focusNode = nodes.find((n: any) => n.id === sel) || nodes[0];
-                return <NodePanel key={focusNode.id} snap={focusNode} api={api} status={statusFor(focusNode.id)} extraClass="is-focus" onRemove={removeNode} onConnect={setConnectFor} />;
+                return <NodePanel key={focusNode.id} snap={focusNode} api={api} status={statusFor(focusNode.id)} extraClass="is-focus" onMaximize={setMaximized} onColumns={() => setTweak('layout', 'columns')} onRemove={removeNode} onConnect={setConnectFor} />;
               })()}
               <div className="focus-rail">
                 {nodes.map((n: any) => (
@@ -170,7 +185,7 @@ export function App() {
               style={t.layout === 'columns' ? { gridTemplateColumns: `repeat(${Math.min(nodes.length, 3)}, minmax(0,1fr))` } : undefined}>
               {nodes.map((n: any) => (
                 <NodePanel key={n.id} snap={n} api={api} status={statusFor(n.id)}
-                  onFocus={() => { setSelected(n.id); setTweak('layout', 'focus'); }} onRemove={removeNode} onConnect={setConnectFor} />
+                  onMaximize={setMaximized} onColumns={t.layout !== 'columns' ? () => setTweak('layout', 'columns') : undefined} onRemove={removeNode} onConnect={setConnectFor} />
               ))}
             </div>
           )}
@@ -182,7 +197,12 @@ export function App() {
         const n = nodes.find((x: any) => x.id === connectFor);
         return n ? <ConnectPeerDialog snap={n} onCancel={() => setConnectFor(null)} onConnect={doConnect} onDisconnect={(id: string) => api.disconnectPeer(id)} /> : null;
       })()}
+      {maximized && (() => {
+        const n = nodes.find((x: any) => x.id === maximized);
+        return n ? <MaxModal snap={n} api={api} status={statusFor(n.id)} onClose={() => setMaximized(null)} onConnect={setConnectFor} /> : null;
+      })()}
       {toast && <div className="toast-wrap"><div className="toast"><span className="accent">⚠ </span>{toast.msg}</div></div>}
+      <ConfirmHost />
 
       <Settings t={t} set={setTweak} />
     </div>
