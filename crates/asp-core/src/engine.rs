@@ -443,7 +443,12 @@ impl Engine {
         }
         let empty_set: std::collections::HashSet<&String> = empty_dirs.iter().collect();
         for f in &live_dirs {
-            if !empty_set.contains(&f.path) {
+            // Delete a tracked dir entity when its folder is no longer empty / is
+            // gone, OR when it was vacated this pass (files renamed/deleted away).
+            // The `vacated` clause also cleans up a *stale* entity — e.g. one a
+            // prior build wrongly authored for a rename leftover — propagating the
+            // removal so the old folder disappears on every node.
+            if !empty_set.contains(&f.path) || vacated.contains(&f.path) {
                 if let Some(wr) = self.record_dir_delete(&f.file_id)? {
                     authored.push(wr);
                 }

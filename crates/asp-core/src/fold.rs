@@ -63,13 +63,18 @@ pub fn fold_order(rows: &[LogRow]) -> Vec<LogRow> {
             }
         }
     }
-    // Any rows left out (cycle — impossible with Merkle parents) appended stably.
+    // Any rows left out (a `parent` cycle — impossible with real Merkle parents,
+    // but an adversarial/garbage peer could forge one) are appended in canonical
+    // tiebreak order, NOT input order, so the fold stays permutation-invariant
+    // (deterministic) even on malformed input.
     if out.len() != rows.len() {
-        for (i, r) in rows.iter().enumerate() {
-            if !out.iter().any(|o| o.id == r.id) {
-                let _ = i;
-                out.push(r.clone());
-            }
+        let placed: HashSet<&str> = out.iter().map(|r| r.id.as_str()).collect();
+        let mut leftover: Vec<&LogRow> = rows.iter().filter(|r| !placed.contains(r.id.as_str())).collect();
+        leftover.sort_by(|a, b| {
+            a.lamport.cmp(&b.lamport).then_with(|| a.site_id.cmp(&b.site_id)).then_with(|| a.id.cmp(&b.id))
+        });
+        for r in leftover {
+            out.push(r.clone());
         }
     }
     out
