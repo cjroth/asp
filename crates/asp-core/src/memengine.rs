@@ -41,6 +41,10 @@ fn random_id() -> String {
 
 pub struct MemEngine {
     identity: Identity,
+    /// Per-vault authoring id, distinct from `identity` (the connection key), so
+    /// two in-process vaults that share a device seed never collide on
+    /// `(site_id, seq)` and defeat version-vector catch-up (§Security).
+    site: String,
     blobs: MemBlobStore,
     rows: RefCell<Vec<LogRow>>,
     files: RefCell<Vec<FileRow>>,
@@ -49,13 +53,20 @@ pub struct MemEngine {
 }
 
 impl MemEngine {
-    /// Create a fresh in-memory vault authoring as `identity`.
+    /// Create a fresh in-memory vault authoring as `identity` (the connection key)
+    /// under a fresh per-vault `site_id`.
     pub fn create(identity: Identity, vault_id: &str) -> MemEngine {
         let mut cfg = BTreeMap::new();
         cfg.insert("vault_id".to_string(), vault_id.to_string());
         cfg.insert("tiebreak_key".to_string(), "lamport".to_string());
         MemEngine {
             identity,
+            site: {
+                use rand::RngCore;
+                let mut b = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut b);
+                hex::encode(b)
+            },
             blobs: MemBlobStore::new(),
             rows: RefCell::new(Vec::new()),
             files: RefCell::new(Vec::new()),
@@ -64,8 +75,9 @@ impl MemEngine {
         }
     }
 
+    /// The authoring identity (per-vault, distinct from the device connection key).
     pub fn site_id(&self) -> String {
-        self.identity.node_id().to_hex()
+        self.site.clone()
     }
 
     // ----- counters -----
