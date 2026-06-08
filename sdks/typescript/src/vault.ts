@@ -35,6 +35,23 @@ export interface SyncOptions {
   timeoutMs?: number;
 }
 
+/**
+ * The slice of the engine a host (the Obsidian bridge) drives. Both the
+ * in-process {@link Vault} (synchronous) and the worker-backed `WorkerVault`
+ * (asynchronous, off-thread) satisfy it — methods may return a value OR a
+ * Promise of it, so callers `await` uniformly. `nodeSsh` stays synchronous (the
+ * worker proxy caches the identity from init).
+ */
+export interface EngineVault {
+  writeFile(path: string, bytes: Uint8Array): void | Promise<void>;
+  deleteFile(path: string): void | Promise<void>;
+  renameFile(from: string, to: string): void | Promise<void>;
+  files(): Record<string, Uint8Array> | Promise<Record<string, Uint8Array>>;
+  sync(url: string, opts?: SyncOptions): Promise<number>;
+  nodeSsh(): string;
+  free(): void | Promise<void>;
+}
+
 export class Vault {
   private eng: WasmEngineInstance;
 

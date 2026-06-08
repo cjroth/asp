@@ -7,7 +7,13 @@
 // (vault I/O, the event→push path, settings, a status bar).
 
 import { Notice, Plugin, PluginSettingTab, Setting, type EventRef } from 'obsidian';
-import { initAsp, normalizePeerUrl, Vault as SdkVault } from '../../../sdks/typescript/src/index.ts';
+import {
+  type FromWorker,
+  normalizePeerUrl,
+  type ToWorker,
+  WorkerVault,
+  workerPort,
+} from '../../../sdks/typescript/src/index.ts';
 import { Bridge } from './bridge.ts';
 import { LogBuffer } from './log-buffer.ts';
 import { LogModal } from './log-modal.ts';
@@ -15,10 +21,12 @@ import { ObsidianHost } from './obsidian-host.ts';
 import { PathFilter } from './path-filter.ts';
 import { type SyncState, SyncController } from './sync-controller.ts';
 
-// The wasm engine bytes, inlined at build time by esbuild (see
-// esbuild.config.mjs). Decoded once and handed to `initAsp` so `main.js` is
-// fully self-contained — no sibling .wasm to fetch.
+// Inlined at build time by esbuild (see esbuild.config.mjs), so `main.js` is
+// fully self-contained — no sibling files to fetch:
+//   • the wasm engine bytes (base64), shipped to the worker's `init`;
+//   • the engine Web Worker bundle (IIFE source), started as a Blob Worker.
 declare const __ASP_WASM_B64__: string;
+declare const __ASP_ENGINE_WORKER__: string;
 function wasmBytes(): Uint8Array {
   const bin = atob(__ASP_WASM_B64__);
   const out = new Uint8Array(bin.length);
@@ -70,7 +78,8 @@ export default class AspPlugin extends Plugin {
   /** Last sync state, mirrored to the status bar AND any open settings banner. */
   syncState: SyncState = 'idle';
   private readonly stateListeners = new Set<(s: SyncState) => void>();
-  private sdk?: SdkVault;
+  private worker?: Worker;
+  private sdk?: WorkerVault;
   private bridge?: Bridge;
   private controller?: SyncController;
   private statusEl?: HTMLElement;
@@ -94,13 +103,25 @@ export default class AspPlugin extends Plugin {
       await this.saveData(this.settings);
     }
 
-    this.log.append('plugin loading — initializing the wasm engine…');
-    // Instantiate the wasm engine from the inlined bytes before any engine use
-    // (the web target loads asynchronously). Idempotent.
-    await initAsp(wasmBytes());
+    this.log.append('plugin loading — starting the engine worker…');
+    // The one engine, in wasm — but inside a Web Worker, so its synchronous
+    // fold/merge/hash/feed work never blocks the Obsidian UI. The worker source
+    // and wasm bytes are both inlined; we start it from a Blob (no sibling file)
+    // and ship the bytes in via `init`. Empty vault id adopts the peer's.
+    const blob = new Blob([__ASP_ENGINE_WORKER__], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    this.worker = new Worker(url);
+    URL.revokeObjectURL(url);
+    this.worker.onerror = (e) =>
+      this.log.append(`engine worker error: ${e.message ?? String(e)}`, 'error');
+    this.sdk = new WorkerVault(workerPort<ToWorker, FromWorker>(this.worker));
+    const identity = await this.sdk.init({
+      seed: hexToBytes(this.settings.seedHex),
+      vaultId: '',
+      wasmBytes: wasmBytes(),
+    });
+    this.log.append(`engine worker ready — device key ${identity.nodeSsh}`);
 
-    // The one engine, in wasm — a thin node. Empty vault id adopts the peer's.
-    this.sdk = new SdkVault(hexToBytes(this.settings.seedHex), '');
     const host = new ObsidianHost(this.app.vault.adapter);
     this.bridge = new Bridge(this.sdk, host, new PathFilter(await this.readIgnore(host)));
     this.controller = new SyncController(this.sdk, this.bridge);
@@ -108,7 +129,6 @@ export default class AspPlugin extends Plugin {
     const logger = (msg: string, level?: 'info' | 'error') => this.log.append(msg, level);
     this.bridge.setLogger(logger);
     this.controller.setLogger(logger);
-    this.log.append(`engine ready — device key ${this.deviceKey()}`);
 
     this.statusEl = this.addStatusBarItem();
     this.controller.subscribe((s) => {
@@ -153,7 +173,9 @@ export default class AspPlugin extends Plugin {
   onunload(): void {
     this.stopPolling();
     clearTimeout(this.debounce);
-    this.sdk?.free();
+    void this.sdk?.free();
+    this.worker?.terminate();
+    this.worker = undefined;
   }
 
   /** Periodic background pull. Cheap: no full re-read, and materialize only

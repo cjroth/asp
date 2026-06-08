@@ -2,7 +2,13 @@
 // one Rust engine (asp-core) compiled to wasm. One engine everywhere: a TS/wasm
 // node computes byte-identical state to the native `asp` daemon.
 
-export { normalizePeerUrl, Vault, type SyncOptions } from './vault.ts';
+export { type EngineVault, normalizePeerUrl, Vault, type SyncOptions } from './vault.ts';
+
+// Engine Web Worker: run the wasm engine + transport off the renderer thread.
+export { type Port, linkedPorts, selfPort, workerPort } from './worker/channel.ts';
+export { EngineWorkerHost } from './worker/engine-host.ts';
+export type { Command, FromWorker, Identity, InitPayload, Reply, ToWorker } from './worker/protocol.ts';
+export { WorkerVault } from './worker/worker-vault.ts';
 export type { FileMeta, WasmEngineInstance, WireBlob, WireRow } from './engine-types.ts';
 export {
   contentHash,

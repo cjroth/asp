@@ -3,7 +3,7 @@
 // listens — it makes an outbound connection to a full node (an `asp watch
 // --listen` process or Context Desktop) which serves the merged tree.
 
-import type { Vault } from '../../../sdks/typescript/src/index.ts';
+import type { EngineVault } from '../../../sdks/typescript/src/index.ts';
 import type { Bridge } from './bridge.ts';
 import type { Logger } from './log-buffer.ts';
 
@@ -21,7 +21,7 @@ export class SyncController {
   private log: Logger = () => {};
 
   constructor(
-    private vault: Vault,
+    private vault: EngineVault,
     private bridge: Bridge,
   ) {}
 
