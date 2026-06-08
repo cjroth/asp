@@ -92,8 +92,10 @@ export class Vault {
   /**
    * One-shot sync against a listening `asp` peer: connect, run the mutual-auth
    * handshake + bidirectional version-vector catch-up, converge, and close.
+   * Resolves with the number of rows integrated FROM the peer this pass — so a
+   * caller can skip an expensive re-materialize when nothing new arrived (0).
    */
-  async sync(url: string, opts: SyncOptions = {}): Promise<void> {
+  async sync(url: string, opts: SyncOptions = {}): Promise<number> {
     const idleMs = opts.idleMs ?? 800;
     const timeoutMs = opts.timeoutMs ?? 15000;
     const base = normalizePeerUrl(url);
@@ -110,7 +112,8 @@ export class Vault {
       ws.addEventListener('error', onErr, { once: true });
     });
 
-    return await new Promise<void>((resolve, reject) => {
+    return await new Promise<number>((resolve, reject) => {
+      let integrated = 0;
       let idle: ReturnType<typeof setTimeout> | undefined;
       const hardStop = setTimeout(() => {
         try {
@@ -126,7 +129,7 @@ export class Vault {
           ws.close();
         } catch {}
         if (err) reject(err);
-        else resolve();
+        else resolve(integrated);
       };
       const resetIdle = () => {
         clearTimeout(idle);
@@ -141,6 +144,7 @@ export class Vault {
         } catch (e) {
           return done(e as Error);
         }
+        integrated += r.integrated;
         for (const out of r.out) ws.send(Uint8Array.from(out));
         if (r.closed) {
           return done(r.closed.includes('denied') ? new Error(r.closed) : undefined);

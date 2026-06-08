@@ -44,6 +44,13 @@ const DEFAULTS: AspSettings = {
   connectedOnce: false,
 };
 
+/** How often to poll the peer for changes. A thin node makes outbound,
+ * one-shot syncs (it never listens), so a peer-side change only lands on the
+ * next sync — without this, a remote rename never shows up until a *local*
+ * edit triggers one. Each poll is cheap now (no full re-read; materialize only
+ * runs when rows actually arrive). */
+const POLL_MS = 10_000;
+
 function randomSeedHex(): string {
   const b = new Uint8Array(32);
   crypto.getRandomValues(b);
@@ -68,6 +75,10 @@ export default class AspPlugin extends Plugin {
   private controller?: SyncController;
   private statusEl?: HTMLElement;
   private debounce?: ReturnType<typeof setTimeout>;
+  private pollTimer?: ReturnType<typeof setInterval>;
+  /** Guards against overlapping syncs (a poll firing mid-sync would open a
+   * second connection feeding the same engine). */
+  private syncing = false;
 
   async onload(): Promise<void> {
     this.settings = Object.assign({ ...DEFAULTS }, (await this.loadData()) as AspSettings);
@@ -130,14 +141,37 @@ export default class AspPlugin extends Plugin {
     this.addCommand({ id: 'asp-sync-now', name: 'Sync now', callback: () => void this.syncNow() });
     this.addSettingTab(new AspSettingTab(this.app, this));
 
+    // Initial full sync (captures the whole vault into the engine once), then a
+    // lightweight periodic pull so peer-side changes appear without a local edit.
     if (this.settings.enabled && this.settings.peerUrl) {
-      this.log.append('auto-sync on load (enabled + peer set)');
-      void this.syncNow();
+      this.log.append('startup: initial sync…');
+      void this.runSync({ reconcile: true, quiet: true });
     }
+    this.startPolling();
   }
 
   onunload(): void {
+    this.stopPolling();
+    clearTimeout(this.debounce);
     this.sdk?.free();
+  }
+
+  /** Periodic background pull. Cheap: no full re-read, and materialize only
+   * runs when the peer actually sent rows. Skips ticks while disabled, without
+   * a peer, or while another sync is in flight. */
+  private startPolling(): void {
+    this.stopPolling();
+    this.pollTimer = setInterval(() => {
+      if (!this.settings.enabled || !this.settings.peerUrl || !this.settings.connectedOnce) return;
+      void this.runSync({ reconcile: false, background: true, quiet: true });
+    }, POLL_MS);
+  }
+
+  private stopPolling(): void {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = undefined;
+    }
   }
 
   /** Subscribe to sync-state changes (the settings banner uses this). Fires
@@ -148,27 +182,37 @@ export default class AspPlugin extends Plugin {
     return () => this.stateListeners.delete(cb);
   }
 
-  /** Run one sync pass with visible feedback. Never fails silently. Returns
-   * whether it converged. */
-  private async runSync(): Promise<boolean> {
+  /**
+   * Run one sync pass. `reconcile` re-captures the whole vault (initial /
+   * manual recovery); `background` keeps the status steady for polls; `quiet`
+   * suppresses the toast (used by automatic syncs). Never overlaps another sync.
+   * Returns whether it converged.
+   */
+  private async runSync(
+    opts: { reconcile?: boolean; background?: boolean; quiet?: boolean } = {},
+  ): Promise<boolean> {
     if (!this.controller) return false;
+    if (this.syncing) return false; // a sync is already in flight
     const peerUrl = normalizePeerUrl(this.settings.peerUrl); // bare host → wss://
     if (!peerUrl) {
-      new Notice('asp: set a Peer URL first');
+      if (!opts.quiet) new Notice('asp: set a Peer URL first');
       this.log.append('sync: no Peer URL set — nothing to connect to', 'error');
       return false;
     }
+    this.syncing = true;
     try {
-      await this.controller.syncOnce({
-        peerUrl,
-        authKey: this.settings.authKey || undefined,
-      });
-      new Notice('asp: synced');
+      await this.controller.syncOnce(
+        { peerUrl, authKey: this.settings.authKey || undefined },
+        { reconcile: opts.reconcile, background: opts.background },
+      );
+      if (!opts.quiet) new Notice('asp: synced');
       return true;
     } catch (e) {
       // The controller already logged the underlying error.
-      new Notice(`asp sync failed: ${String(e)}`);
+      if (!opts.quiet) new Notice(`asp sync failed: ${String(e)}`);
       return false;
+    } finally {
+      this.syncing = false;
     }
   }
 
@@ -176,7 +220,7 @@ export default class AspPlugin extends Plugin {
    * controls so the next settings render shows them. */
   async connect(): Promise<boolean> {
     this.log.append('connect: attempting first sync…');
-    const ok = await this.runSync();
+    const ok = await this.runSync({ reconcile: true });
     if (ok && !this.settings.connectedOnce) {
       this.settings.connectedOnce = true;
       this.settings.enabled = true;
@@ -187,7 +231,7 @@ export default class AspPlugin extends Plugin {
   }
 
   async syncNow(): Promise<void> {
-    await this.runSync();
+    await this.runSync({ reconcile: true });
   }
 
   private async readIgnore(host: ObsidianHost): Promise<string> {
@@ -198,7 +242,12 @@ export default class AspPlugin extends Plugin {
   private scheduleSync(): void {
     if (!this.settings.enabled || !this.settings.peerUrl) return;
     clearTimeout(this.debounce);
-    this.debounce = setTimeout(() => void this.syncNow(), 600);
+    // A local edit was already captured by the event handler — just push it.
+    // No reconcile (don't re-read the whole vault), no toast, no status flash.
+    this.debounce = setTimeout(
+      () => void this.runSync({ reconcile: false, background: true, quiet: true }),
+      600,
+    );
   }
 
   deviceKey(): string {

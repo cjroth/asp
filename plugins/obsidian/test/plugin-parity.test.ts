@@ -68,7 +68,9 @@ test('Obsidian plugin (bridge + controller) converges with the real asp CLI', as
     const bridge = new Bridge(sdk, host);
     const controller = new SyncController(sdk, bridge);
 
-    await controller.syncOnce({ peerUrl: url, authKey: 'S' });
+    // Initial sync captures the whole host tree (the plugin does this once at
+    // startup / on manual sync); the hot path skips reconcile.
+    await controller.syncOnce({ peerUrl: url, authKey: 'S' }, { reconcile: true });
 
     // The plugin pulled the CLI note into the Obsidian vault...
     expect(host.getText('cli-note.md')).toBe('# from the CLI\n');
@@ -80,6 +82,21 @@ test('Obsidian plugin (bridge + controller) converges with the real asp CLI', as
     while (!existsSync(cliCopy) && Date.now() < deadline) await sleep(100);
     expect(existsSync(cliCopy)).toBe(true);
     expect(readFileSync(cliCopy, 'utf8')).toBe('# typed in Obsidian\n');
+
+    // A PEER-side change must reach the plugin on a LATER sync — not only at
+    // first connect. (This is the "renamed on another device, never shows up in
+    // Obsidian" bug: the thin node is one-shot, so without a re-sync the change
+    // never arrives.) The hot-path sync uses reconcile:false, exactly like the
+    // plugin's periodic poll.
+    writeFileSync(join(dir, 'peer-added.md'), '# added on the peer\n');
+    let pulled = false;
+    const dl2 = Date.now() + 8000;
+    while (!pulled && Date.now() < dl2) {
+      await controller.syncOnce({ peerUrl: url, authKey: 'S' }, { reconcile: false });
+      if (host.getText('peer-added.md') === '# added on the peer\n') pulled = true;
+      else await sleep(300);
+    }
+    expect(pulled).toBe(true);
   } finally {
     hub.kill();
   }
