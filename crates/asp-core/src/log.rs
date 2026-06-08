@@ -51,6 +51,10 @@ pub enum MergeClass {
     Text,
     Code,
     Binary,
+    /// A content-free **directory entity** — `result_hash` is always NULL and it
+    /// never merges. Materialized as a real directory (`mkdir`), so an empty
+    /// folder replicates without a marker file (§Capture: empty directories).
+    Dir,
 }
 
 impl MergeClass {
@@ -59,6 +63,7 @@ impl MergeClass {
             MergeClass::Text => "text",
             MergeClass::Code => "code",
             MergeClass::Binary => "binary",
+            MergeClass::Dir => "dir",
         }
     }
     pub fn parse(s: &str) -> Option<MergeClass> {
@@ -66,6 +71,7 @@ impl MergeClass {
             "text" => MergeClass::Text,
             "code" => MergeClass::Code,
             "binary" => MergeClass::Binary,
+            "dir" => MergeClass::Dir,
             _ => return None,
         })
     }

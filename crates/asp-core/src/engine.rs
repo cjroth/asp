@@ -10,7 +10,7 @@ use crate::error::{AspError, AspResult};
 use crate::fold::compute_files;
 use crate::gitexport;
 use crate::identity::Identity;
-use crate::log::{Kind, LogRow};
+use crate::log::{Kind, LogRow, MergeClass};
 use crate::order::NodeId;
 use crate::session::SessionVault;
 use crate::sqlite::SqliteStore;
@@ -257,14 +257,18 @@ impl Engine {
         let files = compute_files(&self.store, &rows)?;
         self.store.replace_files(&files)?;
 
-        // Desired on-disk set.
+        // Desired on-disk set: content files (path -> bytes) and directory
+        // entities (paths to `mkdir`).
         let mut desired: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut desired_dirs: Vec<String> = Vec::new();
         let mut hashes: BTreeMap<String, String> = BTreeMap::new();
         for f in &files {
             if f.deleted {
                 continue;
             }
-            if let Some(h) = &f.result_hash {
+            if f.merge_class == MergeClass::Dir {
+                desired_dirs.push(f.path.clone());
+            } else if let Some(h) = &f.result_hash {
                 let bytes = self.store.get_blob(h)?.unwrap_or_default();
                 desired.insert(f.path.clone(), bytes);
                 hashes.insert(f.path.clone(), h.clone());
@@ -291,12 +295,18 @@ impl Engine {
             }
         }
 
-        // Remove files that were live before but no longer are (delete/rename-away).
+        // Materialize empty directories (the content-free dir entities).
+        for path in &desired_dirs {
+            let _ = fs::create_dir_all(self.root.join(path));
+        }
+
+        // Remove files/dirs that were live before but no longer are.
+        let desired_dir_set: std::collections::HashSet<&String> = desired_dirs.iter().collect();
         for path in old_live {
-            if !desired.contains_key(&path) {
+            if !desired.contains_key(&path) && !desired_dir_set.contains(&path) {
                 let abs = self.root.join(&path);
-                let _ = fs::remove_file(&abs);
-                // prune now-empty parent dirs up to root
+                let _ = fs::remove_file(&abs); // no-op if it was a directory
+                self.prune_empty_dirs(Some(abs.as_path()));
                 self.prune_empty_dirs(abs.parent());
             }
         }
@@ -337,8 +347,11 @@ impl Engine {
     /// flush and by startup reconciliation.
     pub fn capture_rescan(&self) -> AspResult<Vec<WireRow>> {
         let on_disk = self.scan_disk()?;
-        let live: BTreeMap<String, FileRow> =
-            self.store.live_files()?.into_iter().map(|f| (f.path.clone(), f)).collect();
+        // Content files vs directory entities are tracked separately: directories
+        // are first-class, content-free entities (§Capture: empty directories).
+        let (live_files, live_dirs): (Vec<FileRow>, Vec<FileRow>) =
+            self.store.live_files()?.into_iter().partition(|f| f.merge_class != MergeClass::Dir);
+        let live: BTreeMap<String, FileRow> = live_files.into_iter().map(|f| (f.path.clone(), f)).collect();
 
         let mut disappeared: Vec<String> = Vec::new();
         let mut changed: Vec<String> = Vec::new();
@@ -399,7 +412,108 @@ impl Engine {
                 authored.push(wr);
             }
         }
+
+        // Directory entities: a physically-empty in-scope directory is a
+        // first-class, content-free entity so the folder replicates without a
+        // marker file (§Capture). Create one for each empty dir not yet tracked;
+        // delete a tracked dir entity once the folder is gone or holds a real file
+        // (no longer physically empty).
+        let empty_dirs = self.empty_in_scope_dirs();
+        let tracked: std::collections::HashSet<String> = live_dirs.iter().map(|f| f.path.clone()).collect();
+        for path in &empty_dirs {
+            if !tracked.contains(path) {
+                if let Some(wr) = self.record_dir_create(path)? {
+                    authored.push(wr);
+                }
+            }
+        }
+        let empty_set: std::collections::HashSet<&String> = empty_dirs.iter().collect();
+        for f in &live_dirs {
+            if !empty_set.contains(&f.path) {
+                if let Some(wr) = self.record_dir_delete(&f.file_id)? {
+                    authored.push(wr);
+                }
+            }
+        }
         Ok(authored)
+    }
+
+    /// Physically-empty in-scope directories under the root (leaf empties).
+    fn empty_in_scope_dirs(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        self.collect_empty_dirs(&self.root, &mut out);
+        out
+    }
+
+    fn collect_empty_dirs(&self, dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let rel = match path.strip_prefix(&self.root) {
+                Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                Err(_) => continue,
+            };
+            if self.scope.ignored(&rel) {
+                continue;
+            }
+            if fs::read_dir(&path).map(|mut it| it.next().is_none()).unwrap_or(false) {
+                out.push(rel);
+            } else {
+                self.collect_empty_dirs(&path, out);
+            }
+        }
+    }
+
+    /// Author a `dir` create for an empty directory (content-free, random id so a
+    /// recreated-after-delete folder is a fresh entity; same-path dirs dedupe in
+    /// the fold by path — directories are identity-by-path, unlike files).
+    fn record_dir_create(&self, rel: &str) -> AspResult<Option<WireRow>> {
+        let (lamport, seq) = self.next_counters()?;
+        let row = LogRow {
+            id: String::new(),
+            site_id: self.site_id(),
+            lamport,
+            seq,
+            ts: now_unix() as i64,
+            file_id: random_id(),
+            kind: Kind::Create,
+            merge_class: MergeClass::Dir,
+            parent: None,
+            base_hash: None,
+            result_hash: None,
+            path: Some(rel.to_string()),
+            sig: vec![],
+        }
+        .seal();
+        self.store.append_row(&row)?;
+        self.materialize()?;
+        Ok(Some(self.wire(row)?))
+    }
+
+    fn record_dir_delete(&self, file_id: &str) -> AspResult<Option<WireRow>> {
+        let (lamport, seq) = self.next_counters()?;
+        let row = LogRow {
+            id: String::new(),
+            site_id: self.site_id(),
+            lamport,
+            seq,
+            ts: now_unix() as i64,
+            file_id: file_id.to_string(),
+            kind: Kind::Delete,
+            merge_class: MergeClass::Dir,
+            parent: self.tip(file_id)?,
+            base_hash: None,
+            result_hash: None,
+            path: None,
+            sig: vec![],
+        }
+        .seal();
+        self.store.append_row(&row)?;
+        self.materialize()?;
+        Ok(Some(self.wire(row)?))
     }
 
     /// Walk the in-scope working tree into a `rel_path -> bytes` map.

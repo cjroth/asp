@@ -194,8 +194,10 @@ fn resolve_paths(states: HashMap<String, FileState>) -> Vec<FileRow> {
     let mut taken: HashSet<String> = HashSet::new();
     let mut out: Vec<FileRow> = Vec::new();
 
+    // Pass 1 — content files. They claim paths (with ` (n)` suffixing among
+    // themselves); a real file always wins a path over a directory entity.
     for (file_id, st) in all.iter() {
-        if !st.created {
+        if !st.created || st.merge_class == MergeClass::Dir {
             continue;
         }
         let base_path = st.path.clone().unwrap_or_default();
@@ -225,6 +227,33 @@ fn resolve_paths(states: HashMap<String, FileState>) -> Vec<FileRow> {
             conflict: st.conflict,
         });
     }
+
+    // Pass 2 — directory entities. Identity is by PATH (not file_id): same-path
+    // dir entities (concurrent creates / recreate-after-delete) dedupe to one
+    // live directory with no suffix; a dir whose path a real file took is dropped
+    // (the file implies the folder).
+    let mut dir_taken: HashSet<String> = HashSet::new();
+    for (file_id, st) in all.iter() {
+        if !st.created || st.merge_class != MergeClass::Dir || st.deleted {
+            continue;
+        }
+        let path = st.path.clone().unwrap_or_default();
+        if taken.contains(&path) || dir_taken.contains(&path) {
+            continue;
+        }
+        dir_taken.insert(path.clone());
+        out.push(FileRow {
+            file_id: (*file_id).clone(),
+            path,
+            result_hash: None,
+            merge_class: MergeClass::Dir,
+            deleted: false,
+            lamport: st.lamport,
+            site_id: st.site_id.clone(),
+            conflict: false,
+        });
+    }
+
     out.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.file_id.cmp(&b.file_id)));
     out
 }
@@ -321,6 +350,37 @@ mod tests {
         let f = files.iter().find(|f| f.file_id == "f1").unwrap();
         assert_eq!(f.merge_class, MergeClass::Code, "reclass switched the routing class");
         assert_eq!(f.result_hash.as_deref(), Some(h0.as_str()), "content carried across the boundary");
+    }
+
+    #[test]
+    fn concurrent_dir_entities_dedupe_by_path_no_suffix() {
+        let s = crate::store::MemBlobStore::new();
+        // Two nodes create the same empty dir (distinct random file_ids).
+        let mut a = mkrow("aa", 1, 0, "da", Kind::Create, None, None, None, Some("notes/empty"));
+        a.merge_class = MergeClass::Dir;
+        let a = a.seal();
+        let mut b = mkrow("bb", 1, 0, "db", Kind::Create, None, None, None, Some("notes/empty"));
+        b.merge_class = MergeClass::Dir;
+        let b = b.seal();
+        let files = compute_files(&s, &[a, b]).unwrap();
+        let dirs: Vec<_> = files.iter().filter(|f| !f.deleted && f.merge_class == MergeClass::Dir).collect();
+        assert_eq!(dirs.len(), 1, "same-path dir entities dedupe to one");
+        assert_eq!(dirs[0].path, "notes/empty");
+        assert!(!files.iter().any(|f| f.path == "notes/empty (1)"), "no (n) suffix for dirs");
+    }
+
+    #[test]
+    fn real_file_wins_path_over_dir_entity() {
+        let s = crate::store::MemBlobStore::new();
+        let hb = s.put_blob(b"i am a file\n").unwrap();
+        let file = mkrow("aa", 1, 0, "f1", Kind::Create, None, None, Some(&hb), Some("x"));
+        let mut dir = mkrow("bb", 1, 0, "d1", Kind::Create, None, None, None, Some("x"));
+        dir.merge_class = MergeClass::Dir;
+        let dir = dir.seal();
+        let files = compute_files(&s, &[file, dir]).unwrap();
+        let live: Vec<_> = files.iter().filter(|f| !f.deleted).collect();
+        assert_eq!(live.len(), 1, "the file claims path x; the dir entity is dropped");
+        assert_eq!(live[0].merge_class, MergeClass::Text);
     }
 
     #[test]
