@@ -42,9 +42,12 @@ declare module 'obsidian' {
     display(): void;
   }
   export class Setting {
+    /** The right-hand control container of the row (where added components go). */
+    controlEl: HTMLElement;
     constructor(containerEl: HTMLElement);
     setName(name: string): this;
     setDesc(desc: string): this;
+    setHeading(): this;
     addText(cb: (t: TextComponent) => void): this;
     addToggle(cb: (t: ToggleComponent) => void): this;
     addButton(cb: (b: ButtonComponent) => void): this;
@@ -52,7 +55,17 @@ declare module 'obsidian' {
   export interface TextComponent {
     setValue(v: string): this;
     setPlaceholder(v: string): this;
+    setDisabled(disabled: boolean): this;
     onChange(cb: (v: string) => void): this;
+  }
+  export class Modal {
+    app: App;
+    contentEl: HTMLElement;
+    constructor(app: App);
+    open(): void;
+    close(): void;
+    onOpen(): void;
+    onClose(): void;
   }
   export interface ToggleComponent {
     setValue(v: boolean): this;

@@ -9,7 +9,8 @@
 import { Notice, Plugin, PluginSettingTab, Setting, type EventRef } from 'obsidian';
 import { initAsp, normalizePeerUrl, Vault as SdkVault } from '../../../sdks/typescript/src/index.ts';
 import { Bridge } from './bridge.ts';
-import { type LogEntry, LogBuffer } from './log-buffer.ts';
+import { LogBuffer } from './log-buffer.ts';
+import { LogModal } from './log-modal.ts';
 import { ObsidianHost } from './obsidian-host.ts';
 import { PathFilter } from './path-filter.ts';
 import { type SyncState, SyncController } from './sync-controller.ts';
@@ -209,15 +210,7 @@ export default class AspPlugin extends Plugin {
   }
 }
 
-const CARD_STYLE: Partial<CSSStyleDeclaration> = {
-  border: '1px solid var(--background-modifier-border)',
-  borderRadius: '8px',
-  background: 'var(--background-secondary)',
-  padding: '10px 12px',
-  margin: '12px 0 0',
-};
-
-/** Map a sync state to the top banner's label + dot colour. */
+/** Map a sync state to a short status label + dot colour. */
 function statusInfo(s: SyncState): { label: string; color: string } {
   switch (s) {
     case 'connecting':
@@ -232,8 +225,7 @@ function statusInfo(s: SyncState): { label: string; color: string } {
 }
 
 class AspSettingTab extends PluginSettingTab {
-  // Subscriptions live only while the tab is open; torn down on hide/re-render.
-  private unsubLog?: () => void;
+  // Live status subscription, torn down on hide/re-render.
   private unsubState?: () => void;
 
   constructor(
@@ -244,9 +236,7 @@ class AspSettingTab extends PluginSettingTab {
   }
 
   hide(): void {
-    this.unsubLog?.();
     this.unsubState?.();
-    this.unsubLog = undefined;
     this.unsubState = undefined;
   }
 
@@ -256,10 +246,10 @@ class AspSettingTab extends PluginSettingTab {
     root.empty?.();
     while (root.firstChild) root.removeChild(root.firstChild);
 
-    // Live status at the very top: Not connected / Syncing… / In sync.
-    this.renderStatusBanner(root);
-
     const connected = this.plugin.settings.connectedOnce;
+
+    // Live status at the top — a native row whose control shows a dot + label.
+    this.renderStatusRow(root);
 
     // Peer URL — both stages. A bare host is fine; wss:// is assumed.
     new Setting(root).setName('Peer URL').addText((t) =>
@@ -300,66 +290,45 @@ class AspSettingTab extends PluginSettingTab {
           if (v) void this.plugin.syncNow();
         }),
       );
-      this.renderDeviceKeyCard(root);
+
+      // The device's public identity — a read-only field (scrolls within the
+      // input, so the long key can't overflow on mobile) + Copy.
+      new Setting(root)
+        .setName("This Device's Public Key")
+        .addText((t) => t.setValue(this.plugin.deviceKey()).setDisabled(true))
+        .addButton((b) =>
+          b.setButtonText('Copy').onClick(() => {
+            void navigator.clipboard?.writeText(this.plugin.deviceKey());
+            new Notice('asp: public key copied');
+          }),
+        );
     }
 
-    // Log — both stages, inside a card.
-    this.renderLogCard(root);
+    // Log — both stages. A button that opens the viewer modal (readable +
+    // copyable on mobile, where the dev console isn't reachable).
+    new Setting(root)
+      .setName('Log')
+      .addButton((b) =>
+        b.setButtonText('Open log').onClick(() => new LogModal(this.app, this.plugin.log).open()),
+      );
   }
 
-  /** A titled, bordered card; returns the body element to fill. */
-  private card(root: HTMLElement, title: string): HTMLElement {
-    const wrap = document.createElement('div');
-    Object.assign(wrap.style, CARD_STYLE);
-    const head = document.createElement('div');
-    head.textContent = title;
-    Object.assign(head.style, {
-      fontSize: '11px',
-      fontWeight: '600',
-      letterSpacing: '0.06em',
-      textTransform: 'uppercase',
-      color: 'var(--text-muted)',
-      marginBottom: '8px',
-    } as Partial<CSSStyleDeclaration>);
-    const body = document.createElement('div');
-    wrap.appendChild(head);
-    wrap.appendChild(body);
-    root.appendChild(wrap);
-    return body;
-  }
-
-  private addButton(parent: HTMLElement, text: string, onClick: () => void): void {
-    const btn = document.createElement('button');
-    btn.textContent = text;
-    btn.addEventListener('click', onClick);
-    parent.appendChild(btn);
-  }
-
-  /** Live connection status, pinned at the top of the tab. */
-  private renderStatusBanner(root: HTMLElement): void {
-    const banner = document.createElement('div');
-    Object.assign(banner.style, {
-      display: 'flex',
-      alignItems: 'center',
-      gap: '8px',
-      padding: '8px 12px',
-      margin: '4px 0',
-      border: '1px solid var(--background-modifier-border)',
-      borderRadius: '8px',
-      background: 'var(--background-secondary)',
-      fontWeight: '600',
-    } as Partial<CSSStyleDeclaration>);
+  /** A native "Status" row whose control shows a live dot + label. */
+  private renderStatusRow(root: HTMLElement): void {
+    const setting = new Setting(root).setName('Status');
     const dot = document.createElement('span');
     Object.assign(dot.style, {
       width: '10px',
       height: '10px',
       borderRadius: '50%',
+      display: 'inline-block',
+      verticalAlign: 'middle',
+      marginRight: '8px',
       flex: '0 0 auto',
     } as Partial<CSSStyleDeclaration>);
     const label = document.createElement('span');
-    banner.appendChild(dot);
-    banner.appendChild(label);
-    root.appendChild(banner);
+    setting.controlEl.appendChild(dot);
+    setting.controlEl.appendChild(label);
 
     // Fires immediately with the current state, then on every change.
     this.unsubState = this.plugin.onSyncState((s) => {
@@ -367,79 +336,5 @@ class AspSettingTab extends PluginSettingTab {
       dot.style.background = info.color;
       label.textContent = info.label;
     });
-  }
-
-  /** Device key in a card: a wrapping, selectable monospace box (so the long
-   * ssh-ed25519 string can't overflow on mobile) + a Copy button. */
-  private renderDeviceKeyCard(root: HTMLElement): void {
-    const body = this.card(root, 'Device key');
-    const box = document.createElement('div');
-    box.textContent = this.plugin.deviceKey() || '(generated on first load)';
-    Object.assign(box.style, {
-      fontFamily: 'var(--font-monospace, monospace)',
-      fontSize: '12px',
-      lineHeight: '1.4',
-      wordBreak: 'break-all',
-      overflowWrap: 'anywhere',
-      whiteSpace: 'pre-wrap',
-      userSelect: 'all',
-    } as Partial<CSSStyleDeclaration>);
-    body.appendChild(box);
-    const actions = document.createElement('div');
-    actions.style.marginTop = '8px';
-    body.appendChild(actions);
-    this.addButton(actions, 'Copy', () => {
-      void navigator.clipboard?.writeText(this.plugin.deviceKey());
-      new Notice('asp: device key copied');
-    });
-  }
-
-  /** Activity log in a card: Copy-all / Clear + a scrolling pre. The only
-   * window into the plugin on mobile (no dev console), visible before connect. */
-  private renderLogCard(root: HTMLElement): void {
-    const body = this.card(root, 'Log');
-    const actions = document.createElement('div');
-    Object.assign(actions.style, {
-      display: 'flex',
-      gap: '8px',
-      marginBottom: '8px',
-    } as Partial<CSSStyleDeclaration>);
-    body.appendChild(actions);
-
-    const pre = document.createElement('pre');
-    Object.assign(pre.style, {
-      maxHeight: '220px',
-      overflow: 'auto',
-      whiteSpace: 'pre-wrap',
-      wordBreak: 'break-word',
-      fontFamily: 'var(--font-monospace, monospace)',
-      fontSize: '11px',
-      lineHeight: '1.45',
-      padding: '8px',
-      margin: '0',
-      border: '1px solid var(--background-modifier-border)',
-      borderRadius: '6px',
-      background: 'var(--background-primary)',
-    } as Partial<CSSStyleDeclaration>);
-    body.appendChild(pre);
-
-    const fmt = (e: LogEntry) => `[${e.ts}] ${e.level === 'error' ? 'ERR ' : ''}${e.msg}`;
-    const render = () => {
-      const entries = this.plugin.log.snapshot();
-      pre.textContent = entries.length ? entries.map(fmt).join('\n') : '(no activity yet)';
-      pre.scrollTop = pre.scrollHeight;
-    };
-
-    this.addButton(actions, 'Copy all', () => {
-      void navigator.clipboard?.writeText(this.plugin.log.toText());
-      new Notice('asp: log copied');
-    });
-    this.addButton(actions, 'Clear', () => {
-      this.plugin.log.clear();
-      render();
-    });
-
-    render();
-    this.unsubLog = this.plugin.log.subscribe(() => render());
   }
 }
