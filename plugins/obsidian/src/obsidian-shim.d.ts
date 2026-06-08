@@ -10,6 +10,8 @@ declare module 'obsidian' {
     writeBinary(path: string, data: ArrayBuffer): Promise<void>;
     exists(path: string): Promise<boolean>;
     remove(path: string): Promise<void>;
+    mkdir(path: string): Promise<void>;
+    rmdir(path: string, recursive: boolean): Promise<void>;
     list(path: string): Promise<{ files: string[]; folders: string[] }>;
   }
   export interface Vault {

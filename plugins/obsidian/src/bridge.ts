@@ -6,6 +6,7 @@
 
 import type { Vault } from '../../../sdks/typescript/src/index.ts';
 import type { HostVault } from './host.ts';
+import type { Logger } from './log-buffer.ts';
 import { PathFilter } from './path-filter.ts';
 
 function eq(a: Uint8Array, b: Uint8Array): boolean {
@@ -15,6 +16,8 @@ function eq(a: Uint8Array, b: Uint8Array): boolean {
 }
 
 export class Bridge {
+  private log: Logger = () => {};
+
   constructor(
     private vault: Vault,
     private host: HostVault,
@@ -23,6 +26,10 @@ export class Bridge {
 
   setFilter(f: PathFilter) {
     this.filter = f;
+  }
+
+  setLogger(log: Logger) {
+    this.log = log;
   }
 
   /** A host file was created or modified — capture it into the engine. */
@@ -43,27 +50,47 @@ export class Bridge {
     this.vault.renameFile(from, to);
   }
 
-  /** Seed the engine from the host's current contents (startup reconcile). */
-  async reconcileFromHost(): Promise<void> {
+  /** Seed the engine from the host's current contents (startup reconcile).
+   * Returns the number of files captured. */
+  async reconcileFromHost(): Promise<number> {
+    let n = 0;
     for (const path of await this.host.list()) {
       if (this.filter.ignored(path)) continue;
       const bytes = await this.host.read(path);
-      if (bytes != null) this.vault.writeFile(path, bytes);
+      if (bytes != null) {
+        this.vault.writeFile(path, bytes);
+        n++;
+      }
     }
+    this.log(`reconcile: staged ${n} local file${n === 1 ? '' : 's'} into the engine`);
+    return n;
   }
 
-  /** Render the engine's materialized tree back to the host vault. */
-  async materializeToHost(): Promise<void> {
+  /** Render the engine's materialized tree back to the host vault. Returns the
+   * counts actually changed on disk. */
+  async materializeToHost(): Promise<{ written: number; removed: number }> {
     const files = this.vault.files();
     const want = new Set(Object.keys(files));
+    let written = 0;
+    let removed = 0;
     for (const [path, bytes] of Object.entries(files)) {
       const cur = await this.host.read(path);
-      if (cur == null || !eq(cur, bytes)) await this.host.write(path, bytes);
+      if (cur == null || !eq(cur, bytes)) {
+        await this.host.write(path, bytes);
+        written++;
+        this.log(`pull: wrote ${path}`);
+      }
     }
     // Remove host files the engine no longer has (deletes/renames-away).
     for (const path of await this.host.list()) {
       if (this.filter.ignored(path)) continue;
-      if (!want.has(path)) await this.host.remove(path);
+      if (!want.has(path)) {
+        await this.host.remove(path);
+        removed++;
+        this.log(`pull: removed ${path}`);
+      }
     }
+    this.log(`materialize: ${written} written, ${removed} removed (${want.size} in tree)`);
+    return { written, removed };
   }
 }

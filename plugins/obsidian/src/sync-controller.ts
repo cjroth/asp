@@ -5,6 +5,7 @@
 
 import type { Vault } from '../../../sdks/typescript/src/index.ts';
 import type { Bridge } from './bridge.ts';
+import type { Logger } from './log-buffer.ts';
 
 export type SyncState = 'idle' | 'connecting' | 'connected' | 'error';
 
@@ -17,11 +18,16 @@ export class SyncController {
   state: SyncState = 'idle';
   lastError?: string;
   private onState?: (s: SyncState) => void;
+  private log: Logger = () => {};
 
   constructor(
     private vault: Vault,
     private bridge: Bridge,
   ) {}
+
+  setLogger(log: Logger) {
+    this.log = log;
+  }
 
   subscribe(cb: (s: SyncState) => void) {
     this.onState = cb;
@@ -36,13 +42,18 @@ export class SyncController {
   /** One sync pass: reconcile local changes, connect, catch up, materialize. */
   async syncOnce(cfg: SyncConfig): Promise<void> {
     this.set('connecting');
+    this.log(`sync: connecting to ${cfg.peerUrl}${cfg.authKey ? ' (with auth key)' : ''}…`);
     try {
       await this.bridge.reconcileFromHost();
       await this.vault.sync(cfg.peerUrl, { authKey: cfg.authKey });
-      await this.bridge.materializeToHost();
+      this.log('sync: handshake + catch-up complete');
+      const { written, removed } = await this.bridge.materializeToHost();
       this.set('connected');
+      this.log(`sync: connected ✓ (${written} written, ${removed} removed)`);
     } catch (e) {
-      this.set('error', String(e));
+      const msg = String(e);
+      this.set('error', msg);
+      this.log(`sync failed: ${msg}`, 'error');
       throw e;
     }
   }

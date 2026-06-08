@@ -9,6 +9,7 @@
 import { Notice, Plugin, PluginSettingTab, Setting, type EventRef } from 'obsidian';
 import { initAsp, Vault as SdkVault } from '../../../sdks/typescript/src/index.ts';
 import { Bridge } from './bridge.ts';
+import { type LogEntry, LogBuffer } from './log-buffer.ts';
 import { ObsidianHost } from './obsidian-host.ts';
 import { PathFilter } from './path-filter.ts';
 import { SyncController } from './sync-controller.ts';
@@ -29,9 +30,18 @@ interface AspSettings {
   authKey: string;
   seedHex: string;
   enabled: boolean;
+  /** True once a first connect has succeeded — gates the sync controls so a
+   * fresh setup only shows connection fields + a Connect button. */
+  connectedOnce: boolean;
 }
 
-const DEFAULTS: AspSettings = { peerUrl: '', authKey: '', seedHex: '', enabled: false };
+const DEFAULTS: AspSettings = {
+  peerUrl: '',
+  authKey: '',
+  seedHex: '',
+  enabled: false,
+  connectedOnce: false,
+};
 
 function randomSeedHex(): string {
   const b = new Uint8Array(32);
@@ -46,6 +56,9 @@ function hexToBytes(h: string): Uint8Array {
 
 export default class AspPlugin extends Plugin {
   settings: AspSettings = { ...DEFAULTS };
+  /** In-app trace, visible in settings before a sync ever connects — the only
+   * way to read what the plugin is doing on mobile (no dev console there). */
+  readonly log = new LogBuffer();
   private sdk?: SdkVault;
   private bridge?: Bridge;
   private controller?: SyncController;
@@ -58,7 +71,15 @@ export default class AspPlugin extends Plugin {
       this.settings.seedHex = randomSeedHex();
       await this.saveData(this.settings);
     }
+    // Migration: a tester upgrading from a build without staged settings who
+    // already has a peer configured has clearly connected before — don't bounce
+    // them back to the stage-1 "Connect" screen.
+    if (!this.settings.connectedOnce && this.settings.peerUrl) {
+      this.settings.connectedOnce = true;
+      await this.saveData(this.settings);
+    }
 
+    this.log.append('plugin loading — initializing the wasm engine…');
     // Instantiate the wasm engine from the inlined bytes before any engine use
     // (the web target loads asynchronously). Idempotent.
     await initAsp(wasmBytes());
@@ -68,6 +89,11 @@ export default class AspPlugin extends Plugin {
     const host = new ObsidianHost(this.app.vault.adapter);
     this.bridge = new Bridge(this.sdk, host, new PathFilter(await this.readIgnore(host)));
     this.controller = new SyncController(this.sdk, this.bridge);
+
+    const logger = (msg: string, level?: 'info' | 'error') => this.log.append(msg, level);
+    this.bridge.setLogger(logger);
+    this.controller.setLogger(logger);
+    this.log.append(`engine ready — device key ${this.deviceKey()}`);
 
     this.statusEl = this.addStatusBarItem();
     this.controller.subscribe((s) => this.renderStatus(s));
@@ -96,11 +122,55 @@ export default class AspPlugin extends Plugin {
     this.addCommand({ id: 'asp-sync-now', name: 'Sync now', callback: () => void this.syncNow() });
     this.addSettingTab(new AspSettingTab(this.app, this));
 
-    if (this.settings.enabled && this.settings.peerUrl) void this.syncNow();
+    if (this.settings.enabled && this.settings.peerUrl) {
+      this.log.append('auto-sync on load (enabled + peer set)');
+      void this.syncNow();
+    }
   }
 
   onunload(): void {
     this.sdk?.free();
+  }
+
+  /** Run one sync pass with visible feedback. Never fails silently. Returns
+   * whether it converged. */
+  private async runSync(): Promise<boolean> {
+    if (!this.controller) return false;
+    if (!this.settings.peerUrl) {
+      new Notice('asp: set a Peer URL first');
+      this.log.append('sync: no Peer URL set — nothing to connect to', 'error');
+      return false;
+    }
+    try {
+      await this.controller.syncOnce({
+        peerUrl: this.settings.peerUrl,
+        authKey: this.settings.authKey || undefined,
+      });
+      new Notice('asp: synced');
+      return true;
+    } catch (e) {
+      // The controller already logged the underlying error.
+      new Notice(`asp sync failed: ${String(e)}`);
+      return false;
+    }
+  }
+
+  /** First-time connect (the stage-1 button). On success, unlock the sync
+   * controls so the next settings render shows them. */
+  async connect(): Promise<boolean> {
+    this.log.append('connect: attempting first sync…');
+    const ok = await this.runSync();
+    if (ok && !this.settings.connectedOnce) {
+      this.settings.connectedOnce = true;
+      this.settings.enabled = true;
+      await this.saveData(this.settings);
+      this.log.append('connect: enrolled ✓ — sync controls unlocked');
+    }
+    return ok;
+  }
+
+  async syncNow(): Promise<void> {
+    await this.runSync();
   }
 
   private async readIgnore(host: ObsidianHost): Promise<string> {
@@ -114,18 +184,6 @@ export default class AspPlugin extends Plugin {
     this.debounce = setTimeout(() => void this.syncNow(), 600);
   }
 
-  async syncNow(): Promise<void> {
-    if (!this.controller || !this.settings.peerUrl) return;
-    try {
-      await this.controller.syncOnce({
-        peerUrl: this.settings.peerUrl,
-        authKey: this.settings.authKey || undefined,
-      });
-    } catch (e) {
-      new Notice(`asp sync failed: ${String(e)}`);
-    }
-  }
-
   deviceKey(): string {
     return this.sdk?.nodeSsh() ?? '';
   }
@@ -136,6 +194,9 @@ export default class AspPlugin extends Plugin {
 }
 
 class AspSettingTab extends PluginSettingTab {
+  /** Live-log subscription, torn down on each re-render and when the tab hides. */
+  private unsub?: () => void;
+
   constructor(
     app: AspPlugin['app'],
     private plugin: AspPlugin,
@@ -143,11 +204,21 @@ class AspSettingTab extends PluginSettingTab {
     super(app, plugin);
   }
 
-  display(): void {
-    const { containerEl } = this;
-    containerEl.empty?.();
+  hide(): void {
+    this.unsub?.();
+    this.unsub = undefined;
+  }
 
-    new Setting(containerEl)
+  display(): void {
+    this.hide();
+    const root = this.containerEl;
+    root.empty?.();
+    while (root.firstChild) root.removeChild(root.firstChild);
+
+    const connected = this.plugin.settings.connectedOnce;
+
+    // ---- Connection details (both stages) -------------------------------
+    new Setting(root)
       .setName('Peer URL')
       .setDesc('A full node in listen mode, e.g. wss://hub:9000 (or ws:// behind a TLS proxy).')
       .addText((t) =>
@@ -160,7 +231,7 @@ class AspSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
+    new Setting(root)
       .setName('Auth key')
       .setDesc('The AUTH_KEY enrollment secret for first connect (optional once enrolled).')
       .addText((t) =>
@@ -170,9 +241,25 @@ class AspSettingTab extends PluginSettingTab {
         }),
       );
 
-    new Setting(containerEl)
-      .setName('Sync enabled')
-      .addToggle((t) =>
+    if (!connected) {
+      // ---- Stage 1: not yet connected — just connect. The sync controls
+      // (enable toggle, device key, sync now) appear only after a first
+      // successful connect, so a fresh setup isn't cluttered with options
+      // that don't apply yet.
+      new Setting(root)
+        .setName('Connect')
+        .setDesc('Connect to the peer and sync for the first time. Sync options unlock once connected.')
+        .addButton((b) =>
+          b.setButtonText('Connect').onClick(async () => {
+            b.setButtonText('Connecting…');
+            const ok = await this.plugin.connect();
+            b.setButtonText('Connect');
+            if (ok) this.display(); // reveal stage 2
+          }),
+        );
+    } else {
+      // ---- Stage 2: connected — full sync controls.
+      new Setting(root).setName('Sync enabled').addToggle((t) =>
         t.setValue(this.plugin.settings.enabled).onChange(async (v) => {
           this.plugin.settings.enabled = v;
           await this.plugin.saveData(this.plugin.settings);
@@ -180,15 +267,96 @@ class AspSettingTab extends PluginSettingTab {
         }),
       );
 
-    new Setting(containerEl)
+      new Setting(root)
+        .setName('Sync now')
+        .addButton((b) => b.setButtonText('Sync').onClick(() => void this.plugin.syncNow()));
+
+      this.renderDeviceKey(root);
+    }
+
+    // ---- Log (both stages) ----------------------------------------------
+    this.renderLog(root);
+  }
+
+  /** The device key rendered in a wrapping, selectable monospace box so the
+   * long ssh-ed25519 string can't overflow the card and shift the settings
+   * screen on mobile (it used to be a single unbroken `setDesc` line). */
+  private renderDeviceKey(root: HTMLElement): void {
+    new Setting(root)
       .setName('Device key')
-      .setDesc(this.plugin.deviceKey() || '(generated on first load)')
+      .setDesc('Authorize this device on the peer with this key.')
       .addButton((b) =>
-        b.setButtonText('Copy').onClick(() => void navigator.clipboard?.writeText(this.plugin.deviceKey())),
+        b.setButtonText('Copy').onClick(() => {
+          void navigator.clipboard?.writeText(this.plugin.deviceKey());
+          new Notice('asp: device key copied');
+        }),
       );
 
-    new Setting(containerEl).setName('Sync now').addButton((b) =>
-      b.setButtonText('Sync').onClick(() => void this.plugin.syncNow()),
-    );
+    const box = document.createElement('div');
+    box.textContent = this.plugin.deviceKey() || '(generated on first load)';
+    Object.assign(box.style, {
+      fontFamily: 'var(--font-monospace, monospace)',
+      fontSize: '12px',
+      lineHeight: '1.4',
+      wordBreak: 'break-all',
+      overflowWrap: 'anywhere',
+      whiteSpace: 'pre-wrap',
+      userSelect: 'all',
+      padding: '6px 8px',
+      margin: '0 0 12px',
+      border: '1px solid var(--background-modifier-border)',
+      borderRadius: '6px',
+      background: 'var(--background-secondary)',
+    } as Partial<CSSStyleDeclaration>);
+    root.appendChild(box);
+  }
+
+  /** Always-visible, copyable activity log — the only window into what the
+   * plugin is doing on mobile (no dev console there), and useful for debugging
+   * before a connection is ever made. */
+  private renderLog(root: HTMLElement): void {
+    const pre = document.createElement('pre');
+    Object.assign(pre.style, {
+      maxHeight: '220px',
+      overflow: 'auto',
+      whiteSpace: 'pre-wrap',
+      wordBreak: 'break-word',
+      fontFamily: 'var(--font-monospace, monospace)',
+      fontSize: '11px',
+      lineHeight: '1.45',
+      padding: '8px',
+      margin: '4px 0 0',
+      border: '1px solid var(--background-modifier-border)',
+      borderRadius: '6px',
+      background: 'var(--background-secondary)',
+    } as Partial<CSSStyleDeclaration>);
+
+    const fmt = (e: LogEntry) => `[${e.ts}] ${e.level === 'error' ? 'ERR ' : ''}${e.msg}`;
+    const render = () => {
+      const entries = this.plugin.log.snapshot();
+      pre.textContent = entries.length ? entries.map(fmt).join('\n') : '(no activity yet)';
+      pre.scrollTop = pre.scrollHeight;
+    };
+
+    new Setting(root)
+      .setName('Log')
+      .setDesc('Recent activity. Copy this when reporting an issue.')
+      .addButton((b) =>
+        b.setButtonText('Copy all').onClick(() => {
+          void navigator.clipboard?.writeText(this.plugin.log.toText());
+          new Notice('asp: log copied');
+        }),
+      )
+      .addButton((b) =>
+        b.setButtonText('Clear').onClick(() => {
+          this.plugin.log.clear();
+          render();
+        }),
+      );
+
+    root.appendChild(pre);
+    render();
+    // Stream new lines into the open viewer; torn down in hide()/next display().
+    this.unsub = this.plugin.log.subscribe(() => render());
   }
 }
