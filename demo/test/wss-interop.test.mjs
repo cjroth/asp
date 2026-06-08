@@ -72,21 +72,26 @@ try {
   const pulled = await waitFor(() => filesOf()['from-asp.md'] === 'hello from the real asp node\n');
   check('demo node pulled the native vault over ws://', pulled);
   check('demo node adopted the native vault id', snap().site && snap().rowCount > 0);
-
-  // wait for the one-shot sync to settle, then author + push back
   await waitFor(() => snap().syncing === false);
+  check('connection is LIVE (persistent watch, not one-shot)', snap().live === true);
+
+  // realtime SEND: author on the demo node → native receives with NO re-sync.
   api.createFile(id, '', 'from-browser.md');
   const f = Object.values(snap().files).find((x) => x.path === 'from-browser.md');
   api.stageEdit(id, f.file_id, 'hello from the wasm demo node\n');
   api.commitNow(id, f.file_id);
-  await sleep(40);
-  await api.connectPeer(id, url, 'S'); // push our new row to the hub
-
   const hubFile = join(dir, 'from-browser.md');
-  const got = await waitFor(() => existsSync(hubFile));
-  check('real asp node received the demo node edit (push-back)', got);
-  check('real asp node materialized the exact content',
-    got && readFileSync(hubFile, 'utf8') === 'hello from the wasm demo node\n');
+  const got = await waitFor(() => existsSync(hubFile) && readFileSync(hubFile, 'utf8') === 'hello from the wasm demo node\n');
+  check('realtime push: native node received the demo edit live (no re-sync)', got);
+
+  // realtime RECEIVE: change a file on the native side → demo node gets it live.
+  writeFileSync(join(dir, 'from-asp.md'), 'edited on the real asp node\n');
+  const recv = await waitFor(() => filesOf()['from-asp.md'] === 'edited on the real asp node\n', 12000);
+  check('realtime receive: demo node got the native edit live (no re-sync)', recv);
+
+  api.disconnectPeer(id);
+  await sleep(100);
+  check('disconnect stops the live link', snap().live === false);
 } finally {
   hub.kill();
 }

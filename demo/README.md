@@ -44,11 +44,13 @@ bun run serve               # http://localhost:5173
   entropy delivers exactly the missing rows.
 - **file ops** — edit, create, new folder, inline rename, delete (tombstone,
   remove-wins), move (drag → rename row).
-- **bridge to a real peer (ws://)** — a node can clone from / sync with an actual
-  `asp watch --listen` process (CLI / Obsidian / Desktop) over the genuine
-  Session: ed25519 handshake + version-vector catch-up. Use the **⇄** button on a
-  node, or pick *“real ws:// peer”* in the Add-node dialog. (For a public https
-  site, point at a `wss://` peer — browsers block `ws://` from `https://`.)
+- **bridge to a real peer (ws://) — live** — a node opens a **persistent** (watch)
+  connection to an actual `asp watch --listen` process (CLI / Obsidian / Desktop)
+  over the genuine Session: ed25519 handshake + version-vector catch-up, then the
+  socket stays open so edits flow **both ways in real time** (and on through the
+  in-page mesh). Use the **⇄** button on a node (Disconnect to stop), or pick
+  *“real ws:// peer”* in the Add-node dialog. (For a public https site, point at a
+  `wss://` peer — browsers block `ws://` from `https://`.)
 - **persistence (OPFS)** — the whole mesh (per-node seed, vault rows, topology,
   settings) is saved to the Origin Private File System and restored on reload;
   *Reset* clears it. Restore replays rows through the real fold, not a UI snapshot.

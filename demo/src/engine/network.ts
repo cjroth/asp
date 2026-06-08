@@ -94,7 +94,10 @@ interface Node {
   createdRemote: string | null;
   externalUrl?: string;  // a real `asp watch --listen` peer this node bridges to
   authKey?: string;
-  syncing?: boolean;     // a real ws:// sync is in flight
+  syncing?: boolean;     // initial handshake/catch-up in flight
+  liveWs?: WebSocket;    // a persistent (watch) connection to the external peer
+  live?: boolean;        // the live connection is open + authed
+  liveAuthed?: boolean;
 }
 
 export interface NetworkOpts {
@@ -213,6 +216,8 @@ export function createNetwork(opts: NetworkOpts) {
           const peer = findNode(pid2);
           if (peer) syncEdge(to, peer, 'row', from.id);
         }
+        // bridge: forward in-page-originated rows to a live external peer too.
+        pushLive(to, deltaJson);
       }
       emit();
     }, cfg.latencyMs);
@@ -223,6 +228,23 @@ export function createNetwork(opts: NetworkOpts) {
       const peer = findNode(pid);
       if (peer) syncEdge(node, peer, kind);
     }
+  }
+
+  // Optimistic real-time push of new rows over a node's live ws:// connection
+  // (the wire analogue of the native daemon pushing to connected peers).
+  function pushLive(node: Node, rowsJson: string) {
+    const ws = node.liveWs;
+    if (!ws || !node.liveAuthed || ws.readyState !== 1) return;
+    const rows = JSON.parse(rowsJson) as any[];
+    if (rows.length === 0) return;
+    try {
+      ws.send(node.eng.push_frame(rowsJson) as any);
+      logLine(node, [
+        { t: 'DEBUG', c: 'lvl' }, { t: ' push      ', c: 'tag' },
+        { t: `→ ${hostOf(node.externalUrl || '')} `, c: 'dim' },
+        { t: `${rows.length} row${rows.length > 1 ? 's' : ''}`, c: 'k push' }, { t: ' live', c: 'dim' },
+      ]);
+    } catch { /* socket closing */ }
   }
 
   // ====================================================================
@@ -304,101 +326,120 @@ export function createNetwork(opts: NetworkOpts) {
   };
 
   // ---- bridge a node to a REAL peer over ws:// (the genuine Session) --------
-  // A one-shot real sync: open a WebSocket to an `asp watch --listen` node, run
-  // the ed25519 handshake + bidirectional version-vector catch-up via the
-  // engine's own connect_start()/feed(), converge, close. Imported rows are
-  // folded into this node's engine by the Session; we then gossip them through
-  // the in-page mesh so the whole demo converges with the external peer.
+  // A PERSISTENT (watch) connection to an `asp watch --listen` node: the ed25519
+  // handshake + version-vector catch-up via the engine's connect_start()/feed(),
+  // then the socket STAYS OPEN. Incoming Push/Rows frames are fed → integrated →
+  // gossiped through the in-page mesh (real-time receive); locally-authored rows
+  // are sent as Rows frames (real-time send, see pushLive). The promise resolves
+  // once the INITIAL catch-up converges (so addNode can open a file).
   api.connectPeer = (nodeId: string, url: string, authKey?: string): Promise<boolean> => {
     const node = findNode(nodeId);
     if (!node) return Promise.resolve(false);
-    if (node.syncing) { O.onToast('a sync is already in flight', 'warn'); return Promise.resolve(false); }
+    if (node.liveWs) { try { node.liveWs.close(); } catch {} node.liveWs = undefined; node.live = false; node.liveAuthed = false; }
     node.externalUrl = url;
     node.authKey = authKey || undefined;
     node.syncing = true;
 
-    const idleMs = 900;
     const timeoutMs = 15000;
     const fullUrl = authKey ? `${url}${url.includes('?') ? '&' : '?'}auth_key=${encodeURIComponent(authKey)}` : url;
     const beforeVv = vvOf(node);
 
     logLine(node, [
-      { t: 'INFO', c: 'lvl' }, { t: ' connect   ', c: 'tag' },
-      { t: `dial ${hostOf(url)}`, c: 'hl' }, { t: ' ws:// real peer · handshake…', c: 'dim' },
+      { t: 'INFO', c: 'lvl' }, { t: ' watch     ', c: 'tag' },
+      { t: `dial ${hostOf(url)}`, c: 'hl' }, { t: ' ws:// real peer · live · handshake…', c: 'dim' },
     ]);
     emit();
 
     return new Promise<boolean>((resolve) => {
+      const logErr = (msg: string) => {
+        logLine(node!, [{ t: 'WARN', c: 'lvl warn' }, { t: ' watch     ', c: 'tag' }, { t: hostOf(url), c: 'hl' }, { t: ` · ${msg}`, c: 'dim' }]);
+        O.onToast(`${node!.name}: ${msg}`, 'warn');
+      };
       let ws: WebSocket;
-      try {
-        ws = new WebSocket(fullUrl);
-      } catch (e) {
-        return finish(false, `dial failed: ${String(e)}`);
-      }
+      try { ws = new WebSocket(fullUrl); } catch (e) { node!.syncing = false; logErr(`dial failed: ${String(e)}`); emit(); return resolve(false); }
       ws.binaryType = 'arraybuffer';
-      let idle: ReturnType<typeof setTimeout>;
+      node.liveWs = ws;
       let authedLogged = false;
-      let finished = false;
-      const hardStop = setTimeout(() => finish(false, 'sync timed out'), timeoutMs);
-      const resetIdle = () => { clearTimeout(idle); idle = setTimeout(() => finish(true), idleMs); };
+      let settled = false;
+      let convergeIdle: ReturnType<typeof setTimeout>;
+      const hardStop = setTimeout(() => settle(false, 'handshake timed out'), timeoutMs);
 
-      function finish(ok: boolean, err?: string): void {
-        if (finished) return;
-        finished = true;
-        clearTimeout(idle); clearTimeout(hardStop);
-        try { ws.close(); } catch {}
+      // Resolve once the INITIAL catch-up goes idle — but keep the socket OPEN.
+      function settleConverged() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(hardStop);
         node!.syncing = false;
-        if (err) {
-          logLine(node!, [
-            { t: 'WARN', c: 'lvl warn' }, { t: ' connect   ', c: 'tag' },
-            { t: hostOf(url), c: 'hl' }, { t: ` · ${err}`, c: 'dim' },
-          ]);
-          O.onToast(`${node!.name}: ${err}`, 'warn');
-        } else {
-          const imported = (JSON.parse(node!.eng.rows_after(JSON.stringify(beforeVv))) as any[]).length;
-          gossip(node!, 'catchup'); // share the imported rows with in-page peers
-          logLine(node!, [
-            { t: 'INFO', c: 'lvl' }, { t: ' synced    ', c: 'tag' },
-            { t: hostOf(url), c: 'k catchup' }, { t: ` · converged (+${imported} rows)`, c: 'dim' },
-          ]);
-        }
+        const imported = (JSON.parse(node!.eng.rows_after(JSON.stringify(beforeVv))) as any[]).length;
+        gossip(node!, 'catchup');
+        logLine(node!, [
+          { t: 'INFO', c: 'lvl' }, { t: ' live      ', c: 'tag' },
+          { t: hostOf(url), c: 'k catchup' }, { t: ` · converged (+${imported} rows) · watching`, c: 'dim' },
+        ]);
         emit();
-        resolve(ok && !err);
+        resolve(true);
       }
+      function settle(ok: boolean, err?: string) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(hardStop); clearTimeout(convergeIdle);
+        node!.syncing = false;
+        try { ws.close(); } catch {}
+        if (err) logErr(err);
+        emit();
+        resolve(ok);
+      }
+      const bumpConverge = () => { if (settled) return; clearTimeout(convergeIdle); convergeIdle = setTimeout(settleConverged, 900); };
 
       ws.onopen = () => {
-        try { ws.send(node!.eng.connect_start() as any); } catch (e) { return finish(false, `handshake: ${String(e)}`); }
-        resetIdle();
+        try { ws.send(node!.eng.connect_start() as any); } catch (e) { return settle(false, `handshake: ${String(e)}`); }
+        bumpConverge();
       };
       ws.onmessage = (ev: MessageEvent) => {
         const frame = new Uint8Array(ev.data as ArrayBuffer);
         let r: any;
-        try { r = JSON.parse(node!.eng.feed(frame)); } catch (e) { return finish(false, `feed: ${String(e)}`); }
-        for (const out of r.out) ws.send(Uint8Array.from(out) as any);
+        try { r = JSON.parse(node!.eng.feed(frame)); } catch (e) { logErr(`feed: ${String(e)}`); try { ws.close(); } catch {} return; }
+        for (const out of r.out) { try { ws.send(Uint8Array.from(out) as any); } catch {} }
         if (r.authed && !authedLogged) {
           authedLogged = true;
-          logLine(node!, [
-            { t: 'INFO', c: 'lvl' }, { t: ' handshake ', c: 'tag' },
-            { t: 'ed25519 mutual-auth ok', c: 'k handshake' }, { t: ' · admitted', c: 'dim' },
-          ]);
+          node!.live = true; node!.liveAuthed = true;
+          logLine(node!, [{ t: 'INFO', c: 'lvl' }, { t: ' handshake ', c: 'tag' }, { t: 'ed25519 mutual-auth ok', c: 'k handshake' }, { t: ' · admitted', c: 'dim' }]);
           emit();
         }
         if (r.integrated) {
-          logLine(node!, [
-            { t: 'INFO', c: 'lvl' }, { t: ' catch-up  ', c: 'tag' },
-            { t: `← ${hostOf(url)} `, c: 'dim' }, { t: `+${r.integrated} rows`, c: 'k catchup' }, { t: ' folded', c: 'dim' },
-          ]);
+          logLine(node!, [{ t: 'INFO', c: 'lvl' }, { t: ' catch-up  ', c: 'tag' }, { t: `← ${hostOf(url)} `, c: 'dim' }, { t: `+${r.integrated} rows`, c: 'k catchup' }, { t: ' folded', c: 'dim' }]);
+          gossip(node!, 'catchup'); // propagate the external change through the in-page mesh
           emit();
         }
         if (r.closed) {
           const denied = String(r.closed).toLowerCase().includes('deni');
-          return finish(!denied, denied ? `denied: ${r.closed}` : undefined);
+          if (!settled) return settle(!denied, denied ? `denied: ${r.closed}` : undefined);
+          try { ws.close(); } catch {}
+          return;
         }
-        resetIdle();
+        bumpConverge();
       };
-      ws.onerror = () => finish(false, 'ws error (peer not listening, or mixed-content/cert)');
-      ws.onclose = () => finish(true);
+      ws.onerror = () => { if (!settled) settle(false, 'ws error (peer not listening, or mixed-content/cert)'); };
+      ws.onclose = () => {
+        if (node!.liveWs === ws) { node!.liveWs = undefined; node!.live = false; node!.liveAuthed = false; }
+        if (settled) {
+          logLine(node!, [{ t: 'WARN', c: 'lvl warn' }, { t: ' watch     ', c: 'tag' }, { t: hostOf(url), c: 'hl' }, { t: ' · link closed', c: 'dim' }]);
+          emit();
+        } else {
+          settle(false, 'closed before converge');
+        }
+      };
     });
+  };
+
+  api.disconnectPeer = (nodeId: string) => {
+    const node = findNode(nodeId);
+    if (!node || !node.liveWs) return;
+    const ws = node.liveWs;
+    node.liveWs = undefined; node.live = false; node.liveAuthed = false;
+    try { ws.close(); } catch {}
+    logLine(node, [{ t: 'INFO', c: 'lvl' }, { t: ' disconnect', c: 'tag' }, { t: hostOf(node.externalUrl || ''), c: 'hl' }, { t: ' · stopped watching', c: 'dim' }]);
+    emit();
   };
 
   // ---- OPFS persistence: full-state serialize / restore --------------------
@@ -469,6 +510,7 @@ export function createNetwork(opts: NetworkOpts) {
   api.removeNode = (id: string) => {
     const i = nodes.findIndex((n) => n.id === id);
     if (i < 0) return;
+    if (nodes[i].liveWs) { try { nodes[i].liveWs!.close(); } catch {} }
     for (let j = edges.length - 1; j >= 0; j--) if (edges[j].a === id || edges[j].b === id) edges.splice(j, 1);
     try { nodes[i].eng.free(); } catch {}
     nodes.splice(i, 1);
@@ -485,6 +527,7 @@ export function createNetwork(opts: NetworkOpts) {
     if (!node || node.online === online) return;
     node.online = online;
     if (!online) {
+      if (node.liveWs) { const w = node.liveWs; node.liveWs = undefined; node.live = false; node.liveAuthed = false; try { w.close(); } catch {} }
       logLine(node, [
         { t: 'WARN', c: 'lvl warn' }, { t: ' offline   ', c: 'tag' },
         { t: 'link down', c: 'hl' }, { t: ' · edits queue locally (offline-first)', c: 'dim' },
@@ -536,7 +579,8 @@ export function createNetwork(opts: NetworkOpts) {
     if (content === view.content) return; // net-zero
     const before = vvOf(node);
     node.eng.record_write(view.path, enc.encode(content));
-    const authored = authoredSince(node, before);
+    const authoredJson = node.eng.rows_after(JSON.stringify(before));
+    const authored = JSON.parse(authoredJson) as any[];
     const r = authored[authored.length - 1]?.row;
     logLine(node, [
       { t: 'INFO', c: 'lvl' }, { t: ' commit    ', c: 'tag' },
@@ -544,6 +588,7 @@ export function createNetwork(opts: NetworkOpts) {
       r ? { t: ` file_id=${fileId.slice(0, 8)} lamport=${r.lamport} seq=${r.seq} ${(r.base_hash || '∅').slice(0, 4)}→${(r.result_hash || '').slice(0, 4)}`, c: 'dim' } : { t: '', c: 'dim' },
     ]);
     gossip(node, 'row');
+    pushLive(node, authoredJson);
     emit();
   }
 
@@ -563,7 +608,8 @@ export function createNetwork(opts: NetworkOpts) {
     }
     const before = vvOf(node);
     node.eng.record_write(path, enc.encode(''));
-    const authored = authoredSince(node, before);
+    const authoredJson = node.eng.rows_after(JSON.stringify(before));
+    const authored = JSON.parse(authoredJson) as any[];
     const r = authored[authored.length - 1]?.row;
     const fid = r ? r.file_id : null;
     if (fid) node.openFileId = fid;
@@ -573,6 +619,7 @@ export function createNetwork(opts: NetworkOpts) {
       { t: ` file_id=${(fid || '').slice(0, 8)} class=${r ? r.merge_class : ''} lamport=${r ? r.lamport : ''}`, c: 'dim' },
     ]);
     gossip(node, 'row');
+    pushLive(node, authoredJson);
     emit();
   };
 
@@ -597,13 +644,15 @@ export function createNetwork(opts: NetworkOpts) {
     if (!np || np === view.path) return;
     const before = vvOf(node);
     node.eng.record_rename(view.path, np);
-    const r = authoredSince(node, before)[0]?.row;
+    const authoredJson = node.eng.rows_after(JSON.stringify(before));
+    const r = (JSON.parse(authoredJson) as any[])[0]?.row;
     logLine(node, [
       { t: 'INFO', c: 'lvl' }, { t: ' commit    ', c: 'tag' },
       { t: 'rename', c: 'k rename' }, { t: ` ${view.path} → ${np}`, c: 'hl' },
       { t: ` file_id=${fileId.slice(0, 8)} (stable) lamport=${r ? r.lamport : ''}`, c: 'dim' },
     ]);
     gossip(node, 'row');
+    pushLive(node, authoredJson);
     emit();
   };
 
@@ -623,7 +672,8 @@ export function createNetwork(opts: NetworkOpts) {
     if (!view || view.deleted) return;
     const before = vvOf(node);
     node.eng.record_remove(view.path);
-    const r = authoredSince(node, before)[0]?.row;
+    const authoredJson = node.eng.rows_after(JSON.stringify(before));
+    const r = (JSON.parse(authoredJson) as any[])[0]?.row;
     const wasOpen = node.openFileId === fileId;
     if (wasOpen) {
       const live = Object.values(filesView(node)).find((x) => !x.deleted);
@@ -635,6 +685,7 @@ export function createNetwork(opts: NetworkOpts) {
       { t: ` tombstone · remove-wins lamport=${r ? r.lamport : ''}`, c: 'dim' },
     ]);
     gossip(node, 'row');
+    pushLive(node, authoredJson);
     emit();
   };
 
@@ -657,8 +708,12 @@ export function createNetwork(opts: NetworkOpts) {
       const queued = queuedFor(node);
       return { kind: 'offline', label: 'Offline', note: queued ? `${queued} queued` : 'isolated' };
     }
+    if (node.live) {
+      if (inflightByNode[node.id]) return { kind: 'syncing', label: 'Syncing', note: 'frames in flight' };
+      return { kind: 'insync', label: 'Live', note: hostOf(node.externalUrl || '') };
+    }
     if (peersOf(node.id).length === 0) {
-      if (node.externalUrl) return { kind: 'insync', label: 'Linked', note: hostOf(node.externalUrl) };
+      if (node.externalUrl) return { kind: 'solo', label: 'Linked', note: `${hostOf(node.externalUrl)} (idle)` };
       return { kind: 'solo', label: 'Solo', note: 'no peers' };
     }
     if (inflightByNode[node.id]) return { kind: 'syncing', label: 'Syncing', note: 'frames in flight' };
@@ -695,6 +750,7 @@ export function createNetwork(opts: NetworkOpts) {
       createdRemote: n.createdRemote,
       externalUrl: n.externalUrl,
       syncing: !!n.syncing,
+      live: !!n.live,
       peers: peersOf(n.id).map((pid) => findNode(pid)?.name).filter(Boolean),
       rowCount: n.eng.row_count(),
       sshKey: n.eng.node_ssh(),

@@ -380,17 +380,18 @@ export function AddNodeDialog({ snap, onCancel, onAdd }: any) {
 }
 
 /* ==================================================================== */
-export function ConnectPeerDialog({ snap, onCancel, onConnect }: any) {
+export function ConnectPeerDialog({ snap, onCancel, onConnect, onDisconnect }: any) {
   const [url, setUrl] = useState(snap.externalUrl || 'ws://127.0.0.1:9000');
   const [authKey, setAuthKey] = useState('');
   return (
     <div className="overlay" onMouseDown={(e) => { if ((e.target as HTMLElement).classList.contains('overlay')) onCancel(); }}>
       <div className="dialog">
         <div className="dialog-head">
-          <span className="eyebrow">asp sync &lt;url&gt;</span>
-          <h3>Bridge “{snap.name}” to a real peer</h3>
-          <p>Run a one-shot real sync against an <code>asp watch --listen</code> node (CLI / Obsidian / Desktop):
-            ed25519 handshake, version-vector catch-up, converge. Imported rows propagate through the in-page mesh too.</p>
+          <span className="eyebrow">asp watch --peer &lt;url&gt;</span>
+          <h3>{snap.live ? `“${snap.name}” is live` : `Bridge “${snap.name}” to a real peer`}</h3>
+          <p>Open a <b>live</b> connection to an <code>asp watch --listen</code> node (CLI / Obsidian / Desktop):
+            ed25519 handshake + version-vector catch-up, then the socket stays open — edits propagate
+            <b> both ways in real time</b>, and through the in-page mesh too.</p>
         </div>
         <div className="dialog-body">
           <div className="field">
@@ -403,9 +404,10 @@ export function ConnectPeerDialog({ snap, onCancel, onConnect }: any) {
           </div>
         </div>
         <div className="dialog-foot">
+          {snap.live && <button className="btn ghost" onClick={() => { onDisconnect(snap.id); onCancel(); }}>Disconnect</button>}
           <button className="btn ghost" onClick={onCancel}>Cancel</button>
           <button className="btn primary" onClick={() => onConnect(url.trim(), authKey.trim() || undefined)} disabled={!url.trim()}>
-            <span className="glyph">⇄</span>Sync now
+            <span className="glyph">⇄</span>{snap.live ? 'Reconnect' : 'Watch peer'}
           </button>
         </div>
       </div>

@@ -194,6 +194,14 @@ impl WasmEngine {
         Ok(n)
     }
 
+    /// Wrap locally-authored wire rows in a `Rows` data frame to send over a live
+    /// (already-handshaked) connection — optimistic real-time push, the wire
+    /// analogue of the native daemon pushing new rows to connected peers.
+    pub fn push_frame(&self, wire_rows_json: &str) -> Result<Vec<u8>, JsError> {
+        let rows: Vec<WireRow> = serde_json::from_str(wire_rows_json).map_err(to_err)?;
+        Msg::Rows { rows }.to_bytes().map_err(to_err)
+    }
+
     /// Per-file fold metadata for rich rendering: a JSON array of
     /// `{file_id, path, result_hash, merge_class, deleted, conflict}`.
     pub fn files_detail_json(&self) -> Result<String, JsError> {

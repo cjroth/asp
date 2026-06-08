@@ -180,7 +180,7 @@ export function App() {
       {dialog && <AddNodeDialog snap={snap} onCancel={() => setDialog(false)} onAdd={addNode} />}
       {connectFor && (() => {
         const n = nodes.find((x: any) => x.id === connectFor);
-        return n ? <ConnectPeerDialog snap={n} onCancel={() => setConnectFor(null)} onConnect={doConnect} /> : null;
+        return n ? <ConnectPeerDialog snap={n} onCancel={() => setConnectFor(null)} onConnect={doConnect} onDisconnect={(id: string) => api.disconnectPeer(id)} /> : null;
       })()}
       {toast && <div className="toast-wrap"><div className="toast"><span className="accent">⚠ </span>{toast.msg}</div></div>}
 
