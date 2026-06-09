@@ -39,6 +39,13 @@ export class SyncController {
     this.onState?.(s);
   }
 
+  /** Return to the pristine 'idle' state — used when the user resets the sync
+   * config (the remote is forgotten, so any prior connected/error state is
+   * stale). Notifies subscribers so the status row repaints. */
+  reset() {
+    this.set('idle');
+  }
+
   /**
    * One sync pass: (optionally) re-capture the host tree, connect, catch up,
    * and materialize ONLY when the peer actually sent something.
@@ -68,7 +75,15 @@ export class SyncController {
       }
       this.set('connected');
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      let msg = e instanceof Error ? e.message : String(e);
+      // A browser/Electron WebSocket can't read the HTTP status of a failed
+      // upgrade — a hub 401 (wrong auth key) surfaces only as a generic
+      // pre-handshake connect error. If we presented an auth key, that's the
+      // likely cause: the key didn't match. (An already-authorized device
+      // needs no auth key at all.)
+      if (cfg.authKey && /ws connect failed|before handshake|connection error/i.test(msg)) {
+        msg += ' — the hub rejected the upgrade. The auth key looks wrong; if this device is already authorized you can leave it blank.';
+      }
       this.set('error', msg);
       this.log(`sync failed: ${msg}`, 'error');
       throw e;

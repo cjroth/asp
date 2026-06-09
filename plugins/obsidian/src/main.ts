@@ -17,6 +17,7 @@ import {
 import { Bridge } from './bridge.ts';
 import { LogBuffer } from './log-buffer.ts';
 import { LogModal } from './log-modal.ts';
+import { ConfirmModal } from './confirm-modal.ts';
 import { ObsidianHost } from './obsidian-host.ts';
 import { PathFilter } from './path-filter.ts';
 import { type SyncState, SyncController } from './sync-controller.ts';
@@ -36,7 +37,6 @@ function wasmBytes(): Uint8Array {
 
 interface AspSettings {
   peerUrl: string;
-  authKey: string;
   seedHex: string;
   enabled: boolean;
   /** True once a first connect has succeeded — gates the sync controls so a
@@ -46,7 +46,6 @@ interface AspSettings {
 
 const DEFAULTS: AspSettings = {
   peerUrl: '',
-  authKey: '',
   seedHex: '',
   enabled: false,
   connectedOnce: false,
@@ -88,9 +87,22 @@ export default class AspPlugin extends Plugin {
   /** Guards against overlapping syncs (a poll firing mid-sync would open a
    * second connection feeding the same engine). */
   private syncing = false;
+  /** One-time enrollment secret for the next connect attempt. In memory only —
+   * never persisted (a stored auth key would silently 401 the upgrade once the
+   * hub rotates it or once the device is already enrolled). Discarded on use. */
+  pendingAuthKey = '';
 
   async onload(): Promise<void> {
-    this.settings = Object.assign({ ...DEFAULTS }, (await this.loadData()) as AspSettings);
+    const loaded = ((await this.loadData()) as Partial<AspSettings> & { authKey?: string }) ?? {};
+    // Purge any auth key persisted by an older build — it's enrollment-only and
+    // must not linger (a stale value silently 401s the upgrade on reconnect).
+    const hadStoredAuthKey = typeof loaded.authKey === 'string' && loaded.authKey !== '';
+    delete loaded.authKey;
+    this.settings = Object.assign({ ...DEFAULTS }, loaded);
+    if (hadStoredAuthKey) {
+      await this.saveData(this.settings); // rewrite without the dropped key
+      this.log.append('migrated: dropped stored auth key (now enrollment-only, in memory)');
+    }
     if (!this.settings.seedHex) {
       this.settings.seedHex = randomSeedHex();
       await this.saveData(this.settings);
@@ -224,7 +236,7 @@ export default class AspPlugin extends Plugin {
     this.syncing = true;
     try {
       await this.controller.syncOnce(
-        { peerUrl, authKey: this.settings.authKey || undefined },
+        { peerUrl, authKey: this.pendingAuthKey || undefined },
         { reconcile: opts.reconcile, background: opts.background },
       );
       if (!opts.quiet) new Notice('asp: synced');
@@ -243,17 +255,36 @@ export default class AspPlugin extends Plugin {
   async connect(): Promise<boolean> {
     this.log.append('connect: attempting first sync…');
     const ok = await this.runSync({ reconcile: true });
-    if (ok && !this.settings.connectedOnce) {
-      this.settings.connectedOnce = true;
-      this.settings.enabled = true;
-      await this.saveData(this.settings);
-      this.log.append('connect: enrolled ✓ — sync controls unlocked');
+    if (ok) {
+      // Enrollment done — burn the one-time auth key so it never lingers.
+      this.pendingAuthKey = '';
+      if (!this.settings.connectedOnce) {
+        this.settings.connectedOnce = true;
+        this.settings.enabled = true;
+        await this.saveData(this.settings);
+        this.log.append('connect: enrolled ✓ — sync controls unlocked');
+      }
     }
     return ok;
   }
 
   async syncNow(): Promise<void> {
     await this.runSync({ reconcile: true });
+  }
+
+  /** Forget the remote so the user can set sync up from scratch (re-enter a URL
+   * and, if needed, an enrollment key). Clears the peer/connection config only —
+   * the vault history, the engine, and this device's identity (seedHex) are all
+   * left intact. Drops back to the stage-1 connection flow. */
+  async resetSyncConfig(): Promise<void> {
+    clearTimeout(this.debounce);
+    this.pendingAuthKey = '';
+    this.settings.peerUrl = '';
+    this.settings.connectedOnce = false;
+    this.settings.enabled = false;
+    await this.saveData(this.settings);
+    this.controller?.reset(); // drop stale connected/error state → idle
+    this.log.append('sync config reset — remote forgotten (vault history kept)');
   }
 
   private async readIgnore(host: ObsidianHost): Promise<string> {
@@ -346,14 +377,20 @@ class AspSettingTab extends PluginSettingTab {
     );
 
     if (!connected) {
-      // ---- Stage 1: connecting. The auth key is an enrollment secret — it
-      // only matters here, so it's hidden once connected.
-      new Setting(root).setName('Auth key').addText((t) =>
-        t.setValue(this.plugin.settings.authKey).onChange(async (v) => {
-          this.plugin.settings.authKey = v.trim();
-          await this.plugin.saveData(this.plugin.settings);
-        }),
-      );
+      // ---- Stage 1: connecting. The auth key is a one-time ENROLLMENT secret:
+      // it admits a device the hub doesn't trust yet, after which the device's
+      // own key is authorized and the auth key is never needed again. So it is
+      // NEVER persisted — it lives only in memory for this connect attempt and
+      // is discarded once used (a stale stored key would silently 401 the
+      // upgrade before the device key is ever checked). See `pendingAuthKey`.
+      new Setting(root)
+        .setName('Auth key')
+        .setDesc('One-time enrollment secret. Only needed if this device is not yet authorized on the hub. Not saved.')
+        .addText((t) =>
+          t.setValue(this.plugin.pendingAuthKey).onChange((v) => {
+            this.plugin.pendingAuthKey = v.trim();
+          }),
+        );
       new Setting(root).setName('Connect').addButton((b) =>
         b.setButtonText('Connect').onClick(async () => {
           b.setButtonText('Connecting…');
@@ -399,6 +436,29 @@ class AspSettingTab extends PluginSettingTab {
             void navigator.clipboard?.writeText(this.plugin.deviceKey());
             new Notice('asp: public key copied');
           }),
+        );
+
+      // Reset — forget the remote and return to the connection flow. Vault
+      // history and this device's identity are kept; only the peer config goes.
+      new Setting(root)
+        .setName('Reset sync config')
+        .setDesc('Forget the hub URL and start over. Your notes and history are kept — this only clears the connection so you can re-enter a URL.')
+        .addButton((b) =>
+          b
+            .setButtonText('Reset')
+            .setWarning()
+            .onClick(() => {
+              new ConfirmModal(this.app, {
+                title: 'Reset sync config?',
+                body: 'This forgets the hub URL so you can set sync up from scratch. Your vault history and this device’s identity are kept.',
+                confirmText: 'Reset',
+                onConfirm: async () => {
+                  await this.plugin.resetSyncConfig();
+                  new Notice('asp: sync config reset');
+                  this.display(); // back to stage 1
+                },
+              }).open();
+            }),
         );
     }
 
