@@ -403,7 +403,7 @@ class AspSettingTab extends PluginSettingTab {
       // ---- Stage 2: connected. No auth key, no manual "Sync now" button —
       // sync runs automatically on edit, and the command palette still offers
       // "Sync now".
-      new Setting(root).setName('Sync enabled').addToggle((t) =>
+      new Setting(root).setName('Sync Enabled').addToggle((t) =>
         t.setValue(this.plugin.settings.enabled).onChange(async (v) => {
           this.plugin.settings.enabled = v;
           await this.plugin.saveData(this.plugin.settings);
@@ -437,12 +437,21 @@ class AspSettingTab extends PluginSettingTab {
             new Notice('asp: public key copied');
           }),
         );
+    }
 
-      // Reset — forget the remote and return to the connection flow. Vault
-      // history and this device's identity are kept; only the peer config goes.
+    // Log — both stages. A button that opens the viewer modal (readable +
+    // copyable on mobile, where the dev console isn't reachable).
+    new Setting(root)
+      .setName('Log')
+      .addButton((b) =>
+        b.setButtonText('Open log').onClick(() => new LogModal(this.app, this.plugin.log).open()),
+      );
+
+    // Reset — below the log (stage 2 only). Forgets the remote and returns to
+    // the connection flow; vault history and device identity are kept.
+    if (connected) {
       new Setting(root)
-        .setName('Reset sync config')
-        .setDesc('Forget the hub URL and start over. Your notes and history are kept — this only clears the connection so you can re-enter a URL.')
+        .setName('Reset Sync Config')
         .addButton((b) =>
           b
             .setButtonText('Reset')
@@ -461,14 +470,6 @@ class AspSettingTab extends PluginSettingTab {
             }),
         );
     }
-
-    // Log — both stages. A button that opens the viewer modal (readable +
-    // copyable on mobile, where the dev console isn't reachable).
-    new Setting(root)
-      .setName('Log')
-      .addButton((b) =>
-        b.setButtonText('Open log').onClick(() => new LogModal(this.app, this.plugin.log).open()),
-      );
   }
 
   /** A native "Status" row whose control shows a live dot + label. */
