@@ -83,11 +83,11 @@ export function StatusPill({ status }: any) {
 /* One tree row. Non-recursive + absolutely positioned at `y`: the FileTree
    flattens the visible tree and virtualizes it, so only the rows in view are
    mounted — a 10k-file vault renders ~40 rows, not 10k. */
-function TreeRow({ y, node, depth, snap, collapsed, toggle, api, dragRef, renaming, setRenaming, openMenu, readOnly }: any) {
+function TreeRow({ y, node, depth, snap, expanded, toggle, api, dragRef, renaming, setRenaming, openMenu, readOnly }: any) {
   const [dragOver, setDragOver] = useState(false);
   const isDir = node.type === 'dir';
   const isOpen = snap.openFileId && node.file && node.file.file_id === snap.openFileId;
-  const isCollapsed = isDir && collapsed.has(node.path);
+  const isCollapsed = isDir && !expanded.has(node.path);
   const dirty = !readOnly && node.file && snap.staged[node.file.file_id] != null && snap.staged[node.file.file_id] !== node.file.content;
   const renamingThis = renaming && renaming.id === (isDir ? `d:${node.path}` : node.file.file_id);
 
@@ -135,14 +135,14 @@ function TreeRow({ y, node, depth, snap, collapsed, toggle, api, dragRef, renami
   );
 }
 
-// Flatten the visible (expanded) tree into a linear list — the input to the
-// virtualizer. Collapsed folders contribute their own row but not their kids.
-function flattenTree(tree: any, collapsed: Set<string>): { node: any; depth: number }[] {
+// Flatten the visible tree into a linear list — the input to the virtualizer.
+// Folders are collapsed by default; only those in `expanded` reveal their kids.
+function flattenTree(tree: any, expanded: Set<string>): { node: any; depth: number }[] {
   const out: { node: any; depth: number }[] = [];
   (function walk(node: any, depth: number) {
     for (const c of node.sorted) {
       out.push({ node: c, depth });
-      if (c.type === 'dir' && !collapsed.has(c.path)) walk(c, depth + 1);
+      if (c.type === 'dir' && expanded.has(c.path)) walk(c, depth + 1);
     }
   })(tree, 0);
   return out;
@@ -152,7 +152,11 @@ const TREE_ROW_H = 21; // measured: every .trow is a uniform 21px
 const TREE_OVERSCAN = 8;
 
 export function FileTree({ snap, api, filesOverride, readOnly }: any) {
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  // Folders are collapsed by default; `expanded` holds the paths the user opened.
+  // (Tracking expansion rather than collapse means every vault — live or the
+  // historical time-travel view — starts collapsed and stays consistent, with
+  // no folder-set bookkeeping to re-collapse.)
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [renaming, setRenaming] = useState<any>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; node: any } | null>(null);
   const dragRef = useRef<any>(null);
@@ -162,7 +166,7 @@ export function FileTree({ snap, api, filesOverride, readOnly }: any) {
   // ref); during a sync most snapshot pushes leave a given node's files alone.
   // History view derives folders from paths only (no live mkdirs).
   const tree = useMemo(() => buildTree(files, filesOverride ? new Set<string>() : snap.folders), [files, filesOverride, snap.folders]);
-  const toggle = (path: string) => setCollapsed((s) => { const n = new Set(s); n.has(path) ? n.delete(path) : n.add(path); return n; });
+  const toggle = (path: string) => setExpanded((s) => { const n = new Set(s); n.has(path) ? n.delete(path) : n.add(path); return n; });
   const liveCount = useMemo(() => Object.values<any>(files).filter((f) => !f.deleted).length, [files]);
   const [rootOver, setRootOver] = useState(false);
 
@@ -172,22 +176,12 @@ export function FileTree({ snap, api, filesOverride, readOnly }: any) {
     (function walk(node: any) { for (const c of node.sorted) if (c.type === 'dir') { acc.push(c.path); walk(c); } })(tree);
     return acc;
   }, [tree]);
-  const allExpanded = allDirs.every((d) => !collapsed.has(d));
-  const toggleAll = () => setCollapsed(allExpanded ? new Set(allDirs) : new Set());
-
-  // Start every vault collapsed on first load. Runs once per node, after the
-  // tree has arrived; later edits won't re-collapse what the user expanded.
-  const didAutoCollapse = useRef(false);
-  useLayoutEffect(() => {
-    if (didAutoCollapse.current) return;
-    if (allDirs.length === 0 && liveCount === 0) return; // tree hasn't arrived yet
-    didAutoCollapse.current = true;
-    if (allDirs.length > 0) setCollapsed(new Set(allDirs));
-  }, [allDirs, liveCount]);
+  const allExpanded = allDirs.length > 0 && allDirs.every((d) => expanded.has(d));
+  const toggleAll = () => setExpanded(allExpanded ? new Set() : new Set(allDirs));
 
   // Virtualize: flatten the visible rows, then mount only the window around the
   // scroll position. Render cost is O(visible) regardless of vault size.
-  const flat = useMemo(() => flattenTree(tree, collapsed), [tree, collapsed]);
+  const flat = useMemo(() => flattenTree(tree, expanded), [tree, expanded]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewH, setViewH] = useState(480);
@@ -277,7 +271,7 @@ export function FileTree({ snap, api, filesOverride, readOnly }: any) {
             <div style={{ height: total * TREE_ROW_H, position: 'relative' }}>
               {visible.map(({ node, depth }, i) => (
                 <TreeRow key={node.path + node.type} y={(startRow + i) * TREE_ROW_H} node={node} depth={depth}
-                  snap={snap} collapsed={collapsed} toggle={toggle} api={api} dragRef={dragRef} renaming={renaming} setRenaming={setRenaming} openMenu={openMenuGated} readOnly={readOnly} />
+                  snap={snap} expanded={expanded} toggle={toggle} api={api} dragRef={dragRef} renaming={renaming} setRenaming={setRenaming} openMenu={openMenuGated} readOnly={readOnly} />
               ))}
             </div>
           )}
@@ -816,13 +810,15 @@ export function NodePanel({ snap, api, status, extraClass, onMaximize, onColumns
     return () => { alive = false; };
   }, [api, snap.id, snap.rowCount]);
 
-  // Position each change along a 0..1 axis by wall-clock time (staggered),
-  // falling back to even spacing when every row shares a timestamp.
+  // Position each change evenly by its order along a 0..1 axis. (Positioning by
+  // wall-clock time clumps every same-timestamp row — e.g. a bulk import — into
+  // one spot on the left; even spacing keeps them distinct and scrubbing linear.
+  // Zoom spreads them out for inspection.)
   const fracs = useMemo(() => {
-    if (events.length === 0) return [] as number[];
-    const ts = events.map((e: any) => e.ts);
-    const min = Math.min(...ts), max = Math.max(...ts), span = max - min;
-    return events.map((e: any, i: number) => (span > 0 ? (e.ts - min) / span : events.length <= 1 ? 1 : i / (events.length - 1)));
+    const n = events.length;
+    if (n === 0) return [] as number[];
+    if (n === 1) return [1];
+    return events.map((_e: any, i: number) => i / (n - 1));
   }, [events]);
 
   const shown = scrubFrac == null ? events.length : fracs.filter((f) => f <= scrubFrac + 1e-9).length;
