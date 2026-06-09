@@ -85,6 +85,35 @@ pub struct Session {
     sent_vector: bool,
 }
 
+/// Per-frame catch-up budget. A `Msg::Rows` frame accumulates rows until it
+/// crosses ~4 MiB of blob bytes (or 512 rows), then flushes — so serving a
+/// full clone never holds more than one budget's worth of the history in a
+/// serialized frame at a time. A single row whose blobs exceed the budget
+/// still ships alone (never split a row from its blobs — the fold needs them
+/// together).
+const CATCHUP_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const CATCHUP_CHUNK_ROWS: usize = 512;
+
+/// Drain `rows` into byte-budgeted `Msg::Rows` send steps appended to `out`.
+fn push_rows_chunked(out: &mut Vec<Step>, rows: Vec<WireRow>) {
+    let mut chunk: Vec<WireRow> = Vec::new();
+    let mut chunk_bytes = 0usize;
+    for wr in rows {
+        let row_bytes: usize = wr.blobs.iter().map(|b| b.bytes.len()).sum();
+        if !chunk.is_empty()
+            && (chunk.len() >= CATCHUP_CHUNK_ROWS || chunk_bytes + row_bytes > CATCHUP_CHUNK_BYTES)
+        {
+            out.push(Step::Send(Msg::Rows { rows: std::mem::take(&mut chunk) }));
+            chunk_bytes = 0;
+        }
+        chunk_bytes += row_bytes;
+        chunk.push(wr);
+    }
+    if !chunk.is_empty() {
+        out.push(Step::Send(Msg::Rows { rows: chunk }));
+    }
+}
+
 fn nonce() -> Vec<u8> {
     use rand::RngCore;
     let mut b = [0u8; 32];
@@ -240,9 +269,14 @@ impl Session {
                     self.sent_vector = true;
                     out.push(Step::Send(Msg::Vector { vv: vault.version_vector()? }));
                 }
-                if !rows.is_empty() {
-                    out.push(Step::Send(Msg::Rows { rows }));
-                }
+                // Split the catch-up into byte-budgeted `Msg::Rows` frames instead
+                // of one giant message. A fresh clone is missing the WHOLE history,
+                // so a single frame would buffer the entire vault (every blob
+                // version) AND its serialized copy AND the websocket frame copy —
+                // ~3× the history resident at once (the OOM on a small hub VM).
+                // Each frame is sent + dropped before the next is serialized
+                // (see net.rs), so chunking caps the transient to one budget's worth.
+                push_rows_chunked(&mut out, rows);
                 Ok(out)
             }
             Msg::Rows { rows } => {
@@ -353,6 +387,40 @@ mod tests {
         }
         assert!(la.authed() && cb.authed(), "both authenticated");
         assert_eq!(std::fs::read(db.path().join("a.md")).unwrap(), b"hello from A\n");
+    }
+
+    /// A full clone (peer missing everything) must NOT be serialized as one
+    /// giant `Msg::Rows` — that buffers the whole history (every blob) at once,
+    /// the OOM on a small hub VM. It is split into byte-budgeted frames, each
+    /// sent + dropped before the next, and every row ships exactly once.
+    #[test]
+    fn catchup_rows_are_chunked_by_byte_budget() {
+        let da = tempdir().unwrap();
+        let a = Engine::init(da.path(), Identity::from_seed(&[7; 32])).unwrap();
+        let big = vec![b'x'; 1024 * 1024]; // 1 MiB per file
+        for i in 0..6 {
+            a.record_write(&format!("f{i}.bin"), &big).unwrap();
+        }
+        // The catch-up the listener would assemble for a fresh peer.
+        let mut rows = Vec::new();
+        for (site, _) in a.version_vector().unwrap() {
+            rows.extend(a.rows_after_wire(&site, -1).unwrap());
+        }
+        let total = rows.len();
+        assert!(total >= 6, "expected ≥6 rows, got {total}");
+
+        let mut out = Vec::new();
+        push_rows_chunked(&mut out, rows);
+
+        assert!(out.len() > 1, "≈6 MiB over a 4 MiB budget must span >1 frame, got {}", out.len());
+        let mut shipped = 0;
+        for step in &out {
+            let Step::Send(Msg::Rows { rows }) = step else { panic!("non-Rows step") };
+            let bytes: usize = rows.iter().flat_map(|r| &r.blobs).map(|b| b.bytes.len()).sum();
+            assert!(rows.len() == 1 || bytes <= CATCHUP_CHUNK_BYTES, "frame over budget: {bytes} B");
+            shipped += rows.len();
+        }
+        assert_eq!(shipped, total, "every catch-up row ships exactly once");
     }
 
     fn send_of(s: Step) -> Option<Msg> {

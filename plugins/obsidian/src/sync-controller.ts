@@ -68,7 +68,7 @@ export class SyncController {
       }
       this.set('connected');
     } catch (e) {
-      const msg = String(e);
+      const msg = e instanceof Error ? e.message : String(e);
       this.set('error', msg);
       this.log(`sync failed: ${msg}`, 'error');
       throw e;

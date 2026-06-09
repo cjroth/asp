@@ -134,9 +134,24 @@ export class Vault {
     ws.binaryType = 'arraybuffer';
 
     await new Promise<void>((resolve, reject) => {
-      const onErr = (e: unknown) => reject(new Error(`ws connect failed: ${String(e)}`));
-      ws.addEventListener('open', () => resolve(), { once: true });
-      ws.addEventListener('error', onErr, { once: true });
+      // A WebSocket 'error' Event carries no detail by design (so logging it
+      // raw yields a useless "[object Event]"). The informative signal is the
+      // 'close' that follows a failed upgrade — its code/reason tells you what
+      // happened (e.g. 1006 = abnormal close, what a 502/unreachable host
+      // looks like; 1008/4001 = the hub rejected the auth key). Surface the
+      // host + whichever fires first.
+      let settled = false;
+      const fail = (detail: string) => {
+        if (settled) return;
+        settled = true;
+        reject(new Error(`ws connect failed (${base}): ${detail}`));
+      };
+      ws.addEventListener('open', () => { settled = true; resolve(); }, { once: true });
+      ws.addEventListener('error', () => fail(`connection error (readyState ${ws.readyState})`), { once: true });
+      ws.addEventListener('close', (ev) => {
+        const c = ev as CloseEvent;
+        fail(`closed before handshake — code ${c.code}${c.reason ? ` (${c.reason})` : ''}`);
+      }, { once: true });
     });
 
     return await new Promise<number>((resolve, reject) => {

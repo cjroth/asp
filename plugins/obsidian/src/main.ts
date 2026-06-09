@@ -231,7 +231,7 @@ export default class AspPlugin extends Plugin {
       return true;
     } catch (e) {
       // The controller already logged the underlying error.
-      if (!opts.quiet) new Notice(`asp sync failed: ${String(e)}`);
+      if (!opts.quiet) new Notice(`asp sync failed: ${e instanceof Error ? e.message : String(e)}`);
       return false;
     } finally {
       this.syncing = false;

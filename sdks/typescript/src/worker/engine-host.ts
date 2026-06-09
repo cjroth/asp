@@ -64,7 +64,9 @@ export class EngineWorkerHost {
           return this.reply(cmd.id, true);
       }
     } catch (e) {
-      this.reply(cmd.id, false, undefined, String(e));
+      // Send the bare message across the worker boundary — worker-vault re-wraps
+      // it in `new Error(...)`, so String(e)'s "Error: " prefix would double up.
+      this.reply(cmd.id, false, undefined, e instanceof Error ? e.message : String(e));
     }
   }
 }
