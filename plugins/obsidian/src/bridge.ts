@@ -17,6 +17,9 @@ function eq(a: Uint8Array, b: Uint8Array): boolean {
 
 export class Bridge {
   private log: Logger = () => {};
+  /** path → content hash last written to the host, so an incremental
+   * materialize skips unchanged files without reading or fetching them. */
+  private materializedHashes = new Map<string, string>();
 
   constructor(
     private vault: EngineVault,
@@ -71,23 +74,38 @@ export class Bridge {
   /** Render the engine's materialized tree back to the host vault. Returns the
    * counts actually changed on disk. */
   async materializeToHost(): Promise<{ written: number; removed: number }> {
-    const files = await this.vault.files();
-    const want = new Set(Object.keys(files));
+    // INCREMENTAL: list per-file metadata (path + content hash — cheap, no
+    // content) and fetch only changed files' bytes one at a time. The old path
+    // pulled EVERY file's content at once via files() → files_json serialized
+    // all bytes into a single JSON number-array string, which OOMs/truncates the
+    // worker on a large vault ("Unexpected end of JSON input"). This keeps memory
+    // flat and writes only what actually changed.
+    const detail = (await this.vault.filesDetail()).filter(
+      (f) => !f.deleted && f.merge_class !== 'dir',
+    );
+    const want = new Set(detail.map((f) => f.path));
     let written = 0;
     let removed = 0;
-    for (const [path, bytes] of Object.entries(files)) {
-      const cur = await this.host.read(path);
+    for (const f of detail) {
+      const hash = f.result_hash ?? '';
+      // Unchanged since we last wrote it → skip (no read, no fetch).
+      if (this.materializedHashes.get(f.path) === hash) continue;
+      const bytes = await this.vault.readFile(f.path);
+      if (bytes == null) continue;
+      const cur = await this.host.read(f.path);
       if (cur == null || !eq(cur, bytes)) {
-        await this.host.write(path, bytes);
+        await this.host.write(f.path, bytes);
         written++;
-        this.log(`pull: wrote ${path}`);
+        this.log(`pull: wrote ${f.path}`);
       }
+      this.materializedHashes.set(f.path, hash);
     }
     // Remove host files the engine no longer has (deletes/renames-away).
     for (const path of await this.host.list()) {
       if (this.filter.ignored(path)) continue;
       if (!want.has(path)) {
         await this.host.remove(path);
+        this.materializedHashes.delete(path);
         removed++;
         this.log(`pull: removed ${path}`);
       }

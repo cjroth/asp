@@ -4,6 +4,7 @@
 // is host glue only.
 
 import { type FeedResult, WasmEngine, type WasmEngineInstance } from './engine.ts';
+import type { FileMeta } from './engine-types.ts';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -49,6 +50,12 @@ export interface EngineVault {
   deleteFile(path: string): void | Promise<void>;
   renameFile(from: string, to: string): void | Promise<void>;
   files(): Record<string, Uint8Array> | Promise<Record<string, Uint8Array>>;
+  /** Per-file fold metadata (path + content hash, NO content) — cheap, so a
+   * large vault can be materialized incrementally without serializing every
+   * file's bytes into one giant JSON (which OOMs the worker). */
+  filesDetail(): FileMeta[] | Promise<FileMeta[]>;
+  /** One file's materialized bytes (binary — no JSON number-array blowup). */
+  readFile(path: string): (Uint8Array | undefined) | Promise<Uint8Array | undefined>;
   sync(url: string, opts?: SyncOptions): Promise<number>;
   nodeSsh(): string;
   free(): void | Promise<void>;
@@ -99,6 +106,11 @@ export class Vault {
     const out: Record<string, Uint8Array> = {};
     for (const [p, arr] of Object.entries(raw)) out[p] = Uint8Array.from(arr);
     return out;
+  }
+
+  /** Per-file fold metadata (path + content hash, no content). */
+  filesDetail(): FileMeta[] {
+    return JSON.parse(this.eng.files_detail_json()) as FileMeta[];
   }
 
   /** Seed the engine from the host's current vault contents (whole-set commit). */

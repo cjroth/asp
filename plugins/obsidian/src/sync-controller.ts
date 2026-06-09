@@ -63,7 +63,18 @@ export class SyncController {
       this.log(`sync: connecting to ${cfg.peerUrl}${cfg.authKey ? ' (with auth key)' : ''}…`);
     }
     try {
-      if (opts.reconcile) await this.bridge.reconcileFromHost();
+      if (opts.reconcile) {
+        // ADOPT THE PEER'S STATE BEFORE RECONCILING LOCAL DISK. The engine is
+        // recreated fresh on every plugin load, so reconciling first would
+        // re-import the fold's OWN disambiguated names (`a (1).md`) as brand-new
+        // files; on merge they collide and get re-disambiguated, doubling every
+        // reload — the duplicate-explosion feedback loop. Pulling first gives the
+        // engine the canonical file ids so reconcileFromHost matches by path
+        // (an edit to the existing file) instead of minting a new one.
+        const pulled = await this.vault.sync(cfg.peerUrl, { authKey: cfg.authKey });
+        if (pulled > 0) await this.bridge.materializeToHost();
+        await this.bridge.reconcileFromHost();
+      }
       const integrated = await this.vault.sync(cfg.peerUrl, { authKey: cfg.authKey });
       // Only rewrite the host tree when the peer sent new rows — otherwise the
       // O(files) materialize scan runs for nothing on every no-op poll.

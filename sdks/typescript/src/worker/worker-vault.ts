@@ -4,6 +4,7 @@
 // renderer thread (a postMessage round-trip, not a wasm call). Identity is
 // cached from `init` so the settings UI can read the device key synchronously.
 
+import type { FileMeta } from '../engine-types.ts';
 import type { Port } from './channel.ts';
 import type { Command, FromWorker, Identity, InitPayload, Reply, ToWorker } from './protocol.ts';
 
@@ -68,6 +69,12 @@ export class WorkerVault {
   }
   async files(): Promise<Record<string, Uint8Array>> {
     return (await this.call({ op: 'files' })) as Record<string, Uint8Array>;
+  }
+  async filesDetail(): Promise<FileMeta[]> {
+    return (await this.call({ op: 'filesDetail' })) as FileMeta[];
+  }
+  async readFile(path: string): Promise<Uint8Array | undefined> {
+    return (await this.call({ op: 'readFile', path })) as Uint8Array | undefined;
   }
   async sync(url: string, opts: { authKey?: string } = {}): Promise<number> {
     return (await this.call({ op: 'sync', url, authKey: opts.authKey })) as number;

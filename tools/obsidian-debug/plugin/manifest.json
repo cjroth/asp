@@ -1,0 +1,9 @@
+{
+  "id": "asp-debug",
+  "name": "ASP Debug Bridge",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "DEV-ONLY local debug bridge for developing the Agent Sync Protocol plugin. Exposes eval / console / plugin-reload over a loopback HTTP server so an MCP running inside the OrbStack VM can drive Obsidian on the Mac. Do not ship to users.",
+  "author": "ASP contributors",
+  "isDesktopOnly": true
+}

@@ -54,6 +54,10 @@ export class EngineWorkerHost {
           return this.reply(cmd.id, true);
         case 'files':
           return this.reply(cmd.id, true, this.vaultOrThrow().files());
+        case 'filesDetail':
+          return this.reply(cmd.id, true, this.vaultOrThrow().filesDetail());
+        case 'readFile':
+          return this.reply(cmd.id, true, this.vaultOrThrow().readFile(cmd.path));
         case 'sync': {
           const integrated = await this.vaultOrThrow().sync(cmd.url, { authKey: cmd.authKey });
           return this.reply(cmd.id, true, integrated);

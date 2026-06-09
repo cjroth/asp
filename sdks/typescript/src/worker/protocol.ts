@@ -10,6 +10,8 @@
 // Everything is structured-clone-safe (strings, numbers, Uint8Arrays) so it
 // survives `postMessage` unchanged.
 
+import type { FileMeta } from '../engine-types.ts';
+
 /** The `init` payload — everything the worker needs to stand up the engine.
  * The wasm bytes are shipped in so the worker never fetches (mobile-WebView
  * safe, the same constraint that drives the plugin's inlining). */
@@ -41,6 +43,8 @@ export type Command =
   | { kind: 'cmd'; id: number; op: 'commitFiles'; files: Record<string, Uint8Array> }
   | { kind: 'cmd'; id: number; op: 'writeFiles'; files: Record<string, Uint8Array> }
   | { kind: 'cmd'; id: number; op: 'files' }
+  | { kind: 'cmd'; id: number; op: 'filesDetail' }
+  | { kind: 'cmd'; id: number; op: 'readFile'; path: string }
   | { kind: 'cmd'; id: number; op: 'sync'; url: string; authKey?: string }
   | { kind: 'cmd'; id: number; op: 'free' };
 
@@ -49,8 +53,9 @@ export interface Reply {
   kind: 'reply';
   id: number;
   ok: boolean;
-  /** `init` → Identity; `files` → Record<path,bytes>; `sync` → integrated count. */
-  value?: Identity | Record<string, Uint8Array> | number;
+  /** `init` → Identity; `files` → Record<path,bytes>; `filesDetail` → FileMeta[];
+   * `readFile` → bytes|undefined; `sync` → integrated count. */
+  value?: Identity | Record<string, Uint8Array> | number | FileMeta[] | Uint8Array | undefined;
   /** Present when `!ok`. */
   error?: string;
 }
