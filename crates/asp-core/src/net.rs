@@ -242,7 +242,7 @@ pub async fn serve(
 ) -> Result<()> {
     let listener = TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
     let port = listener.local_addr()?.port();
-    tracing::info!(%bind, port, secure = tls.is_some(), "listening");
+    tracing::info!(%bind, port, secure = tls.is_some(), ws_max_mib = WS_MAX_MSG / 1024 / 1024, "listening");
     if let Some(tx) = port_tx {
         let _ = tx.send(port);
     }
