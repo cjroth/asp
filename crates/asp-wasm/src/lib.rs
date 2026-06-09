@@ -261,6 +261,12 @@ impl WasmEngine {
                 Step::Integrated(rows) => res.integrated += rows.len(),
                 Step::Authenticated(_) => res.authed = true,
                 Step::Closed(reason) => res.closed = Some(reason),
+                // Peer finished sending our catch-up. A browser node is always a
+                // oneshot connector, so this ends the pass cleanly.
+                Step::PeerSynced => res.closed = Some("synced".into()),
+                // Listener-only (streamed by the native driver); a browser node is
+                // never a listener, so this can't occur here.
+                Step::CatchUp { .. } => {}
             }
         }
         res.authed = self.session.as_ref().map(|s| s.authed()).unwrap_or(false);

@@ -64,6 +64,11 @@ pub enum Msg {
     Denied { reason: String },
     /// Graceful close.
     Bye,
+    /// Listener → connector: "I've sent every row you were missing." Lets a
+    /// oneshot connector finish the instant the catch-up stream ends instead of
+    /// waiting out an idle timeout — so completion is explicit (no per-sync tail)
+    /// and independent of how long any single (large) frame took to arrive.
+    Synced,
 }
 
 impl Msg {

@@ -63,6 +63,18 @@ pub enum Step {
     Integrated(Vec<WireRow>),
     /// Close the connection with a reason (handshake/auth failure or `Bye`).
     Closed(String),
+    /// Listener-side catch-up: send the peer (whose version vector is `peer_vv`)
+    /// every row it lacks. The driver STREAMS these in pages rather than building
+    /// the whole set up front — a full-vault build of a large vault is slow on a
+    /// constrained host, and if the first byte doesn't reach the peer before its
+    /// idle timeout the peer closes with 0 rows. Streaming keeps frames flowing
+    /// (idle stays reset) and memory bounded. Only the native driver (net.rs)
+    /// produces real streaming; see also `catchup_rows` for the inline fallback.
+    CatchUp { peer_vv: std::collections::BTreeMap<String, i64> },
+    /// The peer signalled it has sent all our missing rows (`Msg::Synced`). A
+    /// oneshot driver closes on this; a persistent `watch` ignores it and stays
+    /// connected for live pushes.
+    PeerSynced,
 }
 
 pub struct Session {
@@ -94,8 +106,23 @@ pub struct Session {
 const CATCHUP_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const CATCHUP_CHUNK_ROWS: usize = 512;
 
+/// Every row the peer (`peer_vv`) is missing, built up front. Used by the
+/// connector (small push-back) and by non-streaming drivers (the in-process
+/// test); the native listener streams via `Engine::rows_after_wire_page` instead.
+pub(crate) fn catchup_rows(
+    vault: &dyn SessionVault,
+    peer_vv: &std::collections::BTreeMap<String, i64>,
+) -> AspResult<Vec<WireRow>> {
+    let mut rows = Vec::new();
+    for (site, _max) in vault.version_vector()? {
+        let peer_seq = peer_vv.get(&site).copied().unwrap_or(-1);
+        rows.extend(vault.rows_after_wire(&site, peer_seq)?);
+    }
+    Ok(rows)
+}
+
 /// Drain `rows` into byte-budgeted `Msg::Rows` send steps appended to `out`.
-fn push_rows_chunked(out: &mut Vec<Step>, rows: Vec<WireRow>) {
+pub(crate) fn push_rows_chunked(out: &mut Vec<Step>, rows: Vec<WireRow>) {
     let mut chunk: Vec<WireRow> = Vec::new();
     let mut chunk_bytes = 0usize;
     for wr in rows {
@@ -257,26 +284,22 @@ impl Session {
                 if !self.authed {
                     return Ok(vec![Step::Closed("Vector before auth".into())]);
                 }
-                // Send exactly what the peer is missing.
-                let ours = vault.version_vector()?;
-                let mut rows = Vec::new();
-                for (site, _max) in ours {
-                    let peer_seq = vv.get(&site).copied().unwrap_or(-1);
-                    rows.extend(vault.rows_after_wire(&site, peer_seq)?);
-                }
                 let mut out = Vec::new();
                 if !self.sent_vector {
                     self.sent_vector = true;
                     out.push(Step::Send(Msg::Vector { vv: vault.version_vector()? }));
                 }
-                // Split the catch-up into byte-budgeted `Msg::Rows` frames instead
-                // of one giant message. A fresh clone is missing the WHOLE history,
-                // so a single frame would buffer the entire vault (every blob
-                // version) AND its serialized copy AND the websocket frame copy —
-                // ~3× the history resident at once (the OOM on a small hub VM).
-                // Each frame is sent + dropped before the next is serialized
-                // (see net.rs), so chunking caps the transient to one budget's worth.
-                push_rows_chunked(&mut out, rows);
+                // Send the peer what it's missing. The LISTENER (hub / `asp watch`)
+                // may hold a large vault, so it STREAMS the catch-up in pages (see
+                // Step::CatchUp) — building the whole set up front is slow enough on
+                // a small host that the peer idles out before the first byte arrives
+                // and closes with 0 rows. The CONNECTOR's own catch-up (its local
+                // edits pushed back) is small, and the wasm/browser connector can't
+                // stream across its feed() boundary, so it builds inline.
+                match self.role {
+                    Role::Listener => out.push(Step::CatchUp { peer_vv: vv }),
+                    Role::Connector => push_rows_chunked(&mut out, catchup_rows(vault, &vv)?),
+                }
                 Ok(out)
             }
             Msg::Rows { rows } => {
@@ -295,6 +318,9 @@ impl Session {
             }
             Msg::Denied { reason } => Ok(vec![Step::Closed(format!("denied by peer: {reason}"))]),
             Msg::Bye => Ok(vec![Step::Closed("bye".into())]),
+            // Peer finished its catch-up. The driver decides what to do (oneshot
+            // closes; persistent watch stays connected).
+            Msg::Synced => Ok(vec![Step::PeerSynced]),
         }
     }
 
@@ -367,16 +393,12 @@ mod tests {
             let mut n_to_b = Vec::new();
             for m in to_a.drain(..) {
                 for s in la.on_msg(&a, m).unwrap() {
-                    if let Some(m) = send_of(s) {
-                        n_to_b.push(m);
-                    }
+                    n_to_b.extend(msgs_of(&a, s));
                 }
             }
             for m in to_b.drain(..) {
                 for s in cb.on_msg(&b, m).unwrap() {
-                    if let Some(m) = send_of(s) {
-                        n_to_a.push(m);
-                    }
+                    n_to_a.extend(msgs_of(&b, s));
                 }
             }
             to_a = n_to_a;
@@ -421,6 +443,21 @@ mod tests {
             shipped += rows.len();
         }
         assert_eq!(shipped, total, "every catch-up row ships exactly once");
+    }
+
+    /// Expand a step into the frames a real driver would send — including
+    /// streaming the listener's `Step::CatchUp` (which net.rs pages over a socket;
+    /// the in-process pump expands it whole).
+    fn msgs_of(vault: &dyn SessionVault, s: Step) -> Vec<Msg> {
+        match s {
+            Step::Send(m) => vec![m],
+            Step::CatchUp { peer_vv } => {
+                let mut out = Vec::new();
+                push_rows_chunked(&mut out, catchup_rows(vault, &peer_vv).unwrap());
+                out.into_iter().filter_map(send_of).collect()
+            }
+            _ => vec![],
+        }
     }
 
     fn send_of(s: Step) -> Option<Msg> {

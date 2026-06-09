@@ -71,7 +71,7 @@ test('WorkerVault converges with the real asp daemon (off-thread engine path)', 
 
     // Author "in Obsidian", then sync — the engine work runs in the host half.
     await vault.writeFile('obsidian-note.md', enc.encode('# typed in Obsidian\n'));
-    const integrated = await vault.sync(url, { authKey: 'S' });
+    const integrated = await vault.sync(url, { authKey: 'S', idleMs: 500 });
     expect(integrated).toBeGreaterThan(0); // pulled the CLI note
 
     const files = await vault.files();
@@ -89,7 +89,7 @@ test('WorkerVault converges with the real asp daemon (off-thread engine path)', 
     let pulled = false;
     const dl2 = Date.now() + 8000;
     while (!pulled && Date.now() < dl2) {
-      await vault.sync(url, { authKey: 'S' });
+      await vault.sync(url, { authKey: 'S', idleMs: 500 });
       const f = await vault.files();
       if (f['peer-added.md'] && dec.decode(f['peer-added.md']) === '# added on the peer\n') pulled = true;
       else await sleep(300);

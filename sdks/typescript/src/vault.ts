@@ -123,8 +123,13 @@ export class Vault {
    * caller can skip an expensive re-materialize when nothing new arrived (0).
    */
   async sync(url: string, opts: SyncOptions = {}): Promise<number> {
-    const idleMs = opts.idleMs ?? 800;
-    const timeoutMs = opts.timeoutMs ?? 15000;
+    // Idle ends the stream; the listener streams catch-up in pages so frames
+    // flow steadily, but a single large attachment is one multi-second frame —
+    // keep idle above that so it isn't read as end-of-stream. timeoutMs is the
+    // hard ceiling for the whole pass: a first full clone of a big vault streams
+    // for a while, so it must be generous (the old 15s cut large clones short).
+    const idleMs = opts.idleMs ?? 5000;
+    const timeoutMs = opts.timeoutMs ?? 180000;
     const base = normalizePeerUrl(url);
     const fullUrl = opts.authKey
       ? `${base}${base.includes('?') ? '&' : '?'}auth_key=${encodeURIComponent(opts.authKey)}`

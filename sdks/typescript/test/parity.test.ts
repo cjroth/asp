@@ -64,7 +64,7 @@ test('wasm SDK and native asp converge bidirectionally through a relay', async (
     const seed = new Uint8Array(32).fill(9);
     const v = new Vault(seed, '');
     v.writeFile('from-wasm.md', 'hello from wasm\n');
-    await v.sync(url, { authKey: 'S' });
+    await v.sync(url, { authKey: 'S', idleMs: 500 });
 
     // The wasm node pulled the native file.
     expect(v.readTextFile('from-asp.md')).toBe('hello from asp\n');
@@ -101,15 +101,15 @@ test('wasm node and native asp converge a concurrent edit (3-way merge across su
 
     // wasm node clones (pulls doc.md), edits a different line concurrently, syncs.
     const v = new Vault(new Uint8Array(32).fill(5), '');
-    await v.sync(url, { authKey: 'S' });
+    await v.sync(url, { authKey: 'S', idleMs: 500 });
     expect(v.readTextFile('doc.md')).toBe('l1\nl2\nl3\n');
 
     // Native edits line 1; wasm edits line 3 — disjoint, both survive.
     writeFileSync(join(dir, 'doc.md'), 'L1\nl2\nl3\n');
     asp(['--dir', dir, 'commit'], home);
     v.writeFile('doc.md', 'l1\nl2\nL3\n');
-    await v.sync(url, { authKey: 'S' });
-    await v.sync(url, { authKey: 'S' }); // second round to pull native's edit back
+    await v.sync(url, { authKey: 'S', idleMs: 500 });
+    await v.sync(url, { authKey: 'S', idleMs: 500 }); // second round to pull native's edit back
 
     expect(v.readTextFile('doc.md')).toBe('L1\nl2\nL3\n');
     expect(readFileSync(join(dir, 'doc.md'), 'utf8')).toBe('L1\nl2\nL3\n');

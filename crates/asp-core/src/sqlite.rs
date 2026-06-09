@@ -134,6 +134,17 @@ impl SqliteStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// One page of a site's rows after `after` (ascending), capped at `limit` —
+    /// the cursor for streaming a large catch-up without loading the whole site
+    /// (and its blobs) into memory at once. See `Step::CatchUp`.
+    pub fn rows_after_page(&self, site: &str, after: i64, limit: i64) -> AspResult<Vec<LogRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM log WHERE site_id=?1 AND seq>?2 ORDER BY seq LIMIT ?3")?;
+        let rows = stmt.query_map(params![site, after, limit], Self::row_from)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Version vector across all known devices: site_id -> max seq held.
     pub fn version_vector(&self) -> AspResult<BTreeMap<String, i64>> {
         let mut stmt = self.conn.prepare("SELECT site_id, MAX(seq) FROM log GROUP BY site_id")?;

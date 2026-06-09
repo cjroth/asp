@@ -304,6 +304,12 @@ impl Engine {
         Ok(flags)
     }
 
+    /// One page of a site's rows (as wire rows, blobs bundled) after `after`,
+    /// capped at `limit` — the streaming-catch-up cursor (see net.rs / Step::CatchUp).
+    pub fn rows_after_wire_page(&self, site: &str, after: i64, limit: i64) -> AspResult<Vec<WireRow>> {
+        self.store.rows_after_page(site, after, limit)?.into_iter().map(|r| self.wire(r)).collect()
+    }
+
     // ---------------- fold → materialize ----------------
 
     /// Fold the log, write the materialized `files` table, render changed files

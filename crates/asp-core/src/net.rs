@@ -37,6 +37,11 @@ use tokio_tungstenite::{accept_hdr_async_with_config, client_async_with_config, 
 /// session::push_rows_chunked.) Bounded — not unlimited — so a peer can't OOM us.
 const WS_MAX_MSG: usize = 128 * 1024 * 1024;
 
+/// Rows fetched per page when streaming a catch-up (see Step::CatchUp). Small
+/// enough that the first page builds fast (peer's idle timer stays reset) and
+/// memory stays bounded; large enough to amortize lock/round-trips.
+const CATCHUP_PAGE_ROWS: i64 = 256;
+
 fn ws_config() -> WebSocketConfig {
     let mut c = WebSocketConfig::default();
     c.max_message_size = Some(WS_MAX_MSG);
@@ -136,7 +141,12 @@ where
         }
     }
 
-    let idle = Duration::from_millis(700);
+    // Oneshot connectors end the stream by idle. Catch-up is now streamed in
+    // pages so frames flow steadily, but a single un-splittable large row (a big
+    // attachment) is one frame whose transfer can take a couple seconds — keep
+    // the idle comfortably above that so a large frame mid-stream isn't mistaken
+    // for end-of-stream. (Listener connections are persistent and never idle.)
+    let idle = Duration::from_millis(5000);
     let mut announced_auth = false;
     let result: Result<()> = loop {
         let idle_fut = async {
@@ -203,6 +213,61 @@ where
                                     }
                                     tracing::info!(reason, "closing");
                                     closing = true;
+                                }
+                                Step::CatchUp { peer_vv } => {
+                                    // Stream the catch-up in pages: lock the engine only
+                                    // to fetch one page, release it, send, repeat. The
+                                    // first frame reaches the peer in one page's time
+                                    // (not a whole-vault build), keeping its idle timer
+                                    // reset and our memory bounded — the fix for a large
+                                    // vault on a small host serving 0 rows before timeout.
+                                    let our_vv = match engine.lock().unwrap().store.version_vector() {
+                                        Ok(vv) => vv,
+                                        Err(_) => { closing = true; break; }
+                                    };
+                                    'pages: for (site, _max) in our_vv {
+                                        let mut cursor = peer_vv.get(&site).copied().unwrap_or(-1);
+                                        loop {
+                                            let page = {
+                                                let eng = engine.lock().unwrap();
+                                                eng.rows_after_wire_page(&site, cursor, CATCHUP_PAGE_ROWS)
+                                            };
+                                            let page = match page {
+                                                Ok(p) if p.is_empty() => break,
+                                                Ok(p) => p,
+                                                Err(_) => break,
+                                            };
+                                            cursor = page.last().map(|w| w.row.seq as i64).unwrap_or(cursor);
+                                            // Byte-budget each frame (proxy-friendly) — a
+                                            // single oversized row still ships alone.
+                                            let mut sends = Vec::new();
+                                            crate::session::push_rows_chunked(&mut sends, page);
+                                            for s in sends {
+                                                if let Step::Send(m) = s {
+                                                    if send_framed(&mut sink, Message::Binary(m.to_bytes()?)).await.is_err() {
+                                                        closing = true;
+                                                        break 'pages;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Tell the peer the catch-up stream is complete so a
+                                    // oneshot connector can finish immediately instead of
+                                    // waiting out an idle timeout (and so it isn't fooled
+                                    // into closing early by a slow large frame).
+                                    if !closing
+                                        && send_framed(&mut sink, Message::Binary(Msg::Synced.to_bytes()?)).await.is_err()
+                                    {
+                                        closing = true;
+                                    }
+                                }
+                                Step::PeerSynced => {
+                                    // The listener finished sending our catch-up. A oneshot
+                                    // sync/clone is done; a persistent watch stays open.
+                                    if oneshot {
+                                        closing = true;
+                                    }
                                 }
                             }
                         }
