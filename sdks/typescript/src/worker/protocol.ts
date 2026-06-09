@@ -46,6 +46,8 @@ export type Command =
   | { kind: 'cmd'; id: number; op: 'filesDetail' }
   | { kind: 'cmd'; id: number; op: 'readFile'; path: string }
   | { kind: 'cmd'; id: number; op: 'sync'; url: string; authKey?: string }
+  | { kind: 'cmd'; id: number; op: 'dump' }
+  | { kind: 'cmd'; id: number; op: 'load'; stateJson: string }
   | { kind: 'cmd'; id: number; op: 'free' };
 
 /** The reply to a `Command`, by the same `id`. */
@@ -55,7 +57,7 @@ export interface Reply {
   ok: boolean;
   /** `init` → Identity; `files` → Record<path,bytes>; `filesDetail` → FileMeta[];
    * `readFile` → bytes|undefined; `sync` → integrated count. */
-  value?: Identity | Record<string, Uint8Array> | number | FileMeta[] | Uint8Array | undefined;
+  value?: Identity | Record<string, Uint8Array> | number | FileMeta[] | Uint8Array | string | undefined;
   /** Present when `!ok`. */
   error?: string;
 }

@@ -47,15 +47,18 @@ test('BUG SHAPE: reconcile-before-adopt doubles files every reload', () => {
   expect(counts[2]).toBeGreaterThan(counts[1]);
 });
 
-test('FIX: adopt-before-reconcile keeps the file set bounded across reloads', () => {
+test('FIX: restoring persisted engine state before reconcile keeps it bounded', () => {
   const { A, B } = setup();
   const baseline = Object.keys(A.files()).length; // 2: "a.md" + "a (1).md"
   let disk = A.files();
+  let state = A.dump(); // the engine state a thin client persists across reloads
   for (let i = 0; i < 5; i++) {
     const fresh = new Vault(new Uint8Array(32).fill(1), '');
-    exchange(fresh, B); // ADOPT peer state first
-    fresh.writeFiles(disk); // THEN reconcile disk — names match existing ids
+    fresh.load(state); // RESTORE persisted state (the fix) — engine knows file ids
+    fresh.writeFiles(disk); // THEN reconcile disk — matches by path, no new files
+    exchange(fresh, B);
     disk = fresh.files();
+    state = fresh.dump();
     expect(Object.keys(disk).length).toBe(baseline); // never grows
   }
 });

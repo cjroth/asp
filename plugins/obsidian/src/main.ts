@@ -91,6 +91,7 @@ export default class AspPlugin extends Plugin {
    * never persisted (a stored auth key would silently 401 the upgrade once the
    * hub rotates it or once the device is already enrolled). Discarded on use. */
   pendingAuthKey = '';
+  private saveStateTimer?: ReturnType<typeof setTimeout>;
 
   async onload(): Promise<void> {
     const loaded = ((await this.loadData()) as Partial<AspSettings> & { authKey?: string }) ?? {};
@@ -133,6 +134,13 @@ export default class AspPlugin extends Plugin {
       wasmBytes: wasmBytes(),
     });
     this.log.append(`engine worker ready — device key ${identity.nodeSsh}`);
+
+    // Restore persisted engine state BEFORE any reconcile. The engine is rebuilt
+    // fresh each load; without this it would re-import its own materialized tree
+    // (incl. the fold's `a (1).md` disambiguations) as brand-new files, which
+    // collide and multiply every reload (the duplicate-explosion loop). Restoring
+    // gives reconcileFromHost the real file ids so it matches by path instead.
+    await this.restoreEngineState();
 
     const host = new ObsidianHost(this.app.vault.adapter);
     this.bridge = new Bridge(this.sdk, host, new PathFilter(await this.readIgnore(host)));
@@ -239,6 +247,7 @@ export default class AspPlugin extends Plugin {
         { peerUrl, authKey: this.pendingAuthKey || undefined },
         { reconcile: opts.reconcile, background: opts.background },
       );
+      this.scheduleSaveState(); // persist engine state so reloads don't re-import
       if (!opts.quiet) new Notice('asp: synced');
       return true;
     } catch (e) {
@@ -270,6 +279,47 @@ export default class AspPlugin extends Plugin {
 
   async syncNow(): Promise<void> {
     await this.runSync({ reconcile: true });
+  }
+
+  /** File holding the serialized engine state (all rows+blobs), inside the
+   * plugin's own dir so it travels with the install but isn't a vault note. */
+  private statePath(): string {
+    return `${this.manifest.dir}/engine-state.json`;
+  }
+
+  /** Re-integrate persisted engine state, if any, on startup — BEFORE the first
+   * reconcile, so the engine knows its real file ids and reconcileFromHost
+   * matches by path instead of re-importing the materialized tree as new files
+   * (the duplicate-explosion loop). */
+  private async restoreEngineState(): Promise<void> {
+    try {
+      const p = this.statePath();
+      if (await this.app.vault.adapter.exists(p)) {
+        const json = await this.app.vault.adapter.read(p);
+        if (json) {
+          await this.sdk.load(json);
+          this.log.append('restored engine state — reconcile will match existing files');
+        }
+      }
+    } catch (e) {
+      this.log.append(`restore engine state failed (will reconcile fresh): ${String(e)}`, 'error');
+    }
+  }
+
+  /** Debounced: persist the engine state so the next launch restores instead of
+   * re-importing. Serializing the whole log is non-trivial, so coalesce bursts. */
+  private scheduleSaveState(): void {
+    clearTimeout(this.saveStateTimer);
+    this.saveStateTimer = setTimeout(() => void this.saveEngineState(), 2000);
+  }
+
+  private async saveEngineState(): Promise<void> {
+    try {
+      const json = await this.sdk.dump();
+      await this.app.vault.adapter.write(this.statePath(), json);
+    } catch (e) {
+      this.log.append(`save engine state failed: ${String(e)}`, 'error');
+    }
   }
 
   /** Forget the remote so the user can set sync up from scratch (re-enter a URL

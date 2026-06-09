@@ -100,4 +100,6 @@ test('Obsidian plugin (bridge + controller) converges with the real asp CLI', as
   } finally {
     hub.kill();
   }
-});
+  // Real-CLI integration with a propagation-wait loop + two-round
+  // adopt-before-reconcile sync; needs more than bun's 5s default.
+}, 20000);

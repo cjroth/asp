@@ -76,6 +76,12 @@ export class WorkerVault {
   async readFile(path: string): Promise<Uint8Array | undefined> {
     return (await this.call({ op: 'readFile', path })) as Uint8Array | undefined;
   }
+  async dump(): Promise<string> {
+    return (await this.call({ op: 'dump' })) as string;
+  }
+  async load(stateJson: string): Promise<void> {
+    await this.call({ op: 'load', stateJson });
+  }
   async sync(url: string, opts: { authKey?: string } = {}): Promise<number> {
     return (await this.call({ op: 'sync', url, authKey: opts.authKey })) as number;
   }

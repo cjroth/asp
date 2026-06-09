@@ -57,6 +57,13 @@ export interface EngineVault {
   /** One file's materialized bytes (binary — no JSON number-array blowup). */
   readFile(path: string): (Uint8Array | undefined) | Promise<Uint8Array | undefined>;
   sync(url: string, opts?: SyncOptions): Promise<number>;
+  /** Serialize the whole engine state (all rows + blobs) so a thin client can
+   * persist it and {@link load} it on next launch — WITHOUT this, a client that
+   * rebuilds its engine each run re-imports its own materialized tree as new
+   * files, which collide and multiply (the duplicate-explosion loop). */
+  dump(): string | Promise<string>;
+  /** Restore engine state produced by {@link dump} (re-integrates the rows). */
+  load(stateJson: string): void | Promise<void>;
   nodeSsh(): string;
   free(): void | Promise<void>;
 }
@@ -111,6 +118,15 @@ export class Vault {
   /** Per-file fold metadata (path + content hash, no content). */
   filesDetail(): FileMeta[] {
     return JSON.parse(this.eng.files_detail_json()) as FileMeta[];
+  }
+
+  /** Serialize all rows+blobs (the persistable engine state). */
+  dump(): string {
+    return this.eng.rows_after(JSON.stringify({}));
+  }
+  /** Re-integrate a {@link dump} into this engine. */
+  load(stateJson: string): void {
+    this.eng.integrate(stateJson);
   }
 
   /** Seed the engine from the host's current vault contents (whole-set commit). */
