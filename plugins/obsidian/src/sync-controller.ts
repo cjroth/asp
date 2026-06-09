@@ -57,24 +57,36 @@ export class SyncController {
    * - `background` (default false): a periodic poll — don't flash the status to
    *   "connecting" each tick (avoids a 10s dot flicker once connected).
    */
-  async syncOnce(cfg: SyncConfig, opts: { reconcile?: boolean; background?: boolean } = {}): Promise<void> {
+  async syncOnce(
+    cfg: SyncConfig,
+    opts: { reconcile?: boolean; background?: boolean; adoptFirst?: boolean } = {},
+  ): Promise<void> {
     if (!opts.background || this.state !== 'connected') this.set('connecting');
     if (!opts.background) {
       this.log(`sync: connecting to ${cfg.peerUrl}${cfg.authKey ? ' (with auth key)' : ''}…`);
     }
     try {
-      // The engine is restored from persisted state on load (see plugin onload),
-      // so reconcileFromHost matches existing files by path/id — it does NOT
-      // re-import the fold's disambiguated names as new files (the duplicate-
-      // explosion loop). This keeps the correct reconcile→sync order so concurrent
-      // edits 3-way merge (rather than a pull-first order that linearly clobbers).
+      // `adoptFirst`: the engine was rebuilt fresh (no persisted state to restore)
+      // and the host disk may hold files that already exist on the peer. If we
+      // reconciled now, those files would be authored with NEW ids that COLLIDE
+      // with the peer's ids for the same path → the fold disambiguates them to
+      // `a (1).md` and they multiply every reload (the duplicate-explosion loop).
+      // So pull the peer's canonical state FIRST so reconcileFromHost matches by
+      // path and reuses the peer's id. Crucially, do NOT materialize between the
+      // pull and reconcile — that removal pass would delete local-only files
+      // before reconcile adds them to the engine (data loss). A warm/restored
+      // engine skips this and uses the plain reconcile→sync order (3-way merge).
+      let adopted = 0;
+      if (opts.adoptFirst) {
+        adopted = await this.vault.sync(cfg.peerUrl, { authKey: cfg.authKey });
+      }
       if (opts.reconcile) await this.bridge.reconcileFromHost();
       const integrated = await this.vault.sync(cfg.peerUrl, { authKey: cfg.authKey });
-      // Only rewrite the host tree when the peer sent new rows — otherwise the
-      // O(files) materialize scan runs for nothing on every no-op poll.
-      if (integrated > 0) {
+      // Materialize AFTER reconcile (so the engine holds peer + local files and
+      // the removal pass only drops genuinely-gone files). Skip on no-op polls.
+      if (adopted > 0 || integrated > 0) {
         const { written, removed } = await this.bridge.materializeToHost();
-        this.log(`sync: pulled ${integrated} row(s) → ${written} written, ${removed} removed`);
+        this.log(`sync: pulled ${adopted + integrated} row(s) → ${written} written, ${removed} removed`);
       } else if (!opts.background) {
         this.log('sync: up to date (nothing new from peer)');
       }

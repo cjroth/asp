@@ -92,6 +92,9 @@ export default class AspPlugin extends Plugin {
    * hub rotates it or once the device is already enrolled). Discarded on use. */
   pendingAuthKey = '';
   private saveStateTimer?: ReturnType<typeof setTimeout>;
+  /** True once persisted engine state was restored on load — then reconcile
+   * matches existing ids and the first sync needn't adopt-first. */
+  private engineRestored = false;
 
   async onload(): Promise<void> {
     const loaded = ((await this.loadData()) as Partial<AspSettings> & { authKey?: string }) ?? {};
@@ -185,7 +188,10 @@ export default class AspPlugin extends Plugin {
     // lightweight periodic pull so peer-side changes appear without a local edit.
     if (this.settings.enabled && this.settings.peerUrl) {
       this.log.append('startup: initial sync…');
-      void this.runSync({ reconcile: true, quiet: true });
+      // Adopt the peer's file ids first ONLY when we didn't restore engine state
+      // (fresh engine): prevents reconcile from minting colliding ids for files
+      // already on the peer (the duplicate-explosion loop).
+      void this.runSync({ reconcile: true, adoptFirst: !this.engineRestored, quiet: true });
     }
     this.startPolling();
   }
@@ -231,7 +237,7 @@ export default class AspPlugin extends Plugin {
    * Returns whether it converged.
    */
   private async runSync(
-    opts: { reconcile?: boolean; background?: boolean; quiet?: boolean } = {},
+    opts: { reconcile?: boolean; background?: boolean; quiet?: boolean; adoptFirst?: boolean } = {},
   ): Promise<boolean> {
     if (!this.controller) return false;
     if (this.syncing) return false; // a sync is already in flight
@@ -245,7 +251,7 @@ export default class AspPlugin extends Plugin {
     try {
       await this.controller.syncOnce(
         { peerUrl, authKey: this.pendingAuthKey || undefined },
-        { reconcile: opts.reconcile, background: opts.background },
+        { reconcile: opts.reconcile, background: opts.background, adoptFirst: opts.adoptFirst },
       );
       this.scheduleSaveState(); // persist engine state so reloads don't re-import
       if (!opts.quiet) new Notice('asp: synced');
@@ -263,7 +269,7 @@ export default class AspPlugin extends Plugin {
    * controls so the next settings render shows them. */
   async connect(): Promise<boolean> {
     this.log.append('connect: attempting first sync…');
-    const ok = await this.runSync({ reconcile: true });
+    const ok = await this.runSync({ reconcile: true, adoptFirst: !this.engineRestored });
     if (ok) {
       // Enrollment done — burn the one-time auth key so it never lingers.
       this.pendingAuthKey = '';
@@ -298,6 +304,7 @@ export default class AspPlugin extends Plugin {
         const json = await this.app.vault.adapter.read(p);
         if (json) {
           await this.sdk.load(json);
+          this.engineRestored = true;
           this.log.append('restored engine state — reconcile will match existing files');
         }
       }

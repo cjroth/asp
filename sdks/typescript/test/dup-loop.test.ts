@@ -47,6 +47,34 @@ test('BUG SHAPE: reconcile-before-adopt doubles files every reload', () => {
   expect(counts[2]).toBeGreaterThan(counts[1]);
 });
 
+test('FIX: a fresh node adopts peer ids before reconciling same-path files', () => {
+  // The peer (hub) already holds the files; a fresh client's DISK has the same
+  // paths (e.g. it was synced before but lost its engine state). Reconciling
+  // directly would mint NEW ids that collide with the peer's → duplication.
+  // A pristine hub holds the canonical rows. (Use a fresh hub per scenario —
+  // `exchange` MUTATES the hub by integrating the client's rows, so a polluted
+  // hub would no longer be a clean peer for the next scenario.)
+  const mkHub = () => {
+    const h = new Vault(new Uint8Array(32).fill(9), '');
+    h.writeFiles({ 'a.md': enc('A'), 'b.md': enc('B') });
+    return h;
+  };
+  const disk = mkHub().files(); // client disk == hub content/paths
+
+  // BUG: reconcile-first on a fresh engine, then exchange → collisions multiply.
+  const bad = new Vault(new Uint8Array(32).fill(8), '');
+  bad.writeFiles(disk); // fresh ids
+  exchange(bad, mkHub());
+  expect(Object.keys(bad.files()).length).toBeGreaterThan(2); // dups appeared
+
+  // FIX: adopt the peer's rows (ids) FIRST, then reconcile the disk — matches by
+  // path, reuses the peer's ids, no new files.
+  const good = new Vault(new Uint8Array(32).fill(7), '');
+  good.eng.integrate(mkHub().eng.rows_after(JSON.stringify({}))); // adopt-first (pull)
+  good.writeFiles(disk); // reconcile — matches existing ids
+  expect(Object.keys(good.files()).length).toBe(2); // a.md + b.md, no dups
+});
+
 test('FIX: restoring persisted engine state before reconcile keeps it bounded', () => {
   const { A, B } = setup();
   const baseline = Object.keys(A.files()).length; // 2: "a.md" + "a (1).md"
