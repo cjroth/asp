@@ -417,7 +417,6 @@ class AspSettingTab extends PluginSettingTab {
       // `asp auth list`).
       new Setting(root)
         .setName('Peer ID')
-        .setDesc('This device on the hub (matches `asp auth list` / log `peer=…`).')
         .addText((t) => t.setValue(this.plugin.peerId()).setDisabled(true))
         .addButton((b) =>
           b.setButtonText('Copy').onClick(() => {
