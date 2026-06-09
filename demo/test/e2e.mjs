@@ -78,12 +78,12 @@ try {
   check('both report In sync', await panel('laptop').locator('.status.insync').isVisible() && await panel('desktop').locator('.status.insync').isVisible());
 
   // 5) offline → edit → reconnect catch-up
-  await panel('desktop').getByRole('button', { name: 'Go offline' }).click();
+  await panel('desktop').locator('.np-status .set-toggle').click(); // online is a switch in the status bar
   check('desktop shows Offline', await waitVisible(panel('desktop').locator('.status.offline')));
   const offlineEdit = '# Vault\n\nauthored while desktop was offline\n';
   await laptopEd.fill(offlineEdit);
   check('desktop did NOT receive the edit while offline', await waitValueNot(desktopEd, offlineEdit, 2500));
-  await panel('desktop').getByRole('button', { name: 'Reconnect' }).click();
+  await panel('desktop').locator('.np-status .set-toggle').click(); // toggle back online
   check('reconnect delivered the missed edit (catch-up)', await waitValue(desktopEd, offlineEdit, 8000));
 
   // 6) OPFS persistence across reload

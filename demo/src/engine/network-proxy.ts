@@ -122,6 +122,13 @@ export class NetworkProxy {
     return this.snap;
   }
 
+  /** The node's change history (timeline + diff). Async — computed in the
+   * worker on demand (it scans all rows + blobs), NOT shipped in every snapshot
+   * (that would undo the snapshot diet). */
+  history(nodeId: string): Promise<any[]> {
+    return this.request('history', nodeId);
+  }
+
   // ---- fire-and-forget mutations -----------------------------------------
   setConfig(patch: any) { this.send('setConfig', patch); }
   removeNode(id: string) { this.send('removeNode', id); }

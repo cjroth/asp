@@ -91,6 +91,7 @@ interface Node {
   folders: Set<string>;  // local-only folders (mkdir before a file lands)
   lines: LogLine[];
   lineSeq: number;
+  mySites: Set<string>;  // authoring site_ids this node has used (change attribution)
   createdRemote: string | null;
   externalUrl?: string;  // a real `asp watch --listen` peer this node bridges to
   authKey?: string;
@@ -141,6 +142,22 @@ export function createNetwork(opts: NetworkOpts) {
   }
 
   const vvOf = (node: Node): Record<string, number> => JSON.parse(node.eng.version_vector());
+
+  // Remember which authoring site_id(s) this node has written under, so change
+  // events in the timeline can be coloured by the device that made them. The
+  // MemEngine's authoring site is fresh per instance, so we capture it from the
+  // rows just authored (and persist it across reload).
+  function noteAuthored(node: Node, authoredJson: string) {
+    try {
+      for (const w of JSON.parse(authoredJson) as any[]) if (w?.row?.site_id) node.mySites.add(w.row.site_id);
+    } catch { /* ignore */ }
+  }
+  // site_id -> {name, color} across every live node (own authored sites).
+  function siteOwnerMap(): Record<string, { name: string; color: string }> {
+    const m: Record<string, { name: string; color: string }> = {};
+    for (const n of nodes) for (const s of n.mySites) m[s] = { name: n.name, color: n.color };
+    return m;
+  }
 
   // ---- the file map, on a diet -------------------------------------------
   // The old single `filesView` decoded EVERY file's bytes (files_json) on EVERY
@@ -312,6 +329,7 @@ export function createNetwork(opts: NetworkOpts) {
       folders: new Set(),
       lines: [],
       lineSeq: 0,
+      mySites: new Set(),
       createdRemote: null,
     };
     nodes.push(node);
@@ -332,6 +350,7 @@ export function createNetwork(opts: NetworkOpts) {
     } else if (!remote) {
       // genesis vault: author the seed files (real create rows)
       for (const s of SEED) node.eng.record_write(s.path, enc.encode(s.body));
+      noteAuthored(node, node.eng.rows_after('{}'));
       const view = filesMeta(node);
       const readme = Object.values(view).find((f) => f.path === 'README.md');
       node.openFileId = readme ? readme.file_id : Object.values(view)[0]?.file_id ?? null;
@@ -495,6 +514,7 @@ export function createNetwork(opts: NetworkOpts) {
       externalUrl: n.externalUrl,
       authKey: n.authKey,
       folders: [...n.folders],
+      mySites: [...n.mySites],
       rows: JSON.parse(n.eng.rows_after('{}')), // every wire row this node holds
     })),
     edges: edges.map((e) => ({ a: localOf(e.a), b: localOf(e.b) })).filter((e) => e.a && e.b),
@@ -525,6 +545,7 @@ export function createNetwork(opts: NetworkOpts) {
         folders: new Set(sn.folders || []),
         lines: [],
         lineSeq: 0,
+        mySites: new Set(sn.mySites || []),
         createdRemote: sn.createdRemote ?? null,
         externalUrl: sn.externalUrl,
         authKey: sn.authKey,
@@ -617,6 +638,7 @@ export function createNetwork(opts: NetworkOpts) {
     const before = vvOf(node);
     node.eng.record_write(view.path, enc.encode(content));
     const authoredJson = node.eng.rows_after(JSON.stringify(before));
+    noteAuthored(node, authoredJson);
     const authored = JSON.parse(authoredJson) as any[];
     const r = authored[authored.length - 1]?.row;
     logLine(node, [
@@ -646,6 +668,7 @@ export function createNetwork(opts: NetworkOpts) {
     const before = vvOf(node);
     node.eng.record_write(path, enc.encode(''));
     const authoredJson = node.eng.rows_after(JSON.stringify(before));
+    noteAuthored(node, authoredJson);
     const authored = JSON.parse(authoredJson) as any[];
     const r = authored[authored.length - 1]?.row;
     const fid = r ? r.file_id : null;
@@ -682,6 +705,7 @@ export function createNetwork(opts: NetworkOpts) {
     const before = vvOf(node);
     node.eng.record_rename(view.path, np);
     const authoredJson = node.eng.rows_after(JSON.stringify(before));
+    noteAuthored(node, authoredJson);
     const r = (JSON.parse(authoredJson) as any[])[0]?.row;
     logLine(node, [
       { t: 'INFO', c: 'lvl' }, { t: ' commit    ', c: 'tag' },
@@ -753,6 +777,7 @@ export function createNetwork(opts: NetworkOpts) {
     const before = vvOf(node);
     node.eng.record_remove(view.path);
     const authoredJson = node.eng.rows_after(JSON.stringify(before));
+    noteAuthored(node, authoredJson);
     const r = (JSON.parse(authoredJson) as any[])[0]?.row;
     const wasOpen = node.openFileId === fileId;
     if (wasOpen) {
@@ -821,6 +846,41 @@ export function createNetwork(opts: NetworkOpts) {
   };
   api.peersOf = peersOf;
   api.statusOf = statusOf;
+
+  // ---- change history (timeline + diff) ------------------------------
+  // Every file-change row this node holds, in canonical (lamport, site, seq)
+  // order, with before/after text resolved from the bundled content blobs and
+  // the authoring device coloured via siteOwnerMap(). Fetched async via the
+  // proxy (off the main thread); not part of the snapshot (would bloat it).
+  api.history = (nodeId: string) => {
+    const node = findNode(nodeId);
+    if (!node) return [];
+    const wire = JSON.parse(node.eng.rows_after('{}')) as { row: any; blobs: { hash: string; bytes: number[] }[] }[];
+    const blobs: Record<string, string> = {};
+    for (const w of wire) for (const b of w.blobs) if (!(b.hash in blobs)) blobs[b.hash] = dec.decode(Uint8Array.from(b.bytes));
+    const owners = siteOwnerMap();
+    const rows = wire.map((w) => w.row);
+    rows.sort((a, b) => a.lamport - b.lamport || (a.site_id < b.site_id ? -1 : a.site_id > b.site_id ? 1 : 0) || a.seq - b.seq);
+    // resolve each file_id's path as of each row (path is only set on create/rename)
+    const pathOf: Record<string, string> = {};
+    return rows.map((r) => {
+      if (r.path) pathOf[r.file_id] = r.path;
+      const owner = owners[r.site_id];
+      return {
+        rowId: r.id,
+        siteId: r.site_id,
+        ts: r.ts,
+        lamport: r.lamport,
+        fileId: r.file_id,
+        kind: r.kind as string,
+        path: pathOf[r.file_id] || r.path || r.file_id.slice(0, 8),
+        ownerName: owner ? owner.name : `${r.site_id.slice(0, 6)}…`,
+        ownerColor: owner ? owner.color : 'var(--faint)',
+        before: r.base_hash ? (blobs[r.base_hash] ?? '') : '',
+        after: r.result_hash ? (blobs[r.result_hash] ?? '') : '',
+      };
+    });
+  };
 
   api.snapshot = () => ({
     nodes: nodes.map((n) => ({
