@@ -37,10 +37,13 @@ use tokio_tungstenite::{accept_hdr_async_with_config, client_async_with_config, 
 /// session::push_rows_chunked.) Bounded — not unlimited — so a peer can't OOM us.
 const WS_MAX_MSG: usize = 128 * 1024 * 1024;
 
-/// Rows fetched per page when streaming a catch-up (see Step::CatchUp). Small
-/// enough that the first page builds fast (peer's idle timer stays reset) and
-/// memory stays bounded; large enough to amortize lock/round-trips.
-const CATCHUP_PAGE_ROWS: i64 = 256;
+/// Rows fetched per page when streaming a catch-up (see Step::CatchUp). The
+/// receiver re-folds its whole vault once per RECEIVED frame, so small pages
+/// mean many folds of a large vault (a slow, gradual trickle). Keep pages big
+/// to minimize fold count + DB round-trips, while still being small enough that
+/// the first page reaches the peer well within its idle window and memory stays
+/// bounded. Paired with the larger per-frame budget so a page ships as one frame.
+const CATCHUP_PAGE_ROWS: i64 = 2000;
 
 fn ws_config() -> WebSocketConfig {
     let mut c = WebSocketConfig::default();

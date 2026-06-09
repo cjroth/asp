@@ -103,8 +103,8 @@ pub struct Session {
 /// serialized frame at a time. A single row whose blobs exceed the budget
 /// still ships alone (never split a row from its blobs — the fold needs them
 /// together).
-const CATCHUP_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-const CATCHUP_CHUNK_ROWS: usize = 512;
+const CATCHUP_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+const CATCHUP_CHUNK_ROWS: usize = 4096;
 
 /// Every row the peer (`peer_vv`) is missing, built up front. Used by the
 /// connector (small push-back) and by non-streaming drivers (the in-process
@@ -420,7 +420,8 @@ mod tests {
         let da = tempdir().unwrap();
         let a = Engine::init(da.path(), Identity::from_seed(&[7; 32])).unwrap();
         let big = vec![b'x'; 1024 * 1024]; // 1 MiB per file
-        for i in 0..6 {
+        let n = (CATCHUP_CHUNK_BYTES / (1024 * 1024)) + 4; // a few MiB over one frame's budget
+        for i in 0..n {
             a.record_write(&format!("f{i}.bin"), &big).unwrap();
         }
         // The catch-up the listener would assemble for a fresh peer.
@@ -429,12 +430,12 @@ mod tests {
             rows.extend(a.rows_after_wire(&site, -1).unwrap());
         }
         let total = rows.len();
-        assert!(total >= 6, "expected ≥6 rows, got {total}");
+        assert!(total >= n, "expected ≥{n} rows, got {total}");
 
         let mut out = Vec::new();
         push_rows_chunked(&mut out, rows);
 
-        assert!(out.len() > 1, "≈6 MiB over a 4 MiB budget must span >1 frame, got {}", out.len());
+        assert!(out.len() > 1, "data over one frame's byte budget must span >1 frame, got {}", out.len());
         let mut shipped = 0;
         for step in &out {
             let Step::Send(Msg::Rows { rows }) = step else { panic!("non-Rows step") };
