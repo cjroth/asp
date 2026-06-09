@@ -147,6 +147,15 @@ impl WasmEngine {
         Ok(())
     }
 
+    /// Stage a batch of host files (create/edit, no deletes), folding ONCE
+    /// (`{path: [u8]}`). The startup reconcile uses this instead of one
+    /// record_write per file — per-file re-folding is O(n²) over a large vault.
+    pub fn write_files(&self, files_json: &str) -> Result<(), JsError> {
+        let files: BTreeMap<String, Vec<u8>> = serde_json::from_str(files_json).map_err(to_err)?;
+        self.eng.record_writes(&files).map_err(to_err)?;
+        Ok(())
+    }
+
     /// The materialized working tree as JSON `{path: [u8]}`.
     pub fn files_json(&self) -> Result<String, JsError> {
         let m = self.eng.files_map().map_err(to_err)?;

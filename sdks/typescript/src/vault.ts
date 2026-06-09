@@ -44,6 +44,8 @@ export interface SyncOptions {
  */
 export interface EngineVault {
   writeFile(path: string, bytes: Uint8Array): void | Promise<void>;
+  /** Stage a batch of files (create/edit, no deletes) in one fold. */
+  writeFiles(files: Record<string, Uint8Array>): void | Promise<void>;
   deleteFile(path: string): void | Promise<void>;
   renameFile(from: string, to: string): void | Promise<void>;
   files(): Record<string, Uint8Array> | Promise<Record<string, Uint8Array>>;
@@ -104,6 +106,14 @@ export class Vault {
     const obj: Record<string, number[]> = {};
     for (const [p, c] of Object.entries(files)) obj[p] = Array.from(toBytes(c));
     this.eng.commit_files(JSON.stringify(obj));
+  }
+
+  /** Stage a batch of files (create/edit, no deletes) with a single fold — the
+   * startup reconcile seam, so a large vault doesn't re-fold per file. */
+  writeFiles(files: Record<string, Uint8Array | string>): void {
+    const obj: Record<string, number[]> = {};
+    for (const [p, c] of Object.entries(files)) obj[p] = Array.from(toBytes(c));
+    this.eng.write_files(JSON.stringify(obj));
   }
 
   /**

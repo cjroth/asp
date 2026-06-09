@@ -49,6 +49,9 @@ export class EngineWorkerHost {
         case 'commitFiles':
           this.vaultOrThrow().commitFiles(cmd.files);
           return this.reply(cmd.id, true);
+        case 'writeFiles':
+          this.vaultOrThrow().writeFiles(cmd.files);
+          return this.reply(cmd.id, true);
         case 'files':
           return this.reply(cmd.id, true, this.vaultOrThrow().files());
         case 'sync': {

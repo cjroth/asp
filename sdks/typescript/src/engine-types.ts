@@ -12,6 +12,8 @@ export interface WasmEngineInstance {
   record_remove(path: string): void;
   record_rename(from: string, to: string): void;
   commit_files(filesJson: string): void;
+  /** Stage a batch of files (create/edit, no deletes) with a single fold. */
+  write_files(filesJson: string): void;
   files_json(): string;
   read_file(path: string): Uint8Array | undefined;
   /** This node's version vector as JSON `{site_id: max_seq}`. */

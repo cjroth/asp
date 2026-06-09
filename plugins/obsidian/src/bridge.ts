@@ -53,15 +53,17 @@ export class Bridge {
   /** Seed the engine from the host's current contents (startup reconcile).
    * Returns the number of files captured. */
   async reconcileFromHost(): Promise<number> {
-    let n = 0;
+    // Stage every local file in ONE batch (a single fold) rather than a
+    // record_write per file — per-file re-folding is O(n²), which made the
+    // first sync of a large vault crawl.
+    const files: Record<string, Uint8Array> = {};
     for (const path of await this.host.list()) {
       if (this.filter.ignored(path)) continue;
       const bytes = await this.host.read(path);
-      if (bytes != null) {
-        await this.vault.writeFile(path, bytes);
-        n++;
-      }
+      if (bytes != null) files[path] = bytes;
     }
+    const n = Object.keys(files).length;
+    if (n > 0) await this.vault.writeFiles(files);
     this.log(`reconcile: staged ${n} local file${n === 1 ? '' : 's'} into the engine`);
     return n;
   }

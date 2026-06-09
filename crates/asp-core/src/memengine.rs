@@ -110,7 +110,13 @@ impl MemEngine {
 
     /// Author a create/edit for `rel`. Returns the row (with blobs), or None if
     /// the content is unchanged.
-    pub fn record_write(&self, rel: &str, bytes: &[u8]) -> AspResult<Option<WireRow>> {
+    // Author a write row but DON'T materialize — so a batch (commit_files /
+    // record_writes) can fold once at the end instead of per file. Returns the
+    // pushed row, or None if the bytes already match the current content.
+    // (lamport/seq/parent read the log, which is updated here; only the
+    // materialized `files` table is deferred, and each path is touched once per
+    // batch so its base is the pre-batch state — correct.)
+    fn write_row(&self, rel: &str, bytes: &[u8]) -> AspResult<Option<LogRow>> {
         let result_hash = self.blobs.put_blob(bytes)?;
         let (lamport, seq, ts) = (self.next_lamport(), self.next_seq(), now_unix());
         let row = match self.current_for_path(rel) {
@@ -153,11 +159,11 @@ impl MemEngine {
             .seal(),
         };
         self.rows.borrow_mut().push(row.clone());
-        self.materialize()?;
-        Ok(Some(self.wire(row)?))
+        Ok(Some(row))
     }
 
-    pub fn record_remove(&self, rel: &str) -> AspResult<Option<WireRow>> {
+    // Author a delete row without materializing (batch helper, see write_row).
+    fn remove_row(&self, rel: &str) -> AspResult<Option<LogRow>> {
         let Some(cur) = self.current_for_path(rel) else { return Ok(None) };
         let (lamport, seq, ts) = (self.next_lamport(), self.next_seq(), now_unix());
         let row = LogRow {
@@ -177,8 +183,43 @@ impl MemEngine {
         }
         .seal();
         self.rows.borrow_mut().push(row.clone());
-        self.materialize()?;
-        Ok(Some(self.wire(row)?))
+        Ok(Some(row))
+    }
+
+    pub fn record_write(&self, rel: &str, bytes: &[u8]) -> AspResult<Option<WireRow>> {
+        match self.write_row(rel, bytes)? {
+            Some(row) => {
+                self.materialize()?;
+                Ok(Some(self.wire(row)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn record_remove(&self, rel: &str) -> AspResult<Option<WireRow>> {
+        match self.remove_row(rel)? {
+            Some(row) => {
+                self.materialize()?;
+                Ok(Some(self.wire(row)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Author writes for a batch of files (create/edit), materializing the fold
+    /// **once**. Write-only (no deletes) — the seam the host's startup reconcile
+    /// uses to stage a whole vault without re-folding per file (O(n²) → O(n)).
+    pub fn record_writes(&self, files: &BTreeMap<String, Vec<u8>>) -> AspResult<Vec<WireRow>> {
+        let mut rows = Vec::new();
+        for (path, bytes) in files {
+            if let Some(row) = self.write_row(path, bytes)? {
+                rows.push(row);
+            }
+        }
+        if !rows.is_empty() {
+            self.materialize()?;
+        }
+        rows.into_iter().map(|r| self.wire(r)).collect()
     }
 
     pub fn record_rename(&self, old: &str, new: &str) -> AspResult<Option<WireRow>> {
@@ -209,21 +250,26 @@ impl MemEngine {
     /// host's current vault contents. Authors the necessary create/edit/delete
     /// rows. Returns authored rows.
     pub fn commit_files(&self, desired: &BTreeMap<String, Vec<u8>>) -> AspResult<Vec<WireRow>> {
-        let mut authored = Vec::new();
+        let mut rows = Vec::new();
         let current: Vec<String> = self.files.borrow().iter().filter(|f| !f.deleted).map(|f| f.path.clone()).collect();
+        // Author every change against the pre-batch state, then fold ONCE — the
+        // old loop re-folded the whole vault on every file (O(n²)).
         for (path, bytes) in desired {
-            if let Some(wr) = self.record_write(path, bytes)? {
-                authored.push(wr);
+            if let Some(row) = self.write_row(path, bytes)? {
+                rows.push(row);
             }
         }
         for path in current {
             if !desired.contains_key(&path) {
-                if let Some(wr) = self.record_remove(&path)? {
-                    authored.push(wr);
+                if let Some(row) = self.remove_row(&path)? {
+                    rows.push(row);
                 }
             }
         }
-        Ok(authored)
+        if !rows.is_empty() {
+            self.materialize()?;
+        }
+        rows.into_iter().map(|r| self.wire(r)).collect()
     }
 
     pub fn wire(&self, row: LogRow) -> AspResult<WireRow> {

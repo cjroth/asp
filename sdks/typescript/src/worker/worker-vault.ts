@@ -63,6 +63,9 @@ export class WorkerVault {
   async commitFiles(files: Record<string, Uint8Array>): Promise<void> {
     await this.call({ op: 'commitFiles', files });
   }
+  async writeFiles(files: Record<string, Uint8Array>): Promise<void> {
+    await this.call({ op: 'writeFiles', files });
+  }
   async files(): Promise<Record<string, Uint8Array>> {
     return (await this.call({ op: 'files' })) as Record<string, Uint8Array>;
   }

@@ -273,6 +273,37 @@ impl Engine {
         Ok(added)
     }
 
+    /// Integrate a batch of rows, materializing (fold + write to disk + git
+    /// export) **once** at the end. Per-row `integrate` re-materializes on every
+    /// row — O(n²) over a large catch-up (the native daemon / hub serving a big
+    /// clone). Validates every row up front. Returns a per-row flag (true = new).
+    pub fn integrate_many(&self, wrs: &[WireRow]) -> AspResult<Vec<bool>> {
+        for wr in wrs {
+            if !wr.row.id_valid() {
+                return Err(AspError::Protocol("row id does not match its contents".into()));
+            }
+            for b in &wr.blobs {
+                let h = self.store.put_blob(&b.bytes)?;
+                if h != b.hash {
+                    return Err(AspError::Protocol("blob hash mismatch".into()));
+                }
+            }
+        }
+        let mut flags = Vec::with_capacity(wrs.len());
+        let mut any = false;
+        for wr in wrs {
+            let added = self.store.append_row(&wr.row)?;
+            if added {
+                any = true;
+            }
+            flags.push(added);
+        }
+        if any {
+            self.materialize()?;
+        }
+        Ok(flags)
+    }
+
     // ---------------- fold → materialize ----------------
 
     /// Fold the log, write the materialized `files` table, render changed files
@@ -747,6 +778,9 @@ impl SessionVault for Engine {
     }
     fn integrate(&self, wr: &WireRow) -> AspResult<bool> {
         Engine::integrate(self, wr)
+    }
+    fn integrate_many(&self, rows: &[WireRow]) -> AspResult<Vec<bool>> {
+        Engine::integrate_many(self, rows)
     }
     fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<()> {
         Engine::admit(self, peer, ctx)

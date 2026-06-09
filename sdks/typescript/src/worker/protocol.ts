@@ -39,6 +39,7 @@ export type Command =
   | { kind: 'cmd'; id: number; op: 'deleteFile'; path: string }
   | { kind: 'cmd'; id: number; op: 'renameFile'; from: string; to: string }
   | { kind: 'cmd'; id: number; op: 'commitFiles'; files: Record<string, Uint8Array> }
+  | { kind: 'cmd'; id: number; op: 'writeFiles'; files: Record<string, Uint8Array> }
   | { kind: 'cmd'; id: number; op: 'files' }
   | { kind: 'cmd'; id: number; op: 'sync'; url: string; authKey?: string }
   | { kind: 'cmd'; id: number; op: 'free' };
