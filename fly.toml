@@ -33,4 +33,6 @@ primary_region = "ewr"
 [[vm]]
   cpu_kind = "shared"
   cpus = 1
-  memory_mb = 512
+  # 1 GB: the hub holds the whole vault + serves streaming catch-up; 512 MB
+  # OOM-killed under a large/bloated vault with multi-MB catch-up frames.
+  memory_mb = 1024
