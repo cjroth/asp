@@ -3,7 +3,7 @@
    Ported from the design prototype (asp-components.jsx). Consumes the
    per-node snapshot produced by the real-engine network (network.ts).
    ==================================================================== */
-import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useMemo } from 'react';
 import { confirmDialog } from './confirm.tsx';
 
 /* ---------- helpers ---------- */
@@ -74,7 +74,10 @@ export function StatusPill({ status }: any) {
 }
 
 /* ==================================================================== */
-function TreeRow({ node, depth, snap, collapsed, toggle, api, dragRef, renaming, setRenaming, openMenu }: any) {
+/* One tree row. Non-recursive + absolutely positioned at `y`: the FileTree
+   flattens the visible tree and virtualizes it, so only the rows in view are
+   mounted — a 10k-file vault renders ~40 rows, not 10k. */
+function TreeRow({ y, node, depth, snap, collapsed, toggle, api, dragRef, renaming, setRenaming, openMenu }: any) {
   const [dragOver, setDragOver] = useState(false);
   const isDir = node.type === 'dir';
   const isOpen = snap.openFileId && node.file && node.file.file_id === snap.openFileId;
@@ -101,51 +104,94 @@ function TreeRow({ node, depth, snap, collapsed, toggle, api, dragRef, renaming,
   }
 
   return (
-    <div className="tnode">
-      <div
-        className={`trow ${isDir ? 'folder ' : ''}${isOpen ? 'active ' : ''}${dragOver ? 'dragover' : ''}`}
-        style={{ paddingLeft: 8 + depth * 13 }}
-        draggable={!isDir && !renamingThis}
-        onDragStart={(e) => { dragRef.current = node.file.file_id; e.dataTransfer.effectAllowed = 'move'; }}
-        onDragEnd={() => { dragRef.current = null; }}
-        onDragOver={(e) => { if (dragRef.current) { e.preventDefault(); setDragOver(true); } }}
-        onDragLeave={() => setDragOver(false)}
-        onDrop={onDrop}
-        onContextMenu={(e) => openMenu(e, node)}
-        onClick={() => { if (isDir) toggle(node.path); else api.openFile(snap.id, node.file.file_id); }}
-      >
-        {isDir ? <span className="twist">{isCollapsed ? '▸' : '▾'}</span> : <span className="twist" />}
-        {!isDir && <span className="ico">·</span>}
-        {renamingThis
-          ? <input className="rn-in" autoFocus defaultValue={node.name}
-              onClick={(e) => e.stopPropagation()}
-              onBlur={(e) => commitRn((e.target as HTMLInputElement).value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') commitRn((e.target as HTMLInputElement).value); if (e.key === 'Escape') setRenaming(null); }} />
-          : <span className={`nm${dirty ? ' dirty' : ''}`}>{node.name}{isDir ? '/' : ''}</span>}
-        {node.file && node.file.collided && <span className="badge-dot" style={{ background: 'var(--amber)' }} title="conflict / path collision — surfaced" />}
-      </div>
-      {isDir && !isCollapsed && node.sorted.map((c: any) => (
-        <TreeRow key={c.path + c.type} node={c} depth={depth + 1} snap={snap} collapsed={collapsed} toggle={toggle} api={api} dragRef={dragRef} renaming={renaming} setRenaming={setRenaming} openMenu={openMenu} />
-      ))}
+    <div
+      className={`trow ${isDir ? 'folder ' : ''}${isOpen ? 'active ' : ''}${dragOver ? 'dragover' : ''}`}
+      style={{ position: 'absolute', top: y, left: 0, right: 0, paddingLeft: 8 + depth * 13 }}
+      draggable={!isDir && !renamingThis}
+      onDragStart={(e) => { dragRef.current = node.file.file_id; e.dataTransfer.effectAllowed = 'move'; }}
+      onDragEnd={() => { dragRef.current = null; }}
+      onDragOver={(e) => { if (dragRef.current) { e.preventDefault(); setDragOver(true); } }}
+      onDragLeave={() => setDragOver(false)}
+      onDrop={onDrop}
+      onContextMenu={(e) => openMenu(e, node)}
+      onClick={() => { if (isDir) toggle(node.path); else api.openFile(snap.id, node.file.file_id); }}
+    >
+      {isDir ? <span className="twist">{isCollapsed ? '▸' : '▾'}</span> : <span className="twist" />}
+      {!isDir && <span className="ico">·</span>}
+      {renamingThis
+        ? <input className="rn-in" autoFocus defaultValue={node.name}
+            onClick={(e) => e.stopPropagation()}
+            onBlur={(e) => commitRn((e.target as HTMLInputElement).value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') commitRn((e.target as HTMLInputElement).value); if (e.key === 'Escape') setRenaming(null); }} />
+        : <span className={`nm${dirty ? ' dirty' : ''}`}>{node.name}{isDir ? '/' : ''}</span>}
+      {node.file && node.file.collided && <span className="badge-dot" style={{ background: 'var(--amber)' }} title="conflict / path collision — surfaced" />}
     </div>
   );
 }
+
+// Flatten the visible (expanded) tree into a linear list — the input to the
+// virtualizer. Collapsed folders contribute their own row but not their kids.
+function flattenTree(tree: any, collapsed: Set<string>): { node: any; depth: number }[] {
+  const out: { node: any; depth: number }[] = [];
+  (function walk(node: any, depth: number) {
+    for (const c of node.sorted) {
+      out.push({ node: c, depth });
+      if (c.type === 'dir' && !collapsed.has(c.path)) walk(c, depth + 1);
+    }
+  })(tree, 0);
+  return out;
+}
+
+const TREE_ROW_H = 21; // measured: every .trow is a uniform 21px
+const TREE_OVERSCAN = 8;
 
 export function FileTree({ snap, api }: any) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [renaming, setRenaming] = useState<any>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; node: any } | null>(null);
   const dragRef = useRef<any>(null);
-  const tree = buildTree(snap.files, snap.folders);
+  // Rebuild the tree only when the file map / folder set actually change (a new
+  // ref); during a sync most snapshot pushes leave a given node's files alone.
+  const tree = useMemo(() => buildTree(snap.files, snap.folders), [snap.files, snap.folders]);
   const toggle = (path: string) => setCollapsed((s) => { const n = new Set(s); n.has(path) ? n.delete(path) : n.add(path); return n; });
-  const liveCount = Object.values<any>(snap.files).filter((f) => !f.deleted).length;
+  const liveCount = useMemo(() => Object.values<any>(snap.files).filter((f) => !f.deleted).length, [snap.files]);
   const [rootOver, setRootOver] = useState(false);
 
   // Every folder path in the tree, for expand-all / collapse-all.
-  const allDirs: string[] = [];
-  (function walk(node: any) { for (const c of node.sorted) if (c.type === 'dir') { allDirs.push(c.path); walk(c); } })(tree);
+  const allDirs = useMemo(() => {
+    const acc: string[] = [];
+    (function walk(node: any) { for (const c of node.sorted) if (c.type === 'dir') { acc.push(c.path); walk(c); } })(tree);
+    return acc;
+  }, [tree]);
   const allExpanded = allDirs.every((d) => !collapsed.has(d));
   const toggleAll = () => setCollapsed(allExpanded ? new Set(allDirs) : new Set());
+
+  // Start every vault collapsed on first load. Runs once per node, after the
+  // tree has arrived; later edits won't re-collapse what the user expanded.
+  const didAutoCollapse = useRef(false);
+  useLayoutEffect(() => {
+    if (didAutoCollapse.current) return;
+    if (allDirs.length === 0 && liveCount === 0) return; // tree hasn't arrived yet
+    didAutoCollapse.current = true;
+    if (allDirs.length > 0) setCollapsed(new Set(allDirs));
+  }, [allDirs, liveCount]);
+
+  // Virtualize: flatten the visible rows, then mount only the window around the
+  // scroll position. Render cost is O(visible) regardless of vault size.
+  const flat = useMemo(() => flattenTree(tree, collapsed), [tree, collapsed]);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewH, setViewH] = useState(480);
+  useLayoutEffect(() => {
+    const el = scrollRef.current; if (!el) return;
+    const ro = new ResizeObserver(() => setViewH(el.clientHeight));
+    ro.observe(el); setViewH(el.clientHeight);
+    return () => ro.disconnect();
+  }, []);
+  const total = flat.length;
+  const startRow = Math.max(0, Math.floor(scrollTop / TREE_ROW_H) - TREE_OVERSCAN);
+  const endRow = Math.min(total, Math.ceil((scrollTop + viewH) / TREE_ROW_H) + TREE_OVERSCAN);
+  const visible = flat.slice(startRow, endRow);
 
   // Close the context menu on any outside interaction.
   useEffect(() => {
@@ -210,15 +256,21 @@ export function FileTree({ snap, api }: any) {
           <button className="icon-btn" title="New folder" onClick={newFolder}><FolderPlusIcon /></button>
         </span>
       </div>
-      <div className={`tree-scroll${rootOver ? ' dragover' : ''}`}
+      <div className={`tree-scroll${rootOver ? ' dragover' : ''}`} ref={scrollRef}
+        onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
         onDragOver={(e) => { if (dragRef.current) { e.preventDefault(); setRootOver(true); } }}
         onDragLeave={() => setRootOver(false)}
         onDrop={(e) => { e.preventDefault(); setRootOver(false); if (dragRef.current) api.moveFile(snap.id, dragRef.current, ''); }}>
-        {tree.sorted.length === 0
+        {total === 0
           ? <div className="tree-empty">empty vault.<br />press ＋ to create a file.</div>
-          : tree.sorted.map((c: any) => (
-            <TreeRow key={c.path + c.type} node={c} depth={0} snap={snap} collapsed={collapsed} toggle={toggle} api={api} dragRef={dragRef} renaming={renaming} setRenaming={setRenaming} openMenu={openMenu} />
-          ))}
+          : (
+            <div style={{ height: total * TREE_ROW_H, position: 'relative' }}>
+              {visible.map(({ node, depth }, i) => (
+                <TreeRow key={node.path + node.type} y={(startRow + i) * TREE_ROW_H} node={node} depth={depth}
+                  snap={snap} collapsed={collapsed} toggle={toggle} api={api} dragRef={dragRef} renaming={renaming} setRenaming={setRenaming} openMenu={openMenu} />
+              ))}
+            </div>
+          )}
       </div>
       {menu && (
         <div className="ctx-menu" style={{ left: menu.x, top: menu.y }} onClick={(e) => e.stopPropagation()} onContextMenu={(e) => e.preventDefault()}>
@@ -233,9 +285,36 @@ export function FileTree({ snap, api }: any) {
 /* ==================================================================== */
 export function Editor({ snap, api }: any) {
   const f = snap.openFileId ? snap.files[snap.openFileId] : null;
-  const staged = f && snap.staged[f.file_id];
-  const value = staged != null ? staged : (f ? f.content : '');
-  const dirty = f && staged != null && staged !== f.content;
+  const fileId = f ? f.file_id : null;
+  // The engine's authoritative text for the open file (staged overlay, else the
+  // committed content).
+  const engineVal = f ? (snap.staged[f.file_id] != null ? snap.staged[f.file_id] : f.content) : '';
+
+  // Local buffer so keystrokes are instant. The engine runs in a worker, so
+  // api.stageEdit round-trips asynchronously — a controlled <textarea> bound
+  // straight to the round-tripped value drops characters and jumps the caret
+  // under fast typing. We type into local state and inform the engine as a
+  // side-effect, adopting the engine value only when the file switches or a
+  // *remote* edit lands (so live sync still flows into an open editor).
+  const [text, setText] = useState(engineVal);
+  const pending = useRef<string | null>(null); // our last edit, until the engine echoes it back
+  const lastFile = useRef<string | null>(fileId);
+  useEffect(() => {
+    if (fileId !== lastFile.current) {            // switched files → adopt its value
+      lastFile.current = fileId;
+      pending.current = null;
+      setText(engineVal);
+      return;
+    }
+    if (pending.current != null) {
+      if (engineVal === pending.current) pending.current = null; // our edit echoed → synced
+      return;                                     // else: still in flight; ignore stale renders
+    }
+    if (engineVal !== text) setText(engineVal);    // synced + engine moved → a remote edit; adopt it
+  }, [fileId, engineVal]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const value = f ? text : '';
+  const dirty = !!f && f.content !== value;
 
   if (!f || f.deleted) {
     return (
@@ -255,7 +334,7 @@ export function Editor({ snap, api }: any) {
       <div className="ed-area">
         <textarea spellCheck={false} value={value}
           placeholder="// empty file — type to edit, auto-commits on debounce"
-          onChange={(e) => api.stageEdit(snap.id, f.file_id, e.target.value)} />
+          onChange={(e) => { const v = e.target.value; setText(v); pending.current = v; api.stageEdit(snap.id, f.file_id, v); }} />
       </div>
       <div className="ed-foot">
         <span>file_id={f.file_id.slice(0, 8)}</span>
@@ -316,11 +395,17 @@ export function NetworkMap({ snap, packetsRef, selected, onSelect, statusFor }: 
 
   useEffect(() => {
     let raf: number;
+    let wasAnimating = false;
     const loop = () => {
       const now = performance.now();
       const arr = packetsRef.current;
       for (let i = arr.length - 1; i >= 0; i--) if (now - arr[i].started > arr[i].dur + 60) arr.splice(i, 1);
-      force((x) => x + 1);
+      // Only re-render while packets are in flight (plus one final frame to clear
+      // them). Otherwise the map re-rendered every frame forever — constant
+      // main-thread work that made the whole UI feel laggy even while idle.
+      const animating = arr.length > 0;
+      if (animating || wasAnimating) force((x) => x + 1);
+      wasAnimating = animating;
       raf = requestAnimationFrame(loop);
     };
     raf = requestAnimationFrame(loop);

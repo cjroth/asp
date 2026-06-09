@@ -16,6 +16,12 @@ createServer((req, res) => {
   if (!file.startsWith(root) || !existsSync(file) || !statSync(file).isFile()) {
     res.writeHead(404); res.end('not found'); return;
   }
-  res.writeHead(200, { 'Content-Type': TYPES[extname(file)] || 'application/octet-stream' });
+  // No-store: the demo is a single inlined bundle, so a cached main.js silently
+  // serves stale code after a rebuild. For a local preview server we always want
+  // the freshly-built file.
+  res.writeHead(200, {
+    'Content-Type': TYPES[extname(file)] || 'application/octet-stream',
+    'Cache-Control': 'no-store, must-revalidate',
+  });
   createReadStream(file).pipe(res);
 }).listen(port, () => console.log(`demo at http://localhost:${port}`));

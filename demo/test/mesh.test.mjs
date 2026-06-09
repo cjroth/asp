@@ -14,7 +14,7 @@ const api = createNetwork({ latencyMs: 40, debounceMs: 10 });
 const filesOf = (id) => {
   const n = api.snapshot().nodes.find((x) => x.id === id);
   const out = {};
-  for (const f of Object.values(n.files)) if (!f.deleted) out[f.path] = f.content;
+  for (const f of Object.values(n.files)) if (!f.deleted) out[f.path] = api.fileText(id, f.path);
   return out;
 };
 const nodeByName = (name) => api.snapshot().nodes.find((n) => n.name === name);

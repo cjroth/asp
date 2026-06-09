@@ -185,13 +185,10 @@ impl WasmEngine {
     /// `compute_files` fold + `merge3`). Returns how many *new* rows landed.
     pub fn integrate(&self, wire_rows_json: &str) -> Result<usize, JsError> {
         let rows: Vec<WireRow> = serde_json::from_str(wire_rows_json).map_err(to_err)?;
-        let mut n = 0;
-        for wr in &rows {
-            if self.eng.integrate(wr).map_err(to_err)? {
-                n += 1;
-            }
-        }
-        Ok(n)
+        // Batch-integrate: fold once, not once per row (per-row is O(n²) over a
+        // large catch-up / restore — a 3000-row vault was ~10s).
+        let flags = self.eng.integrate_many(&rows).map_err(to_err)?;
+        Ok(flags.into_iter().filter(|b| *b).count())
     }
 
     /// Wrap locally-authored wire rows in a `Rows` data frame to send over a live

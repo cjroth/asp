@@ -38,6 +38,13 @@ pub trait SessionVault {
     /// Rows authored by `site` after `seq`, bundled with their blobs.
     fn rows_after_wire(&self, site: &str, after: i64) -> AspResult<Vec<WireRow>>;
     fn integrate(&self, wr: &WireRow) -> AspResult<bool>;
+    /// Integrate a batch, returning a per-row flag (true = newly added). The
+    /// default integrates one-by-one; engines that re-fold on each `integrate`
+    /// should override this to fold once — the per-row path is O(n²) over a
+    /// large catch-up.
+    fn integrate_many(&self, rows: &[WireRow]) -> AspResult<Vec<bool>> {
+        rows.iter().map(|wr| self.integrate(wr)).collect()
+    }
     fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<()>;
     /// No authored rows yet — the vault has nothing of its own to lose, so it
     /// adopts a peer's vault on connect (like `clone`). A freshly-`init`'d folder
@@ -258,13 +265,10 @@ impl Session {
     }
 
     fn integrate_batch(&self, vault: &dyn SessionVault, rows: Vec<WireRow>) -> AspResult<Vec<WireRow>> {
-        let mut added = Vec::new();
-        for wr in rows {
-            if vault.integrate(&wr)? {
-                added.push(wr);
-            }
-        }
-        Ok(added)
+        // Fold once for the whole batch (see SessionVault::integrate_many) — the
+        // old per-row loop re-folded the log on every row, O(n²) over a catch-up.
+        let flags = vault.integrate_many(&rows)?;
+        Ok(rows.into_iter().zip(flags).filter_map(|(wr, is_new)| is_new.then_some(wr)).collect())
     }
 
     /// Connector-side channel-binding enforcement (§Security, advertised binding).

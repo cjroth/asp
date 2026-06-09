@@ -259,6 +259,48 @@ impl MemEngine {
         Ok(true)
     }
 
+    /// Integrate a batch of wire rows, materializing the fold **once** at the
+    /// end rather than per row. Integrating one-by-one re-folds the whole log on
+    /// every row — O(n²) over a batch (a 3000-row catch-up / restore is ~10s);
+    /// folding once is ~O(n log n). Validates every row up front so a bad row
+    /// can't leave a half-integrated log. Returns a per-row flag: true where the
+    /// row was newly added (the caller forwards those to other peers).
+    pub fn integrate_many(&self, wrs: &[WireRow]) -> AspResult<Vec<bool>> {
+        for wr in wrs {
+            if !wr.row.id_valid() {
+                return Err(AspError::Protocol("row id does not match its contents".into()));
+            }
+            for b in &wr.blobs {
+                let h = self.blobs.put_blob(&b.bytes)?;
+                if h != b.hash {
+                    return Err(AspError::Protocol("blob hash mismatch".into()));
+                }
+            }
+        }
+        // Dedup against rows we already hold and against repeats within the
+        // batch — a HashSet membership test, not the O(rows) linear scan the
+        // per-row path does for each row.
+        let mut seen: std::collections::HashSet<String> =
+            self.rows.borrow().iter().map(|r| r.id.clone()).collect();
+        let mut flags = Vec::with_capacity(wrs.len());
+        let mut added = 0usize;
+        {
+            let mut store = self.rows.borrow_mut();
+            for wr in wrs {
+                let is_new = seen.insert(wr.row.id.clone());
+                if is_new {
+                    store.push(wr.row.clone());
+                    added += 1;
+                }
+                flags.push(is_new);
+            }
+        }
+        if added > 0 {
+            self.materialize()?;
+        }
+        Ok(flags)
+    }
+
     pub fn materialize(&self) -> AspResult<()> {
         let rows = self.rows.borrow().clone();
         let files = compute_files(&self.blobs, &rows)?;
@@ -349,6 +391,9 @@ impl SessionVault for MemEngine {
     }
     fn integrate(&self, wr: &WireRow) -> AspResult<bool> {
         MemEngine::integrate(self, wr)
+    }
+    fn integrate_many(&self, rows: &[WireRow]) -> AspResult<Vec<bool>> {
+        MemEngine::integrate_many(self, rows)
     }
     fn is_pristine(&self) -> bool {
         self.rows.borrow().is_empty()

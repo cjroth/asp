@@ -142,25 +142,62 @@ export function createNetwork(opts: NetworkOpts) {
 
   const vvOf = (node: Node): Record<string, number> => JSON.parse(node.eng.version_vector());
 
-  // The materialized vault as the UI's file map (keyed by file_id).
-  function filesView(node: Node): Record<string, FileView> {
+  // ---- the file map, on a diet -------------------------------------------
+  // The old single `filesView` decoded EVERY file's bytes (files_json) on EVERY
+  // call, and snapshot() runs it for every node on every render — so a large
+  // project re-decoded its whole vault many times per sync and the UI crawled.
+  // The UI actually only needs decoded CONTENT for the open file (the editor)
+  // and any files with a staged edit (the tree's dirty marker); the tree itself
+  // just needs paths + merge class + flags. So we split content out of metadata.
+
+  // Per-file fold metadata — NO content. Cached on row_count: metadata only
+  // changes when a row is authored/integrated, and row_count bumps on every such
+  // row, so an unchanged count means the tree is byte-identical → reuse it.
+  const metaCache = new WeakMap<Node, { rows: number; view: Record<string, FileView> }>();
+  function filesMeta(node: Node): Record<string, FileView> {
+    const rows = node.eng.row_count();
+    const hit = metaCache.get(node);
+    if (hit && hit.rows === rows) return hit.view;
     const detail = JSON.parse(node.eng.files_detail_json()) as {
       file_id: string; path: string; result_hash: string | null; merge_class: string; deleted: boolean; conflict: boolean;
     }[];
-    const raw = JSON.parse(node.eng.files_json()) as Record<string, number[]>;
-    const byPath: Record<string, string> = {};
-    for (const [p, arr] of Object.entries(raw)) byPath[p] = dec.decode(Uint8Array.from(arr));
-    const out: Record<string, FileView> = {};
+    const view: Record<string, FileView> = {};
     for (const f of detail) {
-      out[f.file_id] = {
+      view[f.file_id] = {
         file_id: f.file_id,
         path: f.path,
-        content: byPath[f.path] ?? '',
+        content: '',
         merge_class: f.merge_class,
         result_hash: f.result_hash,
         deleted: f.deleted,
         collided: f.conflict,
       };
+    }
+    metaCache.set(node, { rows, view });
+    return view;
+  }
+
+  // One file's text, decoded on demand (a single wasm read_file, not the whole
+  // vault). Used for the open/staged files the UI renders, and the net-zero
+  // check on commit.
+  function fileText(node: Node, path: string): string {
+    const b = node.eng.read_file(path);
+    return b ? dec.decode(b) : '';
+  }
+
+  // The map handed to the UI: tree metadata for every file, plus decoded content
+  // only for the open file and any files with a staged edit. When nothing is
+  // open or staged we return the cached metadata object verbatim (stable
+  // identity across frames).
+  function filesForSnapshot(node: Node): Record<string, FileView> {
+    const meta = filesMeta(node);
+    const need = new Set<string>(Object.keys(node.staged));
+    if (node.openFileId) need.add(node.openFileId);
+    if (need.size === 0) return meta;
+    const out: Record<string, FileView> = { ...meta };
+    for (const fid of need) {
+      const m = meta[fid];
+      if (m && !m.deleted) out[fid] = { ...m, content: fileText(node, m.path) };
     }
     return out;
   }
@@ -289,13 +326,13 @@ export function createNetwork(opts: NetworkOpts) {
       // Session handshake + version-vector catch-up (asp clone <url>).
       node.createdRemote = hostOf(externalUrl);
       api.connectPeer(node.id, externalUrl, authKey).then(() => {
-        const first = Object.values(filesView(node)).find((f) => !f.deleted);
+        const first = Object.values(filesMeta(node)).find((f) => !f.deleted);
         if (first && !node.openFileId) { node.openFileId = first.file_id; emit(); }
       });
     } else if (!remote) {
       // genesis vault: author the seed files (real create rows)
       for (const s of SEED) node.eng.record_write(s.path, enc.encode(s.body));
-      const view = filesView(node);
+      const view = filesMeta(node);
       const readme = Object.values(view).find((f) => f.path === 'README.md');
       node.openFileId = readme ? readme.file_id : Object.values(view)[0]?.file_id ?? null;
       logLine(node, [
@@ -574,9 +611,9 @@ export function createNetwork(opts: NetworkOpts) {
     const content = node.staged[fileId];
     if (content == null) return;
     delete node.staged[fileId];
-    const view = filesView(node)[fileId];
+    const view = filesMeta(node)[fileId];
     if (!view || view.deleted) return;
-    if (content === view.content) return; // net-zero
+    if (content === fileText(node, view.path)) return; // net-zero
     const before = vvOf(node);
     node.eng.record_write(view.path, enc.encode(content));
     const authoredJson = node.eng.rows_after(JSON.stringify(before));
@@ -602,7 +639,7 @@ export function createNetwork(opts: NetworkOpts) {
     const node = findNode(nodeId);
     if (!node || !name.trim()) return;
     const path = (dir ? `${dir}/` : '') + name.trim();
-    if (Object.values(filesView(node)).some((f) => !f.deleted && f.path === path)) {
+    if (Object.values(filesMeta(node)).some((f) => !f.deleted && f.path === path)) {
       O.onToast(`path exists: ${path}`, 'warn');
       return;
     }
@@ -638,7 +675,7 @@ export function createNetwork(opts: NetworkOpts) {
   api.renameFile = (nodeId: string, fileId: string, newPath: string) => {
     const node = findNode(nodeId);
     if (!node) return;
-    const view = filesView(node)[fileId];
+    const view = filesMeta(node)[fileId];
     if (!view || view.deleted) return;
     const np = newPath.trim();
     if (!np || np === view.path) return;
@@ -658,7 +695,7 @@ export function createNetwork(opts: NetworkOpts) {
 
   api.moveFile = (nodeId: string, fileId: string, newDir: string) => {
     const node = findNode(nodeId);
-    const view = node && filesView(node)[fileId];
+    const view = node && filesMeta(node)[fileId];
     if (!view || view.deleted) return;
     const np = (newDir ? `${newDir}/` : '') + baseOf(view.path);
     if (np === view.path) return;
@@ -672,7 +709,7 @@ export function createNetwork(opts: NetworkOpts) {
     const np = newPath.trim().replace(/\/+$/, '');
     if (!op || !np || op === np) return;
     // Rename every live file under the folder prefix (file_ids stay stable).
-    for (const f of Object.values(filesView(node))) {
+    for (const f of Object.values(filesMeta(node))) {
       if (f.deleted) continue;
       if (f.path === op || f.path.startsWith(`${op}/`)) {
         api.renameFile(nodeId, f.file_id, np + f.path.slice(op.length));
@@ -694,7 +731,7 @@ export function createNetwork(opts: NetworkOpts) {
     if (!node) return;
     const fp = folderPath.trim().replace(/\/+$/, '');
     if (!fp) return;
-    for (const f of Object.values(filesView(node))) {
+    for (const f of Object.values(filesMeta(node))) {
       if (f.deleted) continue;
       if (f.path === fp || f.path.startsWith(`${fp}/`)) api.deleteFile(nodeId, f.file_id);
     }
@@ -711,7 +748,7 @@ export function createNetwork(opts: NetworkOpts) {
   api.deleteFile = (nodeId: string, fileId: string) => {
     const node = findNode(nodeId);
     if (!node) return;
-    const view = filesView(node)[fileId];
+    const view = filesMeta(node)[fileId];
     if (!view || view.deleted) return;
     const before = vvOf(node);
     node.eng.record_remove(view.path);
@@ -719,7 +756,7 @@ export function createNetwork(opts: NetworkOpts) {
     const r = (JSON.parse(authoredJson) as any[])[0]?.row;
     const wasOpen = node.openFileId === fileId;
     if (wasOpen) {
-      const live = Object.values(filesView(node)).find((x) => !x.deleted);
+      const live = Object.values(filesMeta(node)).find((x) => !x.deleted);
       node.openFileId = live ? live.file_id : null;
     }
     logLine(node, [
@@ -775,6 +812,13 @@ export function createNetwork(opts: NetworkOpts) {
 
   api.getNodes = () => nodes;
   api.getEdges = () => edges;
+  // Decode one file's text on demand. snapshot() ships content only for the
+  // open/staged files (the diet), so callers that need any other file's bytes
+  // (e.g. tests asserting convergence) read it through here.
+  api.fileText = (nodeId: string, path: string): string => {
+    const n = findNode(nodeId);
+    return n ? fileText(n, path) : '';
+  };
   api.peersOf = peersOf;
   api.statusOf = statusOf;
 
@@ -785,7 +829,7 @@ export function createNetwork(opts: NetworkOpts) {
       color: n.color,
       online: n.online,
       site: n.id.slice(0, 4),
-      files: filesView(n),
+      files: filesForSnapshot(n),
       folders: n.folders,
       openFileId: n.openFileId,
       lines: n.lines,
@@ -797,11 +841,31 @@ export function createNetwork(opts: NetworkOpts) {
       peers: peersOf(n.id).map((pid) => findNode(pid)?.name).filter(Boolean),
       rowCount: n.eng.row_count(),
       sshKey: n.eng.node_ssh(),
+      // The engine-derived status, computed here so it can ride the snapshot
+      // across the worker boundary (no live Node on the main thread). The
+      // main thread overlays the "frames in flight" bit from packet animation,
+      // which is purely main-thread timing — see App's statusFor.
+      status: statusOf(n, {}),
     })),
     edges: edges.slice(),
   });
 
   api.clearFresh = () => { for (const n of nodes) for (const l of n.lines) l.fresh = false; };
+
+  // Tear the whole mesh down to a clean slate (the "Reset" button). Frees every
+  // engine + live socket and resets the sequence counters, so a rebuilt mesh
+  // starts from n0 again. Symmetric across the in-page and worker-backed paths.
+  api.reset = () => {
+    for (const k of Object.keys(debounceTimers)) { clearTimeout(debounceTimers[k]); delete debounceTimers[k]; }
+    for (const n of nodes) {
+      if (n.liveWs) { try { n.liveWs.close(); } catch {} }
+      try { n.eng.free(); } catch {}
+    }
+    nodes.length = 0;
+    edges.length = 0;
+    nodeSeq = 0; localSeq = 0; packetSeq = 0;
+    emit();
+  };
 
   return api;
 }

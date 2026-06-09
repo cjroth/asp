@@ -9,7 +9,7 @@ const check = (n, c) => { console.log(`${c ? '✓' : '✗ FAIL'}  ${n}`); if (!c
 const filesOf = (api, id) => {
   const n = api.snapshot().nodes.find((x) => x.id === id);
   const out = {};
-  for (const f of Object.values(n.files)) if (!f.deleted) out[f.path] = f.content;
+  for (const f of Object.values(n.files)) if (!f.deleted) out[f.path] = api.fileText(id, f.path);
   return out;
 };
 

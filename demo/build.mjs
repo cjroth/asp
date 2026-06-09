@@ -22,6 +22,33 @@ console.log(`[build] inlining wasm: ${(wasmB64.length / 1024).toFixed(0)} KiB ba
 const dist = resolve(here, 'dist');
 mkdirSync(dist, { recursive: true });
 
+// ---- Phase 1: the engine Web Worker, bundled to a standalone IIFE string. ----
+// The whole mesh sim (every WasmEngine + the live ws:// peers) runs inside this
+// worker, off the renderer thread. It's inlined into the main bundle and started
+// as a Blob Worker (no sibling file), exactly like the Obsidian plugin. The
+// worker receives the wasm bytes via its `init` message, so we neutralize the
+// web glue's `new URL(..., import.meta.url)` branch — it never fetches.
+const workerResult = await esbuild.build({
+  entryPoints: [resolve(here, 'src/engine/network-worker-entry.ts')],
+  bundle: true,
+  format: 'iife',
+  platform: 'browser',
+  target: 'es2020',
+  conditions: ['browser'],
+  define: {
+    'import.meta.url': JSON.stringify('asp-demo://network-worker'),
+    'process.env.NODE_ENV': JSON.stringify(prod ? 'production' : 'development'),
+  },
+  write: false,
+  sourcemap: false,
+  treeShaking: true,
+  minify: prod,
+  logLevel: 'warning',
+});
+const networkWorkerSrc = workerResult.outputFiles[0].text;
+console.log(`[build] engine worker: ${(networkWorkerSrc.length / 1024).toFixed(0)} KiB`);
+
+// ---- Phase 2: the main app bundle. ----
 const opts = {
   entryPoints: [resolve(here, 'src/main.tsx')],
   bundle: true,
@@ -32,6 +59,7 @@ const opts = {
   conditions: ['browser'],
   define: {
     __ASP_WASM_B64__: JSON.stringify(wasmB64),
+    __ASP_NETWORK_WORKER__: JSON.stringify(networkWorkerSrc),
     'process.env.NODE_ENV': JSON.stringify(prod ? 'production' : 'development'),
   },
   outfile: resolve(dist, 'main.js'),

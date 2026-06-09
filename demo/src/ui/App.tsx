@@ -7,7 +7,7 @@ import { createNetwork } from '../engine/network.ts';
 import { NetworkMap, NodePanel, NodeStrip, AddNodeDialog, ConnectPeerDialog, MaxModal } from './components.tsx';
 import { Settings, TWEAK_DEFAULTS, type Tweaks } from './settings.tsx';
 import { ConfirmHost, confirmDialog } from './confirm.tsx';
-import { loadState, saveState, clearState } from '../persist.ts';
+import { loadState, loadStateRaw, saveState, saveStateRaw, clearState } from '../persist.ts';
 
 function EmptyState({ onAdd }: any) {
   return (
@@ -35,13 +35,36 @@ function EmptyState({ onAdd }: any) {
   );
 }
 
-export function App() {
+export function App({ api: injected }: { api?: any } = {}) {
   const [t, setT] = useState<Tweaks>(TWEAK_DEFAULTS);
   const setTweak = useCallback((k: keyof Tweaks, v: any) => setT((p) => ({ ...p, [k]: v })), []);
   const engineRef = useRef<any>(null);
   const packetsRef = useRef<any[]>([]);
   const [, setTick] = useState(0);
   const rerender = useCallback(() => setTick((x) => x + 1), []);
+
+  // The engine emits onChange on every step of a sync (each gossip hop, each
+  // integrated frame). Rendering synchronously on each one means a render storm
+  // during a big catch-up. Coalesce them: at most one render per animation
+  // frame. Falls back to setTimeout where rAF is absent (jsdom/headless).
+  const rafRef = useRef<number | null>(null);
+  const scheduleRender = useCallback(() => {
+    if (rafRef.current != null) return;
+    const raf =
+      typeof requestAnimationFrame !== 'undefined'
+        ? requestAnimationFrame
+        : (cb: FrameRequestCallback) => setTimeout(() => cb(0), 16) as unknown as number;
+    rafRef.current = raf(() => {
+      rafRef.current = null;
+      setTick((x) => x + 1);
+    });
+  }, []);
+  useEffect(
+    () => () => {
+      if (rafRef.current != null && typeof cancelAnimationFrame !== 'undefined') cancelAnimationFrame(rafRef.current);
+    },
+    [],
+  );
   const [dialog, setDialog] = useState(false);
   const [connectFor, setConnectFor] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
@@ -49,22 +72,41 @@ export function App() {
   const [toast, setToast] = useState<any>(null);
   const [loaded, setLoaded] = useState(false);
   const toastTimer = useRef<any>(null);
+  // Signature of the last persisted state (total rows + edges + tweaks). The
+  // autosave skips re-serializing the whole vault when only ephemeral state
+  // (status, log lines, packet animation) changed — so a live peer's snapshot
+  // churn doesn't trigger a multi-MB save on every frame.
+  const lastSaveSig = useRef<string>('');
+  const persistSig = useCallback((s: any) => `${s.nodes.reduce((a: number, n: any) => a + n.rowCount, 0)}|${s.edges.length}|${JSON.stringify(t)}`, [t]);
 
-  function buildEngine() {
-    return createNetwork({
+  // Engine event callbacks — stable, so they're identical for the in-page
+  // engine (passed at construction) and the worker proxy (set after mount).
+  const onPacket = useCallback((pk: any) => { packetsRef.current.push(pk); }, []);
+  const onToast = useCallback((msg: string, kind: string) => {
+    setToast({ msg, kind });
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 2600);
+  }, []);
+
+  // The engine is either injected (the worker-backed NetworkProxy, built in
+  // main.tsx and already initialized) or, with no worker (SSR / tests), a plain
+  // in-page createNetwork. Either way the UI calls the same method surface.
+  if (!engineRef.current) {
+    engineRef.current = injected ?? createNetwork({
       latencyMs: t.latencyMs,
       debounceMs: t.debounceMs,
-      onChange: () => rerender(),
-      onPacket: (pk) => { packetsRef.current.push(pk); },
-      onToast: (msg, kind) => {
-        setToast({ msg, kind });
-        if (toastTimer.current) clearTimeout(toastTimer.current);
-        toastTimer.current = setTimeout(() => setToast(null), 2600);
-      },
+      onChange: () => scheduleRender(),
+      onPacket,
+      onToast,
     });
   }
-  if (!engineRef.current) engineRef.current = buildEngine();
   const api = engineRef.current;
+
+  // The proxy can't take callbacks at construction (these refs don't exist
+  // yet in main.tsx) — wire them once here.
+  useEffect(() => {
+    injected?.setCallbacks({ onChange: scheduleRender, onPacket, onToast });
+  }, [injected, scheduleRender, onPacket, onToast]);
 
   useEffect(() => { api.setConfig({ latencyMs: t.latencyMs, debounceMs: t.debounceMs }); }, [t.latencyMs, t.debounceMs]);
   useEffect(() => { document.documentElement.style.setProperty('--cyan', t.accent); }, [t.accent]);
@@ -77,12 +119,21 @@ export function App() {
   useEffect(() => {
     (async () => {
       try {
-        const s = await loadState();
-        if (s?.nodes?.length) {
-          api.restore(s);
-          if (s.tweaks) setT((prev) => ({ ...prev, ...s.tweaks }));
-          const first = api.getNodes()[0];
+        // Hand the worker the raw OPFS text so it parses the multi-MB document
+        // once, off the main thread (the in-process fallback parses here).
+        const raw = await loadStateRaw();
+        let tweaks: any = null;
+        if (raw && injected) {
+          tweaks = await injected.restore(raw);
+        } else if (raw) {
+          const s = JSON.parse(raw);
+          if (s?.nodes?.length) { api.restore(s); tweaks = s.tweaks ?? null; }
+        }
+        if (api.snapshot().nodes.length) {
+          if (tweaks) setT((prev) => ({ ...prev, ...tweaks }));
+          const first = api.snapshot().nodes[0];
           if (first) setSelected(first.id);
+          lastSaveSig.current = persistSig(api.snapshot()); // don't re-save what we just loaded
           rerender();
         }
       } finally {
@@ -92,25 +143,41 @@ export function App() {
   }, []);
   useEffect(() => {
     if (!loaded) return;
-    const id = setTimeout(() => { void saveState({ tweaks: t, ...api.serialize() }); }, 400);
+    const sig = persistSig(api.snapshot());
+    if (sig === lastSaveSig.current) return; // nothing persistent changed — skip the save
+    const id = setTimeout(() => {
+      lastSaveSig.current = sig;
+      void (async () => {
+        // The worker builds the final JSON string (off the main thread); we just
+        // stream it to disk. Falls back to main-thread serialize with no worker.
+        if (injected) await saveStateRaw(await injected.serialize(t));
+        else await saveState({ tweaks: t, ...api.serialize() });
+      })();
+    }, 1500);
     return () => clearTimeout(id);
   });
 
   const snap = api.snapshot();
 
-  const statusFor = useCallback((nodeId: string) => {
+  // The engine-derived status rides the snapshot (node.status), computed in the
+  // worker. Here we only overlay the "frames in flight" bit, which is pure
+  // main-thread packet-animation timing. Closes over `snap` so the NetworkMap's
+  // own per-frame re-render reflects live packet flight without an engine call.
+  const statusFor = (nodeId: string) => {
+    const node = snap.nodes.find((n: any) => n.id === nodeId);
+    const base = node?.status ?? { kind: 'solo', label: '—', note: '' };
     const now = performance.now();
-    const inflight: Record<string, boolean> = {};
+    let inflight = false;
     for (const pk of packetsRef.current) {
-      if (now - pk.started < pk.dur) { inflight[pk.fromId] = true; inflight[pk.toId] = true; }
+      if (now - pk.started < pk.dur && (pk.fromId === nodeId || pk.toId === nodeId)) { inflight = true; break; }
     }
-    const node = api.getNodes().find((n: any) => n.id === nodeId);
-    return node ? api.statusOf(node, inflight) : { kind: 'solo', label: '—', note: '' };
-  }, [api]);
+    if (inflight && base.kind === 'insync') return { kind: 'syncing', label: 'Syncing', note: 'frames in flight' };
+    return base;
+  };
 
-  function addNode(opts: any) { const id = api.addNode(opts); setDialog(false); if (!selected) setSelected(id); }
+  async function addNode(opts: any) { const id = await Promise.resolve(api.addNode(opts)); setDialog(false); if (!selected) setSelected(id); }
   async function removeNode(id: string) {
-    const node = api.getNodes().find((n: any) => n.id === id);
+    const node = snap.nodes.find((n: any) => n.id === id);
     const ok = await confirmDialog({
       title: `Remove node “${node?.name ?? id}”?`,
       message: <>The node leaves the mesh and its in-page vault is discarded. Other nodes keep their copies.</>,
@@ -119,7 +186,7 @@ export function App() {
     if (!ok) return;
     api.removeNode(id);
     if (maximized === id) setMaximized(null);
-    if (selected === id) { const left = api.getNodes()[0]; setSelected(left ? left.id : null); }
+    if (selected === id) { const left = snap.nodes.find((n: any) => n.id !== id); setSelected(left ? left.id : null); }
   }
   async function reset() {
     const ok = await confirmDialog({
@@ -130,7 +197,7 @@ export function App() {
     if (!ok) return;
     void clearState();
     packetsRef.current.length = 0;
-    engineRef.current = buildEngine();
+    await Promise.resolve(api.reset());
     setSelected(null); rerender();
   }
   function doConnect(url: string, authKey?: string) {

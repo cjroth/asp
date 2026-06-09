@@ -37,6 +37,14 @@ async function waitValueNot(locator, notExpected, ms = 2500) {
   while (Date.now() < deadline) { last = await locator.inputValue().catch(() => ''); if (last === notExpected) return false; await sleep(100); }
   return last !== notExpected;
 }
+// The UI is eventually-consistent: engine state updates ride a snapshot back
+// from the worker and land on the next animation frame, so poll rather than
+// reading visibility the instant an action's click resolves.
+async function waitVisible(locator, ms = 4000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) { if (await locator.isVisible().catch(() => false)) return true; await sleep(100); }
+  return false;
+}
 
 try {
   // clear any prior OPFS state for a deterministic run
@@ -44,8 +52,8 @@ try {
   await page.evaluate(async () => { try { const d = await navigator.storage.getDirectory(); await d.removeEntry('asp-demo-state.json'); } catch {} });
   await page.reload();
 
-  // 1) empty state
-  check('empty-mesh state shown', await page.locator('text=An empty mesh').isVisible());
+  // 1) empty state (wait for the worker to start + first paint after reload)
+  check('empty-mesh state shown', await waitVisible(page.locator('text=An empty mesh')));
 
   // 2) create the first node
   await page.getByRole('button', { name: 'Add a new node' }).click();
@@ -71,7 +79,7 @@ try {
 
   // 5) offline → edit → reconnect catch-up
   await panel('desktop').getByRole('button', { name: 'Go offline' }).click();
-  check('desktop shows Offline', await panel('desktop').locator('.status.offline').isVisible({ timeout: 3000 }));
+  check('desktop shows Offline', await waitVisible(panel('desktop').locator('.status.offline')));
   const offlineEdit = '# Vault\n\nauthored while desktop was offline\n';
   await laptopEd.fill(offlineEdit);
   check('desktop did NOT receive the edit while offline', await waitValueNot(desktopEd, offlineEdit, 2500));

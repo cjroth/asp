@@ -259,6 +259,11 @@ body {
 .canvas {
   flex: 1; overflow: auto; padding: 16px;
   display: grid; gap: 16px; align-content: start;
+  /* Rows fill the canvas so each panel's tree/editor scroll INTERNALLY (head +
+     log stay put). The 380px floor keeps panels usable when several stack (the
+     canvas then scrolls between them), clamped to the canvas height so a short
+     window never scrolls the whole panel instead of the tree. */
+  grid-auto-rows: minmax(min(380px, 100%), 1fr);
 }
 .canvas.cols-1 { grid-template-columns: minmax(0,1fr); }
 .canvas.cols-2 { grid-template-columns: repeat(2, minmax(0,1fr)); }
@@ -276,7 +281,10 @@ body {
 .node-panel {
   border: 1px solid var(--line); background: var(--ink-2);
   display: flex; flex-direction: column; min-width: 0;
-  position: relative; min-height: 380px;
+  /* min-height:0 lets the panel be bounded by its grid row / flex parent so the
+     tree (.tree-scroll) and editor scroll INSIDE the panel instead of growing
+     the page. The 380px floor now lives on the canvas grid-auto-rows. */
+  position: relative; min-height: 0;
 }
 .node-panel.offline { opacity: 0.92; }
 .node-panel.offline::after {
