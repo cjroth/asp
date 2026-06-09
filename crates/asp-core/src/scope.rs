@@ -6,6 +6,13 @@
 /// The engine's private directory, never versioned.
 pub const PRIVATE_DIR: &str = ".asp";
 
+/// Directories that are ALWAYS out of scope, regardless of `.aspignore`. These
+/// hold node-private material (identity keys, engine state) and must never be
+/// versioned or synced. `.context` is the legacy name of the private home from
+/// before the rename — older vaults still carry a `.context/id_ed25519`, and
+/// without this guard that private key would sync to every peer.
+const PRIVATE_DIRS: &[&str] = &[PRIVATE_DIR, ".context"];
+
 /// A compiled set of ignore patterns.
 #[derive(Clone, Default)]
 pub struct Scope {
@@ -53,9 +60,11 @@ impl Scope {
 
     /// Should `rel_path` (a forward-slash relative path) be ignored?
     pub fn ignored(&self, rel_path: &str) -> bool {
-        // The private dir is always out of scope.
-        if rel_path == PRIVATE_DIR || rel_path.starts_with(&format!("{PRIVATE_DIR}/")) {
-            return true;
+        // Private dirs (identity/state) are always out of scope.
+        for d in PRIVATE_DIRS {
+            if rel_path == *d || rel_path.starts_with(&format!("{d}/")) {
+                return true;
+            }
         }
         let mut ignored = false;
         for p in &self.patterns {
@@ -181,6 +190,17 @@ mod tests {
         assert!(s.ignored(".asp"));
         assert!(s.ignored(".asp/asp.db"));
         assert!(!s.ignored("notes/a.md"));
+    }
+
+    #[test]
+    fn legacy_private_dir_and_key_always_ignored() {
+        // A vault from before the rename: the private key must never sync, even
+        // with an empty (or hostile) ignore file.
+        let s = Scope::parse("!.context\n!.context/id_ed25519\n");
+        assert!(s.ignored(".context"));
+        assert!(s.ignored(".context/id_ed25519"));
+        assert!(s.ignored(".context/state"));
+        assert!(!s.ignored("context/note.md")); // a real "context" note dir is fine
     }
 
     #[test]

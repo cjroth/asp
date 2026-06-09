@@ -81,7 +81,7 @@ export class Bridge {
     // worker on a large vault ("Unexpected end of JSON input"). This keeps memory
     // flat and writes only what actually changed.
     const detail = (await this.vault.filesDetail()).filter(
-      (f) => !f.deleted && f.merge_class !== 'dir',
+      (f) => !f.deleted && f.merge_class !== 'dir' && !this.filter.ignored(f.path),
     );
     const want = new Set(detail.map((f) => f.path));
     let written = 0;
