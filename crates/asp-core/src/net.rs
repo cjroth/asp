@@ -25,7 +25,24 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{accept_hdr_async, client_async, WebSocketStream};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{accept_hdr_async_with_config, client_async_with_config, WebSocketStream};
+
+/// WebSocket message/frame ceiling. tungstenite defaults to 16 MiB per message,
+/// but a catch-up frame carries a whole row INCLUDING its blobs, and a single
+/// row can't be split below itself — so one large attachment (a vault with a
+/// >16 MiB file) would make the entire catch-up die with "Message too long".
+/// Raise both the message and frame ceiling well past any realistic note/asset
+/// so big files sync. (Send-side batching still keeps normal frames ~4 MiB; see
+/// session::push_rows_chunked.) Bounded — not unlimited — so a peer can't OOM us.
+const WS_MAX_MSG: usize = 128 * 1024 * 1024;
+
+fn ws_config() -> WebSocketConfig {
+    let mut c = WebSocketConfig::default();
+    c.max_message_size = Some(WS_MAX_MSG);
+    c.max_frame_size = Some(WS_MAX_MSG);
+    c
+}
 
 /// Server TLS material for a `wss://` listener: the rustls config + the cert
 /// fingerprint it advertises as the channel binding.
@@ -298,13 +315,13 @@ async fn accept_one(
             let acceptor = TlsAcceptor::from(t.config.clone());
             let tls_stream = acceptor.accept(tcp).await.context("tls accept")?;
             let cb = upgrade_callback(auth.clone(), auth_state.clone());
-            let ws = accept_hdr_async(tls_stream, cb).await.context("wss upgrade")?;
+            let ws = accept_hdr_async_with_config(tls_stream, cb, Some(ws_config())).await.context("wss upgrade")?;
             let ok = *auth_state.lock().unwrap();
             finish_listener(ws, engine, auth, conns, ok, advertised).await
         }
         None => {
             let cb = upgrade_callback(auth.clone(), auth_state.clone());
-            let ws = accept_hdr_async(tcp, cb).await.context("ws upgrade")?;
+            let ws = accept_hdr_async_with_config(tcp, cb, Some(ws_config())).await.context("ws upgrade")?;
             let ok = *auth_state.lock().unwrap();
             finish_listener(ws, engine, auth, conns, ok, advertised).await
         }
@@ -383,14 +400,14 @@ pub async fn connect(
             .peer_certificates()
             .and_then(|c| c.first())
             .map(|c| crate::tls::cert_fingerprint(c.as_ref()).to_vec());
-        let (ws, _resp) = client_async(request, tls_stream).await.context("wss client handshake")?;
+        let (ws, _resp) = client_async_with_config(request, tls_stream, Some(ws_config())).await.context("wss client handshake")?;
         let session = {
             let eng = engine.lock().unwrap();
             Session::new(Role::Connector, &*eng, Vec::new(), observed, auth.admit_ctx(false))
         };
         run_connection(ws, engine, session, conns, oneshot, on_auth).await
     } else {
-        let (ws, _resp) = client_async(request, tcp).await.context("ws client handshake")?;
+        let (ws, _resp) = client_async_with_config(request, tcp, Some(ws_config())).await.context("ws client handshake")?;
         let session = {
             let eng = engine.lock().unwrap();
             Session::new(Role::Connector, &*eng, Vec::new(), None, auth.admit_ctx(false))
@@ -491,8 +508,68 @@ pub async fn clone_bootstrap(engine: EngineRef, url: &str, auth: &AuthOpts) -> R
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use super::extract_auth_key;
+    use crate::engine::Engine;
+    use crate::identity::Identity;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tempfile::tempdir;
     use tokio_tungstenite::tungstenite::handshake::server::Request;
+
+    /// REGRESSION (the silent hub-sync break): a catch-up frame carries a whole
+    /// row INCLUDING its blobs, and tungstenite caps a WebSocket message at 16
+    /// MiB by default — so a vault with a single file larger than that made the
+    /// ENTIRE catch-up die with "Message too long", and the client ended up with
+    /// 0 rows (looking "in sync" with nothing). The in-process `Session` test
+    /// below converges over a hand-rolled message pump and NEVER touches
+    /// tungstenite, so it could never catch this. This drives a real listener +
+    /// connector over an actual socket with an oversized blob — the only kind of
+    /// test that exercises the transport's frame limit. Must sync ALL files,
+    /// including the >16 MiB one, byte-for-byte.
+    #[tokio::test]
+    async fn ws_catchup_syncs_blob_larger_than_default_frame_limit() {
+        let srv_dir = tempdir().unwrap();
+        let cli_dir = tempdir().unwrap();
+        let srv = Engine::init(srv_dir.path(), Identity::from_seed(&[1; 32])).unwrap();
+        let cli_id = Identity::from_seed(&[2; 32]);
+
+        // 20 MiB > tungstenite's 16 MiB default — the boundary that broke.
+        let big = vec![0xABu8; 20 * 1024 * 1024];
+        srv.record_write("notes/small.md", b"hello\n").unwrap();
+        srv.record_write("assets/big.bin", &big).unwrap();
+        srv.authorize(&cli_id.to_ssh_string(), None, true, "test").unwrap();
+
+        let srv_engine: EngineRef = Arc::new(StdMutex::new(srv));
+        let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
+        let (port_tx, port_rx) = tokio::sync::oneshot::channel::<u16>();
+        let server = tokio::spawn(serve(
+            srv_engine,
+            "127.0.0.1:0",
+            AuthOpts::default(),
+            conns,
+            None,
+            Some(port_tx),
+        ));
+        let port = port_rx.await.expect("listener bound");
+
+        let cli = Engine::init(cli_dir.path(), cli_id).unwrap();
+        let cli_engine: EngineRef = Arc::new(StdMutex::new(cli));
+        let url = format!("ws://127.0.0.1:{port}");
+        clone_bootstrap(cli_engine, &url, &AuthOpts::default())
+            .await
+            .expect("clone should succeed");
+
+        let got = std::fs::read(cli_dir.path().join("assets/big.bin"))
+            .expect("oversized file must have synced to the clone");
+        assert_eq!(got.len(), big.len(), "oversized blob truncated");
+        assert_eq!(got, big, "oversized blob corrupted in transit");
+        assert_eq!(
+            std::fs::read(cli_dir.path().join("notes/small.md")).unwrap(),
+            b"hello\n",
+            "small file should sync too"
+        );
+        server.abort();
+    }
 
     fn req(auth: Option<&str>, uri: &str, subproto: Option<&str>) -> Request {
         let mut b = Request::builder().uri(uri);
