@@ -6,12 +6,18 @@
 /// The engine's private directory, never versioned.
 pub const PRIVATE_DIR: &str = ".asp";
 
-/// Directories that are ALWAYS out of scope, regardless of `.aspignore`. These
-/// hold node-private material (identity keys, engine state) and must never be
-/// versioned or synced. `.context` is the legacy name of the private home from
-/// before the rename — older vaults still carry a `.context/id_ed25519`, and
-/// without this guard that private key would sync to every peer.
-const PRIVATE_DIRS: &[&str] = &[PRIVATE_DIR, ".context"];
+/// Directory names that are ALWAYS out of scope at ANY depth, regardless of
+/// `.aspignore`. They hold node-private material or editor/VCS internals that
+/// must never be versioned or synced:
+///   `.asp`/`.context` — the engine's private home (current + legacy name);
+///     `.context` holds the node's id_ed25519, so without this guard that
+///     PRIVATE KEY would sync to every peer.
+///   `.git`           — version-control internals. Matched at any depth because
+///     vaults commonly hold cloned repos as reference material; a nested
+///     `proj/.git/objects/pack/*.pack` is multi-MB and explodes the synced log.
+///   `.obsidian`      — the editor's config + a plugin's own state/binary.
+///   `.trash`         — local trash.
+const ALWAYS_IGNORE_DIRS: &[&str] = &[PRIVATE_DIR, ".context", ".git", ".obsidian", ".trash"];
 
 /// A compiled set of ignore patterns.
 #[derive(Clone, Default)]
@@ -60,11 +66,9 @@ impl Scope {
 
     /// Should `rel_path` (a forward-slash relative path) be ignored?
     pub fn ignored(&self, rel_path: &str) -> bool {
-        // Private dirs (identity/state) are always out of scope.
-        for d in PRIVATE_DIRS {
-            if rel_path == *d || rel_path.starts_with(&format!("{d}/")) {
-                return true;
-            }
+        // Always-ignored dirs (private/editor/VCS) at ANY depth are out of scope.
+        if rel_path.split('/').any(|seg| ALWAYS_IGNORE_DIRS.contains(&seg)) {
+            return true;
         }
         let mut ignored = false;
         for p in &self.patterns {
@@ -201,6 +205,19 @@ mod tests {
         assert!(s.ignored(".context/id_ed25519"));
         assert!(s.ignored(".context/state"));
         assert!(!s.ignored("context/note.md")); // a real "context" note dir is fine
+    }
+
+    #[test]
+    fn nested_vcs_editor_dirs_ignored_at_any_depth() {
+        let s = Scope::default();
+        // A cloned repo kept as reference material: its multi-MB pack must not sync.
+        assert!(s.ignored("context/gridland/.git/objects/pack/pack-abc.pack"));
+        assert!(s.ignored("notes/proj/.obsidian/workspace.json"));
+        assert!(s.ignored("a/b/.trash/x.md"));
+        // But a real note isn't caught just because a parent name resembles one.
+        assert!(!s.ignored("notes/git-tips/howto.md"));
+        assert!(!s.ignored("projects/gitland/readme.md"));
+        assert!(!s.ignored(".gitignore")); // a file, not the .git dir
     }
 
     #[test]

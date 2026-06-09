@@ -29,11 +29,15 @@ export class PathFilter {
   }
 
   ignored(path: string): boolean {
-    // A hard-ignored top-level dir (or the dir entry itself) — non-overridable.
-    const seg0 = path.split('/')[0];
-    if (PathFilter.HARD_IGNORE_DIRS.includes(seg0)) return true;
-    // .DS_Store at any depth — macOS noise.
-    if (path.split('/').some((s) => s === '.DS_Store')) return true;
+    // A hard-ignored dir at ANY depth — non-overridable. Checking every segment
+    // (not just the first) matters: vaults often hold cloned repos as reference
+    // material, so `notes/proj/.git/objects/pack/…` must be ignored too — those
+    // multi-MB packs were a second source of the bloat-and-dup explosion. Also
+    // catches `.DS_Store` anywhere.
+    const segs = path.split('/');
+    if (segs.some((s) => PathFilter.HARD_IGNORE_DIRS.includes(s) || s === '.DS_Store')) {
+      return true;
+    }
     let ignored = false;
     for (const p of this.patterns) {
       if (this.match(p.glob, path)) ignored = !p.negate;
