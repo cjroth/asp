@@ -141,12 +141,13 @@ where
         }
     }
 
-    // Oneshot connectors end the stream by idle. Catch-up is now streamed in
-    // pages so frames flow steadily, but a single un-splittable large row (a big
-    // attachment) is one frame whose transfer can take a couple seconds — keep
-    // the idle comfortably above that so a large frame mid-stream isn't mistaken
-    // for end-of-stream. (Listener connections are persistent and never idle.)
-    let idle = Duration::from_millis(5000);
+    // Completion is now explicit (Msg::Synced), so idle is no longer how a
+    // oneshot ends normally — it's only a dead-peer / stalled-link backstop.
+    // Make it generous: a single un-splittable large row (a big attachment) is
+    // one frame that can take many seconds to transfer from a small host, and we
+    // must not mistake that for a dead connection. No tail cost — Synced closes
+    // the normal case immediately. (Listener connections are persistent.)
+    let idle = Duration::from_millis(30_000);
     let mut announced_auth = false;
     let result: Result<()> = loop {
         let idle_fut = async {
