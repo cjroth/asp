@@ -49,4 +49,8 @@ EXPOSE 9000
 #                         `asp watch` directly; no CMD override needed.
 #   ASP_AUTHORIZED_KEYS   ssh-ed25519 lines merged into the synced
 #                         authorized_keys on every start.
-CMD ["/bin/sh", "-c", "VAULT_DIR=\"${ASP_DIR:-/mnt/workspace/vault}\" && export ASP_HOME=\"${ASP_HOME:-/mnt/workspace/.asp-home}\" && mkdir -p \"$VAULT_DIR\" \"$ASP_HOME\" && { [ -f \"$VAULT_DIR/.asp/asp.db\" ] || asp init \"$VAULT_DIR\"; } && exec asp watch --dir \"$VAULT_DIR\" --listen --port \"${PORT:-9000}\""]
+# ASP_RESET=1 wipes the vault history (NOT the node identity in ASP_HOME) BEFORE
+# `asp watch` starts — a race-free reseed knob: set the secret, let it reboot to
+# a fresh empty vault (new vault_id, same identity), then unset it. Keeping
+# ASP_HOME preserves peer TOFU trust so clients reconnect without re-pinning.
+CMD ["/bin/sh", "-c", "VAULT_DIR=\"${ASP_DIR:-/mnt/workspace/vault}\" && export ASP_HOME=\"${ASP_HOME:-/mnt/workspace/.asp-home}\" && { [ \"$ASP_RESET\" = \"1\" ] && echo 'ASP_RESET=1: wiping vault history' && rm -rf \"$VAULT_DIR\" || true; } && mkdir -p \"$VAULT_DIR\" \"$ASP_HOME\" && { [ -f \"$VAULT_DIR/.asp/asp.db\" ] || asp init \"$VAULT_DIR\"; } && exec asp watch --dir \"$VAULT_DIR\" --listen --port \"${PORT:-9000}\""]
