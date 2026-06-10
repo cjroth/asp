@@ -1,6 +1,58 @@
 import { expect, test } from 'bun:test';
 import { PathFilter } from '../src/path-filter.ts';
 
+// ── Scope-closure property ────────────────────────────────────────────────
+// The host-side mirror of crates/asp-core/tests/scope_closure.rs. PathFilter is
+// the ACTUAL gate for Obsidian sync, and the nested-`.git` blind spot (matching
+// only the first path segment) lived here too. We assert the filter partitions
+// adversarial vault trees by an INDEPENDENT oracle, so a matcher that drifts
+// from the spec — e.g. back to checking only the top segment — fails here.
+const HARD = ['.asp', '.context', '.git', '.obsidian', '.trash']; // dirs, any depth
+const LOOKALIKES = ['git', 'gitland', 'git-tips', '.gitignore', 'context', 'obsidian', 'obsidian-notes'];
+const REAL = ['notes', 'a.md', 'b.txt', 'dir', 'src', 'README.md', 'proj', 'deep'];
+
+// Independent oracle for a DEFAULT filter (no .aspignore): ignored iff a segment
+// is a hard-ignored dir, or any segment is `.DS_Store`.
+function oracleIgnored(path: string): boolean {
+  const segs = path.split('/');
+  return segs.some((s) => HARD.includes(s) || s === '.DS_Store');
+}
+
+// Deterministic PRNG (mulberry32) so failures reproduce from the seed.
+function rng(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+test('PathFilter partitions adversarial trees by the oracle (scope-closure)', () => {
+  const f = new PathFilter(''); // default: only the hard set applies
+  const r = rng(0xc0ffee);
+  const pick = <T>(arr: T[]) => arr[Math.floor(r() * arr.length)];
+  let sawIgnored = 0;
+  let sawSynced = 0;
+  for (let i = 0; i < 50000; i++) {
+    const depth = 1 + Math.floor(r() * 5);
+    const segs: string[] = [];
+    for (let d = 0; d < depth; d++) {
+      const bucket = Math.floor(r() * 10);
+      segs.push(bucket < 3 ? pick(HARD) : bucket < 6 ? pick([...LOOKALIKES, '.DS_Store']) : pick(REAL));
+    }
+    const path = segs.join('/');
+    const want = oracleIgnored(path);
+    if (f.ignored(path) !== want) throw new Error(`disagreed on ${JSON.stringify(path)}: got ${f.ignored(path)}, want ${want}`);
+    want ? sawIgnored++ : sawSynced++;
+  }
+  // Both sides of the partition must be exercised (guards a one-sided pass).
+  expect(sawIgnored).toBeGreaterThan(1000);
+  expect(sawSynced).toBeGreaterThan(1000);
+});
+
 test('private .asp dir is always excluded', () => {
   const f = new PathFilter('');
   expect(f.ignored('.asp')).toBe(true);
