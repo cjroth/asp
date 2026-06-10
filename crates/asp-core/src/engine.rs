@@ -30,6 +30,12 @@ pub struct Engine {
     pub scope: crate::scope::Scope,
     /// Per-vault authoring `site_id` (distinct from `identity`, the device key).
     pub site: String,
+    /// When set, the per-`record_*` `materialize()` is suppressed — capture
+    /// authors a whole batch (its diff is computed once up front) then folds
+    /// ONCE at the end, turning an N-file capture from O(N²) into O(N).
+    /// (`Engine` is `!Sync` and only ever touched behind a `Mutex`, so a `Cell`
+    /// is safe here.)
+    batch: std::cell::Cell<bool>,
 }
 
 fn now_unix() -> u64 {
@@ -77,7 +83,8 @@ impl Engine {
         let store = SqliteStore::open(&asp_dir.join("asp.db"))?;
         let scope = Self::load_scope(root);
         let site = load_or_create_site_id(&asp_dir)?;
-        let eng = Engine { root: root.to_path_buf(), asp_dir, git_dir, store, identity, scope, site };
+        let eng =
+            Engine { root: root.to_path_buf(), asp_dir, git_dir, store, identity, scope, site, batch: std::cell::Cell::new(false) };
         Ok(eng)
     }
 
@@ -186,7 +193,7 @@ impl Engine {
             }
         };
         self.store.append_row(&row)?;
-        self.materialize()?;
+        self.materialize_unless_batched()?;
         Ok(Some(self.wire(row)?))
     }
 
@@ -211,7 +218,7 @@ impl Engine {
         }
         .seal();
         self.store.append_row(&row)?;
-        self.materialize()?;
+        self.materialize_unless_batched()?;
         Ok(Some(self.wire(row)?))
     }
 
@@ -236,7 +243,7 @@ impl Engine {
         }
         .seal();
         self.store.append_row(&row)?;
-        self.materialize()?;
+        self.materialize_unless_batched()?;
         Ok(Some(self.wire(row)?))
     }
 
@@ -314,6 +321,15 @@ impl Engine {
 
     /// Fold the log, write the materialized `files` table, render changed files
     /// to disk (atomic, self-write-suppressed), and export the derived git repo.
+    /// Materialize unless we're mid-batch (see `batch`). Per-`record_*` callers
+    /// use this so a capture of N files folds once, not once per file.
+    fn materialize_unless_batched(&self) -> AspResult<()> {
+        if self.batch.get() {
+            return Ok(());
+        }
+        self.materialize().map(|_| ())
+    }
+
     /// Returns the materialized path → content-hash map (for echo suppression).
     pub fn materialize(&self) -> AspResult<BTreeMap<String, String>> {
         let rows = self.store.all_rows()?;
@@ -410,7 +426,21 @@ impl Engine {
     /// §Renames). Returns authored rows to push. Used by the `watch` debounce
     /// flush and by startup reconciliation.
     pub fn capture_rescan(&self) -> AspResult<Vec<WireRow>> {
-        let on_disk = self.scan_disk()?;
+        // Author the whole diff with per-row materialize deferred, then fold ONCE.
+        // The diff below is computed from a single pre-pass snapshot, so deferring
+        // is sound: each path is touched at most once, and `current_for_path`
+        // inside `record_*` keeps reading that same pre-capture state. Reset the
+        // flag even on error so a failed scan can't wedge the engine into batch
+        // mode forever.
+        self.batch.set(true);
+        let result = self.capture_rescan_inner(&self.scan_disk()?);
+        self.batch.set(false);
+        let authored = result?;
+        self.materialize()?;
+        Ok(authored)
+    }
+
+    fn capture_rescan_inner(&self, on_disk: &BTreeMap<String, Vec<u8>>) -> AspResult<Vec<WireRow>> {
         // Content files vs directory entities are tracked separately: directories
         // are first-class, content-free entities (§Capture: empty directories).
         let (live_files, live_dirs): (Vec<FileRow>, Vec<FileRow>) =
@@ -572,7 +602,7 @@ impl Engine {
         }
         .seal();
         self.store.append_row(&row)?;
-        self.materialize()?;
+        self.materialize_unless_batched()?;
         Ok(Some(self.wire(row)?))
     }
 
@@ -595,7 +625,7 @@ impl Engine {
         }
         .seal();
         self.store.append_row(&row)?;
-        self.materialize()?;
+        self.materialize_unless_batched()?;
         Ok(Some(self.wire(row)?))
     }
 

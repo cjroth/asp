@@ -348,8 +348,9 @@ impl MemEngine {
     }
 
     pub fn materialize(&self) -> AspResult<()> {
-        let rows = self.rows.borrow().clone();
-        let files = compute_files(&self.blobs, &rows)?;
+        // Fold directly off the borrowed log — cloning the whole Vec<LogRow> on
+        // every write/integrate was pure waste (this is the wasm/Obsidian path).
+        let files = compute_files(&self.blobs, &self.rows.borrow())?;
         *self.files.borrow_mut() = files;
         Ok(())
     }
