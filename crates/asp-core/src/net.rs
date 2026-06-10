@@ -31,7 +31,7 @@ use tokio_tungstenite::{accept_hdr_async_with_config, client_async_with_config, 
 /// WebSocket message/frame ceiling. tungstenite defaults to 16 MiB per message,
 /// but a catch-up frame carries a whole row INCLUDING its blobs, and a single
 /// row can't be split below itself — so one large attachment (a vault with a
-/// >16 MiB file) would make the entire catch-up die with "Message too long".
+/// file larger than 16 MiB) would make the catch-up die with "Message too long".
 /// Raise both the message and frame ceiling well past any realistic note/asset
 /// so big files sync. (Send-side batching still keeps normal frames ~4 MiB; see
 /// session::push_rows_chunked.) Bounded — not unlimited — so a peer can't OOM us.
@@ -44,10 +44,7 @@ const WS_MAX_MSG: usize = 128 * 1024 * 1024;
 const CATCHUP_PAGE_ROWS: i64 = 256;
 
 fn ws_config() -> WebSocketConfig {
-    let mut c = WebSocketConfig::default();
-    c.max_message_size = Some(WS_MAX_MSG);
-    c.max_frame_size = Some(WS_MAX_MSG);
-    c
+    WebSocketConfig { max_message_size: Some(WS_MAX_MSG), max_frame_size: Some(WS_MAX_MSG), ..Default::default() }
 }
 
 /// Server TLS material for a `wss://` listener: the rustls config + the cert
