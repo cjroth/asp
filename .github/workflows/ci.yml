@@ -39,6 +39,21 @@ jobs:
       - name: Clippy (no warnings, all targets incl. tests)
         run: rustup component add clippy && cargo clippy --workspace --all-targets -- -D warnings
 
+  coverage:
+    # Visibility gate: asp-core line coverage must stay above the floor, so the
+    # cold integration seams (engine capture, net protocol) can't silently
+    # regress as the engine grows. Informational per-file table in the log.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust + llvm-tools
+        run: rustup toolchain install stable --profile minimal && rustup component add llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Coverage (floor enforced)
+        run: ./scripts/coverage.sh
+
   sdk:
     runs-on: ubuntu-latest
     steps:
@@ -64,3 +79,10 @@ jobs:
         # The release ships only main.js + manifest.json (the wasm engine is
         # inlined as base64), so a broken bundle must fail CI, not the tag.
         run: cd plugins/obsidian && bun install --frozen-lockfile && bun run build
+
+      - name: Demo — mesh/persist/web-glue/UI + LIVE wss interop
+        # Includes test:interop, which drives a demo node against a REAL
+        # `asp watch --listen` peer and asserts the watch link stays LIVE and
+        # pushes after catch-up. That test guards the live-link regression — it
+        # must run in CI to protect main (it previously ran only locally).
+        run: cd demo && bun install && bun run build && bun run test && bun run test:interop
