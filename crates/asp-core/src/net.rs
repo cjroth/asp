@@ -635,6 +635,87 @@ mod tests {
         server.abort();
     }
 
+    // Boot a listener (optionally TLS) over a real socket; returns its port + a
+    // shared handle to the server engine and the spawned task.
+    async fn boot(
+        srv: Engine,
+        opts: AuthOpts,
+        tls: Option<ServerTls>,
+    ) -> (u16, EngineRef, tokio::task::JoinHandle<Result<()>>) {
+        let srv_engine: EngineRef = Arc::new(StdMutex::new(srv));
+        let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
+        let (port_tx, port_rx) = tokio::sync::oneshot::channel::<u16>();
+        let task = tokio::spawn(serve(srv_engine.clone(), "127.0.0.1:0", opts, conns, tls, Some(port_tx)));
+        let port = port_rx.await.expect("listener bound");
+        (port, srv_engine, task)
+    }
+
+    #[tokio::test]
+    async fn wss_tls_loopback_clone_succeeds() {
+        // Exercises the wss:// path: server presents a self-signed cert, the
+        // connector accepts any cert and binds the channel to its fingerprint.
+        let srv_dir = tempdir().unwrap();
+        let cli_dir = tempdir().unwrap();
+        let srv = Engine::init(srv_dir.path(), Identity::from_seed(&[3; 32])).unwrap();
+        let cli_id = Identity::from_seed(&[4; 32]);
+        srv.record_write("secure.md", b"served over tls\n").unwrap();
+        srv.authorize(&cli_id.to_ssh_string(), None, true, "test").unwrap();
+
+        let (cert, key) = crate::tls::generate_self_signed().unwrap();
+        let stls = ServerTls { fingerprint: crate::tls::cert_fingerprint(&cert).to_vec(), config: crate::tls::server_config(cert, key).unwrap() };
+        let (port, _srv_engine, task) = boot(srv, AuthOpts::default(), Some(stls)).await;
+
+        let cli = Engine::init(cli_dir.path(), cli_id).unwrap();
+        let cli_engine: EngineRef = Arc::new(StdMutex::new(cli));
+        let url = format!("wss://127.0.0.1:{port}");
+        clone_bootstrap(cli_engine, &url, &AuthOpts::default()).await.expect("wss clone should succeed");
+        assert_eq!(std::fs::read(cli_dir.path().join("secure.md")).unwrap(), b"served over tls\n");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn sync_oneshot_pulls_incremental_edits_after_clone() {
+        let srv_dir = tempdir().unwrap();
+        let cli_dir = tempdir().unwrap();
+        let srv = Engine::init(srv_dir.path(), Identity::from_seed(&[5; 32])).unwrap();
+        let cli_id = Identity::from_seed(&[6; 32]);
+        srv.record_write("first.md", b"one\n").unwrap();
+        srv.authorize(&cli_id.to_ssh_string(), None, true, "test").unwrap();
+        let (port, srv_engine, task) = boot(srv, AuthOpts::default(), None).await;
+        let url = format!("ws://127.0.0.1:{port}");
+
+        let cli = Engine::init(cli_dir.path(), cli_id).unwrap();
+        let cli_engine: EngineRef = Arc::new(StdMutex::new(cli));
+        clone_bootstrap(cli_engine.clone(), &url, &AuthOpts::default()).await.expect("clone");
+        assert!(cli_dir.path().join("first.md").exists());
+
+        // A new edit on the server, then a oneshot sync from the client.
+        srv_engine.lock().unwrap().record_write("second.md", b"two\n").unwrap();
+        sync_oneshot(cli_engine, &url, &AuthOpts::default()).await.expect("oneshot sync");
+        assert_eq!(std::fs::read(cli_dir.path().join("second.md")).unwrap(), b"two\n", "oneshot must pull the new edit");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn unauthorized_connect_is_denied() {
+        // Server with no_tofu and an empty admission set rejects an unknown key
+        // that presents no enrollment secret.
+        let srv_dir = tempdir().unwrap();
+        let cli_dir = tempdir().unwrap();
+        let srv = Engine::init(srv_dir.path(), Identity::from_seed(&[7; 32])).unwrap();
+        srv.record_write("private.md", b"secret\n").unwrap();
+        let opts = AuthOpts { no_tofu: true, ..Default::default() };
+        let (port, _srv_engine, task) = boot(srv, opts, None).await;
+
+        let cli = Engine::init(cli_dir.path(), Identity::from_seed(&[8; 32])).unwrap();
+        let cli_engine: EngineRef = Arc::new(StdMutex::new(cli));
+        let url = format!("ws://127.0.0.1:{port}");
+        let r = clone_bootstrap(cli_engine, &url, &AuthOpts::default()).await;
+        assert!(r.is_err(), "an unauthorized, keyless connect must be denied");
+        assert!(!cli_dir.path().join("private.md").exists(), "no data may leak to a denied peer");
+        task.abort();
+    }
+
     fn req(auth: Option<&str>, uri: &str, subproto: Option<&str>) -> Request {
         let mut b = Request::builder().uri(uri);
         if let Some(a) = auth {
