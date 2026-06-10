@@ -85,6 +85,11 @@ export class WorkerVault {
   async sync(url: string, opts: { authKey?: string } = {}): Promise<number> {
     return (await this.call({ op: 'sync', url, authKey: opts.authKey })) as number;
   }
+  /** Abort an in-flight {@link sync} — the worker closes the socket so the
+   * pending sync rejects. Processed even while `sync` is still awaiting. */
+  async cancel(): Promise<void> {
+    await this.call({ op: 'abort' });
+  }
   async free(): Promise<void> {
     await this.call({ op: 'free' });
   }

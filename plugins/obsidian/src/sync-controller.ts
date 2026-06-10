@@ -46,6 +46,19 @@ export class SyncController {
     this.set('idle');
   }
 
+  /** Abort an in-flight connect/sync — e.g. a connect to a mistyped URL that's
+   * hanging. Closes the socket (the pending `vault.sync` rejects) and returns to
+   * idle. Safe to call when nothing is in flight. */
+  async cancel(): Promise<void> {
+    this.log('sync: cancelling…');
+    try {
+      await this.vault.cancel();
+    } catch {
+      /* nothing in flight */
+    }
+    this.set('idle');
+  }
+
   /**
    * One sync pass: (optionally) re-capture the host tree, connect, catch up,
    * and materialize ONLY when the peer actually sent something.
@@ -93,6 +106,13 @@ export class SyncController {
       this.set('connected');
     } catch (e) {
       let msg = e instanceof Error ? e.message : String(e);
+      // A user-initiated cancel is not a failure — drop back to idle quietly
+      // (the cancel() call already set idle; don't paint a red "error").
+      if (/cancell?ed/i.test(msg)) {
+        this.set('idle');
+        this.log('sync: cancelled');
+        throw e;
+      }
       // A browser/Electron WebSocket can't read the HTTP status of a failed
       // upgrade — a hub 401 (wrong auth key) surfaces only as a generic
       // pre-handshake connect error. If we presented an auth key, that's the

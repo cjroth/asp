@@ -34,6 +34,10 @@ export interface SyncOptions {
   idleMs?: number;
   /** Overall timeout (ms). */
   timeoutMs?: number;
+  /** Connect-phase timeout (ms): how long to wait for the WebSocket to open
+   * before giving up. A mistyped-but-TCP-reachable URL can otherwise hang until
+   * the OS TCP timeout (or forever); this bounds it. */
+  connectMs?: number;
 }
 
 /**
@@ -57,6 +61,10 @@ export interface EngineVault {
   /** One file's materialized bytes (binary — no JSON number-array blowup). */
   readFile(path: string): (Uint8Array | undefined) | Promise<Uint8Array | undefined>;
   sync(url: string, opts?: SyncOptions): Promise<number>;
+  /** Abort an in-flight {@link sync} (closes the socket; the pending sync
+   * rejects with a "cancelled" error). A no-op if nothing is in flight. Lets a
+   * UI offer "Cancel" on a connect that's hanging (e.g. a mistyped URL). */
+  cancel(): void | Promise<void>;
   /** Serialize the whole engine state (all rows + blobs) so a thin client can
    * persist it and {@link load} it on next launch — WITHOUT this, a client that
    * rebuilds its engine each run re-imports its own materialized tree as new
@@ -70,6 +78,8 @@ export interface EngineVault {
 
 export class Vault {
   private eng: WasmEngineInstance;
+  /** Set while a `sync` is in flight; closes its socket. See {@link cancel}. */
+  private activeAbort?: () => void;
 
   /** Create a thin node. An empty `vaultId` adopts the peer's vault on connect. */
   constructor(seed: Uint8Array, vaultId = '') {
@@ -159,6 +169,7 @@ export class Vault {
     // a while (the old 15s cut large clones short).
     const idleMs = opts.idleMs ?? 30000;
     const timeoutMs = opts.timeoutMs ?? 180000;
+    const connectMs = opts.connectMs ?? 20000;
     const base = normalizePeerUrl(url);
     const fullUrl = opts.authKey
       ? `${base}${base.includes('?') ? '&' : '?'}auth_key=${encodeURIComponent(opts.authKey)}`
@@ -167,28 +178,44 @@ export class Vault {
     const ws = new WebSocket(fullUrl);
     ws.binaryType = 'arraybuffer';
 
-    await new Promise<void>((resolve, reject) => {
-      // A WebSocket 'error' Event carries no detail by design (so logging it
-      // raw yields a useless "[object Event]"). The informative signal is the
-      // 'close' that follows a failed upgrade — its code/reason tells you what
-      // happened (e.g. 1006 = abnormal close, what a 502/unreachable host
-      // looks like; 1008/4001 = the hub rejected the auth key). Surface the
-      // host + whichever fires first.
-      let settled = false;
-      const fail = (detail: string) => {
-        if (settled) return;
-        settled = true;
-        reject(new Error(`ws connect failed (${base}): ${detail}`));
-      };
-      ws.addEventListener('open', () => { settled = true; resolve(); }, { once: true });
-      ws.addEventListener('error', () => fail(`connection error (readyState ${ws.readyState})`), { once: true });
-      ws.addEventListener('close', (ev) => {
-        const c = ev as CloseEvent;
-        fail(`closed before handshake — code ${c.code}${c.reason ? ` (${c.reason})` : ''}`);
-      }, { once: true });
-    });
+    // A cancel handle: cancel() closes the socket and flags the pass so the
+    // close/error handlers reject with a clear "cancelled" error rather than a
+    // generic connect failure. Cleared in the finally so a later sync starts fresh.
+    let cancelled = false;
+    this.activeAbort = () => {
+      cancelled = true;
+      try {
+        ws.close();
+      } catch {}
+    };
+    try {
+      await new Promise<void>((resolve, reject) => {
+        // A WebSocket 'error' Event carries no detail by design (so logging it
+        // raw yields a useless "[object Event]"). The informative signal is the
+        // 'close' that follows a failed upgrade — its code/reason tells you what
+        // happened (e.g. 1006 = abnormal close, what a 502/unreachable host
+        // looks like; 1008/4001 = the hub rejected the auth key). Surface the
+        // host + whichever fires first.
+        let settled = false;
+        let connectTimer: ReturnType<typeof setTimeout>;
+        const fail = (detail: string) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(connectTimer);
+          reject(new Error(cancelled ? `sync cancelled (${base})` : `ws connect failed (${base}): ${detail}`));
+        };
+        // Bound the connect phase: without this, a TCP-reachable-but-wrong URL
+        // (or a black-hole host) hangs until the OS TCP timeout, with no error.
+        connectTimer = setTimeout(() => fail(`connect timed out after ${Math.round(connectMs / 1000)}s`), connectMs);
+        ws.addEventListener('open', () => { settled = true; clearTimeout(connectTimer); resolve(); }, { once: true });
+        ws.addEventListener('error', () => fail(`connection error (readyState ${ws.readyState})`), { once: true });
+        ws.addEventListener('close', (ev) => {
+          const c = ev as CloseEvent;
+          fail(`closed before handshake — code ${c.code}${c.reason ? ` (${c.reason})` : ''}`);
+        }, { once: true });
+      });
 
-    return await new Promise<number>((resolve, reject) => {
+      return await new Promise<number>((resolve, reject) => {
       let integrated = 0;
       let idle: ReturnType<typeof setTimeout> | undefined;
       const hardStop = setTimeout(() => {
@@ -230,13 +257,24 @@ export class Vault {
         if (r.synced) return done();
         resetIdle();
       });
-      ws.addEventListener('close', () => done());
+      ws.addEventListener('close', () =>
+        done(cancelled ? new Error(`sync cancelled (${base})`) : undefined),
+      );
       ws.addEventListener('error', () => done(new Error('ws error during sync')));
 
       // Opening Hello.
       ws.send(this.eng.connect_start());
       resetIdle();
-    });
+      });
+    } finally {
+      this.activeAbort = undefined;
+    }
+  }
+
+  /** Abort an in-flight {@link sync}: close the socket so the pending pass
+   * rejects. A no-op when nothing is in flight. */
+  cancel(): void {
+    this.activeAbort?.();
   }
 
   free(): void {

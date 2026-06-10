@@ -67,6 +67,11 @@ export class EngineWorkerHost {
           const integrated = await this.vaultOrThrow().sync(cmd.url, { authKey: cmd.authKey });
           return this.reply(cmd.id, true, integrated);
         }
+        case 'abort':
+          // Handled while the in-flight `sync` handler is suspended at its await:
+          // closes that sync's socket so it rejects and its reply unblocks.
+          this.vault?.cancel();
+          return this.reply(cmd.id, true);
         case 'free':
           this.vault?.free();
           this.vault = undefined;

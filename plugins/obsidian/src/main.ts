@@ -287,6 +287,16 @@ export default class AspPlugin extends Plugin {
     await this.runSync({ reconcile: true });
   }
 
+  /** Abort an in-flight connect/sync — the "Cancel" affordance for a connect
+   * that's hanging (e.g. a mistyped Peer URL). Closes the socket so the pending
+   * sync rejects, and frees the `syncing` latch so a corrected URL can be tried
+   * at once. */
+  async cancelSync(): Promise<void> {
+    this.log.append('connect: cancelled by user');
+    await this.controller?.cancel();
+    this.syncing = false;
+  }
+
   /** File holding the serialized engine state (all rows+blobs), inside the
    * plugin's own dir so it travels with the install but isn't a vault note. */
   private statePath(): string {
@@ -450,7 +460,14 @@ class AspSettingTab extends PluginSettingTab {
         );
       new Setting(root).setName('Connect').addButton((b) =>
         b.setButtonText('Connect').onClick(async () => {
-          b.setButtonText('Connecting…');
+          // Toggle: while a connect is in flight this same button cancels it, so
+          // a hanging connect (e.g. a mistyped URL) is never a dead end.
+          if (this.plugin.syncState === 'connecting') {
+            await this.plugin.cancelSync();
+            b.setButtonText('Connect');
+            return;
+          }
+          b.setButtonText('Cancel');
           const ok = await this.plugin.connect();
           b.setButtonText('Connect');
           if (ok) this.display(); // reveal stage 2
