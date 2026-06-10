@@ -716,6 +716,51 @@ mod tests {
         task.abort();
     }
 
+    #[tokio::test]
+    async fn connect_errors_on_unreachable_peer_and_bad_url() {
+        let dir = tempdir().unwrap();
+        let e = Engine::init(dir.path(), Identity::from_seed(&[40; 32])).unwrap();
+        let engine: EngineRef = Arc::new(StdMutex::new(e));
+        let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
+        // Nothing listening on :1 → the TCP connect fails (not a panic, an Err).
+        let unreachable = connect(engine.clone(), "ws://127.0.0.1:1/", &AuthOpts::default(), conns.clone(), true, None).await;
+        assert!(unreachable.is_err(), "an unreachable peer surfaces as an error");
+        // A non-ws scheme is rejected before any socket work.
+        let bad = connect(engine, "ftp://nope/", &AuthOpts::default(), conns, true, None).await;
+        assert!(bad.is_err(), "a non-ws url is rejected");
+    }
+
+    #[test]
+    fn parse_ws_url_schemes_ports_and_errors() {
+        assert_eq!(parse_ws_url("ws://host:1234/path").unwrap(), ("host".to_string(), 1234, false));
+        assert_eq!(parse_ws_url("wss://host/path").unwrap(), ("host".to_string(), 443, true)); // default wss port
+        assert_eq!(parse_ws_url("ws://host").unwrap(), ("host".to_string(), 80, false)); // default ws port
+        assert!(parse_ws_url("http://nope").is_err(), "non-ws scheme rejected");
+        assert!(parse_ws_url("justtext").is_err(), "schemeless rejected");
+    }
+
+    #[tokio::test]
+    async fn watcher_captures_a_disk_write() {
+        // The `asp watch` glue: an OS fs event → debounced capture into the log.
+        let dir = tempdir().unwrap();
+        let e = Engine::init(dir.path(), Identity::from_seed(&[9; 32])).unwrap();
+        let engine: EngineRef = Arc::new(StdMutex::new(e));
+        let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
+        let _watcher = spawn_watcher(engine.clone(), conns, 50).expect("spawn watcher");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await; // let it register
+
+        std::fs::write(dir.path().join("live.md"), b"typed by a human\n").unwrap();
+        let mut captured = false;
+        for _ in 0..80 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if engine.lock().unwrap().materialize().unwrap().contains_key("live.md") {
+                captured = true;
+                break;
+            }
+        }
+        assert!(captured, "watcher should capture a disk write within the timeout");
+    }
+
     fn req(auth: Option<&str>, uri: &str, subproto: Option<&str>) -> Request {
         let mut b = Request::builder().uri(uri);
         if let Some(a) = auth {

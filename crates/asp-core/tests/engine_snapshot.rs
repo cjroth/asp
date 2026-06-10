@@ -33,6 +33,12 @@ fn snapshot_then_restore_reverts_the_working_tree() {
 
     // An unknown target (not a label, not a parseable time) errors.
     assert!(e.restore("no-such-target-xyz").is_err());
+
+    // Restore "as of" a far-future unix timestamp resolves the time path and
+    // yields the current state (a no-op revert) — exercises parse_time_arg.
+    let rows2 = e.restore("9999999999").unwrap();
+    assert!(rows2.is_empty(), "restoring to 'now-ish' authors nothing");
+    assert_eq!(std::fs::read(&f).unwrap(), b"version one\n");
 }
 
 #[test]

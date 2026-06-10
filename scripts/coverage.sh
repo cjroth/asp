@@ -4,7 +4,7 @@
 # (engine capture, net protocol) can't silently regress. Needs:
 #   rustup component add llvm-tools-preview && cargo install cargo-llvm-cov
 set -euo pipefail
-FLOOR="${COVERAGE_FLOOR:-88}"   # asp-core line-coverage floor, in percent
+FLOOR="${COVERAGE_FLOOR:-92}"   # asp-core line-coverage floor, in percent
 cd "$(dirname "$0")/.."
 
 cargo llvm-cov --package asp-core --summary-only "$@"

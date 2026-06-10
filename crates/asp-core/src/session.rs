@@ -411,6 +411,165 @@ mod tests {
         assert_eq!(std::fs::read(db.path().join("a.md")).unwrap(), b"hello from A\n");
     }
 
+    fn ctx() -> AdmitCtx {
+        AdmitCtx { no_tofu: false, auth_key_ok: false, auth_key_configured: false, default_ttl_days: 90, now_unix: 1_700_000_000 }
+    }
+
+    // Drive the SAME pump over two MemEngines — the wasm/browser SessionVault impl
+    // (rows_after_wire / integrate / admit / adopt_vault_id), which the disk-engine
+    // tests never exercise.
+    fn pump(a: &dyn SessionVault, la: &mut Session, b: &dyn SessionVault, cb: &mut Session) {
+        let mut to_a: Vec<Msg> = cb.start().into_iter().filter_map(send_of).collect();
+        let mut to_b: Vec<Msg> = la.start().into_iter().filter_map(send_of).collect();
+        for _ in 0..40 {
+            let (mut na, mut nb) = (Vec::new(), Vec::new());
+            for m in to_a.drain(..) {
+                for s in la.on_msg(a, m).unwrap() {
+                    nb.extend(msgs_of(a, s));
+                }
+            }
+            for m in to_b.drain(..) {
+                for s in cb.on_msg(b, m).unwrap() {
+                    na.extend(msgs_of(b, s));
+                }
+            }
+            to_a = na;
+            to_b = nb;
+            if to_a.is_empty() && to_b.is_empty() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn memengine_sessions_handshake_and_converge() {
+        use crate::MemEngine;
+        let a = MemEngine::create(Identity::from_seed(&[1; 32]), "v");
+        let b = MemEngine::create(Identity::from_seed(&[2; 32]), "v");
+        a.authorize(&Identity::from_seed(&[2; 32]).to_ssh_string(), None, true, "test").unwrap();
+        b.authorize(&Identity::from_seed(&[1; 32]).to_ssh_string(), None, true, "test").unwrap();
+        a.record_write("m.md", b"from mem A\n").unwrap();
+
+        let mut la = Session::new(Role::Listener, &a, Vec::new(), None, ctx());
+        let mut cb = Session::new(Role::Connector, &b, Vec::new(), None, ctx());
+        pump(&a, &mut la, &b, &mut cb);
+
+        assert!(la.authed() && cb.authed(), "both mem sessions authenticate");
+        assert_eq!(b.files_map().unwrap().get("m.md").map(|v| v.as_slice()), Some(&b"from mem A\n"[..]), "B pulled A's file");
+    }
+
+    #[test]
+    fn tofu_admits_an_unknown_peer_but_no_tofu_denies_it() {
+        use crate::MemEngine;
+        let mk = || {
+            let a = MemEngine::create(Identity::from_seed(&[1; 32]), "v");
+            let b = MemEngine::create(Identity::from_seed(&[2; 32]), "v");
+            a.record_write("m.md", b"hi\n").unwrap(); // NO authorize() — rely on admission policy
+            (a, b)
+        };
+
+        // TOFU (no_tofu=false): an unknown peer is admitted on first use → converge.
+        let (a, b) = mk();
+        let mut la = Session::new(Role::Listener, &a, Vec::new(), None, ctx());
+        let mut cb = Session::new(Role::Connector, &b, Vec::new(), None, ctx());
+        pump(&a, &mut la, &b, &mut cb);
+        assert!(la.authed() && cb.authed(), "TOFU admits an unknown peer");
+        assert!(b.files_map().unwrap().contains_key("m.md"));
+
+        // no_tofu: an unknown, un-authorized peer is denied → no data crosses.
+        let deny = || AdmitCtx { no_tofu: true, ..ctx() };
+        let (a, b) = mk();
+        let mut la = Session::new(Role::Listener, &a, Vec::new(), None, deny());
+        let mut cb = Session::new(Role::Connector, &b, Vec::new(), None, deny());
+        pump(&a, &mut la, &b, &mut cb);
+        assert!(!(la.authed() && cb.authed()), "no_tofu denies an unknown peer");
+        assert!(!b.files_map().unwrap().contains_key("m.md"), "no data leaks to a denied peer");
+    }
+
+    #[test]
+    fn proto_mismatch_closes_the_session() {
+        let d = tempdir().unwrap();
+        let e = Engine::init(d.path(), Identity::from_seed(&[1; 32])).unwrap();
+        let mut s = Session::new(Role::Listener, &e, Vec::new(), None, ctx());
+        let hello = Msg::Hello {
+            proto: crate::wire::PROTO + 99,
+            node_id: Identity::from_seed(&[2; 32]).node_id().to_hex(),
+            nonce: vec![0u8; 32],
+            channel_binding: vec![],
+            vault_id: "whatever".into(),
+            is_listener: false,
+        };
+        let steps = s.on_msg(&e, hello).unwrap();
+        assert!(steps.iter().any(|st| matches!(st, Step::Closed(m) if m.contains("proto"))), "proto mismatch must close");
+    }
+
+    #[test]
+    fn differing_populated_vaults_refuse_to_sync() {
+        let (da, db) = (tempdir().unwrap(), tempdir().unwrap());
+        let a = Engine::init(da.path(), Identity::from_seed(&[1; 32])).unwrap();
+        let b = Engine::init(db.path(), Identity::from_seed(&[2; 32])).unwrap();
+        // Both populated → each advertises its OWN (different) vault id.
+        a.record_write("a.md", b"secret A\n").unwrap();
+        b.record_write("b.md", b"secret B\n").unwrap();
+        let la = Session::new(Role::Listener, &a, Vec::new(), None, ctx());
+        let mut cb = Session::new(Role::Connector, &b, Vec::new(), None, ctx());
+        let a_hello = la.start().into_iter().filter_map(send_of).next().expect("A hello");
+        let steps = cb.on_msg(&b, a_hello).unwrap();
+        assert!(
+            steps.iter().any(|st| matches!(st, Step::Closed(m) if m.contains("different vault"))),
+            "two populated vaults with different ids must refuse to sync",
+        );
+    }
+
+    #[test]
+    fn corrupted_handshake_signature_closes_and_does_not_authenticate() {
+        let (da, db) = (tempdir().unwrap(), tempdir().unwrap());
+        let a = Engine::init(da.path(), Identity::from_seed(&[1; 32])).unwrap();
+        let b = Engine::init(db.path(), Identity::from_seed(&[2; 32])).unwrap();
+        let vid = a.store.get_config("vault_id").unwrap().unwrap();
+        b.store.set_config("vault_id", &vid).unwrap();
+        a.authorize(&Identity::from_seed(&[2; 32]).to_ssh_string(), None, true, "t").unwrap();
+        b.authorize(&Identity::from_seed(&[1; 32]).to_ssh_string(), None, true, "t").unwrap();
+        let mut la = Session::new(Role::Listener, &a, Vec::new(), None, ctx());
+        let mut cb = Session::new(Role::Connector, &b, Vec::new(), None, ctx());
+        // Flip a byte of every Auth signature in flight — the transcript no longer
+        // verifies, so both ends must close and neither authenticates.
+        let tamper = |m: Msg| match m {
+            Msg::Auth { mut sig } => {
+                if !sig.is_empty() {
+                    sig[0] ^= 0xFF;
+                }
+                Msg::Auth { sig }
+            }
+            other => other,
+        };
+        let mut to_a: Vec<Msg> = cb.start().into_iter().filter_map(send_of).collect();
+        let mut to_b: Vec<Msg> = la.start().into_iter().filter_map(send_of).collect();
+        let mut closed = false;
+        for _ in 0..10 {
+            let (mut n_to_a, mut n_to_b) = (Vec::new(), Vec::new());
+            for m in to_a.drain(..) {
+                for s in la.on_msg(&a, tamper(m)).unwrap() {
+                    closed |= matches!(s, Step::Closed(_));
+                    n_to_b.extend(msgs_of(&a, s));
+                }
+            }
+            for m in to_b.drain(..) {
+                for s in cb.on_msg(&b, tamper(m)).unwrap() {
+                    closed |= matches!(s, Step::Closed(_));
+                    n_to_a.extend(msgs_of(&b, s));
+                }
+            }
+            to_a = n_to_a;
+            to_b = n_to_b;
+            if to_a.is_empty() && to_b.is_empty() {
+                break;
+            }
+        }
+        assert!(closed, "a corrupted Auth signature must close the session");
+        assert!(!(la.authed() && cb.authed()), "a tampered handshake must not authenticate");
+    }
+
     /// A full clone (peer missing everything) must NOT be serialized as one
     /// giant `Msg::Rows` — that buffers the whole history (every blob) at once,
     /// the OOM on a small hub VM. It is split into byte-budgeted frames, each

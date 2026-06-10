@@ -14,7 +14,7 @@
 //!     `.git/`, `.obsidian/`, or a nested `proj/.git/**` (the leak we shipped);
 //!   - rename inference moves content under a new path instead of delete+create.
 
-use asp_core::{Engine, Identity};
+use asp_core::{Engine, Identity, MergeClass};
 use std::fs;
 use tempfile::TempDir;
 
@@ -102,6 +102,68 @@ fn capture_infers_rename_instead_of_delete_plus_create() {
     // file's identity/history). Capture also may emit a dir entity for the new
     // folder, so bound it rather than pin it exactly.
     assert!(rows.len() <= 2, "rename should not explode into many rows, got {}", rows.len());
+}
+
+#[test]
+fn empty_directories_are_tracked_as_entities_then_pruned() {
+    // A physically-empty in-scope folder is a first-class entity so it
+    // replicates without a marker file; once it holds a real file (or is
+    // removed) the entity is pruned. Exercises record_dir_create/delete +
+    // empty-dir discovery, which the file-only capture tests never reach.
+    let dir = tempfile::tempdir().unwrap();
+    let e = Engine::init(dir.path(), Identity::from_seed(&[14; 32])).unwrap();
+    let live_dirs = |e: &Engine| -> Vec<String> {
+        e.store
+            .live_files()
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.merge_class == MergeClass::Dir && !f.deleted)
+            .map(|f| f.path)
+            .collect()
+    };
+
+    fs::create_dir_all(dir.path().join("emptydir")).unwrap();
+    e.capture_rescan().unwrap();
+    assert!(live_dirs(&e).contains(&"emptydir".to_string()), "empty dir tracked as an entity");
+
+    // Put a file in it → no longer empty → the dir entity is pruned.
+    fs::write(dir.path().join("emptydir").join("f.md"), b"content\n").unwrap();
+    e.capture_rescan().unwrap();
+    assert!(!live_dirs(&e).contains(&"emptydir".to_string()), "non-empty dir is not an entity");
+    assert!(e.materialize().unwrap().contains_key("emptydir/f.md"));
+}
+
+#[test]
+fn record_write_is_a_no_op_on_unchanged_content_and_ignored_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = Engine::init(dir.path(), Identity::from_seed(&[15; 32])).unwrap();
+    assert!(e.record_write("a.md", b"hello\n").unwrap().is_some(), "first write authors a row");
+    assert!(e.record_write("a.md", b"hello\n").unwrap().is_none(), "identical re-write authors nothing");
+    assert!(e.record_write(".git/config", b"x").unwrap().is_none(), "ignored path authors nothing");
+    assert!(e.record_remove("never-existed.md").unwrap().is_none(), "removing an absent file is a no-op");
+}
+
+#[test]
+fn integrate_rejects_tampered_rows() {
+    // A peer's rows are content-addressed + signed; a flipped id or blob hash
+    // must be refused, never folded. (The disk engine's integrate validation.)
+    let (sd, dd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let src = Engine::init(sd.path(), Identity::from_seed(&[16; 32])).unwrap();
+    let dst = Engine::init(dd.path(), Identity::from_seed(&[17; 32])).unwrap();
+    let wr = src.record_write("a.md", b"genuine content\n").unwrap().unwrap();
+
+    let mut bad_id = wr.clone();
+    bad_id.row.id = "deadbeefdeadbeef".into();
+    assert!(dst.integrate(&bad_id).is_err(), "a row whose id doesn't match its contents is rejected");
+
+    let mut bad_blob = wr.clone();
+    if let Some(b) = bad_blob.blobs.first_mut() {
+        b.hash = "0000000000000000".into();
+    }
+    assert!(dst.integrate(&bad_blob).is_err(), "a blob whose hash doesn't match its bytes is rejected");
+
+    // The genuine row integrates fine.
+    assert!(dst.integrate(&wr).is_ok());
 }
 
 #[test]
