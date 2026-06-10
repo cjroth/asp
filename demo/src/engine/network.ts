@@ -582,7 +582,10 @@ export function createNetwork(opts: NetworkOpts) {
         createdRemote: sn.createdRemote ?? null,
         externalUrl: sn.externalUrl,
         authKey: sn.authKey,
-        wantLive: !!sn.wantLive,
+        // Back-compat: state persisted by an older build has no `wantLive`
+        // field, but an `externalUrl` means the user had configured a live
+        // link — so honor it and auto-redial after the upgrade.
+        wantLive: sn.wantLive ?? !!sn.externalUrl,
       };
       logLine(node, [
         { t: 'INFO', c: 'lvl' }, { t: ' restore   ', c: 'tag' },
