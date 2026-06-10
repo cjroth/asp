@@ -216,55 +216,69 @@ export class Vault {
       });
 
       return await new Promise<number>((resolve, reject) => {
-      let integrated = 0;
-      let idle: ReturnType<typeof setTimeout> | undefined;
-      const hardStop = setTimeout(() => {
-        try {
-          ws.close();
-        } catch {}
-        reject(new Error('sync timed out'));
-      }, timeoutMs);
+        let integrated = 0;
+        let synced = false; // did the peer send its explicit completion signal?
+        let settled = false;
+        let idle: ReturnType<typeof setTimeout> | undefined;
+        const hardStop = setTimeout(() => done(new Error('sync timed out')), timeoutMs);
+        const done = (err?: Error) => {
+          if (settled) return; // first outcome wins (close fires after we close)
+          settled = true;
+          clearTimeout(idle);
+          clearTimeout(hardStop);
+          try {
+            ws.close();
+          } catch {}
+          if (err) reject(err);
+          else resolve(integrated);
+        };
+        // Idle is a STALL backstop, NOT a completion. A healthy peer always ends
+        // catch-up with `Synced`; going idle without it means the link stalled
+        // mid-stream — an INCOMPLETE catch-up. Resolving it as success let a
+        // partial pull through, after which `reconcile` mints fresh ids for every
+        // not-yet-received file and the whole vault duplicates (the mobile dup
+        // loop). So a stall must FAIL.
+        const resetIdle = () => {
+          clearTimeout(idle);
+          idle = setTimeout(() => done(new Error(`sync stalled before completion (${base}) — catch-up incomplete`)), idleMs);
+        };
 
-      const done = (err?: Error) => {
-        clearTimeout(idle);
-        clearTimeout(hardStop);
-        try {
-          ws.close();
-        } catch {}
-        if (err) reject(err);
-        else resolve(integrated);
-      };
-      const resetIdle = () => {
-        clearTimeout(idle);
-        idle = setTimeout(() => done(), idleMs);
-      };
+        ws.addEventListener('message', (ev: MessageEvent) => {
+          const frame = new Uint8Array(ev.data as ArrayBuffer);
+          let r: FeedResult;
+          try {
+            r = JSON.parse(this.eng.feed(frame)) as FeedResult;
+          } catch (e) {
+            return done(e as Error);
+          }
+          integrated += r.integrated;
+          for (const out of r.out) ws.send(Uint8Array.from(out));
+          // A protocol-level close is always a failure (denied / proto mismatch /
+          // different vault) — surface it; never treat it as converged.
+          if (r.closed) return done(new Error(r.closed));
+          // The ONE success path: the peer finished streaming our catch-up.
+          if (r.synced) {
+            synced = true;
+            return done();
+          }
+          resetIdle();
+        });
+        // A socket close BEFORE `Synced` is an incomplete catch-up — reject, so the
+        // caller never reconciles against a partial pull and mints duplicates.
+        ws.addEventListener('close', () =>
+          done(
+            cancelled
+              ? new Error(`sync cancelled (${base})`)
+              : synced
+                ? undefined
+                : new Error(`sync closed before completion (${base}) — catch-up incomplete`),
+          ),
+        );
+        ws.addEventListener('error', () => done(new Error('ws error during sync')));
 
-      ws.addEventListener('message', (ev: MessageEvent) => {
-        const frame = new Uint8Array(ev.data as ArrayBuffer);
-        let r: FeedResult;
-        try {
-          r = JSON.parse(this.eng.feed(frame)) as FeedResult;
-        } catch (e) {
-          return done(e as Error);
-        }
-        integrated += r.integrated;
-        for (const out of r.out) ws.send(Uint8Array.from(out));
-        if (r.closed) {
-          return done(r.closed.includes('denied') ? new Error(r.closed) : undefined);
-        }
-        // Peer finished our catch-up — this oneshot pass is complete. (A live
-        // driver would keep the socket open here; see FeedResult.synced.)
-        if (r.synced) return done();
+        // Opening Hello.
+        ws.send(this.eng.connect_start());
         resetIdle();
-      });
-      ws.addEventListener('close', () =>
-        done(cancelled ? new Error(`sync cancelled (${base})`) : undefined),
-      );
-      ws.addEventListener('error', () => done(new Error('ws error during sync')));
-
-      // Opening Hello.
-      ws.send(this.eng.connect_start());
-      resetIdle();
       });
     } finally {
       this.activeAbort = undefined;
