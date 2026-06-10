@@ -95,6 +95,10 @@ struct FeedResult {
     integrated: usize,
     authed: bool,
     closed: Option<String>,
+    /// The peer finished streaming our catch-up (`Msg::Synced`). NOT a close:
+    /// a oneshot driver (SDK `Vault.sync`) ends its pass here, while a live
+    /// driver (the demo's watch link) keeps the socket open for pushed rows.
+    synced: bool,
 }
 
 #[wasm_bindgen]
@@ -248,22 +252,24 @@ impl WasmEngine {
         frame
     }
 
-    /// Feed an inbound frame; returns JSON `{out:[[u8]], integrated, authed, closed}`.
+    /// Feed an inbound frame; returns JSON `{out:[[u8]], integrated, authed, closed, synced}`.
     pub fn feed(&mut self, frame: &[u8]) -> Result<String, JsError> {
         let msg = Msg::from_bytes(frame).map_err(to_err)?;
         let eng = &self.eng;
         let session = self.session.as_mut().ok_or_else(|| JsError::new("no session; call connect_start"))?;
         let steps = session.on_msg(eng, msg).map_err(to_err)?;
-        let mut res = FeedResult { out: Vec::new(), integrated: 0, authed: session.authed(), closed: None };
+        let mut res =
+            FeedResult { out: Vec::new(), integrated: 0, authed: session.authed(), closed: None, synced: false };
         for step in steps {
             match step {
                 Step::Send(m) => res.out.push(m.to_bytes().map_err(to_err)?),
                 Step::Integrated(rows) => res.integrated += rows.len(),
                 Step::Authenticated(_) => res.authed = true,
                 Step::Closed(reason) => res.closed = Some(reason),
-                // Peer finished sending our catch-up. A browser node is always a
-                // oneshot connector, so this ends the pass cleanly.
-                Step::PeerSynced => res.closed = Some("synced".into()),
+                // Peer finished sending our catch-up. Surfaced as its own signal —
+                // not `closed` — because the DRIVER decides: a oneshot sync ends
+                // its pass; a live watch link stays open for pushed rows.
+                Step::PeerSynced => res.synced = true,
                 // Listener-only (streamed by the native driver); a browser node is
                 // never a listener, so this can't occur here.
                 Step::CatchUp { .. } => {}

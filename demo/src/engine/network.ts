@@ -99,6 +99,9 @@ interface Node {
   liveWs?: WebSocket;    // a persistent (watch) connection to the external peer
   live?: boolean;        // the live connection is open + authed
   liveAuthed?: boolean;
+  wantLive?: boolean;    // the user asked for a live link — auto-redial on drop
+  reconnectTimer?: ReturnType<typeof setTimeout>;
+  reconnectDelayMs?: number; // backoff for the next auto-redial
 }
 
 export interface NetworkOpts {
@@ -392,6 +395,8 @@ export function createNetwork(opts: NetworkOpts) {
     const node = findNode(nodeId);
     if (!node) return Promise.resolve(false);
     if (node.liveWs) { try { node.liveWs.close(); } catch {} node.liveWs = undefined; node.live = false; node.liveAuthed = false; }
+    clearTimeout(node.reconnectTimer); node.reconnectTimer = undefined;
+    node.wantLive = true;
     node.externalUrl = url;
     node.authKey = authKey || undefined;
     node.syncing = true;
@@ -420,12 +425,14 @@ export function createNetwork(opts: NetworkOpts) {
       let convergeIdle: ReturnType<typeof setTimeout>;
       const hardStop = setTimeout(() => settle(false, 'handshake timed out'), timeoutMs);
 
-      // Resolve once the INITIAL catch-up goes idle — but keep the socket OPEN.
+      // Resolve once the INITIAL catch-up completes — but keep the socket OPEN.
+      // (Explicitly via the peer's Synced signal; the idle timer is a fallback.)
       function settleConverged() {
         if (settled) return;
         settled = true;
-        clearTimeout(hardStop);
+        clearTimeout(hardStop); clearTimeout(convergeIdle);
         node!.syncing = false;
+        node!.reconnectDelayMs = undefined; // healthy link — reset redial backoff
         const imported = (JSON.parse(node!.eng.rows_after(JSON.stringify(beforeVv))) as any[]).length;
         gossip(node!, 'catchup');
         logLine(node!, [
@@ -473,13 +480,35 @@ export function createNetwork(opts: NetworkOpts) {
           try { ws.close(); } catch {}
           return;
         }
+        // The peer finished streaming our catch-up. That's CONVERGED, exactly —
+        // not a goodbye: stay connected and keep folding live-pushed rows.
+        if (r.synced) return settleConverged();
         bumpConverge();
       };
       ws.onerror = () => { if (!settled) settle(false, 'ws error (peer not listening, or mixed-content/cert)'); };
       ws.onclose = () => {
         if (node!.liveWs === ws) { node!.liveWs = undefined; node!.live = false; node!.liveAuthed = false; }
         if (settled) {
-          logLine(node!, [{ t: 'WARN', c: 'lvl warn' }, { t: ' watch     ', c: 'tag' }, { t: hostOf(url), c: 'hl' }, { t: ' · link closed', c: 'dim' }]);
+          // An established live link dropped (proxy idle, hub restart, network).
+          // The user still wants it — re-dial with backoff so edits made in the
+          // gap propagate on reconnect (the VV catch-up pushes them).
+          if (node!.wantLive && node!.online !== false) {
+            const delay = node!.reconnectDelayMs ?? 1000;
+            node!.reconnectDelayMs = Math.min(delay * 2, 15000);
+            clearTimeout(node!.reconnectTimer);
+            node!.reconnectTimer = setTimeout(() => {
+              node!.reconnectTimer = undefined;
+              if (node!.wantLive && !node!.liveWs && node!.online !== false) {
+                api.connectPeer(node!.id, url, authKey);
+              }
+            }, delay);
+            logLine(node!, [
+              { t: 'WARN', c: 'lvl warn' }, { t: ' watch     ', c: 'tag' }, { t: hostOf(url), c: 'hl' },
+              { t: ` · link closed · redial in ${Math.round(delay / 1000)}s`, c: 'dim' },
+            ]);
+          } else {
+            logLine(node!, [{ t: 'WARN', c: 'lvl warn' }, { t: ' watch     ', c: 'tag' }, { t: hostOf(url), c: 'hl' }, { t: ' · link closed', c: 'dim' }]);
+          }
           emit();
         } else {
           settle(false, 'closed before converge');
@@ -490,7 +519,10 @@ export function createNetwork(opts: NetworkOpts) {
 
   api.disconnectPeer = (nodeId: string) => {
     const node = findNode(nodeId);
-    if (!node || !node.liveWs) return;
+    if (!node) return;
+    node.wantLive = false; // user said stop — no auto-redial
+    clearTimeout(node.reconnectTimer); node.reconnectTimer = undefined;
+    if (!node.liveWs) return;
     const ws = node.liveWs;
     node.liveWs = undefined; node.live = false; node.liveAuthed = false;
     try { ws.close(); } catch {}
@@ -513,6 +545,7 @@ export function createNetwork(opts: NetworkOpts) {
       createdRemote: n.createdRemote,
       externalUrl: n.externalUrl,
       authKey: n.authKey,
+      wantLive: !!n.wantLive,
       folders: [...n.folders],
       mySites: [...n.mySites],
       rows: JSON.parse(n.eng.rows_after('{}')), // every wire row this node holds
@@ -549,6 +582,7 @@ export function createNetwork(opts: NetworkOpts) {
         createdRemote: sn.createdRemote ?? null,
         externalUrl: sn.externalUrl,
         authKey: sn.authKey,
+        wantLive: !!sn.wantLive,
       };
       logLine(node, [
         { t: 'INFO', c: 'lvl' }, { t: ' restore   ', c: 'tag' },
@@ -562,12 +596,23 @@ export function createNetwork(opts: NetworkOpts) {
     localSeq = maxLocal + 1;
     nodeSeq = nodes.length;
     for (const e of state.edges || []) if (idMap[e.a] && idMap[e.b]) edges.push({ a: idMap[e.a], b: idMap[e.b] });
+    // Re-establish live links the user had before the reload — otherwise a
+    // restored node sits silently disconnected and local edits stop propagating
+    // until a manual re-sync. (The redial's VV catch-up pushes anything authored
+    // while the page was closed.)
+    for (const n of nodes) {
+      if (n.wantLive && n.externalUrl && n.online !== false) {
+        api.connectPeer(n.id, n.externalUrl, n.authKey);
+      }
+    }
     emit();
   };
 
   api.removeNode = (id: string) => {
     const i = nodes.findIndex((n) => n.id === id);
     if (i < 0) return;
+    nodes[i].wantLive = false;
+    clearTimeout(nodes[i].reconnectTimer);
     if (nodes[i].liveWs) { try { nodes[i].liveWs!.close(); } catch {} }
     for (let j = edges.length - 1; j >= 0; j--) if (edges[j].a === id || edges[j].b === id) edges.splice(j, 1);
     try { nodes[i].eng.free(); } catch {}
@@ -585,6 +630,7 @@ export function createNetwork(opts: NetworkOpts) {
     if (!node || node.online === online) return;
     node.online = online;
     if (!online) {
+      clearTimeout(node.reconnectTimer); node.reconnectTimer = undefined; // pause redial while offline
       if (node.liveWs) { const w = node.liveWs; node.liveWs = undefined; node.live = false; node.liveAuthed = false; try { w.close(); } catch {} }
       logLine(node, [
         { t: 'WARN', c: 'lvl warn' }, { t: ' offline   ', c: 'tag' },
@@ -605,6 +651,10 @@ export function createNetwork(opts: NetworkOpts) {
           syncEdge(node, peer, 'catchup');  // anti-entropy, both directions
           syncEdge(peer, node, 'catchup');
         }
+      }
+      // Back online: also re-dial the external live link if the user wants one.
+      if (node.wantLive && node.externalUrl && !node.liveWs) {
+        api.connectPeer(node.id, node.externalUrl, node.authKey);
       }
     }
     emit();
@@ -918,6 +968,8 @@ export function createNetwork(opts: NetworkOpts) {
   api.reset = () => {
     for (const k of Object.keys(debounceTimers)) { clearTimeout(debounceTimers[k]); delete debounceTimers[k]; }
     for (const n of nodes) {
+      n.wantLive = false;
+      clearTimeout(n.reconnectTimer);
       if (n.liveWs) { try { n.liveWs.close(); } catch {} }
       try { n.eng.free(); } catch {}
     }

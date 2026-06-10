@@ -151,7 +151,7 @@ export class Vault {
    * caller can skip an expensive re-materialize when nothing new arrived (0).
    */
   async sync(url: string, opts: SyncOptions = {}): Promise<number> {
-    // Completion is explicit (the listener sends Synced; see feed → closed), so
+    // Completion is explicit (the listener sends Synced; see feed → synced), so
     // idle is only a dead-peer/stalled-link backstop — generous, because a single
     // large attachment is one multi-second frame and must not be read as a dead
     // link. No tail: Synced ends the normal case at once. timeoutMs is the hard
@@ -225,6 +225,9 @@ export class Vault {
         if (r.closed) {
           return done(r.closed.includes('denied') ? new Error(r.closed) : undefined);
         }
+        // Peer finished our catch-up — this oneshot pass is complete. (A live
+        // driver would keep the socket open here; see FeedResult.synced.)
+        if (r.synced) return done();
         resetIdle();
       });
       ws.addEventListener('close', () => done());

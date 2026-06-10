@@ -60,4 +60,7 @@ export interface FeedResult {
   integrated: number;
   authed: boolean;
   closed: string | null;
+  /** Peer finished streaming our catch-up. A oneshot sync completes here; a
+   * live watch link ignores it and keeps the socket open for pushed rows. */
+  synced: boolean;
 }
