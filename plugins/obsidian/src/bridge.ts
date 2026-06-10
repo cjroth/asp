@@ -15,6 +15,23 @@ function eq(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
+/** Run `fn` over `items` with at most `limit` in flight. Host filesystem ops on
+ * mobile are 50–100× slower per call than desktop, so doing them one-at-a-time
+ * serializes that latency — a large pull then takes tens of seconds. Bounded
+ * concurrency overlaps the waits (capped so we don't exhaust file handles). */
+async function mapLimit<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+}
+
+const HOST_IO_CONCURRENCY = 16;
+
 export class Bridge {
   private log: Logger = () => {};
   /** path → content hash last written to the host, so an incremental
@@ -60,11 +77,13 @@ export class Bridge {
     // record_write per file — per-file re-folding is O(n²), which made the
     // first sync of a large vault crawl.
     const files: Record<string, Uint8Array> = {};
-    for (const path of await this.host.list()) {
-      if (this.filter.ignored(path)) continue;
+    const paths = (await this.host.list()).filter((p) => !this.filter.ignored(p));
+    // Read the host files concurrently — sequential reads of a large vault on
+    // mobile (high-latency fs) made the first sync crawl.
+    await mapLimit(paths, HOST_IO_CONCURRENCY, async (path) => {
       const bytes = await this.host.read(path);
       if (bytes != null) files[path] = bytes;
-    }
+    });
     const n = Object.keys(files).length;
     if (n > 0) await this.vault.writeFiles(files);
     this.log(`reconcile: staged ${n} local file${n === 1 ? '' : 's'} into the engine`);
@@ -86,30 +105,32 @@ export class Bridge {
     const want = new Set(detail.map((f) => f.path));
     let written = 0;
     let removed = 0;
-    for (const f of detail) {
-      const hash = f.result_hash ?? '';
-      // Unchanged since we last wrote it → skip (no read, no fetch).
-      if (this.materializedHashes.get(f.path) === hash) continue;
+
+    // Only files whose content changed since we last wrote them (cheap sync
+    // filter, no I/O). Then fetch + write them CONCURRENTLY — the per-file host
+    // writes are the bottleneck on mobile's high-latency fs (doing thousands
+    // one-at-a-time took tens of seconds; see the per-file timing in the logs).
+    const changed = detail.filter((f) => this.materializedHashes.get(f.path) !== (f.result_hash ?? ''));
+    await mapLimit(changed, HOST_IO_CONCURRENCY, async (f) => {
       const bytes = await this.vault.readFile(f.path);
-      if (bytes == null) continue;
+      if (bytes == null) return;
       const cur = await this.host.read(f.path);
       if (cur == null || !eq(cur, bytes)) {
         await this.host.write(f.path, bytes);
-        written++;
-        this.log(`pull: wrote ${f.path}`);
+        written++; // JS is single-threaded between awaits — no race on this counter
       }
-      this.materializedHashes.set(f.path, hash);
-    }
-    // Remove host files the engine no longer has (deletes/renames-away).
-    for (const path of await this.host.list()) {
-      if (this.filter.ignored(path)) continue;
-      if (!want.has(path)) {
-        await this.host.remove(path);
-        this.materializedHashes.delete(path);
-        removed++;
-        this.log(`pull: removed ${path}`);
-      }
-    }
+      this.materializedHashes.set(f.path, f.result_hash ?? '');
+    });
+
+    // Remove host files the engine no longer has (deletes/renames-away), also
+    // concurrently. (No per-file log line — a large pull would flood the log.)
+    const toRemove = (await this.host.list()).filter((p) => !this.filter.ignored(p) && !want.has(p));
+    await mapLimit(toRemove, HOST_IO_CONCURRENCY, async (path) => {
+      await this.host.remove(path);
+      this.materializedHashes.delete(path);
+      removed++;
+    });
+
     this.log(`materialize: ${written} written, ${removed} removed (${want.size} in tree)`);
     return { written, removed };
   }

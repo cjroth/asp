@@ -1,6 +1,6 @@
 {
   "name": "asp-obsidian",
-  "version": "0.1.19",
+  "version": "0.1.20",
   "description": "Context for Obsidian — the ASP reference thin-client surface.",
   "license": "MIT OR Apache-2.0",
   "type": "module",
