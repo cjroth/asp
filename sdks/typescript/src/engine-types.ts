@@ -14,6 +14,12 @@ export interface WasmEngineInstance {
   commit_files(filesJson: string): void;
   /** Stage a batch of files (create/edit, no deletes) with a single fold. */
   write_files(filesJson: string): void;
+  /** Author deletes for a JSON array of paths with a single fold. */
+  remove_files(pathsJson: string): void;
+  /** Full engine state as compact msgpack bytes (rows + each blob once). */
+  dump_state(): Uint8Array;
+  /** Restore a `dump_state` snapshot; returns rows newly integrated. */
+  load_state(bytes: Uint8Array): number;
   files_json(): string;
   read_file(path: string): Uint8Array | undefined;
   /** This node's version vector as JSON `{site_id: max_seq}`. */

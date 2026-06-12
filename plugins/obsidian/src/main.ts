@@ -92,9 +92,13 @@ export default class AspPlugin extends Plugin {
    * hub rotates it or once the device is already enrolled). Discarded on use. */
   pendingAuthKey = '';
   private saveStateTimer?: ReturnType<typeof setTimeout>;
-  /** True once persisted engine state was restored on load — then reconcile
-   * matches existing ids and the first sync needn't adopt-first. */
-  private engineRestored = false;
+  /** True once the engine's view reflects this device's state — set when
+   * persisted state is restored on load, or after the first successful sync.
+   * Warm: reconcile matches existing ids (no adopt-first needed) and may
+   * safely capture offline deletions (engine-known paths missing from disk
+   * really were deleted). Cold: neither holds — reconcile must adopt the
+   * peer's ids first and must NOT author deletes. */
+  private engineWarm = false;
 
   async onload(): Promise<void> {
     const loaded = ((await this.loadData()) as Partial<AspSettings> & { authKey?: string }) ?? {};
@@ -188,10 +192,8 @@ export default class AspPlugin extends Plugin {
     // lightweight periodic pull so peer-side changes appear without a local edit.
     if (this.settings.enabled && this.settings.peerUrl) {
       this.log.append('startup: initial sync…');
-      // Adopt the peer's file ids first ONLY when we didn't restore engine state
-      // (fresh engine): prevents reconcile from minting colliding ids for files
-      // already on the peer (the duplicate-explosion loop).
-      void this.runSync({ reconcile: true, adoptFirst: !this.engineRestored, quiet: true });
+      // runSync derives adopt-first / capture-deletes from engine warmth.
+      void this.runSync({ reconcile: true, quiet: true });
     }
     this.startPolling();
   }
@@ -234,10 +236,14 @@ export default class AspPlugin extends Plugin {
    * Run one sync pass. `reconcile` re-captures the whole vault (initial /
    * manual recovery); `background` keeps the status steady for polls; `quiet`
    * suppresses the toast (used by automatic syncs). Never overlaps another sync.
-   * Returns whether it converged.
+   * Adopt-first vs capture-deletes is derived from engine warmth here — a cold
+   * engine must pull the peer's ids before reconciling (the duplicate-explosion
+   * loop) and must never author deletes for not-yet-materialized files; a warm
+   * one must do the opposite, or files deleted while the app was closed
+   * resurrect on every launch. Returns whether it converged.
    */
   private async runSync(
-    opts: { reconcile?: boolean; background?: boolean; quiet?: boolean; adoptFirst?: boolean } = {},
+    opts: { reconcile?: boolean; background?: boolean; quiet?: boolean } = {},
   ): Promise<boolean> {
     if (!this.controller) return false;
     if (this.syncing) return false; // a sync is already in flight
@@ -251,9 +257,16 @@ export default class AspPlugin extends Plugin {
     try {
       await this.controller.syncOnce(
         { peerUrl, authKey: this.pendingAuthKey || undefined },
-        { reconcile: opts.reconcile, background: opts.background, adoptFirst: opts.adoptFirst },
+        {
+          reconcile: opts.reconcile,
+          captureDeletes: opts.reconcile && this.engineWarm,
+          background: opts.background,
+          // Only meaningful when a reconcile follows (it exists to give the
+          // reconcile the peer's ids); a non-reconcile pass pulls anyway.
+          adoptFirst: opts.reconcile && !this.engineWarm,
+        },
       );
-      this.scheduleSaveState(); // persist engine state so reloads don't re-import
+      this.engineWarm = true; // the engine now reflects this device's state
       if (!opts.quiet) new Notice('asp: synced');
       return true;
     } catch (e) {
@@ -261,6 +274,12 @@ export default class AspPlugin extends Plugin {
       if (!opts.quiet) new Notice(`asp sync failed: ${e instanceof Error ? e.message : String(e)}`);
       return false;
     } finally {
+      // Persist engine state so reloads don't re-import — also after a FAILED
+      // pass (offline edits/deletes were still captured as rows and must
+      // survive an app kill). Never while cold: persisting a never-synced
+      // engine would make the next launch skip adopt-first and mint colliding
+      // ids for every file already on the peer.
+      if (this.engineWarm) this.scheduleSaveState();
       this.syncing = false;
     }
   }
@@ -269,7 +288,7 @@ export default class AspPlugin extends Plugin {
    * controls so the next settings render shows them. */
   async connect(): Promise<boolean> {
     this.log.append('connect: attempting first sync…');
-    const ok = await this.runSync({ reconcile: true, adoptFirst: !this.engineRestored });
+    const ok = await this.runSync({ reconcile: true });
     if (ok) {
       // Enrollment done — burn the one-time auth key so it never lingers.
       this.pendingAuthKey = '';
@@ -297,9 +316,17 @@ export default class AspPlugin extends Plugin {
     this.syncing = false;
   }
 
-  /** File holding the serialized engine state (all rows+blobs), inside the
-   * plugin's own dir so it travels with the install but isn't a vault note. */
+  /** File holding the serialized engine state (compact msgpack: rows + each
+   * blob once), inside the plugin's own dir so it travels with the install but
+   * isn't a vault note. */
   private statePath(): string {
+    return `${this.manifest.dir}/engine-state.bin`;
+  }
+
+  /** The pre-0.1.21 state file: a JSON dump that duplicated blobs per row and
+   * inflated every byte to ~4 chars — large vaults OOM'd the worker saving it,
+   * so every launch cold-started. Read once on upgrade, then replaced. */
+  private legacyStatePath(): string {
     return `${this.manifest.dir}/engine-state.json`;
   }
 
@@ -308,14 +335,26 @@ export default class AspPlugin extends Plugin {
    * matches by path instead of re-importing the materialized tree as new files
    * (the duplicate-explosion loop). */
   private async restoreEngineState(): Promise<void> {
+    const adapter = this.app.vault.adapter;
     try {
       const p = this.statePath();
-      if (await this.app.vault.adapter.exists(p)) {
-        const json = await this.app.vault.adapter.read(p);
+      if (await adapter.exists(p)) {
+        const rows = await this.sdk.loadState(new Uint8Array(await adapter.readBinary(p)));
+        this.engineWarm = true;
+        this.log.append(`restored engine state (${rows} rows) — reconcile will match existing files`);
+        return;
+      }
+      // Upgrade path: restore the legacy JSON dump once, then re-save in the
+      // compact format and drop the old file.
+      const legacy = this.legacyStatePath();
+      if (await adapter.exists(legacy)) {
+        const json = await adapter.read(legacy);
         if (json) {
           await this.sdk.load(json);
-          this.engineRestored = true;
-          this.log.append('restored engine state — reconcile will match existing files');
+          this.engineWarm = true;
+          await this.saveEngineState();
+          await adapter.remove(legacy);
+          this.log.append('migrated legacy engine state to the compact format');
         }
       }
     } catch (e) {
@@ -332,8 +371,11 @@ export default class AspPlugin extends Plugin {
 
   private async saveEngineState(): Promise<void> {
     try {
-      const json = await this.sdk.dump();
-      await this.app.vault.adapter.write(this.statePath(), json);
+      const bytes = await this.sdk.dumpState();
+      // Slice to the view's exact range — writeBinary takes an ArrayBuffer, and
+      // the Uint8Array from the worker may sit in a larger buffer.
+      const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      await this.app.vault.adapter.writeBinary(this.statePath(), buf as ArrayBuffer);
     } catch (e) {
       this.log.append(`save engine state failed: ${String(e)}`, 'error');
     }

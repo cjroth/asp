@@ -71,8 +71,16 @@ export class Bridge {
   }
 
   /** Seed the engine from the host's current contents (startup reconcile).
-   * Returns the number of files captured. */
-  async reconcileFromHost(): Promise<number> {
+   * Returns the number of files captured.
+   *
+   * `captureDeletes`: also author deletes for paths the ENGINE holds but the
+   * host disk no longer has — files deleted while the host app was closed (no
+   * delete events fire for those; without this the peer's copy resurrects them
+   * on the next materialize). Only safe on a WARM engine (restored state or a
+   * completed sync this session): on a cold engine "missing from disk" just
+   * means "not materialized yet", and authoring deletes would wipe every file
+   * created on other devices. The caller gates it. */
+  async reconcileFromHost(opts: { captureDeletes?: boolean } = {}): Promise<number> {
     // Stage every local file in ONE batch (a single fold) rather than a
     // record_write per file — per-file re-folding is O(n²), which made the
     // first sync of a large vault crawl.
@@ -86,7 +94,26 @@ export class Bridge {
     });
     const n = Object.keys(files).length;
     if (n > 0) await this.vault.writeFiles(files);
-    this.log(`reconcile: staged ${n} local file${n === 1 ? '' : 's'} into the engine`);
+
+    let deleted = 0;
+    if (opts.captureDeletes) {
+      // Engine paths missing from the host = deleted offline. Locally-ignored
+      // paths are exempt — ignoring a file must not delete it vault-wide.
+      const onHost = new Set(paths);
+      const missing = (await this.vault.filesDetail())
+        .filter(
+          (f) =>
+            !f.deleted && f.merge_class !== 'dir' && !this.filter.ignored(f.path) && !onHost.has(f.path),
+        )
+        .map((f) => f.path);
+      if (missing.length > 0) await this.vault.deleteFiles(missing);
+      deleted = missing.length;
+    }
+
+    this.log(
+      `reconcile: staged ${n} local file${n === 1 ? '' : 's'} into the engine` +
+        (deleted > 0 ? ` (${deleted} deleted while the app was closed)` : ''),
+    );
     return n;
   }
 

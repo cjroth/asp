@@ -39,6 +39,7 @@ export type Command =
   | { kind: 'cmd'; id: number; op: 'init'; payload: InitPayload }
   | { kind: 'cmd'; id: number; op: 'writeFile'; path: string; bytes: Uint8Array }
   | { kind: 'cmd'; id: number; op: 'deleteFile'; path: string }
+  | { kind: 'cmd'; id: number; op: 'deleteFiles'; paths: string[] }
   | { kind: 'cmd'; id: number; op: 'renameFile'; from: string; to: string }
   | { kind: 'cmd'; id: number; op: 'commitFiles'; files: Record<string, Uint8Array> }
   | { kind: 'cmd'; id: number; op: 'writeFiles'; files: Record<string, Uint8Array> }
@@ -49,6 +50,8 @@ export type Command =
   | { kind: 'cmd'; id: number; op: 'abort' }
   | { kind: 'cmd'; id: number; op: 'dump' }
   | { kind: 'cmd'; id: number; op: 'load'; stateJson: string }
+  | { kind: 'cmd'; id: number; op: 'dumpState' }
+  | { kind: 'cmd'; id: number; op: 'loadState'; bytes: Uint8Array }
   | { kind: 'cmd'; id: number; op: 'free' };
 
 /** The reply to a `Command`, by the same `id`. */

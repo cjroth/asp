@@ -68,6 +68,7 @@ test('editor/vcs/private dirs are hard-ignored regardless of ignore file', () =>
   for (const p of [
     '.obsidian',
     '.obsidian/plugins/agent-sync/engine-state.json',
+    '.obsidian/plugins/agent-sync/engine-state.bin',
     '.obsidian/plugins/agent-sync/main.js',
     '.git',
     '.git/objects/ab/cdef',

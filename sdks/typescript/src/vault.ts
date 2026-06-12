@@ -52,6 +52,9 @@ export interface EngineVault {
   /** Stage a batch of files (create/edit, no deletes) in one fold. */
   writeFiles(files: Record<string, Uint8Array>): void | Promise<void>;
   deleteFile(path: string): void | Promise<void>;
+  /** Author deletes for a batch of paths in one fold — the startup-reconcile
+   * seam for capturing files deleted while the host app was closed. */
+  deleteFiles(paths: string[]): void | Promise<void>;
   renameFile(from: string, to: string): void | Promise<void>;
   files(): Record<string, Uint8Array> | Promise<Record<string, Uint8Array>>;
   /** Per-file fold metadata (path + content hash, NO content) — cheap, so a
@@ -68,10 +71,20 @@ export interface EngineVault {
   /** Serialize the whole engine state (all rows + blobs) so a thin client can
    * persist it and {@link load} it on next launch — WITHOUT this, a client that
    * rebuilds its engine each run re-imports its own materialized tree as new
-   * files, which collide and multiply (the duplicate-explosion loop). */
+   * files, which collide and multiply (the duplicate-explosion loop).
+   * LEGACY JSON form — kept only so an existing persisted file can still be
+   * read once and migrated; prefer {@link dumpState}/{@link loadState}. */
   dump(): string | Promise<string>;
   /** Restore engine state produced by {@link dump} (re-integrates the rows). */
   load(stateJson: string): void | Promise<void>;
+  /** Serialize the whole engine state as compact msgpack BYTES — rows + each
+   * blob stored once. The {@link dump} JSON form duplicates blobs per row and
+   * inflates every content byte to ~4 chars, which OOMs a mobile WebView on a
+   * large vault; this form is what thin clients persist. */
+  dumpState(): Uint8Array | Promise<Uint8Array>;
+  /** Restore a {@link dumpState} snapshot (validates row ids + blob hashes).
+   * Returns the number of rows newly integrated. */
+  loadState(bytes: Uint8Array): number | Promise<number>;
   nodeSsh(): string;
   free(): void | Promise<void>;
 }
@@ -105,6 +118,10 @@ export class Vault {
   deleteFile(path: string): void {
     this.eng.record_remove(path);
   }
+  /** Author deletes for a batch of paths with a single fold. */
+  deleteFiles(paths: string[]): void {
+    this.eng.remove_files(JSON.stringify(paths));
+  }
   renameFile(from: string, to: string): void {
     this.eng.record_rename(from, to);
   }
@@ -130,13 +147,23 @@ export class Vault {
     return JSON.parse(this.eng.files_detail_json()) as FileMeta[];
   }
 
-  /** Serialize all rows+blobs (the persistable engine state). */
+  /** Serialize all rows+blobs as JSON (LEGACY — see {@link EngineVault.dump}). */
   dump(): string {
     return this.eng.rows_after(JSON.stringify({}));
   }
   /** Re-integrate a {@link dump} into this engine. */
   load(stateJson: string): void {
     this.eng.integrate(stateJson);
+  }
+
+  /** Compact binary engine state (rows + each blob once) — what thin clients
+   * persist across launches. */
+  dumpState(): Uint8Array {
+    return this.eng.dump_state();
+  }
+  /** Restore a {@link dumpState} snapshot; returns rows newly integrated. */
+  loadState(bytes: Uint8Array): number {
+    return this.eng.load_state(bytes);
   }
 
   /** Seed the engine from the host's current vault contents (whole-set commit). */

@@ -160,6 +160,30 @@ impl WasmEngine {
         Ok(())
     }
 
+    /// Author deletes for a JSON array of paths, folding ONCE — the startup
+    /// reconcile uses this to capture files deleted while the host app was
+    /// closed (no delete events fire for those; without it the peer's copy
+    /// resurrects them on the next materialize).
+    pub fn remove_files(&self, paths_json: &str) -> Result<(), JsError> {
+        let paths: Vec<String> = serde_json::from_str(paths_json).map_err(to_err)?;
+        self.eng.record_removes(&paths).map_err(to_err)?;
+        Ok(())
+    }
+
+    /// Serialize the full engine state as compact msgpack bytes (rows + each
+    /// blob once) — the persistable form for thin clients. The JSON wire dump
+    /// (`rows_after({})`) duplicates blobs per row and inflates every byte to
+    /// ~4 chars, which OOMs a mobile WebView on a large vault.
+    pub fn dump_state(&self) -> Result<Vec<u8>, JsError> {
+        self.eng.export_state().map_err(to_err)
+    }
+
+    /// Restore a `dump_state` snapshot (validates row ids + blob hashes).
+    /// Returns the number of rows newly integrated.
+    pub fn load_state(&self, bytes: &[u8]) -> Result<usize, JsError> {
+        self.eng.import_state(bytes).map_err(to_err)
+    }
+
     /// The materialized working tree as JSON `{path: [u8]}`.
     pub fn files_json(&self) -> Result<String, JsError> {
         let m = self.eng.files_map().map_err(to_err)?;

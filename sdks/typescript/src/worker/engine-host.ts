@@ -43,6 +43,9 @@ export class EngineWorkerHost {
         case 'deleteFile':
           this.vaultOrThrow().deleteFile(cmd.path);
           return this.reply(cmd.id, true);
+        case 'deleteFiles':
+          this.vaultOrThrow().deleteFiles(cmd.paths);
+          return this.reply(cmd.id, true);
         case 'renameFile':
           this.vaultOrThrow().renameFile(cmd.from, cmd.to);
           return this.reply(cmd.id, true);
@@ -63,6 +66,12 @@ export class EngineWorkerHost {
         case 'load':
           this.vaultOrThrow().load(cmd.stateJson);
           return this.reply(cmd.id, true);
+        case 'dumpState':
+          // Binary state (rows + each blob once) — structured-clone-safe, and
+          // far smaller than the legacy JSON dump on a large vault.
+          return this.reply(cmd.id, true, this.vaultOrThrow().dumpState());
+        case 'loadState':
+          return this.reply(cmd.id, true, this.vaultOrThrow().loadState(cmd.bytes));
         case 'sync': {
           const integrated = await this.vaultOrThrow().sync(cmd.url, { authKey: cmd.authKey });
           return this.reply(cmd.id, true, integrated);

@@ -67,12 +67,22 @@ export class SyncController {
    *   Skip it on the hot path — live edits are already captured by the host
    *   event handlers, so re-reading the whole vault on every sync is the main
    *   source of UI lag. Pass it only for the initial capture / manual recovery.
+   * - `captureDeletes` (default false): during the reconcile, also author
+   *   deletes for files the engine holds but the disk no longer has — captures
+   *   deletions made while the app was closed. ONLY safe on a warm engine
+   *   (restored state / already synced); on a cold engine it would delete
+   *   everything not yet materialized. The plugin gates it.
    * - `background` (default false): a periodic poll — don't flash the status to
    *   "connecting" each tick (avoids a 10s dot flicker once connected).
    */
   async syncOnce(
     cfg: SyncConfig,
-    opts: { reconcile?: boolean; background?: boolean; adoptFirst?: boolean } = {},
+    opts: {
+      reconcile?: boolean;
+      captureDeletes?: boolean;
+      background?: boolean;
+      adoptFirst?: boolean;
+    } = {},
   ): Promise<void> {
     if (!opts.background || this.state !== 'connected') this.set('connecting');
     if (!opts.background) {
@@ -93,7 +103,9 @@ export class SyncController {
       if (opts.adoptFirst) {
         adopted = await this.vault.sync(cfg.peerUrl, { authKey: cfg.authKey });
       }
-      if (opts.reconcile) await this.bridge.reconcileFromHost();
+      if (opts.reconcile) {
+        await this.bridge.reconcileFromHost({ captureDeletes: opts.captureDeletes });
+      }
       const integrated = await this.vault.sync(cfg.peerUrl, { authKey: cfg.authKey });
       // Materialize AFTER reconcile (so the engine holds peer + local files and
       // the removal pass only drops genuinely-gone files). Skip on no-op polls.

@@ -12,7 +12,7 @@ export class PathFilter {
   //     .context holds the node's PRIVATE KEY, which must never leave the device.
   //   .git           — version-control internals (huge packs, no merge value).
   //   .obsidian      — the editor's config AND this plugin's own main.js + data +
-  //     persisted engine-state.json. Syncing it is self-referential: a dump lands
+  //     persisted engine-state.bin. Syncing it is self-referential: a dump lands
   //     inside the synced tree, the next reconcile captures it, the next dump
   //     contains the previous dump — an exponential blow-up that also re-imports
   //     the plugin binary as `main (1).js`, `main (2).js`… (the duplicate loop).

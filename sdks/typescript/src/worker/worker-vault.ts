@@ -58,6 +58,9 @@ export class WorkerVault {
   async deleteFile(path: string): Promise<void> {
     await this.call({ op: 'deleteFile', path });
   }
+  async deleteFiles(paths: string[]): Promise<void> {
+    await this.call({ op: 'deleteFiles', paths });
+  }
   async renameFile(from: string, to: string): Promise<void> {
     await this.call({ op: 'renameFile', from, to });
   }
@@ -81,6 +84,12 @@ export class WorkerVault {
   }
   async load(stateJson: string): Promise<void> {
     await this.call({ op: 'load', stateJson });
+  }
+  async dumpState(): Promise<Uint8Array> {
+    return (await this.call({ op: 'dumpState' })) as Uint8Array;
+  }
+  async loadState(bytes: Uint8Array): Promise<number> {
+    return (await this.call({ op: 'loadState', bytes })) as number;
   }
   async sync(url: string, opts: { authKey?: string } = {}): Promise<number> {
     return (await this.call({ op: 'sync', url, authKey: opts.authKey })) as number;

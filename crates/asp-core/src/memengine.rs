@@ -39,6 +39,22 @@ fn random_id() -> String {
     hex::encode(b)
 }
 
+/// On-disk engine state for thin clients (see [`MemEngine::export_state`]):
+/// the row log plus a deduplicated `hash -> bytes` blob table, msgpack-encoded
+/// so blob bytes stay binary.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StateSnapshot {
+    version: u32,
+    vault_id: String,
+    rows: Vec<LogRow>,
+    blobs: BTreeMap<String, serde_bytes::ByteBuf>,
+}
+
+/// Bumped on any incompatible change to [`StateSnapshot`] — an old snapshot
+/// then fails the version check (the host reconciles fresh) instead of
+/// misparsing.
+const STATE_SNAPSHOT_VERSION: u32 = 1;
+
 pub struct MemEngine {
     identity: Identity,
     /// Per-vault authoring id, distinct from `identity` (the connection key), so
@@ -222,6 +238,24 @@ impl MemEngine {
         rows.into_iter().map(|r| self.wire(r)).collect()
     }
 
+    /// Author deletes for a batch of paths, materializing the fold **once** —
+    /// the seam a host's startup reconcile uses to capture files deleted while
+    /// the host app was closed (no events fire for those, and a write-only
+    /// reconcile would let the peer's copy resurrect them). Unknown paths are
+    /// skipped, like `record_remove`.
+    pub fn record_removes(&self, paths: &[String]) -> AspResult<Vec<WireRow>> {
+        let mut rows = Vec::new();
+        for path in paths {
+            if let Some(row) = self.remove_row(path)? {
+                rows.push(row);
+            }
+        }
+        if !rows.is_empty() {
+            self.materialize()?;
+        }
+        rows.into_iter().map(|r| self.wire(r)).collect()
+    }
+
     pub fn record_rename(&self, old: &str, new: &str) -> AspResult<Option<WireRow>> {
         let Some(cur) = self.current_for_path(old) else { return Ok(None) };
         let (lamport, seq, ts) = (self.next_lamport(), self.next_seq(), now_unix());
@@ -345,6 +379,89 @@ impl MemEngine {
             self.materialize()?;
         }
         Ok(flags)
+    }
+
+    // ----- persistence (thin-client state snapshot) -----
+
+    /// Serialize the full engine state — every log row plus each referenced
+    /// content blob stored **once** — as compact msgpack bytes. This is the
+    /// persistable form for thin clients (the Obsidian plugin) that rebuild the
+    /// engine each launch. The wire form (`rows_after` over an empty vector) is
+    /// the wrong shape for persistence: it bundles base+result blobs *per row*,
+    /// so an edit history duplicates content, and a JSON dump inflates every
+    /// content byte to ~4 characters — both of which OOM a mobile WebView on a
+    /// large vault.
+    pub fn export_state(&self) -> AspResult<Vec<u8>> {
+        let rows = self.rows.borrow().clone();
+        let mut blobs: BTreeMap<String, serde_bytes::ByteBuf> = BTreeMap::new();
+        for r in &rows {
+            for h in [r.base_hash.as_ref(), r.result_hash.as_ref()].into_iter().flatten() {
+                if !blobs.contains_key(h) {
+                    if let Some(bytes) = self.blobs.get_blob(h)? {
+                        blobs.insert(h.clone(), serde_bytes::ByteBuf::from(bytes));
+                    }
+                }
+            }
+        }
+        let snap = StateSnapshot {
+            version: STATE_SNAPSHOT_VERSION,
+            vault_id: SessionVault::vault_id(self),
+            rows,
+            blobs,
+        };
+        rmp_serde::to_vec_named(&snap).map_err(|e| AspError::Protocol(e.to_string()))
+    }
+
+    /// Re-integrate a snapshot produced by [`export_state`]. Validates like
+    /// `integrate` does — Merkle row ids and blob hashes — because the snapshot
+    /// is host-supplied input (a corrupt or tampered state file must fail
+    /// loudly, not poison the log). Adopts the snapshot's vault id when this
+    /// engine has none; refuses a snapshot for a *different* vault. Returns the
+    /// number of rows newly added (idempotent: re-importing yields 0).
+    pub fn import_state(&self, bytes: &[u8]) -> AspResult<usize> {
+        let snap: StateSnapshot =
+            rmp_serde::from_slice(bytes).map_err(|e| AspError::Protocol(e.to_string()))?;
+        if snap.version != STATE_SNAPSHOT_VERSION {
+            return Err(AspError::Protocol(format!(
+                "unsupported engine state snapshot version {}",
+                snap.version
+            )));
+        }
+        for r in &snap.rows {
+            if !r.id_valid() {
+                return Err(AspError::Protocol("state row id does not match its contents".into()));
+            }
+        }
+        for (hash, b) in &snap.blobs {
+            let h = self.blobs.put_blob(b)?;
+            if &h != hash {
+                return Err(AspError::Protocol("state blob hash mismatch".into()));
+            }
+        }
+        let mine = SessionVault::vault_id(self);
+        if !snap.vault_id.is_empty() {
+            if mine.is_empty() {
+                self.adopt_vault_id(&snap.vault_id)?;
+            } else if mine != snap.vault_id {
+                return Err(AspError::Protocol("state snapshot is for a different vault".into()));
+            }
+        }
+        let mut seen: std::collections::HashSet<String> =
+            self.rows.borrow().iter().map(|r| r.id.clone()).collect();
+        let mut added = 0usize;
+        {
+            let mut store = self.rows.borrow_mut();
+            for r in snap.rows {
+                if seen.insert(r.id.clone()) {
+                    store.push(r);
+                    added += 1;
+                }
+            }
+        }
+        if added > 0 {
+            self.materialize()?;
+        }
+        Ok(added)
     }
 
     pub fn materialize(&self) -> AspResult<()> {
@@ -477,6 +594,120 @@ mod tests {
         assert!(e.record_write("a.md", b"hello world\n").unwrap().is_none());
         e.record_remove("a.md").unwrap();
         assert!(e.read_file("a.md").unwrap().is_none());
+    }
+
+    /// The persistence snapshot round-trips the full engine state: a fresh
+    /// engine that imports it folds to byte-identical files, holds the same
+    /// log, and keeps the vault id. Re-import is idempotent (0 rows added).
+    #[test]
+    fn state_snapshot_roundtrips_and_is_idempotent() {
+        let a = MemEngine::create(Identity::from_seed(&[1; 32]), "v1");
+        a.record_write("a.md", b"one\n").unwrap();
+        a.record_write("dir/b.md", b"two\n").unwrap();
+        a.record_write("a.md", b"one edited\n").unwrap();
+        a.record_rename("dir/b.md", "dir/c.md").unwrap();
+        a.record_write("gone.md", b"bye\n").unwrap();
+        a.record_remove("gone.md").unwrap();
+
+        let snap = a.export_state().unwrap();
+        let b = MemEngine::create(Identity::from_seed(&[2; 32]), "");
+        let added = b.import_state(&snap).unwrap();
+        assert_eq!(added, a.row_count(), "every row lands");
+        assert_eq!(b.files_map().unwrap(), a.files_map().unwrap(), "byte-identical fold");
+        assert_eq!(SessionVault::vault_id(&b), "v1", "vault id adopted from the snapshot");
+        assert_eq!(b.import_state(&snap).unwrap(), 0, "re-import is a no-op");
+    }
+
+    /// The snapshot stores each blob ONCE. The wire form (`rows_after({})`)
+    /// bundles base+result blobs per row, so an edit history duplicates large
+    /// content — the snapshot must not (that duplication is what OOM'd mobile).
+    #[test]
+    fn state_snapshot_dedups_blobs_across_history() {
+        let e = MemEngine::create(Identity::from_seed(&[1; 32]), "v1");
+        let big_a = vec![b'a'; 200_000];
+        let big_b = vec![b'b'; 200_000];
+        // Edit back and forth: 5 rows, but only TWO distinct blobs.
+        e.record_write("big.bin", &big_a).unwrap();
+        e.record_write("big.bin", &big_b).unwrap();
+        e.record_write("big.bin", &big_a).unwrap();
+        e.record_write("big.bin", &big_b).unwrap();
+        e.record_write("big.bin", &big_a).unwrap();
+
+        let snap = e.export_state().unwrap();
+        // Two blobs + rows + framing — comfortably under three blobs' worth.
+        assert!(
+            snap.len() < 3 * 200_000,
+            "snapshot must hold each blob once (got {} bytes)",
+            snap.len()
+        );
+        // And it still restores the full history.
+        let b = MemEngine::create(Identity::from_seed(&[2; 32]), "");
+        assert_eq!(b.import_state(&snap).unwrap(), 5);
+        assert_eq!(b.read_file("big.bin").unwrap().unwrap(), big_a);
+    }
+
+    /// A snapshot is host-supplied input: corrupt bytes, a tampered row, and a
+    /// snapshot from another vault must all fail loudly (not poison the log).
+    #[test]
+    fn state_snapshot_rejects_corrupt_or_foreign_state() {
+        let e = MemEngine::create(Identity::from_seed(&[1; 32]), "v1");
+        e.record_write("a.md", b"hello\n").unwrap();
+        let snap = e.export_state().unwrap();
+
+        // Truncated / garbage bytes.
+        let b = MemEngine::create(Identity::from_seed(&[2; 32]), "");
+        assert!(b.import_state(&snap[..snap.len() / 2]).is_err());
+        assert!(b.import_state(b"not a snapshot").is_err());
+        assert_eq!(b.row_count(), 0, "failed import leaves the log untouched");
+
+        // A tampered row: re-encode with one row's site_id flipped → Merkle id
+        // no longer matches its contents.
+        let mut parsed: StateSnapshot = rmp_serde::from_slice(&snap).unwrap();
+        parsed.rows[0].site_id = "ff".repeat(32);
+        let tampered = rmp_serde::to_vec_named(&parsed).unwrap();
+        assert!(b.import_state(&tampered).is_err());
+
+        // A tampered blob: bytes no longer hash to their table key.
+        let mut parsed: StateSnapshot = rmp_serde::from_slice(&snap).unwrap();
+        let key = parsed.blobs.keys().next().unwrap().clone();
+        parsed.blobs.insert(key, serde_bytes::ByteBuf::from(&b"swapped"[..]));
+        let bad_blob = rmp_serde::to_vec_named(&parsed).unwrap();
+        assert!(b.import_state(&bad_blob).is_err());
+
+        // A future snapshot version (incompatible format change).
+        let mut parsed: StateSnapshot = rmp_serde::from_slice(&snap).unwrap();
+        parsed.version = STATE_SNAPSHOT_VERSION + 1;
+        let future = rmp_serde::to_vec_named(&parsed).unwrap();
+        assert!(b.import_state(&future).is_err());
+
+        // A snapshot for a different vault.
+        let other = MemEngine::create(Identity::from_seed(&[3; 32]), "v2");
+        assert!(other.import_state(&snap).is_err(), "refuses a snapshot for another vault");
+    }
+
+    /// Batch deletes: one fold, unknown paths skipped, and the authored rows
+    /// carry across the wire (a peer integrating them drops the files too).
+    #[test]
+    fn record_removes_batch_deletes_and_propagates() {
+        let a = MemEngine::create(Identity::from_seed(&[1; 32]), "v1");
+        a.record_write("keep.md", b"k\n").unwrap();
+        a.record_write("x.md", b"x\n").unwrap();
+        a.record_write("dir/y.md", b"y\n").unwrap();
+        let b = MemEngine::create(Identity::from_seed(&[2; 32]), "v1");
+        b.import_state(&a.export_state().unwrap()).unwrap();
+
+        let rows = a
+            .record_removes(&["x.md".into(), "dir/y.md".into(), "never-existed.md".into()])
+            .unwrap();
+        assert_eq!(rows.len(), 2, "unknown path authors nothing");
+        assert!(a.read_file("x.md").unwrap().is_none());
+        assert!(a.read_file("dir/y.md").unwrap().is_none());
+        assert_eq!(a.read_file("keep.md").unwrap().as_deref(), Some(&b"k\n"[..]));
+
+        for r in &rows {
+            b.integrate(r).unwrap();
+        }
+        assert_eq!(a.files_map().unwrap(), b.files_map().unwrap(), "deletes propagate");
     }
 
     /// The wasm-safe MemEngine and a fresh MemEngine converge by exchanging wire
