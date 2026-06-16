@@ -25,14 +25,12 @@ rmp-serde.workspace = true
 similar.workspace = true
 thiserror.workspace = true
 
-# Native-only: the SQLite substrate, derived-git encoding (sha1/flate2/toml), TLS
-# for wss://, and the tokio WebSocket driver (`net`) reused by the CLI and the
-# desktop engine. Gated out of the wasm SDK surface (the wasm node keeps its
-# log/blobs in memory and injects its own transport).
+# Native-only: the SQLite substrate, derived-git encoding (sha1/flate2/toml), the
+# iroh QUIC transport (`iroh_net`) + relay server, and the debounced filesystem
+# watcher — reused by the CLI and the desktop engine. Gated out of the wasm SDK
+# surface, which runs iroh-in-wasm (`iroh_wasm`) over a relay instead.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rusqlite.workspace = true
-rustls.workspace = true
-rcgen.workspace = true
 sha1.workspace = true
 flate2.workspace = true
 toml.workspace = true
@@ -42,10 +40,6 @@ iroh-tickets.workspace = true
 iroh-relay.workspace = true
 n0-future.workspace = true
 tokio.workspace = true
-tokio-tungstenite.workspace = true
-tokio-rustls.workspace = true
-rustls-pki-types.workspace = true
-futures-util.workspace = true
 notify.workspace = true
 tracing.workspace = true
 

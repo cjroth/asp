@@ -40,8 +40,6 @@ pub mod iroh_net;
 pub mod iroh_wasm;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod sqlite;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod tls;
 
 pub use authkeys::{AdmitCtx, AuthKey};
 pub use error::{AspError, AspResult};
