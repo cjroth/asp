@@ -20,21 +20,21 @@ function asp(args, home) {
   const r = spawnSync(ASP, args, { env: { ...process.env, ASP_HOME: home, ASP_LOG: 'warn' } });
   if (r.status !== 0) throw new Error(`asp ${args.join(' ')} failed: ${r.stderr}`);
 }
-async function readPort(stream) {
+async function readMatch(stream, re, ms = 20000) {
   const reader = stream.getReader();
   const dec = new TextDecoder();
   let buf = '';
-  const deadline = Date.now() + 15000;
+  const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
     const { value, done } = await reader.read();
     if (done) break;
     buf += dec.decode(value);
-    const m = buf.match(/:\/\/0\.0\.0\.0:(\d+)/);
-    if (m) { reader.releaseLock(); return Number.parseInt(m[1], 10); }
+    const m = buf.match(re);
+    if (m) { reader.releaseLock(); return m[1]; }
   }
-  throw new Error('asp listener did not announce a port');
+  throw new Error(`process did not emit ${re}`);
 }
-async function waitFor(pred, ms = 9000) {
+async function waitFor(pred, ms = 30000) {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) { if (pred()) return true; await sleep(80); }
   return false;
@@ -49,18 +49,26 @@ asp(['--dir', dir, 'init'], home);
 writeFileSync(join(dir, 'from-asp.md'), 'hello from the real asp node\n');
 asp(['--dir', dir, 'commit'], home);
 
+const relayPort = 20000 + Math.floor(Math.random() * 20000);
+const relayUrl = `http://127.0.0.1:${relayPort}`;
+const relay = Bun.spawn([ASP, 'relay', '--listen-addr', `127.0.0.1:${relayPort}`], {
+  env: { ...process.env, ASP_LOG: 'warn' },
+  stdout: 'pipe',
+  stderr: 'ignore',
+});
+await readMatch(relay.stdout, /relay listening on (http:\/\/\S+)/);
+
 const hub = Bun.spawn(
-  [ASP, '--dir', dir, 'watch', '--listen', '--no-tls', '--port', '0', '--auth-key', 'S'],
+  [ASP, '--dir', dir, '--relay-url', relayUrl, 'watch', '--listen', '--auth-key', 'S'],
   { env: { ...process.env, ASP_HOME: home, ASP_LOG: 'warn' }, stdout: 'pipe', stderr: 'ignore' },
 );
 
 try {
-  const port = await readPort(hub.stdout);
-  const url = `ws://127.0.0.1:${port}`;
+  const ticket = await readMatch(hub.stdout, /^ticket: (\S+)/m);
   const api = createNetwork({ latencyMs: 30, debounceMs: 10 });
 
-  // A demo node that clones from the REAL peer (asp clone <url>).
-  const id = api.addNode({ name: 'browser', externalUrl: url, authKey: 'S' });
+  // A demo node that clones from the REAL peer (asp clone <ticket>), over iroh.
+  const id = api.addNode({ name: 'browser', externalUrl: ticket, authKey: 'S', relayUrl });
   const filesOf = () => {
     const n = api.snapshot().nodes.find((x) => x.id === id);
     const out = {};
@@ -70,7 +78,7 @@ try {
   const snap = () => api.snapshot().nodes.find((x) => x.id === id);
 
   const pulled = await waitFor(() => filesOf()['from-asp.md'] === 'hello from the real asp node\n');
-  check('demo node pulled the native vault over ws://', pulled);
+  check('demo node pulled the native vault over iroh', pulled);
   check('demo node adopted the native vault id', snap().site && snap().rowCount > 0);
   await waitFor(() => snap().syncing === false);
   check('connection is LIVE (persistent watch, not one-shot)', snap().live === true);
@@ -94,6 +102,7 @@ try {
   check('disconnect stops the live link', snap().live === false);
 } finally {
   hub.kill();
+  relay.kill();
 }
 
 console.log(fail === 0 ? '\nWS INTEROP: ALL PASS' : `\nWS INTEROP: ${fail} FAILURE(S)`);

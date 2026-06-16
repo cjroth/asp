@@ -679,13 +679,20 @@ export function AddNodeDialog({ snap, onCancel, onAdd }: any) {
   const [remoteId, setRemoteId] = useState<string | null>(existing.length ? existing[existing.length - 1].id : null);
   const [name, setName] = useState('');
   const [source, setSource] = useState<'local' | 'external'>('local');
-  const [url, setUrl] = useState('wss://127.0.0.1:9000');
+  const [url, setUrl] = useState('');
   const [authKey, setAuthKey] = useState('');
+  const [relayUrl, setRelayUrl] = useState('');
   const external = source === 'external';
 
   function submit() {
     const base: any = { name: name.trim() || undefined };
-    if (external) onAdd({ ...base, externalUrl: url.trim(), authKey: authKey.trim() || undefined });
+    if (external)
+      onAdd({
+        ...base,
+        externalUrl: url.trim(),
+        authKey: authKey.trim() || undefined,
+        relayUrl: relayUrl.trim() || undefined,
+      });
     else onAdd({ ...base, remoteId: isFirst ? null : remoteId });
   }
 
@@ -693,10 +700,10 @@ export function AddNodeDialog({ snap, onCancel, onAdd }: any) {
     <div className="overlay" onMouseDown={(e) => { if ((e.target as HTMLElement).classList.contains('overlay')) onCancel(); }}>
       <div className="dialog">
         <div className="dialog-head">
-          <span className="eyebrow">{external ? 'asp clone <url>' : isFirst ? 'asp init' : 'asp clone'}</span>
+          <span className="eyebrow">{external ? 'asp clone <ticket>' : isFirst ? 'asp init' : 'asp clone'}</span>
           <h3>{isFirst ? 'Create the first node' : 'Add a node to the mesh'}</h3>
           <p>{external
-            ? 'Clone from a real `asp watch --listen` peer (CLI / Obsidian / Desktop) over wss://. Genuine ed25519 handshake + version-vector catch-up — the live interop bridge.'
+            ? 'Clone from a real `asp watch --listen` peer (CLI / Obsidian / Desktop) over iroh — paste the ticket it prints. Genuine ed25519 handshake + version-vector catch-up — the live interop bridge.'
             : isFirst
               ? "Spins up a vault with this device's ed25519 identity and a few seed files."
               : 'The new node clones from a remote peer: authenticate, full catch-up, then sync live. Pick which existing node to use as its remote.'}</p>
@@ -706,7 +713,7 @@ export function AddNodeDialog({ snap, onCancel, onAdd }: any) {
             <label>source</label>
             <div className="seg" style={{ maxWidth: 240 }}>
               <button className={!external ? 'on' : ''} onClick={() => setSource('local')}>{isFirst ? 'new vault' : 'in-page peer'}</button>
-              <button className={external ? 'on' : ''} onClick={() => setSource('external')}>real wss:// peer</button>
+              <button className={external ? 'on' : ''} onClick={() => setSource('external')}>real iroh peer</button>
             </div>
           </div>
           <div className="field">
@@ -716,12 +723,16 @@ export function AddNodeDialog({ snap, onCancel, onAdd }: any) {
           {external ? (
             <>
               <div className="field">
-                <label>peer url (wss://)</label>
-                <input type="text" value={url} placeholder="wss://127.0.0.1:9000" onChange={(e) => setUrl(e.target.value)} />
+                <label>peer ticket</label>
+                <input type="text" value={url} placeholder="paste the hub's iroh ticket…" onChange={(e) => setUrl(e.target.value)} />
               </div>
               <div className="field">
                 <label>auth key (AUTH_KEY enrollment secret)</label>
                 <input type="text" value={authKey} placeholder="optional once enrolled" onChange={(e) => setAuthKey(e.target.value)} />
+              </div>
+              <div className="field">
+                <label>relay url (optional)</label>
+                <input type="text" value={relayUrl} placeholder="default public relays" onChange={(e) => setRelayUrl(e.target.value)} />
               </div>
             </>
           ) : !isFirst ? (

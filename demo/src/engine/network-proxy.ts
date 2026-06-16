@@ -99,8 +99,8 @@ export class NetworkProxy {
   addNode(opts: any): Promise<string> {
     return this.request('addNode', opts);
   }
-  connectPeer(nodeId: string, url: string, authKey?: string): Promise<boolean> {
-    return this.request('connectPeer', nodeId, url, authKey);
+  connectPeer(nodeId: string, ticket: string, authKey?: string, relayUrl?: string): Promise<boolean> {
+    return this.request('connectPeer', nodeId, ticket, authKey, relayUrl);
   }
   /** Serialize the whole mesh to the final OPFS JSON string, built INSIDE the
    * worker (it holds every row) so the main thread never stringifies the

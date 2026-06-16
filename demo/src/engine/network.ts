@@ -93,13 +93,14 @@ interface Node {
   lineSeq: number;
   mySites: Set<string>;  // authoring site_ids this node has used (change attribution)
   createdRemote: string | null;
-  externalUrl?: string;  // a real `asp watch --listen` peer this node bridges to
+  externalUrl?: string;  // a real `asp watch --listen` peer (its iroh ticket)
   authKey?: string;
+  relayUrl?: string;     // optional relay override (self-hosted `asp relay`)
   syncing?: boolean;     // initial handshake/catch-up in flight
-  liveWs?: WebSocket;    // a persistent (watch) connection to the external peer
-  live?: boolean;        // the live connection is open + authed
+  pollTimer?: ReturnType<typeof setTimeout>; // the live-sync poll (iroh is one-shot)
+  live?: boolean;        // the live (polled) link is up + authed
   liveAuthed?: boolean;
-  wantLive?: boolean;    // the user asked for a live link — auto-redial on drop
+  wantLive?: boolean;    // the user asked for a live link — keep polling
   reconnectTimer?: ReturnType<typeof setTimeout>;
   reconnectDelayMs?: number; // backoff for the next auto-redial
 }
@@ -287,21 +288,69 @@ export function createNetwork(opts: NetworkOpts) {
     }
   }
 
-  // Optimistic real-time push of new rows over a node's live ws:// connection
-  // (the wire analogue of the native daemon pushing to connected peers).
+  // One bridge sync pass to the external iroh peer (the genuine Session: dial the
+  // ticket via the relay, handshake, bidirectional version-vector catch-up). iroh
+  // is one-shot, so "live" is a fast poll loop (below) plus an immediate sync when
+  // this node authors a row (pushLive) — the connector's catch-up carries the new
+  // rows to the peer, and the same pass pulls anything new back.
+  async function bridgeSync(node: Node): Promise<void> {
+    if (!node.wantLive || !node.externalUrl) return;
+    const beforeVv = vvOf(node);
+    try {
+      await node.eng.sync(node.externalUrl, node.authKey, node.relayUrl);
+      node.live = true;
+      node.liveAuthed = true;
+      node.syncing = false;
+      node.reconnectDelayMs = undefined;
+      const imported = (JSON.parse(node.eng.rows_after(JSON.stringify(beforeVv))) as any[]).length;
+      if (imported > 0) {
+        gossip(node, 'catchup'); // propagate the external change through the in-page mesh
+        logLine(node, [
+          { t: 'INFO', c: 'lvl' }, { t: ' catch-up  ', c: 'tag' },
+          { t: `← ${hostOf(node.externalUrl)} `, c: 'dim' }, { t: `+${imported} rows`, c: 'k catchup' }, { t: ' folded', c: 'dim' },
+        ]);
+      }
+      emit();
+    } catch (e) {
+      node.live = false;
+      node.liveAuthed = false;
+      node.syncing = false;
+      throw e;
+    }
+  }
+
+  const LIVE_POLL_MS = 1000;
+  function scheduleLivePoll(node: Node, delay = LIVE_POLL_MS) {
+    clearTimeout(node.pollTimer);
+    node.pollTimer = setTimeout(async () => {
+      node.pollTimer = undefined;
+      try {
+        await bridgeSync(node);
+      } catch {
+        /* transient — keep polling so a dropped link recovers */
+      }
+      if (node.wantLive) scheduleLivePoll(node);
+    }, delay);
+  }
+
+  // A locally-authored row should reach the peer promptly: trigger an immediate
+  // bridge sync (the poll-loop equivalent of the old optimistic socket push).
   function pushLive(node: Node, rowsJson: string) {
-    const ws = node.liveWs;
-    if (!ws || !node.liveAuthed || ws.readyState !== 1) return;
+    if (!node.wantLive || !node.externalUrl) return;
     const rows = JSON.parse(rowsJson) as any[];
     if (rows.length === 0) return;
-    try {
-      ws.send(node.eng.push_frame(rowsJson) as any);
-      logLine(node, [
-        { t: 'DEBUG', c: 'lvl' }, { t: ' push      ', c: 'tag' },
-        { t: `→ ${hostOf(node.externalUrl || '')} `, c: 'dim' },
-        { t: `${rows.length} row${rows.length > 1 ? 's' : ''}`, c: 'k push' }, { t: ' live', c: 'dim' },
-      ]);
-    } catch { /* socket closing */ }
+    clearTimeout(node.pollTimer);
+    node.pollTimer = undefined;
+    logLine(node, [
+      { t: 'DEBUG', c: 'lvl' }, { t: ' push      ', c: 'tag' },
+      { t: `→ ${hostOf(node.externalUrl)} `, c: 'dim' },
+      { t: `${rows.length} row${rows.length > 1 ? 's' : ''}`, c: 'k push' }, { t: ' live', c: 'dim' },
+    ]);
+    bridgeSync(node)
+      .catch(() => {})
+      .finally(() => {
+        if (node.wantLive) scheduleLivePoll(node);
+      });
   }
 
   // ====================================================================
@@ -311,7 +360,7 @@ export function createNetwork(opts: NetworkOpts) {
 
   api.setConfig = (patch: Partial<typeof cfg>) => Object.assign(cfg, patch);
 
-  api.addNode = ({ name, remoteId, externalUrl, authKey }: { name?: string; remoteId?: string | null; externalUrl?: string; authKey?: string }) => {
+  api.addNode = ({ name, remoteId, externalUrl, authKey, relayUrl }: { name?: string; remoteId?: string | null; externalUrl?: string; authKey?: string; relayUrl?: string }) => {
     const idx = nodeSeq++;
     const remote = remoteId != null ? findNode(remoteId) : null;
     // genesis seeds its own vault; a clone (in-page or external) adopts the
@@ -343,10 +392,10 @@ export function createNetwork(opts: NetworkOpts) {
     ]);
 
     if (externalUrl) {
-      // clone from a REAL `asp watch --listen` peer over ws:// — the genuine
-      // Session handshake + version-vector catch-up (asp clone <url>).
+      // clone from a REAL `asp watch --listen` peer over iroh (by ticket) — the
+      // genuine Session handshake + version-vector catch-up (asp clone <ticket>).
       node.createdRemote = hostOf(externalUrl);
-      api.connectPeer(node.id, externalUrl, authKey).then(() => {
+      api.connectPeer(node.id, externalUrl, authKey, relayUrl).then(() => {
         const first = Object.values(filesMeta(node)).find((f) => !f.deleted);
         if (first && !node.openFileId) { node.openFileId = first.file_id; emit(); }
       });
@@ -391,141 +440,57 @@ export function createNetwork(opts: NetworkOpts) {
   // gossiped through the in-page mesh (real-time receive); locally-authored rows
   // are sent as Rows frames (real-time send, see pushLive). The promise resolves
   // once the INITIAL catch-up converges (so addNode can open a file).
-  api.connectPeer = (nodeId: string, url: string, authKey?: string): Promise<boolean> => {
+  api.connectPeer = (nodeId: string, ticket: string, authKey?: string, relayUrl?: string): Promise<boolean> => {
     const node = findNode(nodeId);
     if (!node) return Promise.resolve(false);
-    if (node.liveWs) { try { node.liveWs.close(); } catch {} node.liveWs = undefined; node.live = false; node.liveAuthed = false; }
+    clearTimeout(node.pollTimer); node.pollTimer = undefined;
     clearTimeout(node.reconnectTimer); node.reconnectTimer = undefined;
     node.wantLive = true;
-    node.externalUrl = url;
+    node.externalUrl = ticket;
     node.authKey = authKey || undefined;
+    node.relayUrl = relayUrl || undefined;
     node.syncing = true;
-
-    const timeoutMs = 15000;
-    const fullUrl = authKey ? `${url}${url.includes('?') ? '&' : '?'}auth_key=${encodeURIComponent(authKey)}` : url;
-    const beforeVv = vvOf(node);
 
     logLine(node, [
       { t: 'INFO', c: 'lvl' }, { t: ' watch     ', c: 'tag' },
-      { t: `dial ${hostOf(url)}`, c: 'hl' }, { t: ' wss:// real peer · live · handshake…', c: 'dim' },
+      { t: `dial ${hostOf(ticket)}`, c: 'hl' }, { t: ' iroh real peer · live · handshake…', c: 'dim' },
     ]);
     emit();
 
-    return new Promise<boolean>((resolve) => {
-      const logErr = (msg: string) => {
-        logLine(node!, [{ t: 'WARN', c: 'lvl warn' }, { t: ' watch     ', c: 'tag' }, { t: hostOf(url), c: 'hl' }, { t: ` · ${msg}`, c: 'dim' }]);
-        O.onToast(`${node!.name}: ${msg}`, 'warn');
-      };
-      let ws: WebSocket;
-      try { ws = new WebSocket(fullUrl); } catch (e) { node!.syncing = false; logErr(`dial failed: ${String(e)}`); emit(); return resolve(false); }
-      ws.binaryType = 'arraybuffer';
-      node.liveWs = ws;
-      let authedLogged = false;
-      let settled = false;
-      let convergeIdle: ReturnType<typeof setTimeout>;
-      const hardStop = setTimeout(() => settle(false, 'handshake timed out'), timeoutMs);
-
-      // Resolve once the INITIAL catch-up completes — but keep the socket OPEN.
-      // (Explicitly via the peer's Synced signal; the idle timer is a fallback.)
-      function settleConverged() {
-        if (settled) return;
-        settled = true;
-        clearTimeout(hardStop); clearTimeout(convergeIdle);
-        node!.syncing = false;
-        node!.reconnectDelayMs = undefined; // healthy link — reset redial backoff
-        const imported = (JSON.parse(node!.eng.rows_after(JSON.stringify(beforeVv))) as any[]).length;
-        gossip(node!, 'catchup');
-        logLine(node!, [
+    // iroh is one-shot: converge with a first bridge sync, then keep a fast poll
+    // loop alive (+ an immediate sync on each local edit) for the "live" feel.
+    return bridgeSync(node)
+      .then(() => {
+        logLine(node, [
           { t: 'INFO', c: 'lvl' }, { t: ' live      ', c: 'tag' },
-          { t: hostOf(url), c: 'k catchup' }, { t: ` · converged (+${imported} rows) · watching`, c: 'dim' },
+          { t: hostOf(ticket), c: 'k catchup' }, { t: ' · converged · watching', c: 'dim' },
         ]);
         emit();
-        resolve(true);
-      }
-      function settle(ok: boolean, err?: string) {
-        if (settled) return;
-        settled = true;
-        clearTimeout(hardStop); clearTimeout(convergeIdle);
-        node!.syncing = false;
-        try { ws.close(); } catch {}
-        if (err) logErr(err);
+        scheduleLivePoll(node);
+        return true;
+      })
+      .catch((e) => {
+        const msg = String(e);
+        const denied = /deni|invalid auth/i.test(msg);
+        logLine(node, [{ t: 'WARN', c: 'lvl warn' }, { t: ' watch     ', c: 'tag' }, { t: hostOf(ticket), c: 'hl' }, { t: ` · ${denied ? `denied: ${msg}` : msg}`, c: 'dim' }]);
+        O.onToast(`${node.name}: ${denied ? 'admission denied' : 'connect failed'}`, 'warn');
+        node.syncing = false;
         emit();
-        resolve(ok);
-      }
-      const bumpConverge = () => { if (settled) return; clearTimeout(convergeIdle); convergeIdle = setTimeout(settleConverged, 900); };
-
-      ws.onopen = () => {
-        try { ws.send(node!.eng.connect_start() as any); } catch (e) { return settle(false, `handshake: ${String(e)}`); }
-        bumpConverge();
-      };
-      ws.onmessage = (ev: MessageEvent) => {
-        const frame = new Uint8Array(ev.data as ArrayBuffer);
-        let r: any;
-        try { r = JSON.parse(node!.eng.feed(frame)); } catch (e) { logErr(`feed: ${String(e)}`); try { ws.close(); } catch {} return; }
-        for (const out of r.out) { try { ws.send(Uint8Array.from(out) as any); } catch {} }
-        if (r.authed && !authedLogged) {
-          authedLogged = true;
-          node!.live = true; node!.liveAuthed = true;
-          logLine(node!, [{ t: 'INFO', c: 'lvl' }, { t: ' handshake ', c: 'tag' }, { t: 'ed25519 mutual-auth ok', c: 'k handshake' }, { t: ' · admitted', c: 'dim' }]);
-          emit();
-        }
-        if (r.integrated) {
-          logLine(node!, [{ t: 'INFO', c: 'lvl' }, { t: ' catch-up  ', c: 'tag' }, { t: `← ${hostOf(url)} `, c: 'dim' }, { t: `+${r.integrated} rows`, c: 'k catchup' }, { t: ' folded', c: 'dim' }]);
-          gossip(node!, 'catchup'); // propagate the external change through the in-page mesh
-          emit();
-        }
-        if (r.closed) {
-          const denied = String(r.closed).toLowerCase().includes('deni');
-          if (!settled) return settle(!denied, denied ? `denied: ${r.closed}` : undefined);
-          try { ws.close(); } catch {}
-          return;
-        }
-        // The peer finished streaming our catch-up. That's CONVERGED, exactly —
-        // not a goodbye: stay connected and keep folding live-pushed rows.
-        if (r.synced) return settleConverged();
-        bumpConverge();
-      };
-      ws.onerror = () => { if (!settled) settle(false, 'ws error (peer not listening, or mixed-content/cert)'); };
-      ws.onclose = () => {
-        if (node!.liveWs === ws) { node!.liveWs = undefined; node!.live = false; node!.liveAuthed = false; }
-        if (settled) {
-          // An established live link dropped (proxy idle, hub restart, network).
-          // The user still wants it — re-dial with backoff so edits made in the
-          // gap propagate on reconnect (the VV catch-up pushes them).
-          if (node!.wantLive && node!.online !== false) {
-            const delay = node!.reconnectDelayMs ?? 1000;
-            node!.reconnectDelayMs = Math.min(delay * 2, 15000);
-            clearTimeout(node!.reconnectTimer);
-            node!.reconnectTimer = setTimeout(() => {
-              node!.reconnectTimer = undefined;
-              if (node!.wantLive && !node!.liveWs && node!.online !== false) {
-                api.connectPeer(node!.id, url, authKey);
-              }
-            }, delay);
-            logLine(node!, [
-              { t: 'WARN', c: 'lvl warn' }, { t: ' watch     ', c: 'tag' }, { t: hostOf(url), c: 'hl' },
-              { t: ` · link closed · redial in ${Math.round(delay / 1000)}s`, c: 'dim' },
-            ]);
-          } else {
-            logLine(node!, [{ t: 'WARN', c: 'lvl warn' }, { t: ' watch     ', c: 'tag' }, { t: hostOf(url), c: 'hl' }, { t: ' · link closed', c: 'dim' }]);
-          }
-          emit();
-        } else {
-          settle(false, 'closed before converge');
-        }
-      };
-    });
+        // A denial is terminal; a transient failure keeps retrying so the link recovers.
+        if (denied) { node.wantLive = false; return false; }
+        scheduleLivePoll(node, 2000);
+        return false;
+      });
   };
 
   api.disconnectPeer = (nodeId: string) => {
     const node = findNode(nodeId);
     if (!node) return;
-    node.wantLive = false; // user said stop — no auto-redial
+    node.wantLive = false; // user said stop — no auto-redial / poll
     clearTimeout(node.reconnectTimer); node.reconnectTimer = undefined;
-    if (!node.liveWs) return;
-    const ws = node.liveWs;
-    node.liveWs = undefined; node.live = false; node.liveAuthed = false;
-    try { ws.close(); } catch {}
+    clearTimeout(node.pollTimer); node.pollTimer = undefined;
+    if (!node.live && !node.externalUrl) return;
+    node.live = false; node.liveAuthed = false;
     logLine(node, [{ t: 'INFO', c: 'lvl' }, { t: ' disconnect', c: 'tag' }, { t: hostOf(node.externalUrl || ''), c: 'hl' }, { t: ' · stopped watching', c: 'dim' }]);
     emit();
   };
@@ -545,6 +510,7 @@ export function createNetwork(opts: NetworkOpts) {
       createdRemote: n.createdRemote,
       externalUrl: n.externalUrl,
       authKey: n.authKey,
+      relayUrl: n.relayUrl,
       wantLive: !!n.wantLive,
       folders: [...n.folders],
       mySites: [...n.mySites],
@@ -582,6 +548,7 @@ export function createNetwork(opts: NetworkOpts) {
         createdRemote: sn.createdRemote ?? null,
         externalUrl: sn.externalUrl,
         authKey: sn.authKey,
+        relayUrl: sn.relayUrl,
         // Back-compat: state persisted by an older build has no `wantLive`
         // field, but an `externalUrl` means the user had configured a live
         // link — so honor it and auto-redial after the upgrade.
@@ -605,7 +572,7 @@ export function createNetwork(opts: NetworkOpts) {
     // while the page was closed.)
     for (const n of nodes) {
       if (n.wantLive && n.externalUrl && n.online !== false) {
-        api.connectPeer(n.id, n.externalUrl, n.authKey);
+        api.connectPeer(n.id, n.externalUrl, n.authKey, n.relayUrl);
       }
     }
     emit();
@@ -616,7 +583,7 @@ export function createNetwork(opts: NetworkOpts) {
     if (i < 0) return;
     nodes[i].wantLive = false;
     clearTimeout(nodes[i].reconnectTimer);
-    if (nodes[i].liveWs) { try { nodes[i].liveWs!.close(); } catch {} }
+    clearTimeout(nodes[i].pollTimer);
     for (let j = edges.length - 1; j >= 0; j--) if (edges[j].a === id || edges[j].b === id) edges.splice(j, 1);
     try { nodes[i].eng.free(); } catch {}
     nodes.splice(i, 1);
@@ -634,7 +601,7 @@ export function createNetwork(opts: NetworkOpts) {
     node.online = online;
     if (!online) {
       clearTimeout(node.reconnectTimer); node.reconnectTimer = undefined; // pause redial while offline
-      if (node.liveWs) { const w = node.liveWs; node.liveWs = undefined; node.live = false; node.liveAuthed = false; try { w.close(); } catch {} }
+      clearTimeout(node.pollTimer); node.pollTimer = undefined; node.live = false; node.liveAuthed = false;
       logLine(node, [
         { t: 'WARN', c: 'lvl warn' }, { t: ' offline   ', c: 'tag' },
         { t: 'link down', c: 'hl' }, { t: ' · edits queue locally (offline-first)', c: 'dim' },
@@ -656,8 +623,8 @@ export function createNetwork(opts: NetworkOpts) {
         }
       }
       // Back online: also re-dial the external live link if the user wants one.
-      if (node.wantLive && node.externalUrl && !node.liveWs) {
-        api.connectPeer(node.id, node.externalUrl, node.authKey);
+      if (node.wantLive && node.externalUrl && !node.pollTimer) {
+        api.connectPeer(node.id, node.externalUrl, node.authKey, node.relayUrl);
       }
     }
     emit();
@@ -973,7 +940,7 @@ export function createNetwork(opts: NetworkOpts) {
     for (const n of nodes) {
       n.wantLive = false;
       clearTimeout(n.reconnectTimer);
-      if (n.liveWs) { try { n.liveWs.close(); } catch {} }
+      clearTimeout(n.pollTimer);
       try { n.eng.free(); } catch {}
     }
     nodes.length = 0;
