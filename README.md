@@ -42,15 +42,16 @@ crates/
     gitexport.rs   minimal stock-git object writer (derived read-only history)
     config.rs      synced config; genesis-immutable tiebreak_key
     scope.rs       hand-rolled .aspignore matcher
-    net.rs         tokio + WebSocket driver over the sans-IO Session (wss + ws)
+    iroh_net.rs    native iroh (QUIC) driver over the sans-IO Session; relay server
+    iroh_wasm.rs   the browser iroh driver (relayed; one owned future, wasm-bindgen)
+    net.rs         shared driver helpers (conns/fanout, debounced fs watcher)
     memengine.rs   the wasm-safe in-memory engine (thin node, same fold/Session)
-    tls.rs         self-signed wss:// + channel-binding fingerprint
   asp/             the native CLI (full node)
     main.rs        clap CLI; flag > env > config resolution
     idstore.rs     device-global identity (~/.asp/id_ed25519, never synced)
     gitcli.rs      read-only `asp git` allowlist
   asp-wasm/        wasm-bindgen surface over asp-core (the one engine in wasm)
-sdks/typescript/   @asp/sdk — Vault + WebSocket transport over the wasm engine
+sdks/typescript/   @asp/sdk — Vault over the wasm engine (iroh-in-wasm transport)
 plugins/obsidian/  Context for Obsidian — reference thin-client over @asp/sdk
 desktop/engine/    asp-desktop-engine — multi-vault manager linking asp-core
 desktop/src-tauri/ Context Desktop — Tauri shell over the engine (+ React UI)
@@ -94,8 +95,8 @@ conformance vectors and the SDK⇄real-`asp` parity e2e.
 
 ## Build
 
-Requirements: Rust (stable, 1.89+), a C compiler (for bundled SQLite), and `git`
-on `PATH` (used only by the read-only `asp git` inspector).
+Requirements: Rust (stable, 1.91+, for iroh 1.0), a C compiler (for bundled
+SQLite), and `git` on `PATH` (used only by the read-only `asp git` inspector).
 
 ```sh
 cargo build --release -p asp        # the `asp` CLI → target/release/asp
@@ -106,8 +107,10 @@ cargo build --workspace             # core + CLI + e2e
 
 ```sh
 cargo test --workspace                              # core unit + multi-process e2e + desktop engine
-cargo build -p asp-core --target wasm32-unknown-unknown   # the one engine, in wasm
-cd sdks/typescript && bun run build:wasm && bun test      # conformance + SDK⇄asp parity
+# the one engine, in wasm (iroh's wasm backend needs the getrandom cfg):
+RUSTFLAGS='--cfg getrandom_backend="wasm_js"' \
+  cargo build -p asp-core --target wasm32-unknown-unknown
+cd sdks/typescript && bun run build:wasm && bun test      # conformance + SDK⇄asp parity (iroh-in-wasm)
 cd plugins/obsidian && bun test                           # plugin ⇄ asp parity
 ```
 
@@ -118,40 +121,44 @@ coherence, PITR, and the full auth/transport matrix. The SDK + plugin suites
 spawn the real binary too and drive a wasm node against it. See `tests/e2e/`,
 `sdks/typescript/test/`, and `plugins/obsidian/test/`.
 
-## Quick start (two devices through a relay)
+## Quick start (two devices, dialed by key over iroh)
 
 ```sh
 # Device A: create a vault and author some notes
 ASP_HOME=~/.asp-a  asp init --dir ./vault-a
 echo "# plan" > ./vault-a/plan.md
 
-# A relay/hub (a peer like any other), enrolling peers with a shared secret
-ASP_HOME=~/.asp-hub  asp watch --listen --no-tls --port 9000 \
-    --auth-key SECRET --dir ./hub        # prints: listening on ws://0.0.0.0:9000
+# An always-on hub (a peer like any other), enrolling peers with a shared secret.
+# It prints a connection TICKET (and a scannable QR) on start — share it.
+ASP_HOME=~/.asp-hub  asp watch --listen --auth-key SECRET --dir ./hub
+#   → ticket: endpointaaaa…  (paste this on the other devices)
 
-# A publishes to the relay
-ASP_HOME=~/.asp-a  asp sync ws://127.0.0.1:9000 --auth-key SECRET --dir ./vault-a
+# A publishes to the hub (dial by ticket; no IP/port, no TLS to configure)
+ASP_HOME=~/.asp-a  asp sync <TICKET> --auth-key SECRET --dir ./vault-a
 
-# Device B bootstraps from the relay
-ASP_HOME=~/.asp-b  asp clone ws://127.0.0.1:9000 ./vault-b --auth-key SECRET
+# Device B bootstraps from the hub
+ASP_HOME=~/.asp-b  asp clone <TICKET> ./vault-b --auth-key SECRET
 cat ./vault-b/plan.md                    # → "# plan"
 ```
 
-For continuous real-time sync, run `asp watch --peer ws://… --auth-key SECRET`
-on each device instead of one-shot `sync`.
+iroh dials a node by its **public key** (the device's ed25519 identity): a direct
+hole-punched link when the network allows, a relay only for setup / last resort.
+For continuous real-time sync, run `asp watch --peer <TICKET> --auth-key SECRET`
+on each device instead of one-shot `sync`. To self-host relay infrastructure run
+`asp relay` (a stateless forwarder — stores and sees nothing).
 
 ### CLI
 
-`asp init | clone | watch | sync | commit | key | authorize | revoke | auth
-list|extend | status | snapshot | restore | log | git | scope | completions`.
-Every deployment knob has a flag, an `ASP_*` env var, and (where applicable) a
-config key, resolved **flag > env > config**: `--dir/ASP_DIR`,
-`--no-tls/ASP_NO_TLS`, `--port/PORT`, `--auth-key/ASP_AUTH_KEY`,
-`--authorized-keys/ASP_AUTHORIZED_KEYS`, `--default-key-ttl/ASP_DEFAULT_KEY_TTL`,
-`--no-tofu/ASP_NO_TOFU`, `--debounce/ASP_DEBOUNCE`, `--log/ASP_LOG`,
-`--debug/ASP_DEBUG`. All read/status commands support `--json`. The derived repo
-is read-only: `asp git` is a deny-by-default allowlist and every mutating verb is
-refused.
+`asp init | clone | watch | sync | relay | ticket | commit | key | authorize |
+revoke | auth list|extend | status | snapshot | restore | log | git | scope |
+completions`. Every deployment knob has a flag, an `ASP_*` env var, and (where
+applicable) a config key, resolved **flag > env > config**: `--dir/ASP_DIR`,
+`--listen/ASP_LISTEN`, `--relay-url/ASP_RELAY_URL`, `--no-relay/ASP_NO_RELAY`,
+`--auth-key/ASP_AUTH_KEY`, `--authorized-keys/ASP_AUTHORIZED_KEYS`,
+`--default-key-ttl/ASP_DEFAULT_KEY_TTL`, `--no-tofu/ASP_NO_TOFU`,
+`--debounce/ASP_DEBOUNCE`, `--log/ASP_LOG`, `--debug/ASP_DEBUG`. All read/status
+commands support `--json`. The derived repo is read-only: `asp git` is a
+deny-by-default allowlist and every mutating verb is refused.
 
 ## Status — what's implemented
 
@@ -164,10 +171,12 @@ refused.
   remove-wins truth table; `reclass` boundary.
 - ed25519 identity + `authorized_keys` table (admission / expiry / listen-start
   migration / `AUTH_KEY` enrollment / TOFU / `--no-tofu`); mutual-auth handshake.
-- Transport: `wss://` self-signed TLS (advertised cert-fingerprint channel
-  binding) by default, `--no-tls` `ws://` behind a TLS-terminating proxy;
-  version-vector catch-up, optimistic push, relay forward-then-merge; debounced
-  capture with self-write suppression, startup reconciliation, rename inference.
+- Transport: **iroh** (QUIC, dial-by-key) — direct hole-punched links with relay
+  fallback, always end-to-end encrypted; the device key is the iroh `NodeId`;
+  ticket/`NodeId` addressing with QR pairing; a self-hostable `asp relay`; browser
+  nodes run iroh-in-wasm over a relay. Version-vector catch-up, optimistic push,
+  hub forward-then-merge; debounced capture with self-write suppression, startup
+  reconciliation, rename inference.
 - Snapshots + point-in-time restore (named-exact and "as of T"); stock-git
   compatible read-only derived history with cross-node SHA convergence.
 - `embeddings` table + read/write/search API (substrate only — never populated
@@ -186,8 +195,6 @@ refused.
 
 **Deferred (documented as post-v1 in the spec, or secondary):**
 
-- Live channel-binding *mismatch-abort* hardening beyond the implemented
-  advertised-binding handshake; **iroh** QUIC P2P (phase 2).
 - `fold_cache` memoization, keyframe+diff for large binaries, tombstone/blob GC,
   frame chunking on throttled links, and the central debug-log **collector**
   (the local `--debug` source is wired; the network upload is post-v1).
