@@ -90,6 +90,11 @@ pub struct Session {
     /// e.g. plaintext `ws://` or a WebView that can't read the peer cert).
     observed_binding: Option<Vec<u8>>,
     admit: AdmitCtx,
+    /// Connector: the enrollment secret to present in `Hello`. Listener: unused.
+    present_auth_key: Option<String>,
+    /// Listener: the configured enrollment secrets to validate a presented key
+    /// against. Connector: unused.
+    configured_auth_keys: Vec<String>,
     peer_node: Option<NodeId>,
     peer_nonce: Option<Vec<u8>>,
     sent_auth: bool,
@@ -156,6 +161,24 @@ impl Session {
         observed_binding: Option<Vec<u8>>,
         admit: AdmitCtx,
     ) -> Session {
+        Session::with_auth(role, vault, advertised_binding, observed_binding, admit, Vec::new())
+    }
+
+    /// Like [`Session::new`] but with the AUTH_KEY enrollment secrets. A connector
+    /// presents `auth_keys.first()` in its `Hello`; a listener validates a
+    /// presented key against the whole set (§Security, auth-key enrollment).
+    pub fn with_auth(
+        role: Role,
+        vault: &dyn SessionVault,
+        advertised_binding: Vec<u8>,
+        observed_binding: Option<Vec<u8>>,
+        admit: AdmitCtx,
+        auth_keys: Vec<String>,
+    ) -> Session {
+        let (present_auth_key, configured_auth_keys) = match role {
+            Role::Connector => (auth_keys.into_iter().next(), Vec::new()),
+            Role::Listener => (None, auth_keys),
+        };
         // A pristine vault (no authored rows) advertises an EMPTY vault id so it
         // adopts the peer's vault on connect — exactly like `clone`. This makes
         // "init then `watch --peer`" with no local content Just Work, and is how a
@@ -170,6 +193,8 @@ impl Session {
             advertised_binding,
             observed_binding,
             admit,
+            present_auth_key,
+            configured_auth_keys,
             peer_node: None,
             peer_nonce: None,
             sent_auth: false,
@@ -191,6 +216,7 @@ impl Session {
             },
             vault_id: self.vault_id.clone(),
             is_listener: self.role == Role::Listener,
+            auth_key: self.present_auth_key.clone(),
         })]
     }
 
@@ -215,9 +241,27 @@ impl Session {
 
     pub fn on_msg(&mut self, vault: &dyn SessionVault, msg: Msg) -> AspResult<Vec<Step>> {
         match msg {
-            Msg::Hello { proto, node_id, nonce, channel_binding, vault_id, is_listener } => {
+            Msg::Hello { proto, node_id, nonce, channel_binding, vault_id, is_listener, auth_key } => {
                 if proto != PROTO {
                     return Ok(vec![Step::Closed(format!("proto mismatch: {proto} != {PROTO}"))]);
+                }
+                // Listener: validate a presented AUTH_KEY against the configured
+                // enrollment set (§Security). A mismatch denies loudly with no
+                // fall-through; a match flips `auth_key_ok` so admission enrolls
+                // this peer; an absent key proceeds to normal admission (an
+                // already-enrolled peer needs no secret).
+                if self.role == Role::Listener && !self.configured_auth_keys.is_empty() {
+                    if let Some(presented) = &auth_key {
+                        if self.configured_auth_keys.iter().any(|k| k == presented) {
+                            self.admit.auth_key_ok = true;
+                        } else {
+                            let reason = "invalid auth key".to_string();
+                            return Ok(vec![
+                                Step::Send(Msg::Denied { reason: reason.clone() }),
+                                Step::Closed(reason),
+                            ]);
+                        }
+                    }
                 }
                 // Vault matching, with clone adoption: a fresh node (empty
                 // vault_id) adopts the peer's; an empty peer vault_id means the
@@ -498,6 +542,7 @@ mod tests {
             channel_binding: vec![],
             vault_id: "whatever".into(),
             is_listener: false,
+            auth_key: None,
         };
         let steps = s.on_msg(&e, hello).unwrap();
         assert!(steps.iter().any(|st| matches!(st, Step::Closed(m) if m.contains("proto"))), "proto mismatch must close");

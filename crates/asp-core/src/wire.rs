@@ -46,6 +46,11 @@ pub enum Msg {
         channel_binding: Vec<u8>,
         vault_id: String,
         is_listener: bool,
+        /// AUTH_KEY enrollment secret a connector presents (§Security). Carried
+        /// here over the authenticated iroh stream — iroh has no HTTP upgrade
+        /// header. `None` from a listener and from already-enrolled connectors.
+        #[serde(default)]
+        auth_key: Option<String>,
     },
     /// ed25519 signature over the mutual-auth transcript.
     Auth {

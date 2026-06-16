@@ -267,7 +267,7 @@ async fn accept_one(
     let admit = auth.admit_ctx(false);
     let session = {
         let eng = engine.lock().unwrap();
-        Session::new(Role::Listener, &*eng, Vec::new(), None, admit)
+        Session::with_auth(Role::Listener, &*eng, Vec::new(), None, admit, auth.auth_keys.clone())
     };
     let _peer = node_id_of(&conn);
     drive(send, recv, engine, session, false, None).await
@@ -292,7 +292,14 @@ pub async fn connect(
     let (send, recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
     let session = {
         let eng = engine.lock().unwrap();
-        Session::new(Role::Connector, &*eng, Vec::new(), None, auth.admit_ctx(false))
+        Session::with_auth(
+            Role::Connector,
+            &*eng,
+            Vec::new(),
+            None,
+            auth.admit_ctx(false),
+            auth.auth_keys.clone(),
+        )
     };
     drive(send, recv, engine, session, oneshot, on_auth).await
 }
@@ -388,5 +395,44 @@ mod tests {
         assert!(r.is_err(), "an unauthorized keyless peer must be denied");
         assert!(!cli_dir.path().join("private.md").exists(), "no data may leak");
         server.abort();
+    }
+
+    /// AUTH_KEY enrollment over iroh: the secret rides in the `Hello` handshake
+    /// (no WS header). A connector presenting the right secret is enrolled and
+    /// syncs; a wrong secret is denied loudly and leaks nothing.
+    #[tokio::test]
+    async fn iroh_auth_key_enrollment_and_mismatch() {
+        async fn attempt(secret: &str, cli_seed: u8) -> (Result<()>, tempfile::TempDir) {
+            let srv_dir = tempdir().unwrap();
+            let cli_dir = tempdir().unwrap();
+            let srv_id = Identity::from_seed(&[21; 32]);
+            let cli_id = Identity::from_seed(&[cli_seed; 32]);
+            let srv = Engine::init(srv_dir.path(), srv_id.clone()).unwrap();
+            srv.record_write("enrolled.md", b"members only\n").unwrap();
+            let srv_ep = bind_endpoint(&srv_id.seed(), false).await.unwrap();
+            let cli_ep = bind_endpoint(&cli_id.seed(), false).await.unwrap();
+            let dial = loopback_addr(&srv_ep);
+            let srv_engine: EngineRef = Arc::new(StdMutex::new(srv));
+            // Listener configures the enrollment secret "S3CRET" (no pre-authorized
+            // keys; auth-key configured implicitly disables TOFU).
+            let srv_opts = AuthOpts { auth_keys: vec!["S3CRET".into()], ..Default::default() };
+            let server = tokio::spawn(serve(srv_engine, srv_ep, srv_opts));
+            let cli = Engine::init(cli_dir.path(), cli_id).unwrap();
+            let cli_engine: EngineRef = Arc::new(StdMutex::new(cli));
+            let cli_opts = AuthOpts { auth_keys: vec![secret.into()], ..Default::default() };
+            let r = clone_bootstrap(cli_engine, &cli_ep, dial, &cli_opts).await;
+            server.abort();
+            (r, cli_dir)
+        }
+
+        // Right secret → enrolled and synced.
+        let (ok, dir) = attempt("S3CRET", 22).await;
+        ok.expect("correct auth key must enroll and sync over iroh");
+        assert_eq!(std::fs::read(dir.path().join("enrolled.md")).unwrap(), b"members only\n");
+
+        // Wrong secret → denied, nothing leaks.
+        let (bad, dir) = attempt("WRONG", 23).await;
+        assert!(bad.is_err(), "a wrong auth key must be denied");
+        assert!(!dir.path().join("enrolled.md").exists(), "no data may leak on a bad key");
     }
 }
