@@ -39,6 +39,7 @@ toml.workspace = true
 anyhow.workspace = true
 iroh.workspace = true
 iroh-tickets.workspace = true
+iroh-relay.workspace = true
 n0-future.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true

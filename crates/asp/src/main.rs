@@ -6,7 +6,7 @@
 
 mod gitcli;
 mod idstore;
-use asp_core::net;
+use asp_core::{iroh_net, net};
 
 use anyhow::{anyhow, Context, Result};
 use asp_core::authkeys::{expiry_from_ttl_days, format_date_ymd_utc, parse_ttl, TtlSpec};
@@ -23,18 +23,19 @@ struct Cli {
     /// Vault directory (locates the config). Flag+env only.
     #[arg(short = 'C', long = "dir", global = true, env = "ASP_DIR")]
     dir: Option<PathBuf>,
-    /// Serve plaintext ws:// instead of wss:// (behind a TLS-terminating proxy).
-    /// The env var accepts any boolish value (1/true/yes/on, 0/false/no/off).
+    /// Disable iroh relays/discovery — direct/LAN dialing only (no public relays).
+    /// Useful on a trusted LAN or in hermetic tests. The env var accepts any
+    /// boolish value (1/true/yes/on, 0/false/no/off).
     #[arg(
-        long = "no-tls",
+        long = "no-relay",
         global = true,
-        env = "ASP_NO_TLS",
+        env = "ASP_NO_RELAY",
         value_parser = clap::builder::BoolishValueParser::new(),
         num_args = 0..=1,
         default_value_t = false,
         default_missing_value = "true"
     )]
-    no_tls: bool,
+    no_relay: bool,
     /// AUTH_KEY enrollment secret(s), comma-separated (listener accepts / connector presents).
     #[arg(long = "auth-key", global = true, env = "ASP_AUTH_KEY")]
     auth_key: Option<String>,
@@ -77,20 +78,27 @@ enum Cmd {
     /// Create a new scoped vault and this node's identity.
     Init { path: Option<PathBuf> },
     /// Bootstrap a new node from a listening peer (authenticate, catch-up, pin).
-    Clone { url: String, into: Option<PathBuf>, #[arg(long)] watch: bool },
+    /// `peer` is an iroh ticket or a bare 64-hex node id.
+    Clone { peer: String, into: Option<PathBuf>, #[arg(long)] watch: bool },
     /// The primary long-running command: watch + sync. `--listen` also accepts peers.
     Watch {
         #[arg(long)]
         listen: bool,
-        #[arg(long, env = "PORT")]
-        port: Option<u16>,
-        /// Peer URL(s) to connect to (repeatable).
+        /// Peer(s) to connect to — iroh ticket or node id (repeatable).
         #[arg(long = "peer")]
         peers: Vec<String>,
     },
-    /// One-shot: capture local changes, sync with a peer, exit. With no URL, uses
-    /// the saved peer (from `clone`).
-    Sync { url: Option<String> },
+    /// One-shot: capture local changes, sync with a peer, exit. With no peer, uses
+    /// the saved peer (from `clone`). `peer` is an iroh ticket or node id.
+    Sync { peer: Option<String> },
+    /// Run a pure iroh relay (forwards encrypted packets, stores/sees nothing).
+    Relay {
+        /// HTTP bind address for the relay (default 0.0.0.0:8080).
+        #[arg(long = "listen-addr")]
+        bind: Option<String>,
+    },
+    /// Print this node's connection ticket (and node id) as text + a QR code.
+    Ticket,
     /// Capture on-disk changes into the log (no network).
     Commit,
     /// Generate / show the node's SSH public key.
@@ -315,22 +323,56 @@ async fn run(cli: Cli) -> Result<()> {
             clap_complete::generate(*shell, &mut cmd, "asp", &mut std::io::stdout());
             Ok(())
         }
-        Cmd::Sync { url } => {
+        Cmd::Sync { peer } => {
             let engine = open_engine(&cli)?;
             seed_authorized_keys(&cli, &engine)?;
             let auth = auth_opts(&cli, &engine);
-            // No URL → use the saved peer (clone's `origin`); a supplied URL is
+            // No peer → use the saved peer (clone's `origin`); a supplied peer is
             // offered for saving, then used for this run.
-            let supplied: Vec<String> = url.clone().into_iter().collect();
-            let peer = resolve_peers(&engine, &supplied)
+            let supplied: Vec<String> = peer.clone().into_iter().collect();
+            let spec = resolve_peers(&engine, &supplied)
                 .into_iter()
                 .next()
-                .ok_or_else(|| anyhow!("no peer configured — pass a URL or `asp clone` first"))?;
-            net::sync_oneshot(Arc::new(Mutex::new(engine)), &peer, &auth).await
+                .ok_or_else(|| anyhow!("no peer configured — pass a ticket/node id or `asp clone` first"))?;
+            let addr = iroh_net::parse_peer(&spec)?;
+            let ep = iroh_net::bind_endpoint(&engine.identity.seed(), !cli.no_relay).await?;
+            let r = iroh_net::sync_oneshot(Arc::new(Mutex::new(engine)), &ep, addr, &auth).await;
+            ep.close().await;
+            r
         }
-        Cmd::Clone { url, into, watch } => clone_cmd(&cli, url, into.clone(), *watch).await,
-        Cmd::Watch { listen, port, peers } => watch_cmd(&cli, *listen, *port, peers.clone()).await,
+        Cmd::Clone { peer, into, watch } => clone_cmd(&cli, peer, into.clone(), *watch).await,
+        Cmd::Watch { listen, peers } => watch_cmd(&cli, *listen, peers.clone()).await,
+        Cmd::Relay { bind } => {
+            let bind = bind.clone().unwrap_or_else(|| "0.0.0.0:8080".into());
+            let addr: std::net::SocketAddr = bind.parse().map_err(|_| anyhow!("bad relay bind address: {bind}"))?;
+            println!("starting iroh relay on {addr} (forwards ciphertext, stores nothing)");
+            iroh_net::run_relay(addr).await
+        }
+        Cmd::Ticket => {
+            let engine = open_engine(&cli)?;
+            let ep = iroh_net::bind_endpoint(&engine.identity.seed(), !cli.no_relay).await?;
+            let ticket = iroh_net::ticket(&ep, !cli.no_relay).await?;
+            print_ticket(&ticket, &engine.site_id());
+            ep.close().await;
+            Ok(())
+        }
     }
+}
+
+/// Print a connection ticket as copy-paste text, a node id, and a scannable QR
+/// code in the terminal (phone-to-desktop pairing). QR is a render concern of
+/// the surface, not the engine — the engine only emits the ticket string.
+fn print_ticket(ticket: &str, node_id: &str) {
+    println!("node:   {node_id}");
+    println!("ticket: {ticket}");
+    if let Ok(code) = qrcode::QrCode::new(ticket.as_bytes()) {
+        let rendered = code
+            .render::<qrcode::render::unicode::Dense1x2>()
+            .quiet_zone(true)
+            .build();
+        println!("\n{rendered}");
+    }
+    println!("share the ticket (or scan the QR) on another device: `asp clone <ticket>`");
 }
 
 fn resolve_ttl(ttl: Option<&str>, engine: &Engine, cli: &Cli) -> Result<(Option<u64>, bool)> {
@@ -471,31 +513,36 @@ fn scope_cmd(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn clone_cmd(cli: &Cli, url: &str, into: Option<PathBuf>, watch: bool) -> Result<()> {
+async fn clone_cmd(cli: &Cli, peer: &str, into: Option<PathBuf>, watch: bool) -> Result<()> {
     let dir = into.or_else(|| cli.dir.clone()).unwrap_or_else(|| PathBuf::from("asp-vault"));
     let id = idstore::load_or_generate()?;
     let engine = Engine::open(&dir, id).map_err(|e| anyhow!("clone open: {e}"))?;
     seed_authorized_keys(cli, &engine)?;
     let auth = auth_opts(cli, &engine);
+    let seed = engine.identity.seed();
+    let addr = iroh_net::parse_peer(peer)?;
+    let ep = iroh_net::bind_endpoint(&seed, !cli.no_relay).await?;
     let engine: EngineRef = Arc::new(Mutex::new(engine));
-    net::clone_bootstrap(engine.clone(), url, &auth).await?;
+    let pinned = iroh_net::clone_bootstrap(engine.clone(), &ep, addr, &auth).await?;
     let vid = {
         let e = engine.lock().unwrap();
-        // clone always saves the source URL as the default peer (`origin`); pin it
-        // even if the auth channel didn't surface the NodeId in time.
+        // clone saves the source ticket as the default peer (`origin`), pinning
+        // the listener's NodeId (verified by iroh) for re-dial.
         if saved_peer_urls(&e).is_empty() {
-            let _ = e.store.add_peer(url, "", now_unix());
+            let node_hex = pinned.map(|n| n.to_hex()).unwrap_or_default();
+            let _ = e.store.add_peer(peer, &node_hex, now_unix());
         }
         VaultConfig::new(&e.store).vault_id()?.unwrap_or_default()
     };
-    println!("cloned vault {} into {} (peer {url})", &vid[..8.min(vid.len())], dir.display());
+    println!("cloned vault {} into {}", &vid[..8.min(vid.len())], dir.display());
     if watch {
-        return run_watch_loop(cli, engine, false, None, vec![url.to_string()]).await;
+        return run_watch_loop(cli, engine, ep, false, vec![peer.to_string()]).await;
     }
+    ep.close().await;
     Ok(())
 }
 
-async fn watch_cmd(cli: &Cli, listen: bool, port: Option<u16>, peers: Vec<String>) -> Result<()> {
+async fn watch_cmd(cli: &Cli, listen: bool, peers: Vec<String>) -> Result<()> {
     let engine = open_engine(cli)?;
     seed_authorized_keys(cli, &engine)?;
     let ttl_days = default_ttl_days(cli, &engine);
@@ -506,18 +553,18 @@ async fn watch_cmd(cli: &Cli, listen: bool, port: Option<u16>, peers: Vec<String
     // No --peer → connect to the saved peer(s) (clone's `origin`); a supplied
     // --peer is offered for saving (consent), then used.
     let resolved = resolve_peers(&engine, &peers);
-    run_watch_loop(cli, Arc::new(Mutex::new(engine)), listen, port, resolved).await
+    let ep = iroh_net::bind_endpoint(&engine.identity.seed(), !cli.no_relay).await?;
+    run_watch_loop(cli, Arc::new(Mutex::new(engine)), ep, listen, resolved).await
 }
 
 async fn run_watch_loop(
     cli: &Cli,
     engine: EngineRef,
+    ep: iroh_net::Endpoint,
     listen: bool,
-    port: Option<u16>,
     peers: Vec<String>,
 ) -> Result<()> {
-    use std::collections::HashMap;
-    let conns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let conns = iroh_net::new_conns();
     let (auth, _vid, root, site, debounce) = {
         let e = engine.lock().unwrap();
         let auth = auth_opts(cli, &e);
@@ -528,33 +575,24 @@ async fn run_watch_loop(
     };
 
     if listen {
-        // Default transport is wss:// with a persisted self-signed cert; --no-tls
-        // serves plaintext ws:// (behind a TLS-terminating proxy / local).
-        let tls = if cli.no_tls {
-            None
-        } else {
-            let eng = engine.lock().unwrap();
-            let (cert, key) = asp_core::tls::load_or_generate(&eng.asp_dir)?;
-            let fingerprint = asp_core::tls::cert_fingerprint(&cert).to_vec();
-            let config = asp_core::tls::server_config(cert, key)?;
-            Some(net::ServerTls { config, fingerprint })
-        };
-        let scheme = if tls.is_some() { "wss" } else { "ws" };
-        let bind = format!("0.0.0.0:{}", port.unwrap_or(9000));
-        let (ptx, prx) = tokio::sync::oneshot::channel();
-        let (e, a, c) = (engine.clone(), auth.clone(), conns.clone());
+        // A listening node is a hub: print its ticket + QR so peers can pair.
+        match iroh_net::ticket(&ep, !cli.no_relay).await {
+            Ok(ticket) => {
+                println!("listening as a hub — share this ticket with peers:");
+                print_ticket(&ticket, &site);
+            }
+            Err(e) => tracing::warn!("could not mint ticket: {e}"),
+        }
+        let (e, a, c, server_ep) = (engine.clone(), auth.clone(), conns.clone(), ep.clone());
         tokio::spawn(async move {
-            if let Err(e) = net::serve(e, &bind, a, c, tls, Some(ptx)).await {
+            if let Err(e) = iroh_net::serve(e, server_ep, a, c).await {
                 tracing::error!("listener stopped: {e}");
             }
         });
-        if let Ok(p) = prx.await {
-            println!("listening on {scheme}://0.0.0.0:{p}");
-        }
     }
 
-    for url in peers {
-        let (e, a, c) = (engine.clone(), auth.clone(), conns.clone());
+    for spec in peers {
+        let (e, a, c, dial_ep) = (engine.clone(), auth.clone(), conns.clone(), ep.clone());
         tokio::spawn(async move {
             // Reconnect with exponential backoff + full jitter. A flapping or
             // rejected peer (auth fail, listener overload, network blip) must not
@@ -568,20 +606,29 @@ async fn run_watch_loop(
             const MAX: std::time::Duration = std::time::Duration::from_secs(60);
             const HEALTHY: std::time::Duration = std::time::Duration::from_secs(30);
             let mut backoff = BASE;
+            // Resolve the peer spec (ticket / node id) once; iroh re-resolves the
+            // live address on each dial via the embedded hints + discovery.
+            let addr = match iroh_net::parse_peer(&spec) {
+                Ok(a) => a,
+                Err(err) => {
+                    eprintln!("error: bad peer {spec}: {err}");
+                    return;
+                }
+            };
             loop {
                 let started = std::time::Instant::now();
-                if let Err(err) = net::connect(e.clone(), &url, &a, c.clone(), false, None).await {
+                if let Err(err) = iroh_net::connect(e.clone(), &dial_ep, addr.clone(), &a, false, c.clone(), None).await {
                     let msg = err.to_string();
                     // A vault mismatch is permanent — retrying is futile. Tell the
                     // operator exactly how to fix it and stop hammering the peer.
                     if msg.contains("different vault") {
                         eprintln!(
-                            "error: peer {url} is a DIFFERENT vault — they were created separately and won't merge.\n\
-                             To follow it, clone instead of init: `asp clone {url} <dir>` (this folder's local edits would be replaced)."
+                            "error: peer {spec} is a DIFFERENT vault — they were created separately and won't merge.\n\
+                             To follow it, clone instead of init: `asp clone {spec} <dir>` (this folder's local edits would be replaced)."
                         );
                         break;
                     }
-                    tracing::debug!("peer {url} disconnected: {err}");
+                    tracing::debug!("peer {spec} disconnected: {err}");
                 }
                 // A connection that lasted a while was healthy — restart from BASE.
                 // One that dropped almost immediately escalates the delay.

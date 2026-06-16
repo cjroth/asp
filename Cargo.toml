@@ -54,8 +54,10 @@ clap_complete = "4"
 # p2p transport (iroh: QUIC + NAT hole-punching + relay fallback; dial-by-key)
 iroh = "1"
 iroh-tickets = "1"
-iroh-relay = { version = "1", features = ["server"] }
+iroh-relay = { version = "1", default-features = false, features = ["server"] }
 n0-future = "0.3"
+# CLI: render a peer ticket as a scannable QR in the terminal
+qrcode = { version = "0.14", default-features = false }
 # async net (CLI driver)
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }

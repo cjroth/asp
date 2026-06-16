@@ -12,13 +12,16 @@
 //! the handshake / catch-up / integrate state machine is byte-for-byte the same
 //! as every other surface — only the bytes' carrier changed.
 
-use crate::net::{fanout, now_unix, AuthOpts, Conns, EngineRef, CONN_SEQ};
+use crate::net::{fanout, AuthOpts, Conns, EngineRef, CONN_SEQ};
 use crate::session::Step;
 use crate::{Msg, NodeId, Role, Session};
 use anyhow::{anyhow, Result};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey, TransportAddr};
+use iroh::{PublicKey, RelayMode, SecretKey, TransportAddr};
 use iroh_tickets::endpoint::EndpointTicket;
+// Re-exported so thin native drivers (the CLI) can name the endpoint/address
+// types without depending on the iroh crate directly.
+pub use iroh::{Endpoint, EndpointAddr};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -107,6 +110,30 @@ pub fn parse_peer(s: &str) -> Result<EndpointAddr> {
         return Ok(EndpointAddr::from(pk));
     }
     Err(anyhow!("not an iroh ticket or 64-hex node id: {s}"))
+}
+
+// ---------------- relay server (`asp relay`) ----------------
+
+/// Run a **pure iroh relay** on `http_bind`: a stateless packet-forwarder for
+/// connection setup / NAT traversal / browser nodes. It holds no vault, stores
+/// nothing, and only ever forwards ciphertext (it cannot decrypt peer traffic).
+/// Lets an operator self-host relay infrastructure with the same binary instead
+/// of depending on the public n0 relays. Runs until cancelled.
+pub async fn run_relay(http_bind: SocketAddr) -> Result<()> {
+    use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+    // ServerConfig is #[non_exhaustive]: build via Default, then set public fields.
+    let mut config = ServerConfig::default();
+    config.relay = Some(RelayConfig::new(http_bind));
+    config.quic = None;
+    let server = Server::spawn(config).await.map_err(|e| anyhow!("starting relay: {e}"))?;
+    if let Some(addr) = server.http_addr() {
+        println!("relay listening on http://{addr}");
+        tracing::info!(%addr, "iroh relay (http) up — forwards ciphertext, stores nothing");
+    }
+    // Hold the server alive until the process is cancelled.
+    std::future::pending::<()>().await;
+    drop(server);
+    Ok(())
 }
 
 // ---------------- framing ----------------
@@ -413,20 +440,17 @@ pub async fn sync_oneshot(
 }
 
 /// Clone bootstrap: connect with an empty local vault, adopt the peer's vault,
-/// pull everything, then pin the listener as a peer (by its `NodeId`).
+/// and pull everything. Returns the listener's iroh-verified `NodeId` so the
+/// caller can pin it as the default peer (the CLI saves the source ticket too).
 pub async fn clone_bootstrap(
     engine: EngineRef,
     ep: &Endpoint,
     addr: EndpointAddr,
     auth: &AuthOpts,
-) -> Result<()> {
+) -> Result<Option<NodeId>> {
     let (auth_tx, mut auth_rx) = mpsc::unbounded_channel::<NodeId>();
-    connect(engine.clone(), ep, addr, auth, true, new_conns(), Some(auth_tx)).await?;
-    if let Ok(node) = auth_rx.try_recv() {
-        let eng = engine.lock().unwrap();
-        let _ = eng.store.add_peer(&node.to_hex(), &node.to_hex(), now_unix());
-    }
-    Ok(())
+    connect(engine, ep, addr, auth, true, new_conns(), Some(auth_tx)).await?;
+    Ok(auth_rx.try_recv().ok())
 }
 
 #[cfg(test)]
@@ -508,7 +532,7 @@ mod tests {
     /// syncs; a wrong secret is denied loudly and leaks nothing.
     #[tokio::test]
     async fn iroh_auth_key_enrollment_and_mismatch() {
-        async fn attempt(secret: &str, cli_seed: u8) -> (Result<()>, tempfile::TempDir) {
+        async fn attempt(secret: &str, cli_seed: u8) -> (Result<Option<NodeId>>, tempfile::TempDir) {
             let srv_dir = tempdir().unwrap();
             let cli_dir = tempdir().unwrap();
             let srv_id = Identity::from_seed(&[21; 32]);
