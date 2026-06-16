@@ -67,7 +67,7 @@ pub struct AuthOpts {
 }
 
 impl AuthOpts {
-    fn admit_ctx(&self, auth_key_ok: bool) -> AdmitCtx {
+    pub(crate) fn admit_ctx(&self, auth_key_ok: bool) -> AdmitCtx {
         AdmitCtx {
             no_tofu: self.no_tofu,
             auth_key_ok,

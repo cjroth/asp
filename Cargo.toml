@@ -22,7 +22,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["ASP contributors"]
-rust-version = "1.89"
+rust-version = "1.91"
 
 [workspace.dependencies]
 # crypto / identity
@@ -51,6 +51,11 @@ anyhow = "1"
 # cli
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
+# p2p transport (iroh: QUIC + NAT hole-punching + relay fallback; dial-by-key)
+iroh = "1"
+iroh-tickets = "1"
+iroh-relay = { version = "1", features = ["server"] }
+n0-future = "0.3"
 # async net (CLI driver)
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
