@@ -55,8 +55,24 @@ fn node_id_of(conn: &Connection) -> NodeId {
 /// public n0 relays + discovery (production: reachable across NATs and from
 /// browser nodes) or a relay-less endpoint (LAN / loopback tests).
 pub async fn bind_endpoint(seed: &[u8; 32], relays: bool) -> Result<Endpoint> {
+    bind_endpoint_relay(seed, relays, None).await
+}
+
+/// Bind with an explicit relay choice: `relay_url` pins one relay (a self-hosted
+/// `asp relay`, or a local relay in tests) regardless of `relays`; otherwise
+/// `relays` selects the public n0 relays vs a relay-less endpoint.
+pub async fn bind_endpoint_relay(
+    seed: &[u8; 32],
+    relays: bool,
+    relay_url: Option<&str>,
+) -> Result<Endpoint> {
+    use std::str::FromStr;
     let sk = secret_key(seed);
-    let builder = if relays {
+    let builder = if let Some(u) = relay_url {
+        let url = iroh::RelayUrl::from_str(u.trim()).map_err(|e| anyhow!("bad relay url: {e}"))?;
+        let map: iroh::RelayMap = [url].into_iter().collect();
+        Endpoint::builder(iroh::endpoint::presets::Empty).relay_mode(RelayMode::Custom(map))
+    } else if relays {
         Endpoint::builder(iroh::endpoint::presets::N0)
     } else {
         Endpoint::builder(iroh::endpoint::presets::Empty).relay_mode(RelayMode::Disabled)

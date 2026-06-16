@@ -91,8 +91,8 @@ export class WorkerVault {
   async loadState(bytes: Uint8Array): Promise<number> {
     return (await this.call({ op: 'loadState', bytes })) as number;
   }
-  async sync(url: string, opts: { authKey?: string } = {}): Promise<number> {
-    return (await this.call({ op: 'sync', url, authKey: opts.authKey })) as number;
+  async sync(ticket: string, opts: { authKey?: string; relayUrl?: string } = {}): Promise<number> {
+    return (await this.call({ op: 'sync', ticket, authKey: opts.authKey, relayUrl: opts.relayUrl })) as number;
   }
   /** Abort an in-flight {@link sync} — the worker closes the socket so the
    * pending sync rejects. Processed even while `sync` is still awaiting. */

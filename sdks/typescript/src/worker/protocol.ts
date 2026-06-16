@@ -46,7 +46,7 @@ export type Command =
   | { kind: 'cmd'; id: number; op: 'files' }
   | { kind: 'cmd'; id: number; op: 'filesDetail' }
   | { kind: 'cmd'; id: number; op: 'readFile'; path: string }
-  | { kind: 'cmd'; id: number; op: 'sync'; url: string; authKey?: string }
+  | { kind: 'cmd'; id: number; op: 'sync'; ticket: string; authKey?: string; relayUrl?: string }
   | { kind: 'cmd'; id: number; op: 'abort' }
   | { kind: 'cmd'; id: number; op: 'dump' }
   | { kind: 'cmd'; id: number; op: 'load'; stateJson: string }

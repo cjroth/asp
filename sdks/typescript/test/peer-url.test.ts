@@ -1,28 +1,17 @@
 import { expect, test } from 'bun:test';
 import { normalizePeerUrl } from '../src/index.ts';
 
-test('schemeless host defaults to wss://', () => {
-  expect(normalizePeerUrl('hub:9000')).toBe('wss://hub:9000');
-  expect(normalizePeerUrl('example.com')).toBe('wss://example.com');
-  expect(normalizePeerUrl('example.com/sync')).toBe('wss://example.com/sync');
+// With iroh, a peer is an opaque **ticket** (or a bare node id) — there is no URL
+// scheme to default or rewrite. normalizePeerUrl just trims; the value is passed
+// through untouched (kept as a named export for callers that previously
+// normalized a URL).
+test('peer spec is trimmed and otherwise passed through untouched', () => {
+  const ticket = 'endpointaaaabbbbccccddddeeeeffff0123456789';
+  expect(normalizePeerUrl(`  ${ticket}  `)).toBe(ticket);
+  expect(normalizePeerUrl(ticket)).toBe(ticket);
 });
 
-test('explicit ws/wss is left untouched', () => {
-  expect(normalizePeerUrl('wss://h:9000')).toBe('wss://h:9000');
-  expect(normalizePeerUrl('ws://127.0.0.1:8080')).toBe('ws://127.0.0.1:8080');
-});
-
-test('http(s) maps to ws(s)', () => {
-  expect(normalizePeerUrl('https://h:9000')).toBe('wss://h:9000');
-  expect(normalizePeerUrl('http://127.0.0.1:8080')).toBe('ws://127.0.0.1:8080');
-});
-
-test('whitespace trimmed; empty stays empty', () => {
-  expect(normalizePeerUrl('  hub:9000  ')).toBe('wss://hub:9000');
+test('empty / whitespace-only stays empty', () => {
   expect(normalizePeerUrl('')).toBe('');
   expect(normalizePeerUrl('   ')).toBe('');
-});
-
-test('leading slashes are not doubled into the scheme', () => {
-  expect(normalizePeerUrl('//h:9000')).toBe('wss://h:9000');
 });

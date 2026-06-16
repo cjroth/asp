@@ -36,6 +36,10 @@ struct Cli {
         default_missing_value = "true"
     )]
     no_relay: bool,
+    /// Pin a specific iroh relay (a self-hosted `asp relay`, or a local relay in
+    /// tests) instead of the public n0 relays. e.g. http://127.0.0.1:8080
+    #[arg(long = "relay-url", global = true, env = "ASP_RELAY_URL")]
+    relay_url: Option<String>,
     /// AUTH_KEY enrollment secret(s), comma-separated (listener accepts / connector presents).
     #[arg(long = "auth-key", global = true, env = "ASP_AUTH_KEY")]
     auth_key: Option<String>,
@@ -335,7 +339,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .next()
                 .ok_or_else(|| anyhow!("no peer configured — pass a ticket/node id or `asp clone` first"))?;
             let addr = iroh_net::parse_peer(&spec)?;
-            let ep = iroh_net::bind_endpoint(&engine.identity.seed(), !cli.no_relay).await?;
+            let ep = iroh_net::bind_endpoint_relay(&engine.identity.seed(), !cli.no_relay, cli.relay_url.as_deref()).await?;
             let r = iroh_net::sync_oneshot(Arc::new(Mutex::new(engine)), &ep, addr, &auth).await;
             ep.close().await;
             r
@@ -350,7 +354,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Ticket => {
             let engine = open_engine(&cli)?;
-            let ep = iroh_net::bind_endpoint(&engine.identity.seed(), !cli.no_relay).await?;
+            let ep = iroh_net::bind_endpoint_relay(&engine.identity.seed(), !cli.no_relay, cli.relay_url.as_deref()).await?;
             let ticket = iroh_net::ticket(&ep, !cli.no_relay).await?;
             print_ticket(&ticket, &engine.site_id());
             ep.close().await;
@@ -521,7 +525,7 @@ async fn clone_cmd(cli: &Cli, peer: &str, into: Option<PathBuf>, watch: bool) ->
     let auth = auth_opts(cli, &engine);
     let seed = engine.identity.seed();
     let addr = iroh_net::parse_peer(peer)?;
-    let ep = iroh_net::bind_endpoint(&seed, !cli.no_relay).await?;
+    let ep = iroh_net::bind_endpoint_relay(&seed, !cli.no_relay, cli.relay_url.as_deref()).await?;
     let engine: EngineRef = Arc::new(Mutex::new(engine));
     let pinned = iroh_net::clone_bootstrap(engine.clone(), &ep, addr, &auth).await?;
     let vid = {
@@ -553,7 +557,7 @@ async fn watch_cmd(cli: &Cli, listen: bool, peers: Vec<String>) -> Result<()> {
     // No --peer → connect to the saved peer(s) (clone's `origin`); a supplied
     // --peer is offered for saving (consent), then used.
     let resolved = resolve_peers(&engine, &peers);
-    let ep = iroh_net::bind_endpoint(&engine.identity.seed(), !cli.no_relay).await?;
+    let ep = iroh_net::bind_endpoint_relay(&engine.identity.seed(), !cli.no_relay, cli.relay_url.as_deref()).await?;
     run_watch_loop(cli, Arc::new(Mutex::new(engine)), ep, listen, resolved).await
 }
 

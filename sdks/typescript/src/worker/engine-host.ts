@@ -73,7 +73,7 @@ export class EngineWorkerHost {
         case 'loadState':
           return this.reply(cmd.id, true, this.vaultOrThrow().loadState(cmd.bytes));
         case 'sync': {
-          const integrated = await this.vaultOrThrow().sync(cmd.url, { authKey: cmd.authKey });
+          const integrated = await this.vaultOrThrow().sync(cmd.ticket, { authKey: cmd.authKey, relayUrl: cmd.relayUrl });
           return this.reply(cmd.id, true, integrated);
         }
         case 'abort':

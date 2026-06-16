@@ -3,7 +3,7 @@
 // version-vector catch-up). All protocol/merge logic is in the engine; this file
 // is host glue only.
 
-import { type FeedResult, WasmEngine, type WasmEngineInstance } from './engine.ts';
+import { WasmEngine, type WasmEngineInstance } from './engine.ts';
 import type { FileMeta } from './engine-types.ts';
 
 const enc = new TextEncoder();
@@ -14,30 +14,20 @@ function toBytes(c: Uint8Array | string): Uint8Array {
 }
 
 /**
- * Default the scheme of a peer URL. A bare host (`hub:9000`, `example.com/path`)
- * is assumed to be a *secure* WebSocket — `wss://`. Explicit `ws://`/`wss://` is
- * left untouched; `http(s)://` is mapped to the `ws(s)://` equivalent (a common
- * paste). Empty stays empty so callers can detect "no peer set".
+ * Normalize a pasted peer spec. With iroh, a peer is an opaque **ticket** (or a
+ * bare node id) — there is no URL scheme to default. We just trim; empty stays
+ * empty so callers can detect "no peer set". (Kept as a named export for callers
+ * that previously normalized a URL.)
  */
-export function normalizePeerUrl(url: string): string {
-  const u = url.trim();
-  if (!u) return '';
-  if (/^wss?:\/\//i.test(u)) return u;
-  if (/^https:\/\//i.test(u)) return u.replace(/^https:\/\//i, 'wss://');
-  if (/^http:\/\//i.test(u)) return u.replace(/^http:\/\//i, 'ws://');
-  return `wss://${u.replace(/^\/+/, '')}`;
+export function normalizePeerUrl(spec: string): string {
+  return spec.trim();
 }
 
 export interface SyncOptions {
   authKey?: string;
-  /** Idle window (ms) after which a one-shot sync is considered converged. */
-  idleMs?: number;
-  /** Overall timeout (ms). */
-  timeoutMs?: number;
-  /** Connect-phase timeout (ms): how long to wait for the WebSocket to open
-   * before giving up. A mistyped-but-TCP-reachable URL can otherwise hang until
-   * the OS TCP timeout (or forever); this bounds it. */
-  connectMs?: number;
+  /** Override the default public relays with a specific relay URL — e.g. a
+   * self-hosted `asp relay`, or a local relay in tests. */
+  relayUrl?: string;
 }
 
 /**
@@ -91,8 +81,6 @@ export interface EngineVault {
 
 export class Vault {
   private eng: WasmEngineInstance;
-  /** Set while a `sync` is in flight; closes its socket. See {@link cancel}. */
-  private activeAbort?: () => void;
 
   /** Create a thin node. An empty `vaultId` adopts the peer's vault on connect. */
   constructor(seed: Uint8Array, vaultId = '') {
@@ -182,141 +170,23 @@ export class Vault {
   }
 
   /**
-   * One-shot sync against a listening `asp` peer: connect, run the mutual-auth
-   * handshake + bidirectional version-vector catch-up, converge, and close.
-   * Resolves with the number of rows integrated FROM the peer this pass — so a
-   * caller can skip an expensive re-materialize when nothing new arrived (0).
+   * One-shot sync against a listening `asp` peer over **iroh**: dial the peer's
+   * ticket (via a relay — a browser can't do UDP), run the mutual-auth handshake
+   * + bidirectional version-vector catch-up, converge, and close. Resolves with
+   * the number of rows integrated FROM the peer this pass — so a caller can skip
+   * an expensive re-materialize when nothing new arrived (0). iroh runs inside
+   * the wasm engine; this method is host glue only.
    */
-  async sync(url: string, opts: SyncOptions = {}): Promise<number> {
-    // Completion is explicit (the listener sends Synced; see feed → synced), so
-    // idle is only a dead-peer/stalled-link backstop — generous, because a single
-    // large attachment is one multi-second frame and must not be read as a dead
-    // link. No tail: Synced ends the normal case at once. timeoutMs is the hard
-    // ceiling for the whole pass — a first full clone of a big vault streams for
-    // a while (the old 15s cut large clones short).
-    const idleMs = opts.idleMs ?? 30000;
-    const timeoutMs = opts.timeoutMs ?? 180000;
-    const connectMs = opts.connectMs ?? 20000;
-    const base = normalizePeerUrl(url);
-    const fullUrl = opts.authKey
-      ? `${base}${base.includes('?') ? '&' : '?'}auth_key=${encodeURIComponent(opts.authKey)}`
-      : base;
-
-    const ws = new WebSocket(fullUrl);
-    ws.binaryType = 'arraybuffer';
-
-    // A cancel handle: cancel() closes the socket and flags the pass so the
-    // close/error handlers reject with a clear "cancelled" error rather than a
-    // generic connect failure. Cleared in the finally so a later sync starts fresh.
-    let cancelled = false;
-    this.activeAbort = () => {
-      cancelled = true;
-      try {
-        ws.close();
-      } catch {}
-    };
-    try {
-      await new Promise<void>((resolve, reject) => {
-        // A WebSocket 'error' Event carries no detail by design (so logging it
-        // raw yields a useless "[object Event]"). The informative signal is the
-        // 'close' that follows a failed upgrade — its code/reason tells you what
-        // happened (e.g. 1006 = abnormal close, what a 502/unreachable host
-        // looks like; 1008/4001 = the hub rejected the auth key). Surface the
-        // host + whichever fires first.
-        let settled = false;
-        let connectTimer: ReturnType<typeof setTimeout>;
-        const fail = (detail: string) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(connectTimer);
-          reject(new Error(cancelled ? `sync cancelled (${base})` : `ws connect failed (${base}): ${detail}`));
-        };
-        // Bound the connect phase: without this, a TCP-reachable-but-wrong URL
-        // (or a black-hole host) hangs until the OS TCP timeout, with no error.
-        connectTimer = setTimeout(() => fail(`connect timed out after ${Math.round(connectMs / 1000)}s`), connectMs);
-        ws.addEventListener('open', () => { settled = true; clearTimeout(connectTimer); resolve(); }, { once: true });
-        ws.addEventListener('error', () => fail(`connection error (readyState ${ws.readyState})`), { once: true });
-        ws.addEventListener('close', (ev) => {
-          const c = ev as CloseEvent;
-          fail(`closed before handshake — code ${c.code}${c.reason ? ` (${c.reason})` : ''}`);
-        }, { once: true });
-      });
-
-      return await new Promise<number>((resolve, reject) => {
-        let integrated = 0;
-        let synced = false; // did the peer send its explicit completion signal?
-        let settled = false;
-        let idle: ReturnType<typeof setTimeout> | undefined;
-        const hardStop = setTimeout(() => done(new Error('sync timed out')), timeoutMs);
-        const done = (err?: Error) => {
-          if (settled) return; // first outcome wins (close fires after we close)
-          settled = true;
-          clearTimeout(idle);
-          clearTimeout(hardStop);
-          try {
-            ws.close();
-          } catch {}
-          if (err) reject(err);
-          else resolve(integrated);
-        };
-        // Idle is a STALL backstop, NOT a completion. A healthy peer always ends
-        // catch-up with `Synced`; going idle without it means the link stalled
-        // mid-stream — an INCOMPLETE catch-up. Resolving it as success let a
-        // partial pull through, after which `reconcile` mints fresh ids for every
-        // not-yet-received file and the whole vault duplicates (the mobile dup
-        // loop). So a stall must FAIL.
-        const resetIdle = () => {
-          clearTimeout(idle);
-          idle = setTimeout(() => done(new Error(`sync stalled before completion (${base}) — catch-up incomplete`)), idleMs);
-        };
-
-        ws.addEventListener('message', (ev: MessageEvent) => {
-          const frame = new Uint8Array(ev.data as ArrayBuffer);
-          let r: FeedResult;
-          try {
-            r = JSON.parse(this.eng.feed(frame)) as FeedResult;
-          } catch (e) {
-            return done(e as Error);
-          }
-          integrated += r.integrated;
-          for (const out of r.out) ws.send(Uint8Array.from(out));
-          // A protocol-level close is always a failure (denied / proto mismatch /
-          // different vault) — surface it; never treat it as converged.
-          if (r.closed) return done(new Error(r.closed));
-          // The ONE success path: the peer finished streaming our catch-up.
-          if (r.synced) {
-            synced = true;
-            return done();
-          }
-          resetIdle();
-        });
-        // A socket close BEFORE `Synced` is an incomplete catch-up — reject, so the
-        // caller never reconciles against a partial pull and mints duplicates.
-        ws.addEventListener('close', () =>
-          done(
-            cancelled
-              ? new Error(`sync cancelled (${base})`)
-              : synced
-                ? undefined
-                : new Error(`sync closed before completion (${base}) — catch-up incomplete`),
-          ),
-        );
-        ws.addEventListener('error', () => done(new Error('ws error during sync')));
-
-        // Opening Hello.
-        ws.send(this.eng.connect_start());
-        resetIdle();
-      });
-    } finally {
-      this.activeAbort = undefined;
-    }
+  async sync(ticket: string, opts: SyncOptions = {}): Promise<number> {
+    const spec = ticket.trim();
+    if (!spec) throw new Error('sync: empty peer ticket');
+    return await this.eng.sync(spec, opts.authKey, opts.relayUrl);
   }
 
-  /** Abort an in-flight {@link sync}: close the socket so the pending pass
-   * rejects. A no-op when nothing is in flight. */
-  cancel(): void {
-    this.activeAbort?.();
-  }
+  /** Abort an in-flight {@link sync}. iroh drives the connection inside the wasm
+   * engine with its own timeouts, so there is no socket to close from here; this
+   * is a no-op kept for API compatibility with the {@link EngineVault} interface. */
+  cancel(): void {}
 
   free(): void {
     this.eng.free();

@@ -75,11 +75,13 @@ pub async fn sync_oneshot(
     auth_keys: Vec<String>,
     relay_url: Option<String>,
 ) -> Result<usize, String> {
-    let seed = eng.device_seed();
-    let ep = bind(&seed, relay_url).await?;
+    // Parse the ticket first (cheap, fails fast on a malformed/empty ticket
+    // before we bind an endpoint or touch the network).
     let addr: EndpointAddr = EndpointTicket::from_str(ticket.trim())
         .map(EndpointAddr::from)
         .map_err(|e| format!("bad ticket: {e}"))?;
+    let seed = eng.device_seed();
+    let ep = bind(&seed, relay_url).await?;
 
     let result = drive(&ep, &eng, addr, auth_keys).await;
     ep.close().await;
@@ -94,6 +96,7 @@ async fn drive(
 ) -> Result<usize, String> {
     let conn = ep.connect(addr, ALPN).await.map_err(|e| format!("connect: {e}"))?;
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
+    use n0_future::time::{timeout, Duration};
 
     let admit = AdmitCtx {
         no_tofu: false,
@@ -139,11 +142,19 @@ async fn drive(
             }
         }
         if done {
+            // Send a graceful `Bye` end-marker, then wait for the listener to
+            // close the connection — it does so only after draining our catch-up
+            // rows (QUIC orders our `Rows` before this `Bye`). This guarantees our
+            // pushed edits were received before we tear down; a fixed delay would
+            // race the relay RTT and silently drop the push.
+            let _ = write_frame(&mut send, &Msg::Bye.to_bytes().map_err(|e| e.to_string())?).await;
+            let _ = send.finish();
+            let _ = timeout(Duration::from_secs(10), conn.closed()).await;
             break;
         }
     }
-    let _ = send.finish();
     if !synced {
+        let _ = send.finish();
         return Err("sync closed before completion — catch-up incomplete".into());
     }
     Ok(integrated)

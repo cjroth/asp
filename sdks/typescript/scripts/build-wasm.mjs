@@ -17,6 +17,9 @@ for (const [target, out] of [
   const res = spawnSync('wasm-pack', ['build', '--release', '--target', target, '--out-dir', out], {
     cwd: crateDir,
     stdio: 'inherit',
+    // iroh-in-wasm pulls getrandom 0.3+, whose browser backend is opt-in via this
+    // cfg (no UDP in the sandbox → iroh relays QUIC over a WebSocket).
+    env: { ...process.env, RUSTFLAGS: `${process.env.RUSTFLAGS ?? ''} --cfg getrandom_backend="wasm_js"`.trim() },
   });
   if (res.status !== 0) {
     console.error('[build-wasm] wasm-pack failed. Install: cargo install wasm-pack');

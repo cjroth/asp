@@ -34,6 +34,11 @@ export interface WasmEngineInstance {
   files_detail_json(): string;
   connect_start(): Uint8Array;
   feed(frame: Uint8Array): string;
+  /** Sync over iroh: dial `ticket` (an iroh ticket) via a relay, run the
+   * handshake + version-vector catch-up, converge, and close. Resolves with the
+   * number of rows integrated from the peer. `relayUrl` overrides the default
+   * public relays (a private/test relay). iroh runs inside the wasm module. */
+  sync(ticket: string, authKey?: string, relayUrl?: string): Promise<number>;
   free(): void;
 }
 
