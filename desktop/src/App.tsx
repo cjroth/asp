@@ -5,7 +5,7 @@ import { api, type VaultInfo } from './lib/api';
 export default function App() {
   const [vaults, setVaults] = useState<VaultInfo[]>([]);
   const [identity, setIdentity] = useState('');
-  const [cloneUrl, setCloneUrl] = useState('');
+  const [cloneTicket, setCloneTicket] = useState('');
   const [authKey, setAuthKey] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -31,10 +31,10 @@ export default function App() {
 
   const cloneRemote = async () => {
     const dest = await open({ directory: true });
-    if (typeof dest === 'string' && cloneUrl) {
+    if (typeof dest === 'string' && cloneTicket) {
       setBusy(true);
       try {
-        await api.cloneRemote(dest, cloneUrl, authKey || undefined);
+        await api.cloneRemote(dest, cloneTicket, authKey || undefined);
         await reload();
       } finally {
         setBusy(false);
@@ -51,9 +51,9 @@ export default function App() {
         <button type="button" onClick={addFolder} disabled={busy}>
           Add folder
         </button>
-        <input placeholder="wss://hub:9000" value={cloneUrl} onChange={(e) => setCloneUrl(e.target.value)} />
+        <input placeholder="paste an iroh ticket" value={cloneTicket} onChange={(e) => setCloneTicket(e.target.value)} />
         <input placeholder="auth key" value={authKey} onChange={(e) => setAuthKey(e.target.value)} />
-        <button type="button" onClick={cloneRemote} disabled={busy || !cloneUrl}>
+        <button type="button" onClick={cloneRemote} disabled={busy || !cloneTicket}>
           Clone remote
         </button>
       </section>
@@ -67,7 +67,7 @@ export default function App() {
 }
 
 function VaultRow({ vault, authKey, onChange }: { vault: VaultInfo; authKey: string; onChange: () => void }) {
-  const [port, setPort] = useState<number | null>(vault.listening_port);
+  const [ticket, setTicket] = useState<string | null>(vault.listening_ticket);
   const [rows, setRows] = useState<number | null>(null);
 
   useEffect(() => {
@@ -75,8 +75,8 @@ function VaultRow({ vault, authKey, onChange }: { vault: VaultInfo; authKey: str
   }, [vault.id]);
 
   const toggleListen = async () => {
-    const p = await api.setAllowConnections(vault.id, port == null, authKey || undefined);
-    setPort(p);
+    const t = await api.setAllowConnections(vault.id, ticket == null, authKey || undefined);
+    setTicket(t);
     onChange();
   };
 
@@ -85,11 +85,11 @@ function VaultRow({ vault, authKey, onChange }: { vault: VaultInfo; authKey: str
       <div style={{ fontWeight: 600 }}>{vault.path}</div>
       <div style={{ fontSize: 12, color: '#777' }}>
         vault {vault.vault_id.slice(0, 8)} · {rows ?? '…'} rows
-        {port != null ? ` · listening on ws://127.0.0.1:${port}` : ''}
+        {ticket != null ? ` · listening (ticket ${ticket.slice(0, 20)}…)` : ''}
       </div>
       <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
         <button type="button" onClick={toggleListen}>
-          {port == null ? 'Allow connections' : 'Stop listening'}
+          {ticket == null ? "Allow connections" : "Stop listening"}
         </button>
       </div>
     </div>

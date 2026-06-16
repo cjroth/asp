@@ -7,7 +7,8 @@ export interface VaultInfo {
   path: string;
   vault_id: string;
   enabled: boolean;
-  listening_port: number | null;
+  // The iroh connection ticket this folder is listening on (share to pair), or null.
+  listening_ticket: string | null;
 }
 export interface VaultStatus {
   id: string;
@@ -15,18 +16,19 @@ export interface VaultStatus {
   rows: number;
   files: number;
   head: string;
-  listening_port: number | null;
+  listening_ticket: string | null;
   peers: string[];
 }
 
 export const api = {
   listVaults: () => invoke<VaultInfo[]>('list_vaults'),
   addLocalFolder: (path: string) => invoke<VaultInfo>('add_local_folder', { path }),
-  cloneRemote: (dest: string, url: string, authKey?: string) =>
-    invoke<VaultInfo>('clone_remote', { dest, url, authKey }),
+  // `ticket` is an iroh ticket or bare node id (replaces the old ws:// URL).
+  cloneRemote: (dest: string, ticket: string, authKey?: string) =>
+    invoke<VaultInfo>('clone_remote', { dest, ticket, authKey }),
   setAllowConnections: (id: string, on: boolean, authKey?: string) =>
-    invoke<number | null>('set_allow_connections', { id, on, authKey }),
-  syncNow: (id: string, url: string, authKey?: string) => invoke<void>('sync_now', { id, url, authKey }),
+    invoke<string | null>('set_allow_connections', { id, on, authKey }),
+  syncNow: (id: string, ticket: string, authKey?: string) => invoke<void>('sync_now', { id, ticket, authKey }),
   getStatus: (id: string) => invoke<VaultStatus>('get_status', { id }),
   getIdentity: () => invoke<string>('get_identity'),
   authorize: (id: string, pubkey: string) => invoke<void>('authorize', { id, pubkey }),
