@@ -78,14 +78,17 @@ impl AuthOpts {
     }
 }
 
-type Conns = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Msg>>>>;
-static CONN_SEQ: AtomicU64 = AtomicU64::new(1);
+/// Registry of live peer connections for real-time fan-out (hub forward-then-
+/// merge + the watcher's live push). Transport-agnostic — shared by the iroh
+/// driver. Keyed by a process-unique connection id.
+pub(crate) type Conns = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Msg>>>>;
+pub(crate) static CONN_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-async fn fanout(conns: &Conns, except: u64, msg: &Msg) {
+pub(crate) async fn fanout(conns: &Conns, except: u64, msg: &Msg) {
     let map = conns.lock().await;
     for (id, tx) in map.iter() {
         if *id != except {

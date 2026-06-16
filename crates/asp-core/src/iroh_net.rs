@@ -12,14 +12,19 @@
 //! the handshake / catch-up / integrate state machine is byte-for-byte the same
 //! as every other surface — only the bytes' carrier changed.
 
-use crate::net::{now_unix, AuthOpts, EngineRef};
+use crate::net::{fanout, now_unix, AuthOpts, Conns, EngineRef, CONN_SEQ};
 use crate::session::Step;
 use crate::{Msg, NodeId, Role, Session};
 use anyhow::{anyhow, Result};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, TransportAddr};
+use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey, TransportAddr};
+use iroh_tickets::endpoint::EndpointTicket;
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
 /// Application-layer protocol negotiated on the QUIC connection. A bump here is a
 /// hard, visible transport-incompatibility boundary (distinct from the in-band
@@ -76,6 +81,34 @@ pub fn loopback_addr(ep: &Endpoint) -> EndpointAddr {
     addr
 }
 
+// ---------------- addressing (tickets / node ids) ----------------
+
+/// This node's shareable connection **ticket** — its `NodeId` plus relay/direct
+/// address hints, base32-encoded for copy-paste / QR. With relays on, waits for
+/// the home relay so the ticket is dialable from anywhere; relay-less, it carries
+/// whatever direct addresses are known.
+pub async fn ticket(ep: &Endpoint, relays: bool) -> Result<String> {
+    if relays {
+        // Ensure the home relay (and thus a globally-dialable address) is present.
+        ep.online().await;
+    }
+    Ok(EndpointTicket::new(ep.addr()).to_string())
+}
+
+/// Parse a peer spec into a dial address: an iroh **ticket** (preferred — carries
+/// relay/address hints) or a bare 64-hex **`NodeId`** (resolved via discovery).
+pub fn parse_peer(s: &str) -> Result<EndpointAddr> {
+    let s = s.trim();
+    if let Ok(t) = s.parse::<EndpointTicket>() {
+        return Ok(EndpointAddr::from(t));
+    }
+    if let Some(node) = NodeId::from_hex(s) {
+        let pk = PublicKey::from_bytes(&node.0).map_err(|e| anyhow!("bad node id: {e}"))?;
+        return Ok(EndpointAddr::from(pk));
+    }
+    Err(anyhow!("not an iroh ticket or 64-hex node id: {s}"))
+}
+
 // ---------------- framing ----------------
 
 /// Write one length-delimited frame: a `u32` big-endian length, then the bytes.
@@ -112,21 +145,45 @@ async fn send_msg(send: &mut SendStream, msg: &Msg) -> Result<()> {
 
 // ---------------- session driver ----------------
 
-/// Drive one connection's `Session` to completion over an iroh bi-stream. A
-/// oneshot connector (`sync`/`clone`) finishes when the peer signals `Synced`; a
-/// listener stays until the peer closes. `on_auth` surfaces the authenticated
-/// peer `NodeId` (used by `clone` to pin the listener).
+/// Drive one connection's `Session` over an iroh bi-stream. A oneshot connector
+/// (`sync`/`clone`) finishes when the peer signals `Synced`; a listener / `watch`
+/// connector (`oneshot=false`) stays open for live push. Registers itself in
+/// `conns` so the watcher and other peers can fan out new rows to it (hub
+/// forward-then-merge). `on_auth` surfaces the authenticated peer `NodeId`.
+///
+/// A QUIC `RecvStream` read is **not** cancel-safe (a half-read length-delimited
+/// frame would lose bytes if dropped by `select!`), so a dedicated reader task
+/// owns `recv` and forwards whole frames over a channel; the main loop only
+/// selects over cancel-safe channel receives.
 async fn drive(
     mut send: SendStream,
-    mut recv: RecvStream,
+    recv: RecvStream,
     engine: EngineRef,
     mut session: Session,
     oneshot: bool,
+    conns: Conns,
     on_auth: Option<mpsc::UnboundedSender<NodeId>>,
 ) -> Result<()> {
+    let conn_id = CONN_SEQ.fetch_add(1, Ordering::SeqCst);
+    let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+    conns.lock().await.insert(conn_id, tx);
+
+    // Reader task: owns `recv`, ships each whole frame over `inbound`.
+    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let reader = tokio::spawn(async move {
+        let mut recv = recv;
+        while let Ok(Some(frame)) = read_frame(&mut recv).await {
+            if inbound_tx.send(frame).is_err() {
+                break;
+            }
+        }
+    });
+
     for step in session.start() {
         if let Step::Send(m) = step {
-            send_msg(&mut send, &m).await?;
+            if send_msg(&mut send, &m).await.is_err() {
+                break;
+            }
         }
     }
 
@@ -136,9 +193,24 @@ async fn drive(
     // `Denied` frame — so completion, not a clean close, is the success gate.
     let mut completed = false;
     let result: Result<()> = loop {
-        let frame = match read_frame(&mut recv).await? {
-            Some(f) => f,
-            None => break Ok(()),
+        let frame = tokio::select! {
+            biased;
+            // Outbound live push (watcher / fan-out from a sibling connection).
+            outbound = rx.recv() => {
+                match outbound {
+                    Some(m) => {
+                        if send_msg(&mut send, &m).await.is_err() { break Ok(()); }
+                        continue;
+                    }
+                    None => break Ok(()),
+                }
+            }
+            inbound = inbound_rx.recv() => {
+                match inbound {
+                    Some(f) => f,
+                    None => break Ok(()), // peer closed
+                }
+            }
         };
         let msg = match Msg::from_bytes(&frame) {
             Ok(m) => m,
@@ -155,17 +227,24 @@ async fn drive(
         let mut closing = false;
         for step in steps {
             match step {
-                Step::Send(m) => send_msg(&mut send, &m).await?,
+                Step::Send(m) => {
+                    if send_msg(&mut send, &m).await.is_err() {
+                        closing = true;
+                        break;
+                    }
+                }
                 Step::Authenticated(node) => {
                     tracing::info!(peer = %&node.to_hex()[..12], "iroh handshake ok");
                     if let Some(s) = &on_auth {
                         let _ = s.send(node);
                     }
                 }
-                Step::Integrated(_rows) => {
-                    // Live fan-out to other peers (hub forward-then-merge) is added
-                    // with the multi-connection watch host; a single sync/clone
-                    // connection has no siblings to forward to.
+                Step::Integrated(rows) => {
+                    // Hub forward-then-merge: push newly-integrated rows to every
+                    // other live peer so a relay propagates without re-folding.
+                    for wr in rows {
+                        fanout(&conns, conn_id, &Msg::Push { row: Box::new(wr) }).await;
+                    }
                 }
                 Step::Closed(reason) => {
                     if reason.contains("denied") || reason.contains("different vault") {
@@ -174,6 +253,8 @@ async fn drive(
                         } else {
                             ""
                         };
+                        conns.lock().await.remove(&conn_id);
+                        reader.abort();
                         return Err(anyhow!("{reason}{hint}"));
                     }
                     tracing::info!(reason, "closing");
@@ -198,6 +279,8 @@ async fn drive(
         }
     };
 
+    conns.lock().await.remove(&conn_id);
+    reader.abort();
     let _ = send.finish();
     // A oneshot that never completed catch-up was rejected/unreachable/denied.
     if oneshot && result.is_ok() && (!session.authed() || !completed) {
@@ -239,15 +322,23 @@ async fn stream_catchup(
 
 // ---------------- listener (hub) ----------------
 
+/// A fresh, empty connection registry (no live siblings to fan out to). Used by
+/// oneshot `sync`/`clone`; `watch` shares one registry across all peers.
+pub fn new_conns() -> Conns {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
 /// Accept inbound iroh connections forever, driving each as a listener `Session`
-/// gated by the `authorized_keys` admission set.
-pub async fn serve(engine: EngineRef, ep: Endpoint, auth: AuthOpts) -> Result<()> {
+/// gated by the `authorized_keys` admission set. `conns` is the shared registry
+/// so inbound peers receive the watcher's live pushes and each other's rows.
+pub async fn serve(engine: EngineRef, ep: Endpoint, auth: AuthOpts, conns: Conns) -> Result<()> {
     tracing::info!(endpoint = %ep.id().fmt_short(), "iroh listening");
     while let Some(incoming) = ep.accept().await {
         let engine = engine.clone();
         let auth = auth.clone();
+        let conns = conns.clone();
         tokio::spawn(async move {
-            if let Err(e) = accept_one(incoming, engine, auth).await {
+            if let Err(e) = accept_one(incoming, engine, auth, conns).await {
                 tracing::debug!("iroh accept error: {e}");
             }
         });
@@ -259,6 +350,7 @@ async fn accept_one(
     incoming: iroh::endpoint::Incoming,
     engine: EngineRef,
     auth: AuthOpts,
+    conns: Conns,
 ) -> Result<()> {
     let conn = incoming.await.map_err(|e| anyhow!("accept: {e}"))?;
     let (send, recv) = conn.accept_bi().await.map_err(|e| anyhow!("accept_bi: {e}"))?;
@@ -270,19 +362,21 @@ async fn accept_one(
         Session::with_auth(Role::Listener, &*eng, Vec::new(), None, admit, auth.auth_keys.clone())
     };
     let _peer = node_id_of(&conn);
-    drive(send, recv, engine, session, false, None).await
+    drive(send, recv, engine, session, false, conns, None).await
 }
 
 // ---------------- connector (sync / clone / watch) ----------------
 
 /// Dial a peer by address and drive a connector `Session`. `oneshot` ends on the
-/// peer's `Synced`; a persistent `watch` passes `false` and stays connected.
+/// peer's `Synced`; a persistent `watch` passes `false` and stays connected so
+/// the watcher's live pushes (over `conns`) reach it.
 pub async fn connect(
     engine: EngineRef,
     ep: &Endpoint,
     addr: EndpointAddr,
     auth: &AuthOpts,
     oneshot: bool,
+    conns: Conns,
     on_auth: Option<mpsc::UnboundedSender<NodeId>>,
 ) -> Result<()> {
     let conn = ep
@@ -301,11 +395,25 @@ pub async fn connect(
             auth.auth_keys.clone(),
         )
     };
-    drive(send, recv, engine, session, oneshot, on_auth).await
+    drive(send, recv, engine, session, oneshot, conns, on_auth).await
+}
+
+/// One-shot sync: capture local disk changes, connect, exchange, exit.
+pub async fn sync_oneshot(
+    engine: EngineRef,
+    ep: &Endpoint,
+    addr: EndpointAddr,
+    auth: &AuthOpts,
+) -> Result<()> {
+    {
+        let eng = engine.lock().unwrap();
+        eng.capture_rescan()?;
+    }
+    connect(engine, ep, addr, auth, true, new_conns(), None).await
 }
 
 /// Clone bootstrap: connect with an empty local vault, adopt the peer's vault,
-/// pull everything, then pin the listener as a peer.
+/// pull everything, then pin the listener as a peer (by its `NodeId`).
 pub async fn clone_bootstrap(
     engine: EngineRef,
     ep: &Endpoint,
@@ -313,13 +421,11 @@ pub async fn clone_bootstrap(
     auth: &AuthOpts,
 ) -> Result<()> {
     let (auth_tx, mut auth_rx) = mpsc::unbounded_channel::<NodeId>();
-    let ticket_id = addr.id;
-    connect(engine.clone(), ep, addr, auth, true, Some(auth_tx)).await?;
+    connect(engine.clone(), ep, addr, auth, true, new_conns(), Some(auth_tx)).await?;
     if let Ok(node) = auth_rx.try_recv() {
         let eng = engine.lock().unwrap();
         let _ = eng.store.add_peer(&node.to_hex(), &node.to_hex(), now_unix());
     }
-    let _ = ticket_id;
     Ok(())
 }
 
@@ -353,7 +459,7 @@ mod tests {
         let dial = loopback_addr(&srv_ep);
 
         let srv_engine: EngineRef = Arc::new(StdMutex::new(srv));
-        let server = tokio::spawn(serve(srv_engine, srv_ep, AuthOpts::default()));
+        let server = tokio::spawn(serve(srv_engine, srv_ep, AuthOpts::default(), new_conns()));
 
         let cli = Engine::init(cli_dir.path(), cli_id).unwrap();
         let cli_engine: EngineRef = Arc::new(StdMutex::new(cli));
@@ -387,7 +493,7 @@ mod tests {
 
         let srv_engine: EngineRef = Arc::new(StdMutex::new(srv));
         let opts = AuthOpts { no_tofu: true, ..Default::default() };
-        let server = tokio::spawn(serve(srv_engine, srv_ep, opts));
+        let server = tokio::spawn(serve(srv_engine, srv_ep, opts, new_conns()));
 
         let cli = Engine::init(cli_dir.path(), cli_id).unwrap();
         let cli_engine: EngineRef = Arc::new(StdMutex::new(cli));
@@ -416,7 +522,7 @@ mod tests {
             // Listener configures the enrollment secret "S3CRET" (no pre-authorized
             // keys; auth-key configured implicitly disables TOFU).
             let srv_opts = AuthOpts { auth_keys: vec!["S3CRET".into()], ..Default::default() };
-            let server = tokio::spawn(serve(srv_engine, srv_ep, srv_opts));
+            let server = tokio::spawn(serve(srv_engine, srv_ep, srv_opts, new_conns()));
             let cli = Engine::init(cli_dir.path(), cli_id).unwrap();
             let cli_engine: EngineRef = Arc::new(StdMutex::new(cli));
             let cli_opts = AuthOpts { auth_keys: vec![secret.into()], ..Default::default() };
@@ -434,5 +540,68 @@ mod tests {
         let (bad, dir) = attempt("WRONG", 23).await;
         assert!(bad.is_err(), "a wrong auth key must be denied");
         assert!(!dir.path().join("enrolled.md").exists(), "no data may leak on a bad key");
+    }
+
+    /// Persistent `watch` over iroh: a connector stays connected after catch-up
+    /// and receives a **live push** when the hub authors a new row — the
+    /// real-time path (conns registry + fan-out), not just one-shot catch-up.
+    #[tokio::test]
+    async fn iroh_live_push_reaches_a_watching_peer() {
+        let srv_dir = tempdir().unwrap();
+        let cli_dir = tempdir().unwrap();
+        let srv_id = Identity::from_seed(&[31; 32]);
+        let cli_id = Identity::from_seed(&[32; 32]);
+        let srv = Engine::init(srv_dir.path(), srv_id.clone()).unwrap();
+        srv.record_write("base.md", b"start\n").unwrap();
+        srv.authorize(&cli_id.to_ssh_string(), None, true, "test").unwrap();
+
+        let srv_ep = bind_endpoint(&srv_id.seed(), false).await.unwrap();
+        let cli_ep = bind_endpoint(&cli_id.seed(), false).await.unwrap();
+        let dial = loopback_addr(&srv_ep);
+        let srv_engine: EngineRef = Arc::new(StdMutex::new(srv));
+        let srv_conns = new_conns();
+        let server = tokio::spawn(serve(srv_engine.clone(), srv_ep, AuthOpts::default(), srv_conns.clone()));
+
+        // The client clones to adopt the vault, then connects a persistent watch.
+        let cli = Engine::init(cli_dir.path(), cli_id).unwrap();
+        let cli_engine: EngineRef = Arc::new(StdMutex::new(cli));
+        clone_bootstrap(cli_engine.clone(), &cli_ep, dial.clone(), &AuthOpts::default())
+            .await
+            .unwrap();
+        let watcher = {
+            let (e, a) = (cli_engine.clone(), AuthOpts::default());
+            let ep = cli_ep.clone();
+            let dial = dial.clone();
+            tokio::spawn(async move { connect(e, &ep, dial, &a, false, new_conns(), None).await })
+        };
+
+        // Give the watch connection time to handshake + register.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // The hub authors a new row and fans it out live to connected peers.
+        let pushed = {
+            let eng = srv_engine.lock().unwrap();
+            eng.record_write("live.md", b"pushed live\n").unwrap();
+            let site = eng.site_id();
+            crate::SessionVault::rows_after_wire(&*eng, &site, -1).unwrap()
+        };
+        for wr in pushed {
+            if wr.row.path.as_deref() == Some("live.md") {
+                fanout(&srv_conns, 0, &Msg::Push { row: Box::new(wr) }).await;
+            }
+        }
+
+        // The watching client should materialize the pushed file within a bound.
+        let mut got = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if cli_dir.path().join("live.md").exists() {
+                got = true;
+                break;
+            }
+        }
+        assert!(got, "a live push must reach and materialize on a watching peer");
+        assert_eq!(std::fs::read(cli_dir.path().join("live.md")).unwrap(), b"pushed live\n");
+        watcher.abort();
+        server.abort();
     }
 }
