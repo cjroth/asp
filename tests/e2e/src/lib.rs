@@ -48,6 +48,9 @@ impl Node {
         let mut c = Command::new(&self.bin);
         c.env("ASP_HOME", &self.home);
         c.env("ASP_LOG", "warn");
+        // Hermetic: no public n0 relays/DNS — peers dial directly by the ticket's
+        // embedded loopback/LAN addresses (every node is on the same host).
+        c.env("ASP_NO_RELAY", "1");
         c.arg("--dir").arg(&self.dir);
         c
     }
@@ -192,47 +195,39 @@ impl Node {
     }
 }
 
-/// A listening relay/hub: `asp watch --listen` in the background. Killed on drop.
+/// A listening relay/hub: `asp watch --listen` in the background, dialed by the
+/// **iroh ticket** it prints on start. Killed on drop.
 pub struct Hub {
     child: Child,
-    pub port: u16,
+    ticket: String,
     pub dir: PathBuf,
-    secure: bool,
     _home: PathBuf,
     _drain: std::thread::JoinHandle<()>,
 }
 
 impl Hub {
     pub fn start(root: &Path, name: &str, auth_key: Option<&str>, extra: &[&str]) -> Hub {
-        Hub::start_inner(root, name, auth_key, extra, false)
-    }
-
-    /// A `wss://` listener (default transport: self-signed TLS).
-    pub fn start_tls(root: &Path, name: &str, auth_key: Option<&str>) -> Hub {
-        Hub::start_inner(root, name, auth_key, &[], true)
-    }
-
-    fn start_inner(root: &Path, name: &str, auth_key: Option<&str>, extra: &[&str], tls: bool) -> Hub {
         let dir = root.join(name);
         let home = root.join(format!("home-{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&home).unwrap();
         let mut c = Command::new(asp_bin());
-        c.env("ASP_HOME", &home).env("ASP_LOG", "warn").arg("--dir").arg(&dir).args(["watch", "--listen", "--port", "0"]);
-        if !tls {
-            c.arg("--no-tls");
-        }
+        c.env("ASP_HOME", &home)
+            .env("ASP_LOG", "warn")
+            .env("ASP_NO_RELAY", "1")
+            .arg("--dir")
+            .arg(&dir)
+            .args(["watch", "--listen"]);
         if let Some(k) = auth_key {
             c.arg("--auth-key").arg(k);
         }
         c.args(extra);
-        let secure = tls;
         c.stdout(Stdio::piped()).stderr(Stdio::null());
         let mut child = c.spawn().expect("spawn hub");
         let stdout = child.stdout.take().unwrap();
 
-        // Read stdout until the listen line; keep draining afterwards.
-        let (tx, rx) = mpsc::channel::<u16>();
+        // Read stdout until the ticket line; keep draining afterwards.
+        let (tx, rx) = mpsc::channel::<String>();
         let drain = std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
@@ -243,8 +238,8 @@ impl Hub {
                     Ok(0) => break,
                     Ok(_) => {
                         if !sent {
-                            if let Some(p) = parse_port(&line) {
-                                let _ = tx.send(p);
+                            if let Some(t) = parse_ticket(&line) {
+                                let _ = tx.send(t);
                                 sent = true;
                             }
                         }
@@ -254,13 +249,13 @@ impl Hub {
             }
         });
 
-        let port = rx.recv_timeout(Duration::from_secs(20)).expect("hub did not announce a port");
-        Hub { child, port, dir, secure, _home: home, _drain: drain }
+        let ticket = rx.recv_timeout(Duration::from_secs(20)).expect("hub did not announce a ticket");
+        Hub { child, ticket, dir, _home: home, _drain: drain }
     }
 
+    /// The hub's connection ticket — the peer spec for `clone`/`sync`/`--peer`.
     pub fn url(&self) -> String {
-        let scheme = if self.secure { "wss" } else { "ws" };
-        format!("{scheme}://127.0.0.1:{}", self.port)
+        self.ticket.clone()
     }
 }
 
@@ -271,13 +266,8 @@ impl Drop for Hub {
     }
 }
 
-fn parse_port(line: &str) -> Option<u16> {
-    // Scheme-agnostic: matches both "ws://0.0.0.0:PORT" and "wss://0.0.0.0:PORT".
-    let marker = "://0.0.0.0:";
-    let idx = line.find(marker)? + marker.len();
-    let rest = &line[idx..];
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-    rest[..end].parse().ok()
+fn parse_ticket(line: &str) -> Option<String> {
+    line.strip_prefix("ticket: ").map(|t| t.trim().to_string())
 }
 
 /// A persistent `asp watch --peer` node (realtime). Killed on drop.
@@ -291,11 +281,12 @@ impl Watcher {
         let mut c = Command::new(asp_bin());
         c.env("ASP_HOME", &node.home)
             .env("ASP_LOG", "warn")
+            .env("ASP_NO_RELAY", "1")
             .arg("--dir")
             .arg(&node.dir)
-            .args(["watch", "--no-tls", "--debounce", "120"]);
+            .args(["watch", "--debounce", "120"]);
         if listen {
-            c.args(["--listen", "--port", "0"]);
+            c.arg("--listen");
         }
         if !peer_url.is_empty() {
             c.arg("--peer").arg(peer_url);
@@ -355,6 +346,7 @@ pub fn admin_cmd(root: &Path, name: &str, args: &[&str]) -> (bool, String, Strin
     let out = Command::new(asp_bin())
         .env("ASP_HOME", &home)
         .env("ASP_LOG", "warn")
+        .env("ASP_NO_RELAY", "1")
         .arg("--dir")
         .arg(&dir)
         .args(args)

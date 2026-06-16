@@ -95,6 +95,15 @@ pub async fn ticket(ep: &Endpoint, relays: bool) -> Result<String> {
         // Ensure the home relay (and thus a globally-dialable address) is present.
         ep.online().await;
     }
+    // Wait (bounded) for at least one dialable address — direct addresses are
+    // discovered asynchronously just after bind, so a ticket minted too eagerly
+    // could carry no address (undialable under `--no-relay`).
+    for _ in 0..200 {
+        if !ep.addr().addrs.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
     Ok(EndpointTicket::new(ep.addr()).to_string())
 }
 
