@@ -63,8 +63,11 @@ not a redesign.
 - **Efficient & real-time at scale** — many small fast changes, many files,
   network-frugal on flaky/mobile links, ≤ ~1s propagation. A single-file edit costs
   work proportional to that file, never to the whole vault.
-- **Peer-to-peer** — no privileged server. An always-on hub is allowed only as
-  *a peer like any other* (relay + store-and-forward), never a special endpoint.
+- **Peer-to-peer** — no privileged server. Transport is **iroh** (QUIC, dial-by-key):
+  direct device-to-device when the network allows, a stateless relay only for setup /
+  last-resort. An always-on **hub** is allowed only as *a peer like any other*
+  (store-and-forward catch-up for the offline case), never a special endpoint; it is
+  dialed by its key like every other node.
 - **Authenticated admission, not open mesh** — every connection is mutually
   authenticated with **ed25519 SSH keys**; a node admits only peers whose key is in
   its **node-local authorized set** (now a SQLite table, §*Security*). Pubkey auth
@@ -475,11 +478,42 @@ shape as the delete-resurrection class we dissolved:
   under arbitrary mesh gossip.)
 - **Bound every frame** (chunk large transfers) so one oversized message can't kill
   a flaky mobile link.
-- **Transport, phased.** *Phase 1:* WebSockets (default `wss://`, §*Security*) to an
-  always-on hub peer. *Phase 2:* **iroh** (QUIC + NAT hole-punching + relay
-  fallback) for true device-to-device P2P — LAN-speed direct sync, the hub demoted
-  to relay-of-last-resort, connection survival across Wi-Fi↔cellular. Phase 2 is an
-  upgrade, not required for correctness.
+- **Transport: iroh (QUIC, dial-by-key).** The single transport is **iroh** — QUIC
+  with NAT hole-punching and relay fallback, where a node is dialed by its **public
+  key** (`NodeId`), not an IP or URL. This is a *direct* device-to-device link
+  whenever the network allows it (LAN speed, the fewest possible hops), transparently
+  falling back to a relay only when a direct path can't be punched, and surviving
+  network changes (Wi-Fi↔cellular) without a reconnect. There is **no `ws://`/`wss://`
+  transport** — it has been removed entirely. The two roles a node can play are
+  unchanged in spirit but renamed for clarity:
+  - **A *relay* is a stateless packet-forwarder** (iroh's relay) used for connection
+    setup, NAT traversal, and as the path of last resort. It **never sees plaintext
+    and never stores data** — every byte across it is end-to-end encrypted under the
+    two nodes' keys. ASP defaults to the public n0 relays and can be pointed at a
+    self-hosted one (`asp relay`, below). A relay is required for any **browser node**
+    (the SDK/Obsidian/demo surfaces): a browser sandbox can't send UDP, so its iroh
+    traffic is always relayed over a WebSocket to a relay — still E2E-encrypted, still
+    dial-by-key, just never a direct hole-punched path.
+  - **A *hub* is an always-on ordinary node that listens** (`asp watch --listen`).
+    Because a relay stores nothing, asynchronous sync (device A writes, closes the
+    lid; device B comes online hours later) still needs a peer that **holds the log**
+    and serves catch-up. That is the hub: a peer like any other, dialed by its
+    `NodeId`, that just happens to stay online. Hubs are not special endpoints and run
+    the same engine as every other node; a single deployment may be **both** a hub
+    and an `asp relay` at once.
+- **Identity is the iroh key.** A node's ed25519 device identity (§*Security*) **is**
+  its iroh `NodeId` — the same key authenticates the QUIC connection and signs the
+  log. No second keypair. iroh's connection handshake mutually authenticates both
+  node keys at the transport layer, so the peer's identity is cryptographically
+  verified before any ASP frame is read (the former hand-rolled cert channel-binding
+  is subsumed; §*Security*).
+- **Addressing: tickets and bare keys.** A peer is reached by an iroh **ticket** (a
+  copy-paste blob bundling the `NodeId` plus relay/address hints) or, when discovery
+  can resolve it, a bare `NodeId`. Tickets are the primary share unit — printed by a
+  listener on start (with a **QR code** for phone-to-desktop pairing), shown in the
+  Obsidian/desktop UIs, and accepted anywhere a peer used to be given as a URL.
+- **Bound every frame** (chunk large transfers) so one oversized message can't kill
+  a flaky mobile link. (Unchanged: framing rides one iroh bi-directional stream.)
 
 ## Security & authentication
 
@@ -530,17 +564,20 @@ queryable, wasm-portable table instead of a side file.
   recommended path for fresh deployments).** A listener MAY be configured with one or
   more **auth keys** — shared secrets that authorize a *new* peer to enroll itself
   into `authorized_keys`. Configured via `ASP_AUTH_KEY` (or `--auth-key`;
-  comma-separated for multiple, supports rotation). On connect the client presents
-  the secret in the WebSocket upgrade — preferred `Authorization: Bearer <key>`;
-  fallback for clients that cannot set headers (e.g. browser `WebSocket`): the
-  `?auth_key=<key>` query parameter or the `bearer.<key>` subprotocol. On match the
-  upgrade succeeds and, after the mutual ed25519 handshake completes, the listener
-  **inserts the client's public key as a row in `authorized_keys`** (with a default
-  expiry) and proceeds normally. **From the next connection onward the client is a
-  plain authorized peer** — the auth key is not used again unless the row is removed
-  or expires. A mismatching key returns HTTP 401 at the upgrade with no fall-through,
-  so operator misconfiguration fails loudly. Absent the header entirely the upgrade
-  proceeds to the handshake — already-enrolled peers connect without the auth key.
+  comma-separated for multiple, supports rotation). Because iroh has **no HTTP
+  upgrade** to carry a header, the client presents the secret **as a field of its
+  first handshake frame** (`Hello.auth_key`), sent over the already-mutually-
+  authenticated, encrypted iroh stream — the same place the connector proves its
+  `NodeId`. On match the listener, after the handshake completes, **inserts the
+  client's public key as a row in `authorized_keys`** (with a default expiry) and
+  proceeds normally. **From the next connection onward the client is a plain
+  authorized peer** — the auth key is not used again unless the row is removed or
+  expires. A configured listener that receives a *mismatching* secret denies admission
+  with a distinct, loud error (`Msg::Denied { reason: "invalid auth key" }`) and no
+  fall-through, so operator misconfiguration fails loudly. A *missing* auth-key field
+  proceeds to normal admission — already-enrolled peers connect without it. (The auth
+  key never authenticates the *channel*; iroh's key handshake already did. It only
+  gates *enrollment*, exactly as before — its blast radius is unchanged.)
   The auth key is **a bootstrap secret, not an API key**: rotating/removing it stops
   *future* enrollments but never severs already-enrolled peers (revoke a specific
   peer by deleting its row). A compromised shared secret therefore has a bounded
@@ -569,31 +606,27 @@ queryable, wasm-portable table instead of a side file.
   list` to inspect. The CLI also accepts a `ttl=NNd added=YYYY-MM-DD` input form,
   normalizing to absolute `expires_at`. Clock skew is irrelevant at day-granularity.
 
-- **Mutual authentication.** The handshake requires each side to sign, with its
-  ed25519 key, a transcript covering both nonces and a binding to the underlying
-  transport, so a captured handshake cannot be replayed/relayed onto another channel.
-  Both directions authenticate: a connecting node also verifies the listener's key,
-  enabling key pinning (`asp clone` pins the listener's NodeId into `peers`).
-
-- **Advertised channel binding (the listener owns it).** The transport binding mixed
-  into the signed transcript is **not** each side's local view of the certificate
-  (that desynchronizes the moment a benign TLS-terminating proxy sits in front of the
-  listener). Instead, the **listener advertises one channel-binding value in its
-  `Hello`** — the SHA-256 of the certificate it serves, or an all-zero/empty
-  *binding-disabled* marker when it runs `--no-tls` behind a TLS terminator — and
-  **both sides sign over that single advertised value**. Separately, and only as an
-  explicit check with its own distinct error, the connector enforces the binding:
-  - *Advertised binding disabled* (all-zero/empty): degraded mode. The connector
-    skips the certificate comparison; trust falls back to the **TOFU-pinned listener
-    identity** (the transcript covers the listener's NodeId, which a MITM cannot
-    forge). Required behind a re-terminating reverse proxy.
-  - *Binding advertised but unobservable* (plaintext `ws://`, or a browser
-    `WebSocket` that cannot read the peer cert): degraded as above; SHOULD warn.
-  - *Binding advertised and observable*: the connector MUST verify the advertised
-    fingerprint equals the certificate it actually saw and MUST abort with a distinct
-    channel-binding error on mismatch — the live MITM / cert-substitution defense.
-  A handshake-transcript or framing change bumps the wire `proto` version so skew is
-  reported as a clear version-mismatch, not an opaque signature error.
+- **Mutual authentication is the iroh connection.** iroh dials *by public key*: its
+  QUIC/TLS handshake proves each side holds the private key for the `NodeId` it
+  claims, **before any ASP frame is exchanged**, in both directions. So channel-level
+  mutual auth — and listener-key pinning (`asp clone` pins the listener's `NodeId`
+  into `peers`) — is provided by the transport itself, not a hand-rolled signature
+  exchange. There is no certificate to fingerprint and no nonce/signature round-trip
+  to forge: the connection *is* the proof.
+- **App-level handshake binds vault + proto + identity.** Over the authenticated iroh
+  stream both sides still exchange a `Hello` carrying `proto`, `vault_id`, `node_id`,
+  and (connector only) the optional `auth_key`. The `Hello.node_id` **MUST equal the
+  `NodeId` iroh already authenticated for that connection** — a mismatch aborts with a
+  distinct error (defense-in-depth: it can only ever be a bug, never a forge, since
+  the transport key can't be spoofed). This handshake exists to (a) reject a peer on a
+  **different vault** before any rows flow, (b) detect wire-`proto` skew as a clear
+  version mismatch rather than an opaque failure, and (c) carry auth-key enrollment.
+  A `proto`-version bump still signals a framing/handshake change loudly.
+- **No transport-confidentiality knobs.** iroh is **always** end-to-end encrypted
+  under the node keys, on the direct path and across a relay alike. The former
+  `wss://`/`--no-tls`/self-signed-cert/advertised-binding machinery is **removed** —
+  there is no plaintext mode, no certificate to manage, and no reverse-proxy
+  re-termination case to degrade for. A relay (even a hostile one) sees only ciphertext.
 
 - **Per-row integrity (signatures optional by default).** Every row is
   **content-addressed by its Merkle `id`**, so a corrupted or substituted row cannot
@@ -617,19 +650,20 @@ queryable, wasm-portable table instead of a side file.
   totally ordered) — but only once both rows are present, which is exactly what the
   per-vault `site_id` guarantees catch-up will deliver.
 
-- **Transport confidentiality.** Default transport is **`wss://`**: a listener serves
-  TLS using a **self-signed certificate it generates and persists** under the
-  never-synced `.asp/` (ASP ships **no embedded CA** — the X.509 layer is *not* the
-  trust boundary). Connectors accept any server certificate at the TLS layer; trust
-  is established by the ed25519 mutual-auth handshake, which binds the channel and
-  enables listener-key pinning. TLS adds confidentiality only. **`--no-tls` /
-  `ASP_NO_TLS`** opts a listener into plaintext `ws://` for running behind a fronting
-  proxy that already terminates TLS or on a trusted/local network. A listener reached
-  **through a TLS-terminating reverse proxy (Fly.io, Railway, Render, Cloudflare
-  Tunnel, …) MUST run `--no-tls`**: the proxy re-terminates TLS, so only the
-  advertised binding-disabled marker keeps the handshake coherent. Connectors still
-  dial `wss://` so the proxy hop stays encrypted; the pinned listener identity
-  authenticates the peer.
+- **Transport confidentiality is unconditional.** iroh encrypts every connection
+  end-to-end under the two node keys (QUIC/TLS 1.3), so confidentiality is **not a
+  knob** — there is no plaintext mode to opt into and no certificate for an operator
+  to provision. A relay only ever forwards ciphertext it cannot read, so routing
+  through the public n0 relays (or any third-party relay) never exposes content.
+- **Relay & discovery configuration.** Connection setup needs (1) a **relay** for NAT
+  traversal / last-resort forwarding and browser nodes, and (2) **discovery** to turn
+  a bare `NodeId` into a reachable address. Defaults: the **public n0 relays** and
+  iroh's default discovery (DNS + pkarr), so a fresh node syncs with zero infra. Both
+  are overridable — `--relay-url` / `ASP_RELAY_URL` points at a self-hosted relay, and
+  a node can *run* one with **`asp relay`** (a pure iroh relay: forwards encrypted
+  packets, stores and sees nothing, holds no vault). A ticket carries relay hints
+  inline, so it resolves even when discovery is unreachable. On a LAN, mDNS discovery
+  reaches peers with no relay at all.
 
 ## Materialize to disk
 
@@ -686,10 +720,10 @@ runs identically on every surface.**
 - **Compiles to `wasm32` unchanged.** Native daemon, desktop, and in-browser/
   Obsidian node run the **identical** fold/merge and compute **byte-identical**
   state. I/O is injected via traits (storage, transport, clock, rng); only
-  platform-bound pieces (on-disk SQLite backend, listen socket, TLS) are `cfg`-gated
-  behind a native feature. The browser/Obsidian node uses **libSQL-over-OPFS** through
-  the same storage trait, so its `authorized_keys`/`blobs`/`log` tables and fold are
-  the same code as native.
+  platform-bound pieces (on-disk SQLite backend, the native iroh endpoint/listen
+  socket) are `cfg`-gated behind a native feature. The browser/Obsidian node uses
+  **libSQL-over-OPFS** through the same storage trait, so its `authorized_keys`/
+  `blobs`/`log` tables and fold are the same code as native.
 - **Sans-IO `Session`.** The replication state machine consumes inbound frame bytes
   and emits outbound frame bytes + effects, with no sockets/fs/clock of its own. The
   native `asp` driver (tokio) and the wasm/SDK node are both thin drivers over the
@@ -702,9 +736,14 @@ runs identically on every surface.**
   adopted, is held to the same bar:** wasm-byte-identical native↔browser,
   version-pinned in the synced config.
 - **The wasm/TypeScript SDK** is `asp-core` compiled to **one wasm module** plus thin
-  TS bindings and injected host adapters (filesystem/OPFS, WebSocket). The wasm bytes
-  are inlined at build time and `init`'d once (no runtime fetch — the only path that
-  loads WebAssembly reliably in a mobile WebView). The high-level engine binding is
+  TS bindings and injected host adapters (filesystem/OPFS). **iroh runs *inside* the
+  wasm module**: it is built for `wasm32` with its browser feature set and dials peers
+  by `NodeId`/ticket exactly like native, transparently relaying its QUIC traffic over
+  a WebSocket to a relay (a browser can't send UDP). So the SDK no longer hand-rolls a
+  WebSocket protocol — it hands iroh a ticket and gets back a bi-directional stream
+  that carries the *same* `Session` frames as native. The wasm bytes are inlined at
+  build time and `init`'d once (no runtime fetch — the only path that loads
+  WebAssembly reliably in a mobile WebView). The high-level engine binding is
   the *real* full engine; it computes its own byte-identical state via the same
   `compute_main`/merge/fold as native. Low-level functions are retained for the
   cross-surface conformance vectors (§*Testing*).
@@ -736,7 +775,7 @@ They differ only in **node tier** (full vs thin, csp's platform-derived role) an
 > **Obsidian is the *first* client surface, not the only one.** It is described in
 > detail below because it is the v1 reference thin-client target — but the wasm/TS SDK
 > is a general client-sync substrate, not Obsidian-specific. Any host that can hold a
-> local file copy and make an outbound WebSocket connection (another Markdown editor, a
+> local file copy and dial a peer by ticket over iroh (another Markdown editor, a
 > mobile app, a VS Code extension, a custom web app) is a thin node over the *same* SDK,
 > with only host glue (file I/O, event push, settings UI) differing. Wherever this spec
 > says "Obsidian," read it as "the reference client surface" — the engine contract is
@@ -747,22 +786,25 @@ They differ only in **node tier** (full vs thin, csp's platform-derived role) an
 A single binary, `asp`, exposes the **full** engine capability set — nothing the
 protocol can do may be CLI-inaccessible. Command sketch:
 
-- `asp init [path]` — create a new scoped vault and this node's SSH-key identity.
-- `asp clone <url> [into]` — bootstrap a new node from a listening peer: authenticate,
-  full catch-up, materialize, write local identity/config, **pin the listener's
-  NodeId and record the source URL as the default peer** (git's `origin`). `--watch`
-  stays running as the daemon.
-- `asp watch [--listen [addr]] [--peer <url>…]` / `asp sync [<url>]` — **`watch` is
-  the primary long-running command.** Open the vault, watch the scoped tree (debounced
-  auto-commit, self-write suppression), connect to peers, run the realtime sync loop.
-  **The saved peer is the default:** with no `--peer`/URL these connect to the peer(s)
-  recorded by `clone` (`origin`), so the URL need not be re-typed. An explicitly
-  supplied `--peer`/URL is **used for this run but only persisted with consent** — on
-  an interactive terminal the CLI asks before saving it (`y` to save, any other key to
-  decline); non-interactively (CI/scripts) it is never silently written. `--listen`
-  additionally accepts inbound peers (relay/hub) and binds `0.0.0.0:9000` by default
-  (unprivileged; not 443). Default transport `wss://`; `--no-tls` serves `ws://`. Emits
-  operator-visible logging at `INFO`.
+- `asp init [path]` — create a new scoped vault and this node's SSH-key identity (which
+  is also its iroh `NodeId`).
+- `asp clone <ticket|nodeid> [into]` — bootstrap a new node from a listening peer:
+  dial it over iroh, authenticate, full catch-up, materialize, write local
+  identity/config, **pin the listener's `NodeId` and record it as the default peer**
+  (git's `origin`). `--watch` stays running as the daemon.
+- `asp watch [--listen] [--peer <ticket|nodeid>…]` / `asp sync [<ticket|nodeid>]` —
+  **`watch` is the primary long-running command.** Open the vault, watch the scoped
+  tree (debounced auto-commit, self-write suppression), dial peers, run the realtime
+  sync loop. **The saved peer is the default:** with no `--peer`/arg these connect to
+  the peer(s) recorded by `clone` (`origin`), so the ticket need not be re-typed. An
+  explicitly supplied `--peer`/arg is **used for this run but only persisted with
+  consent** — on an interactive terminal the CLI asks before saving it (`y` to save,
+  any other key to decline); non-interactively (CI/scripts) it is never silently
+  written. `--listen` makes this node a **hub**: it binds an iroh endpoint, accepts
+  inbound peers, and on start **prints its ticket and a scannable QR code** (and the
+  bare `NodeId`) so a phone or another device can pair by scan/paste. iroh chooses its
+  own UDP port and the relays handle reachability, so there is **no `--port`, no
+  `0.0.0.0:9000`, and no TLS** to configure. Emits operator-visible logging at `INFO`.
   **Vault adoption vs. mismatch.** A **pristine** local vault — freshly `init`'d with
   *zero authored rows* — advertises an empty vault id and **adopts the peer's vault on
   connect**, exactly like `clone`; so `asp init` then `watch --peer`/`sync` with no
@@ -770,11 +812,19 @@ protocol can do may be CLI-inaccessible. Command sketch:
   first connector's vault. But once a vault **has its own content** it advertises its
   real id, so two **separately-`init`'d** vaults never silently merge — `watch`/`sync`
   to such a peer fails with a clear, actionable error (*"different vault — `asp clone
-  <url>` to follow it"*) and the watch loop stops retrying, rather than looping
+  <ticket>` to follow it"*) and the watch loop stops retrying, rather than looping
   silently. To bidirectionally sync two devices, one must `clone` the other (sharing
   the vault id); independently-created vaults are, by design, distinct.
-- `asp key` — generate / show the node SSH key (OpenSSH format); use an SSH agent if
-  available.
+- `asp relay [--listen-addr <addr>]` — run a **pure iroh relay**: a stateless
+  packet-forwarder for connection setup / NAT traversal / browser nodes. It holds **no
+  vault, stores nothing, and sees only ciphertext**; it is *not* a hub. Lets an
+  operator self-host relay infrastructure with the same binary instead of depending on
+  the public n0 relays. A deployment may run `asp relay` and `asp watch --listen` side
+  by side (relay + hub on one host).
+- `asp ticket` — print this node's connection ticket (and bare `NodeId`) as text and a
+  QR code, for sharing out-of-band.
+- `asp key` — generate / show the node SSH key (OpenSSH format; equals the `NodeId`);
+  use an SSH agent if available.
 - `asp authorize <pubkey> [--ttl 30d|never]` / `asp revoke <pubkey>` — manage the
   `authorized_keys` **table**. `asp auth list` / `asp auth extend <peer> <ttl>`.
 - `asp status` — node identity, peers, sync state, head/`main` SHA.
@@ -796,16 +846,17 @@ config, non-destructively** (a flag/env value never silently rewrites the persis
 config). The documented exceptions: the vault locator (`--dir`/`ASP_DIR`, flag+env
 only, since it locates the config file itself) and `--authorized-keys`/
 `ASP_AUTHORIZED_KEYS` (whose persisted form is the `authorized_keys` table, not vault
-config). Knobs: `--dir`/`ASP_DIR`, `--no-tls`/`ASP_NO_TLS`, `--listen`/`--port`/
-`PORT`, `--log`/`ASP_LOG`, `--debounce`/`ASP_DEBOUNCE`, `--authorized-keys`/
-`ASP_AUTHORIZED_KEYS`, `--auth-key`/`ASP_AUTH_KEY`, `--default-key-ttl`/
-`ASP_DEFAULT_KEY_TTL`, `--no-tofu`/`ASP_NO_TOFU`, and `--debug`/`ASP_DEBUG`
-(§*Testing*). Boolean knobs accept any **boolish** env value
+config). Knobs: `--dir`/`ASP_DIR`, `--listen`/`ASP_LISTEN`, `--relay-url`/
+`ASP_RELAY_URL` (override the default relay), `--log`/`ASP_LOG`, `--debounce`/
+`ASP_DEBOUNCE`, `--authorized-keys`/`ASP_AUTHORIZED_KEYS`, `--auth-key`/`ASP_AUTH_KEY`,
+`--default-key-ttl`/`ASP_DEFAULT_KEY_TTL`, `--no-tofu`/`ASP_NO_TOFU`, and `--debug`/
+`ASP_DEBUG` (§*Testing*). Boolean knobs accept any **boolish** env value
 (`1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`, case-insensitive) — e.g.
-`ASP_NO_TLS=1` and `ASP_NO_TLS=true` are equivalent — so a deploy never crash-loops
-on a `1` where a strict parser wanted `true`. A hosted listener is fully configurable
-by flags *or* env with no file editing, e.g. `asp watch --listen --no-tls --dir
-/data/vol --authorized-keys "$KEYS"`.
+`ASP_LISTEN=1` and `ASP_LISTEN=true` are equivalent — so a deploy never crash-loops
+on a `1` where a strict parser wanted `true`. A hosted hub is fully configurable by
+flags *or* env with no file editing, e.g. `asp watch --listen --dir /data/vol
+--authorized-keys "$KEYS"`. (There is no transport TLS/port to configure — iroh
+manages encryption, ports, and relays itself.)
 
 ### Context Desktop (native full node, Tauri)
 
@@ -844,18 +895,21 @@ inside Obsidian on **desktop (Electron) and mobile (Capacitor WebView)** —
 
 - **A thin node on the wasm/TS SDK.** It holds a complete local working copy, authors
   its own primitive rows offline, and converges on reconnect, but it **never runs the
-  multi-tip merge and never listens/relays** (csp's thin-node HARD INVARIANT). It makes
-  *outbound* connections to a **full node in listen mode** — an `asp watch --listen`
-  process or Context Desktop's per-folder listener — which carries deep history and
-  serves the deterministic merged tree back. A vault synced only between thin nodes
-  (e.g. two phones, no full node) is explicitly unsupported and will not converge.
+  multi-tip merge and never listens/relays** (csp's thin-node HARD INVARIANT). It dials
+  *outbound* (by ticket/`NodeId`, over iroh) to a **full node in listen mode** — a hub:
+  an `asp watch --listen` process or Context Desktop's per-folder listener — which
+  carries deep history and serves the deterministic merged tree back. As a browser
+  node its iroh traffic is relayed (no UDP in the sandbox), still E2E-encrypted and
+  dial-by-key. A vault synced only between thin nodes (e.g. two phones, no full node)
+  is explicitly unsupported and will not converge.
 - **One wasm module + thin TS bindings**, wasm inlined at build time and `init`'d once
   (reliable in a mobile WebView). Storage is **libSQL-over-OPFS** through the same
   storage trait as native, so the on-disk vault is **CLI-interchangeable**: identical
   `.asp/`, identical config, same device-key resolution, whether driven by `asp` or the
   plugin.
 - **Host glue only.** Obsidian-vault file I/O, the Obsidian event → SDK push path, the
-  outbound WebSocket client, settings UI, lifecycle, a status bar, and a log buffer/
+  ticket/QR pairing UI (paste or scan a ticket; show this node's own), settings UI,
+  lifecycle, a status bar, and a log buffer/
   modal (which is also the local source for the opt-in debug log, §*Testing*). Module
   decomposition (entry/lifecycle, sync controller, host bridge, storage adapter,
   identity store, settings + settings tab, path filter, catch-up/reconcile, status
@@ -978,15 +1032,18 @@ convergence, not an in-process shortcut.
 - *Topology:* relay/hub forward-then-merge; relay mesh; two clones through one relay;
   transitive relay trust (multi-writer single-relay converges without each enumerating
   the other's key).
-- *Auth (pubkey):* `authorized_keys`-table admission; **`AUTH_KEY` enrollment**
-  (`Bearer` / `?auth_key=` / `bearer.<key>` subprotocol; 401 on mismatch, no
-  fall-through; absent header proceeds for already-enrolled peers); **TOFU** bounded to
+- *Auth (pubkey):* `authorized_keys`-table admission; **`AUTH_KEY` enrollment** carried
+  in the `Hello.auth_key` handshake field (mismatch denied with a distinct error, no
+  fall-through; absent field proceeds for already-enrolled peers); **TOFU** bounded to
   the empty-set window; `--no-tofu`; per-key **expiry** + listen-start default-fill
   migration (idempotent) + `auth extend`/`auth list`; expired peer re-enrolls and
   refreshes TTL; same-`site_id`/single-writer protection.
-- *Transport:* `wss://` self-signed default; `--no-tls` plaintext behind a proxy;
-  advertised channel binding (disabled-marker behind a re-terminating proxy; mismatch
-  aborts with a distinct error); listener-key pinning on `clone`.
+- *Transport (iroh):* dial by ticket and by bare `NodeId`; iroh connection-level
+  mutual key auth (the `Hello.node_id` must equal the iroh-verified remote `NodeId`);
+  always-encrypted (no plaintext mode); direct hole-punched path when reachable and
+  relay fallback when not; a node reachable **only** via relay still converges; a
+  browser/wasm node syncs through a relay; listener-key pinning on `clone`; the
+  self-hosted `asp relay` forwards traffic it cannot decrypt and stores no vault.
 - *Derived git:* read-only allowlist deny-by-default (assert every mutating verb is
   rejected); deterministic SHAs converge cross-node; coexists with a project's own
   `.git`.
@@ -1044,10 +1101,12 @@ The v1 spine is built and **CI-green across every surface from one engine**
 empty folders, 3-way merge (text clean-resolve / code conflict-surface / binary LWW)
 with delete remove-wins and the `reclass` boundary, ed25519 mutual-auth +
 `authorized_keys` admission (expiry / listen-start migration / `AUTH_KEY` enrollment
-over `Bearer`/`?auth_key=`/`bearer.<key>` / TOFU / `--no-tofu`), `wss://` self-signed
-TLS with the advertised cert-fingerprint channel binding (and `--no-tls`),
-version-vector catch-up + optimistic push + relay forward-then-merge, snapshots and
-point-in-time restore, and a stock-git-compatible read-only derived history.
+carried in the `Hello.auth_key` handshake field / TOFU / `--no-tofu`), an **iroh**
+transport (QUIC, dial-by-key: direct hole-punched links with relay fallback, always
+end-to-end encrypted, the device key doubling as the iroh `NodeId`, ticket/`NodeId`
+addressing with QR pairing, and a self-hostable `asp relay`), version-vector catch-up
++ optimistic push + hub forward-then-merge, snapshots and point-in-time restore, and a
+stock-git-compatible read-only derived history.
 
 **All four surfaces ship on that one engine and are tested against the real binary:**
 the **`asp` CLI** (native full node, multi-process e2e), the **wasm/TS SDK** (the
@@ -1061,8 +1120,8 @@ randomized multi-node operation streams in shuffled delivery orders all converge
 Genuinely deferred to post-v1 (or as the spec already scopes them): `fold_cache`
 memoization, keyframe+diff for large binaries, tombstone/blob GC, frame chunking on
 throttled links, the central **debug-log collector** (the local `--debug` source is
-wired), **iroh** QUIC P2P (Phase 2), the `wall_clock` offline re-fold experiment, and
-the Obsidian *mobile* wasm-inlining bundle.
+wired), the `wall_clock` offline re-fold experiment, and the Obsidian *mobile*
+wasm-inlining bundle.
 
 ## Deliberately not doing
 
