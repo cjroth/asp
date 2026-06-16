@@ -23,22 +23,22 @@ function asp(args: string[], home: string) {
   const r = spawnSync(ASP, args, { env: { ...process.env, ASP_HOME: home, ASP_LOG: 'warn' } });
   if (r.status !== 0) throw new Error(`asp ${args.join(' ')} failed: ${r.stderr}`);
 }
-async function readPort(stream: ReadableStream<Uint8Array>): Promise<number> {
+async function readMatch(stream: ReadableStream<Uint8Array>, re: RegExp, ms = 20000): Promise<string> {
   const reader = stream.getReader();
-  const dec = new TextDecoder();
+  const td = new TextDecoder();
   let buf = '';
-  const deadline = Date.now() + 15000;
+  const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
     const { value, done } = await reader.read();
     if (done) break;
-    buf += dec.decode(value);
-    const m = buf.match(/:\/\/0\.0\.0\.0:(\d+)/);
+    buf += td.decode(value);
+    const m = buf.match(re);
     if (m) {
       reader.releaseLock();
-      return Number.parseInt(m[1], 10);
+      return m[1];
     }
   }
-  throw new Error('no port');
+  throw new Error(`process did not emit ${re}`);
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -48,17 +48,26 @@ test('Obsidian plugin (bridge + controller) converges with the real asp CLI', as
   const dir = join(root, 'A');
   const home = join(root, 'home-a');
 
+  // A local relay so the browser/wasm thin node (no UDP) can reach the CLI peer.
+  const relayPort = 20000 + Math.floor(Math.random() * 20000);
+  const relayUrl = `http://127.0.0.1:${relayPort}`;
+  const relay = Bun.spawn([ASP, 'relay', '--listen-addr', `127.0.0.1:${relayPort}`], {
+    env: { ...process.env, ASP_LOG: 'warn' },
+    stdout: 'pipe',
+    stderr: 'ignore',
+  });
+  await readMatch(relay.stdout as ReadableStream<Uint8Array>, /relay listening on (http:\/\/\S+)/);
+
   // The CLI side authors a note and listens.
   asp(['--dir', dir, 'init'], home);
   writeFileSync(join(dir, 'cli-note.md'), '# from the CLI\n');
   asp(['--dir', dir, 'commit'], home);
   const hub = Bun.spawn(
-    [ASP, '--dir', dir, 'watch', '--listen', '--no-tls', '--port', '0', '--auth-key', 'S'],
+    [ASP, '--dir', dir, '--relay-url', relayUrl, 'watch', '--listen', '--auth-key', 'S'],
     { env: { ...process.env, ASP_HOME: home, ASP_LOG: 'warn' }, stdout: 'pipe', stderr: 'ignore' },
   );
   try {
-    const port = await readPort(hub.stdout as ReadableStream<Uint8Array>);
-    const url = `ws://127.0.0.1:${port}`;
+    const ticket = await readMatch(hub.stdout as ReadableStream<Uint8Array>, /^ticket: (\S+)/m);
 
     // The "Obsidian" side: a FakeVault with a locally-edited note, wired through
     // the plugin's bridge + controller over an in-memory SDK thin node.
@@ -70,7 +79,7 @@ test('Obsidian plugin (bridge + controller) converges with the real asp CLI', as
 
     // Initial sync captures the whole host tree (the plugin does this once at
     // startup / on manual sync); the hot path skips reconcile.
-    await controller.syncOnce({ peerUrl: url, authKey: 'S' }, { reconcile: true });
+    await controller.syncOnce({ peerUrl: ticket, authKey: 'S', relayUrl }, { reconcile: true });
 
     // The plugin pulled the CLI note into the Obsidian vault...
     expect(host.getText('cli-note.md')).toBe('# from the CLI\n');
@@ -92,14 +101,15 @@ test('Obsidian plugin (bridge + controller) converges with the real asp CLI', as
     let pulled = false;
     const dl2 = Date.now() + 8000;
     while (!pulled && Date.now() < dl2) {
-      await controller.syncOnce({ peerUrl: url, authKey: 'S' }, { reconcile: false });
+      await controller.syncOnce({ peerUrl: ticket, authKey: 'S', relayUrl }, { reconcile: false });
       if (host.getText('peer-added.md') === '# added on the peer\n') pulled = true;
       else await sleep(300);
     }
     expect(pulled).toBe(true);
   } finally {
     hub.kill();
+    relay.kill();
   }
   // Real-CLI integration with a propagation-wait loop + two-round
   // adopt-before-reconcile sync; needs more than bun's 5s default.
-}, 20000);
+}, 60000);

@@ -36,7 +36,10 @@ function wasmBytes(): Uint8Array {
 }
 
 interface AspSettings {
+  /** The peer's iroh ticket (or bare node id) — what `asp watch --listen` prints. */
   peerUrl: string;
+  /** Optional relay override (a self-hosted `asp relay`); blank = public relays. */
+  relayUrl: string;
   seedHex: string;
   enabled: boolean;
   /** True once a first connect has succeeded — gates the sync controls so a
@@ -46,6 +49,7 @@ interface AspSettings {
 
 const DEFAULTS: AspSettings = {
   peerUrl: '',
+  relayUrl: '',
   seedHex: '',
   enabled: false,
   connectedOnce: false,
@@ -247,16 +251,20 @@ export default class AspPlugin extends Plugin {
   ): Promise<boolean> {
     if (!this.controller) return false;
     if (this.syncing) return false; // a sync is already in flight
-    const peerUrl = normalizePeerUrl(this.settings.peerUrl); // bare host → wss://
+    const peerUrl = normalizePeerUrl(this.settings.peerUrl); // a ticket / node id (trimmed)
     if (!peerUrl) {
-      if (!opts.quiet) new Notice('asp: set a Peer URL first');
-      this.log.append('sync: no Peer URL set — nothing to connect to', 'error');
+      if (!opts.quiet) new Notice('asp: set a peer ticket first');
+      this.log.append('sync: no peer ticket set — nothing to connect to', 'error');
       return false;
     }
     this.syncing = true;
     try {
       await this.controller.syncOnce(
-        { peerUrl, authKey: this.pendingAuthKey || undefined },
+        {
+          peerUrl,
+          authKey: this.pendingAuthKey || undefined,
+          relayUrl: this.settings.relayUrl || undefined,
+        },
         {
           reconcile: opts.reconcile,
           captureDeletes: opts.reconcile && this.engineWarm,
@@ -474,16 +482,34 @@ class AspSettingTab extends PluginSettingTab {
     // Live status at the top — a native row whose control shows a dot + label.
     this.renderStatusRow(root);
 
-    // Peer URL — both stages. A bare host is fine; wss:// is assumed.
-    new Setting(root).setName('Peer URL').addText((t) =>
-      t
-        .setPlaceholder('hub:9000  (wss:// assumed)')
-        .setValue(this.plugin.settings.peerUrl)
-        .onChange(async (v) => {
-          this.plugin.settings.peerUrl = v.trim();
-          await this.plugin.saveData(this.plugin.settings);
-        }),
-    );
+    // Peer ticket — both stages. Paste the iroh ticket that `asp watch --listen`
+    // (the hub) prints on start (or a bare node id).
+    new Setting(root)
+      .setName('Peer ticket')
+      .setDesc('The iroh ticket the hub prints on `asp watch --listen` (or a node id).')
+      .addText((t) =>
+        t
+          .setPlaceholder('paste the hub ticket…')
+          .setValue(this.plugin.settings.peerUrl)
+          .onChange(async (v) => {
+            this.plugin.settings.peerUrl = v.trim();
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+
+    // Optional relay override — a self-hosted `asp relay`. Blank = public relays.
+    new Setting(root)
+      .setName('Relay URL (optional)')
+      .setDesc('A self-hosted `asp relay`, e.g. http://relay.example:8080. Blank uses the public relays.')
+      .addText((t) =>
+        t
+          .setPlaceholder('(default public relays)')
+          .setValue(this.plugin.settings.relayUrl)
+          .onChange(async (v) => {
+            this.plugin.settings.relayUrl = v.trim();
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
 
     if (!connected) {
       // ---- Stage 1: connecting. The auth key is a one-time ENROLLMENT secret:

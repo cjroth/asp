@@ -10,8 +10,11 @@ import type { Logger } from './log-buffer.ts';
 export type SyncState = 'idle' | 'connecting' | 'connected' | 'error';
 
 export interface SyncConfig {
+  /** The peer's iroh ticket (or bare node id) — replaces the old ws:// URL. */
   peerUrl: string;
   authKey?: string;
+  /** Optional relay override (a self-hosted `asp relay`); defaults to public relays. */
+  relayUrl?: string;
 }
 
 export class SyncController {
@@ -101,12 +104,12 @@ export class SyncController {
       // engine skips this and uses the plain reconcile→sync order (3-way merge).
       let adopted = 0;
       if (opts.adoptFirst) {
-        adopted = await this.vault.sync(cfg.peerUrl, { authKey: cfg.authKey });
+        adopted = await this.vault.sync(cfg.peerUrl, { authKey: cfg.authKey, relayUrl: cfg.relayUrl });
       }
       if (opts.reconcile) {
         await this.bridge.reconcileFromHost({ captureDeletes: opts.captureDeletes });
       }
-      const integrated = await this.vault.sync(cfg.peerUrl, { authKey: cfg.authKey });
+      const integrated = await this.vault.sync(cfg.peerUrl, { authKey: cfg.authKey, relayUrl: cfg.relayUrl });
       // Materialize AFTER reconcile (so the engine holds peer + local files and
       // the removal pass only drops genuinely-gone files). Skip on no-op polls.
       if (adopted > 0 || integrated > 0) {
@@ -125,13 +128,11 @@ export class SyncController {
         this.log('sync: cancelled');
         throw e;
       }
-      // A browser/Electron WebSocket can't read the HTTP status of a failed
-      // upgrade — a hub 401 (wrong auth key) surfaces only as a generic
-      // pre-handshake connect error. If we presented an auth key, that's the
-      // likely cause: the key didn't match. (An already-authorized device
-      // needs no auth key at all.)
-      if (cfg.authKey && /ws connect failed|before handshake|connection error/i.test(msg)) {
-        msg += ' — the hub rejected the upgrade. The auth key looks wrong; if this device is already authorized you can leave it blank.';
+      // The hub denies admission with a distinct error over the iroh handshake.
+      // If we presented an auth key, a denial likely means the key didn't match.
+      // (An already-authorized device needs no auth key at all.)
+      if (cfg.authKey && /invalid auth key|admission denied|denied/i.test(msg)) {
+        msg += ' — the hub rejected admission. The auth key looks wrong; if this device is already authorized you can leave it blank.';
       }
       this.set('error', msg);
       this.log(`sync failed: ${msg}`, 'error');
