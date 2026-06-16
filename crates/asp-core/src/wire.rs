@@ -9,9 +9,11 @@ use crate::log::LogRow;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Wire protocol version. A handshake-transcript or framing change bumps this so
-/// skew surfaces as a clear version mismatch, not an opaque signature error.
-pub const PROTO: u32 = 1;
+/// Wire protocol version. A handshake or framing change bumps this so skew
+/// surfaces as a clear version mismatch. v2 dropped the app-level nonce/signature
+/// handshake — iroh's QUIC connection authenticates both node keys, so the
+/// `Hello` just binds proto/vault/identity and carries the auth-key.
+pub const PROTO: u32 = 2;
 
 /// One content blob shipped alongside a row.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -34,28 +36,21 @@ pub struct WireRow {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Msg {
-    /// First frame each side sends. The listener's Hello additionally carries the
-    /// advertised channel-binding value (SHA-256 of its served cert, or empty =
-    /// binding-disabled) which both sides sign.
+    /// First frame each side sends over the already-key-authenticated iroh
+    /// connection. It binds the wire `proto`, the `vault_id`, and the claimed
+    /// `node_id` (which the receiver cross-checks against the transport-verified
+    /// remote key), and carries the optional AUTH_KEY enrollment secret. There is
+    /// no nonce/signature: iroh's QUIC handshake already proved each side holds
+    /// the private key for the `NodeId` it claims (§Security).
     Hello {
         proto: u32,
         node_id: String,
-        #[serde(with = "serde_bytes")]
-        nonce: Vec<u8>,
-        #[serde(with = "serde_bytes")]
-        channel_binding: Vec<u8>,
         vault_id: String,
         is_listener: bool,
-        /// AUTH_KEY enrollment secret a connector presents (§Security). Carried
-        /// here over the authenticated iroh stream — iroh has no HTTP upgrade
-        /// header. `None` from a listener and from already-enrolled connectors.
+        /// AUTH_KEY enrollment secret a connector presents (§Security). `None`
+        /// from a listener and from already-enrolled connectors.
         #[serde(default)]
         auth_key: Option<String>,
-    },
-    /// ed25519 signature over the mutual-auth transcript.
-    Auth {
-        #[serde(with = "serde_bytes")]
-        sig: Vec<u8>,
     },
     /// Version vector: site_id -> highest seq held.
     Vector { vv: BTreeMap<String, i64> },
@@ -83,35 +78,6 @@ impl Msg {
     pub fn from_bytes(b: &[u8]) -> AspResult<Msg> {
         rmp_serde::from_slice(b).map_err(|e| AspError::Protocol(e.to_string()))
     }
-}
-
-/// The signed handshake transcript binding both nonces, both identities, the
-/// advertised channel binding, the vault, and the proto version — so a captured
-/// handshake cannot be replayed onto another channel (§Security).
-pub fn transcript(
-    proto: u32,
-    listener_node: &str,
-    connector_node: &str,
-    listener_nonce: &[u8],
-    connector_nonce: &[u8],
-    channel_binding: &[u8],
-    vault_id: &str,
-) -> Vec<u8> {
-    let mut t = Vec::new();
-    t.extend_from_slice(b"asp-handshake-v1");
-    t.extend_from_slice(&proto.to_be_bytes());
-    for part in [
-        listener_node.as_bytes(),
-        connector_node.as_bytes(),
-        listener_nonce,
-        connector_nonce,
-        channel_binding,
-        vault_id.as_bytes(),
-    ] {
-        t.extend_from_slice(&(part.len() as u64).to_be_bytes());
-        t.extend_from_slice(part);
-    }
-    t
 }
 
 #[cfg(test)]

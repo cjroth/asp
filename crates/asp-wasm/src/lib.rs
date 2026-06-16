@@ -6,11 +6,9 @@
 //! computes byte-identical state. The low-level functions back the cross-surface
 //! conformance vectors (wasm output == native output).
 
-use asp_core::authkeys::AdmitCtx;
-use asp_core::session::Step;
 use asp_core::{
     compute_files, identity::ssh_pubkey_string, merge::merge3, oid, store::MemBlobStore, BlobStore,
-    FileRow, Identity, LogRow, MemEngine, MergeClass, Msg, Role, Session, SessionVault, WireRow,
+    FileRow, Identity, LogRow, MemEngine, MergeClass, SessionVault, WireRow,
 };
 use std::collections::BTreeMap;
 use wasm_bindgen::prelude::*;
@@ -86,19 +84,6 @@ pub fn fold_files(rows_json: &str, blobs_json: &str) -> Result<String, JsError> 
 #[wasm_bindgen]
 pub struct WasmEngine {
     eng: std::rc::Rc<MemEngine>,
-    session: Option<Session>,
-}
-
-#[derive(serde::Serialize)]
-struct FeedResult {
-    out: Vec<Vec<u8>>,
-    integrated: usize,
-    authed: bool,
-    closed: Option<String>,
-    /// The peer finished streaming our catch-up (`Msg::Synced`). NOT a close:
-    /// a oneshot driver (SDK `Vault.sync`) ends its pass here, while a live
-    /// driver (the demo's watch link) keeps the socket open for pushed rows.
-    synced: bool,
 }
 
 #[wasm_bindgen]
@@ -109,7 +94,7 @@ impl WasmEngine {
     pub fn new(seed: &[u8], vault_id: &str) -> WasmEngine {
         #[cfg(target_arch = "wasm32")]
         console_error_panic_hook::set_once();
-        WasmEngine { eng: std::rc::Rc::new(MemEngine::create(ident(seed), vault_id)), session: None }
+        WasmEngine { eng: std::rc::Rc::new(MemEngine::create(ident(seed), vault_id)) }
     }
 
     pub fn node_id(&self) -> String {
@@ -228,14 +213,6 @@ impl WasmEngine {
         Ok(flags.into_iter().filter(|b| *b).count())
     }
 
-    /// Wrap locally-authored wire rows in a `Rows` data frame to send over a live
-    /// (already-handshaked) connection — optimistic real-time push, the wire
-    /// analogue of the native daemon pushing new rows to connected peers.
-    pub fn push_frame(&self, wire_rows_json: &str) -> Result<Vec<u8>, JsError> {
-        let rows: Vec<WireRow> = serde_json::from_str(wire_rows_json).map_err(to_err)?;
-        Msg::Rows { rows }.to_bytes().map_err(to_err)
-    }
-
     /// Per-file fold metadata for rich rendering: a JSON array of
     /// `{file_id, path, result_hash, merge_class, deleted, conflict}`.
     pub fn files_detail_json(&self) -> Result<String, JsError> {
@@ -281,45 +258,6 @@ impl WasmEngine {
         })
     }
 
-    /// Begin a connector session; returns the opening `Hello` frame to send.
-    pub fn connect_start(&mut self) -> Vec<u8> {
-        let ctx = AdmitCtx { no_tofu: false, auth_key_ok: false, auth_key_configured: false, default_ttl_days: 90, now_unix: 0 };
-        let s = Session::new(Role::Connector, &*self.eng, Vec::new(), None, ctx);
-        let frame = s
-            .start()
-            .into_iter()
-            .find_map(|st| if let Step::Send(m) = st { m.to_bytes().ok() } else { None })
-            .unwrap_or_default();
-        self.session = Some(s);
-        frame
-    }
-
-    /// Feed an inbound frame; returns JSON `{out:[[u8]], integrated, authed, closed, synced}`.
-    pub fn feed(&mut self, frame: &[u8]) -> Result<String, JsError> {
-        let msg = Msg::from_bytes(frame).map_err(to_err)?;
-        let eng = &*self.eng;
-        let session = self.session.as_mut().ok_or_else(|| JsError::new("no session; call connect_start"))?;
-        let steps = session.on_msg(eng, msg).map_err(to_err)?;
-        let mut res =
-            FeedResult { out: Vec::new(), integrated: 0, authed: session.authed(), closed: None, synced: false };
-        for step in steps {
-            match step {
-                Step::Send(m) => res.out.push(m.to_bytes().map_err(to_err)?),
-                Step::Integrated(rows) => res.integrated += rows.len(),
-                Step::Authenticated(_) => res.authed = true,
-                Step::Closed(reason) => res.closed = Some(reason),
-                // Peer finished sending our catch-up. Surfaced as its own signal —
-                // not `closed` — because the DRIVER decides: a oneshot sync ends
-                // its pass; a live watch link stays open for pushed rows.
-                Step::PeerSynced => res.synced = true,
-                // Listener-only (streamed by the native driver); a browser node is
-                // never a listener, so this can't occur here.
-                Step::CatchUp { .. } => {}
-            }
-        }
-        res.authed = self.session.as_ref().map(|s| s.authed()).unwrap_or(false);
-        serde_json::to_string(&res).map_err(to_err)
-    }
 }
 
 fn to_err<E: std::fmt::Display>(e: E) -> JsError {

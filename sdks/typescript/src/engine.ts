@@ -20,7 +20,6 @@ export {
 } from '#engine';
 
 export type {
-  FeedResult,
   FileMeta,
   WasmEngineCtor,
   WasmEngineInstance,

@@ -51,7 +51,9 @@ fn wire_decode_never_panics_on_arbitrary_or_mutated_bytes() {
         Msg::Bye.to_bytes().unwrap(),
         Msg::Vector { vv: std::collections::BTreeMap::from([("aa".into(), 3i64)]) }.to_bytes().unwrap(),
         Msg::Denied { reason: "x".into() }.to_bytes().unwrap(),
-        Msg::Auth { sig: vec![1, 2, 3] }.to_bytes().unwrap(),
+        Msg::Hello { proto: 2, node_id: "ab".into(), vault_id: "v".into(), is_listener: true, auth_key: None }
+            .to_bytes()
+            .unwrap(),
     ];
     for _ in 0..40_000 {
         let mut m = valids[r.gen_range(0..valids.len())].clone();

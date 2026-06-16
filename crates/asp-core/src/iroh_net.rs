@@ -405,15 +405,16 @@ async fn accept_one(
     conns: Conns,
 ) -> Result<()> {
     let conn = incoming.await.map_err(|e| anyhow!("accept: {e}"))?;
+    // iroh's QUIC handshake already authenticated the remote key; the Session
+    // cross-checks the peer's `Hello.node_id` against it. Admission proper is the
+    // `authorized_keys` table inside the Session.
+    let verified_peer = node_id_of(&conn);
     let (send, recv) = conn.accept_bi().await.map_err(|e| anyhow!("accept_bi: {e}"))?;
-    // The connection's verified remote key gates whether an auth-key was even
-    // needed; admission proper is the `authorized_keys` table inside the Session.
     let admit = auth.admit_ctx(false);
     let session = {
         let eng = engine.lock().unwrap();
-        Session::with_auth(Role::Listener, &*eng, Vec::new(), None, admit, auth.auth_keys.clone())
+        Session::new(Role::Listener, &*eng, admit, verified_peer, auth.auth_keys.clone())
     };
-    let _peer = node_id_of(&conn);
     drive(send, recv, engine, session, false, conns, None).await
 }
 
@@ -435,17 +436,12 @@ pub async fn connect(
         .connect(addr, ALPN)
         .await
         .map_err(|e| anyhow!("iroh connect: {e}"))?;
+    // The listener's key, as authenticated by iroh's QUIC handshake.
+    let verified_peer = node_id_of(&conn);
     let (send, recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
     let session = {
         let eng = engine.lock().unwrap();
-        Session::with_auth(
-            Role::Connector,
-            &*eng,
-            Vec::new(),
-            None,
-            auth.admit_ctx(false),
-            auth.auth_keys.clone(),
-        )
+        Session::new(Role::Connector, &*eng, auth.admit_ctx(false), verified_peer, auth.auth_keys.clone())
     };
     drive(send, recv, engine, session, oneshot, conns, on_auth).await
 }

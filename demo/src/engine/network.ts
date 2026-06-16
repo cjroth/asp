@@ -433,13 +433,13 @@ export function createNetwork(opts: NetworkOpts) {
     return node.id;
   };
 
-  // ---- bridge a node to a REAL peer over ws:// (the genuine Session) --------
-  // A PERSISTENT (watch) connection to an `asp watch --listen` node: the ed25519
-  // handshake + version-vector catch-up via the engine's connect_start()/feed(),
-  // then the socket STAYS OPEN. Incoming Push/Rows frames are fed → integrated →
-  // gossiped through the in-page mesh (real-time receive); locally-authored rows
-  // are sent as Rows frames (real-time send, see pushLive). The promise resolves
-  // once the INITIAL catch-up converges (so addNode can open a file).
+  // ---- bridge a node to a REAL peer over iroh (the genuine Session) ---------
+  // Dials an `asp watch --listen` node by ticket: iroh's QUIC key handshake +
+  // version-vector catch-up via the wasm engine's `sync()`. iroh's `sync` is
+  // one-shot, so "live" is a fast poll loop (scheduleLivePoll) plus an immediate
+  // sync when this node authors a row (pushLive); rows pulled from the peer are
+  // gossiped through the in-page mesh. The promise resolves once the initial
+  // catch-up converges (so addNode can open a file).
   api.connectPeer = (nodeId: string, ticket: string, authKey?: string, relayUrl?: string): Promise<boolean> => {
     const node = findNode(nodeId);
     if (!node) return Promise.resolve(false);

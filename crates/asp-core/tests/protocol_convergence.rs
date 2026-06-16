@@ -8,7 +8,7 @@
 //! reported bug) shows up here as divergence.
 
 use asp_core::session::Step;
-use asp_core::{AdmitCtx, Identity, MemEngine, Msg, Role, Session};
+use asp_core::{AdmitCtx, Identity, MemEngine, Msg, Role, Session, SessionVault};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -22,8 +22,9 @@ fn sends(steps: Vec<Step>) -> Vec<Msg> {
 /// Drive a full handshake + bidirectional version-vector catch-up between two
 /// engines over an in-process message pump (no sockets — the same `Session`).
 fn sync_pair(listener: &MemEngine, connector: &MemEngine) {
-    let mut l = Session::new(Role::Listener, listener, Vec::new(), None, ctx());
-    let mut c = Session::new(Role::Connector, connector, Vec::new(), None, ctx());
+    // Each side's verified peer is the other's key (what iroh would authenticate).
+    let mut l = Session::new(Role::Listener, listener, ctx(), SessionVault::node_id(connector), Vec::new());
+    let mut c = Session::new(Role::Connector, connector, ctx(), SessionVault::node_id(listener), Vec::new());
     let mut to_l: Vec<Msg> = sends(c.start());
     let mut to_c: Vec<Msg> = sends(l.start());
     for _ in 0..64 {

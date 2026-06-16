@@ -28,12 +28,8 @@ export interface WasmEngineInstance {
   rows_after(peerVvJson: string): string;
   /** Integrate JSON `WireRow[]`; returns the count of newly-integrated rows. */
   integrate(wireRowsJson: string): number;
-  /** Wrap authored rows in a `Rows` data frame for live push over a connection. */
-  push_frame(wireRowsJson: string): Uint8Array;
   /** Per-file fold metadata as JSON `FileMeta[]`. */
   files_detail_json(): string;
-  connect_start(): Uint8Array;
-  feed(frame: Uint8Array): string;
   /** Sync over iroh: dial `ticket` (an iroh ticket) via a relay, run the
    * handshake + version-vector catch-up, converge, and close. Resolves with the
    * number of rows integrated from the peer. `relayUrl` overrides the default
@@ -65,13 +61,3 @@ export interface WireRow {
 }
 
 export type WasmEngineCtor = new (seed: Uint8Array, vaultId: string) => WasmEngineInstance;
-
-export interface FeedResult {
-  out: number[][];
-  integrated: number;
-  authed: boolean;
-  closed: string | null;
-  /** Peer finished streaming our catch-up. A oneshot sync completes here; a
-   * live watch link ignores it and keeps the socket open for pushed rows. */
-  synced: boolean;
-}

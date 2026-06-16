@@ -527,9 +527,6 @@ impl SessionVault for MemEngine {
     fn node_id(&self) -> NodeId {
         self.identity.node_id()
     }
-    fn sign(&self, msg: &[u8]) -> Vec<u8> {
-        self.identity.sign(msg)
-    }
     fn vault_id(&self) -> String {
         self.config.borrow().get("vault_id").cloned().unwrap_or_default()
     }

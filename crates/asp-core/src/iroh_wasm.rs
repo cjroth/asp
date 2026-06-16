@@ -95,6 +95,9 @@ async fn drive(
     auth_keys: Vec<String>,
 ) -> Result<usize, String> {
     let conn = ep.connect(addr, ALPN).await.map_err(|e| format!("connect: {e}"))?;
+    // The listener's key, authenticated by iroh's QUIC handshake — the Session
+    // cross-checks the peer's `Hello.node_id` against it.
+    let verified_peer = crate::NodeId(*conn.remote_id().as_bytes());
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
     use n0_future::time::{timeout, Duration};
 
@@ -105,7 +108,7 @@ async fn drive(
         default_ttl_days: 90,
         now_unix: 0,
     };
-    let mut session = Session::with_auth(Role::Connector, &**eng, Vec::new(), None, admit, auth_keys);
+    let mut session = Session::new(Role::Connector, &**eng, admit, verified_peer, auth_keys);
 
     for step in session.start() {
         if let Step::Send(m) = step {

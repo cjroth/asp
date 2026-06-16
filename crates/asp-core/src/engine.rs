@@ -797,9 +797,6 @@ impl SessionVault for Engine {
     fn node_id(&self) -> NodeId {
         self.identity.node_id()
     }
-    fn sign(&self, msg: &[u8]) -> Vec<u8> {
-        self.identity.sign(msg)
-    }
     fn vault_id(&self) -> String {
         self.store.get_config("vault_id").ok().flatten().unwrap_or_default()
     }
