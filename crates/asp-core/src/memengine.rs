@@ -91,6 +91,12 @@ impl MemEngine {
         }
     }
 
+    /// The device connection key seed — used to bind this node's iroh endpoint
+    /// (the device key *is* the iroh NodeId), distinct from the per-vault `site_id`.
+    pub fn device_seed(&self) -> [u8; 32] {
+        self.identity.seed()
+    }
+
     /// The authoring identity (per-vault, distinct from the device connection key).
     pub fn site_id(&self) -> String {
         self.site.clone()

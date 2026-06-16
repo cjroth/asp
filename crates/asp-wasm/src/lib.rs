@@ -85,7 +85,7 @@ pub fn fold_files(rows_json: &str, blobs_json: &str) -> Result<String, JsError> 
 
 #[wasm_bindgen]
 pub struct WasmEngine {
-    eng: MemEngine,
+    eng: std::rc::Rc<MemEngine>,
     session: Option<Session>,
 }
 
@@ -109,7 +109,7 @@ impl WasmEngine {
     pub fn new(seed: &[u8], vault_id: &str) -> WasmEngine {
         #[cfg(target_arch = "wasm32")]
         console_error_panic_hook::set_once();
-        WasmEngine { eng: MemEngine::create(ident(seed), vault_id), session: None }
+        WasmEngine { eng: std::rc::Rc::new(MemEngine::create(ident(seed), vault_id)), session: None }
     }
 
     pub fn node_id(&self) -> String {
@@ -117,11 +117,11 @@ impl WasmEngine {
     }
 
     pub fn node_ssh(&self) -> String {
-        ssh_pubkey_string(&SessionVault::node_id(&self.eng), "asp")
+        ssh_pubkey_string(&SessionVault::node_id(&*self.eng), "asp")
     }
 
     pub fn vault_id(&self) -> String {
-        SessionVault::vault_id(&self.eng)
+        SessionVault::vault_id(&*self.eng)
     }
 
     pub fn row_count(&self) -> usize {
@@ -197,7 +197,7 @@ impl WasmEngine {
     /// This node's version vector as JSON `{site_id: max_seq}` — the catch-up
     /// cursor a peer hands us so we can compute exactly what it lacks.
     pub fn version_vector(&self) -> Result<String, JsError> {
-        let vv = SessionVault::version_vector(&self.eng).map_err(to_err)?;
+        let vv = SessionVault::version_vector(&*self.eng).map_err(to_err)?;
         serde_json::to_string(&vv).map_err(to_err)
     }
 
@@ -208,11 +208,11 @@ impl WasmEngine {
     pub fn rows_after(&self, peer_vv_json: &str) -> Result<String, JsError> {
         let peer_vv: std::collections::BTreeMap<String, i64> =
             serde_json::from_str(peer_vv_json).map_err(to_err)?;
-        let mine = SessionVault::version_vector(&self.eng).map_err(to_err)?;
+        let mine = SessionVault::version_vector(&*self.eng).map_err(to_err)?;
         let mut out: Vec<WireRow> = Vec::new();
         for site in mine.keys() {
             let after = peer_vv.get(site).copied().unwrap_or(-1);
-            let mut rows = SessionVault::rows_after_wire(&self.eng, site, after).map_err(to_err)?;
+            let mut rows = SessionVault::rows_after_wire(&*self.eng, site, after).map_err(to_err)?;
             out.append(&mut rows);
         }
         serde_json::to_string(&out).map_err(to_err)
@@ -263,10 +263,28 @@ impl WasmEngine {
         serde_json::to_string(&metas).map_err(to_err)
     }
 
+    /// Sync over **iroh** (browser → relay): dial `ticket` (an iroh ticket), run
+    /// the handshake + bidirectional version-vector catch-up, converge, and close.
+    /// Returns a Promise resolving to the number of rows integrated from the peer.
+    /// `relay_url` overrides the default public relays (e.g. a private/test relay).
+    /// The whole connect+drive lives in one owned future (no borrow of `self`), so
+    /// it satisfies wasm-bindgen's `'static` requirement.
+    #[cfg(target_arch = "wasm32")]
+    pub fn sync(&self, ticket: String, auth_key: Option<String>, relay_url: Option<String>) -> js_sys::Promise {
+        let eng = self.eng.clone();
+        let auth_keys: Vec<String> = auth_key.into_iter().collect();
+        wasm_bindgen_futures::future_to_promise(async move {
+            asp_core::iroh_wasm::sync_oneshot(eng, ticket, auth_keys, relay_url)
+                .await
+                .map(|n| wasm_bindgen::JsValue::from_f64(n as f64))
+                .map_err(|e| wasm_bindgen::JsValue::from_str(&e))
+        })
+    }
+
     /// Begin a connector session; returns the opening `Hello` frame to send.
     pub fn connect_start(&mut self) -> Vec<u8> {
         let ctx = AdmitCtx { no_tofu: false, auth_key_ok: false, auth_key_configured: false, default_ttl_days: 90, now_unix: 0 };
-        let s = Session::new(Role::Connector, &self.eng, Vec::new(), None, ctx);
+        let s = Session::new(Role::Connector, &*self.eng, Vec::new(), None, ctx);
         let frame = s
             .start()
             .into_iter()
@@ -279,7 +297,7 @@ impl WasmEngine {
     /// Feed an inbound frame; returns JSON `{out:[[u8]], integrated, authed, closed, synced}`.
     pub fn feed(&mut self, frame: &[u8]) -> Result<String, JsError> {
         let msg = Msg::from_bytes(frame).map_err(to_err)?;
-        let eng = &self.eng;
+        let eng = &*self.eng;
         let session = self.session.as_mut().ok_or_else(|| JsError::new("no session; call connect_start"))?;
         let steps = session.on_msg(eng, msg).map_err(to_err)?;
         let mut res =

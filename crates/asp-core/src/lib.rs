@@ -36,6 +36,8 @@ pub mod gitexport;
 pub mod net;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod iroh_net;
+#[cfg(target_arch = "wasm32")]
+pub mod iroh_wasm;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod sqlite;
 #[cfg(not(target_arch = "wasm32"))]

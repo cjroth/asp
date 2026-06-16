@@ -24,6 +24,9 @@ hex.workspace = true
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1"
 getrandom = { version = "0.2", features = ["js"] }
+# iroh-in-wasm sync returns a JS Promise (future_to_promise).
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = false
