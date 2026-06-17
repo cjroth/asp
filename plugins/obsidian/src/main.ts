@@ -482,8 +482,7 @@ class AspSettingTab extends PluginSettingTab {
     // Peer ticket — both stages. Paste the iroh ticket that `asp watch --listen`
     // (the hub) prints on start (or a bare node id).
     new Setting(root)
-      .setName('Peer ticket')
-      .setDesc('The iroh ticket the hub prints on `asp watch --listen` (or a node id).')
+      .setName('Peer Ticket')
       .addText((t) =>
         t
           .setPlaceholder('paste the hub ticket…')
@@ -497,8 +496,7 @@ class AspSettingTab extends PluginSettingTab {
     // Relay is hidden by default — the public relays just work. A "Use custom
     // relay" toggle reveals the field for the rare self-hosted `asp relay` case.
     new Setting(root)
-      .setName('Use custom relay')
-      .setDesc('Off uses the public relays. On lets you point at a self-hosted `asp relay`.')
+      .setName('Use Custom Relay')
       .addToggle((t) =>
         t.setValue(this.plugin.settings.useCustomRelay).onChange(async (v) => {
           this.plugin.settings.useCustomRelay = v;
