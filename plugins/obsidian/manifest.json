@@ -1,7 +1,7 @@
 {
   "id": "agent-sync",
   "name": "Agent Sync Protocol",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "minAppVersion": "1.4.0",
   "description": "Sync your Obsidian vault as agent-readable context via the Agent Sync Protocol — automatic, real-time, deterministic. A thin node over the one Rust engine (wasm).",
   "author": "ASP contributors",

@@ -40,6 +40,9 @@ interface AspSettings {
   peerUrl: string;
   /** Optional relay override (a self-hosted `asp relay`); blank = public relays. */
   relayUrl: string;
+  /** When false the relay field is hidden and the public relays are used; flipping
+   * the "Use custom relay" toggle on reveals `relayUrl`. */
+  useCustomRelay: boolean;
   seedHex: string;
   enabled: boolean;
   /** True once a first connect has succeeded — gates the sync controls so a
@@ -50,6 +53,7 @@ interface AspSettings {
 const DEFAULTS: AspSettings = {
   peerUrl: '',
   relayUrl: '',
+  useCustomRelay: false,
   seedHex: '',
   enabled: false,
   connectedOnce: false,
@@ -263,7 +267,7 @@ export default class AspPlugin extends Plugin {
         {
           peerUrl,
           authKey: this.pendingAuthKey || undefined,
-          relayUrl: this.settings.relayUrl || undefined,
+          relayUrl: (this.settings.useCustomRelay && this.settings.relayUrl) || undefined,
         },
         {
           reconcile: opts.reconcile,
@@ -424,13 +428,6 @@ export default class AspPlugin extends Plugin {
     return this.sdk?.nodeSsh() ?? '';
   }
 
-  /** This device's node id (hex) — the identifier the hub logs as `peer=…` and
-   * lists in `asp auth list`. Lets a user match this device to what they see on
-   * the hub. */
-  peerId(): string {
-    return this.sdk?.nodeId() ?? '';
-  }
-
   private renderStatus(s: string): void {
     if (this.statusEl) this.statusEl.setText?.(`asp: ${s}`) ?? (this.statusEl.textContent = `asp: ${s}`);
   }
@@ -497,19 +494,32 @@ class AspSettingTab extends PluginSettingTab {
           }),
       );
 
-    // Optional relay override — a self-hosted `asp relay`. Blank = public relays.
+    // Relay is hidden by default — the public relays just work. A "Use custom
+    // relay" toggle reveals the field for the rare self-hosted `asp relay` case.
     new Setting(root)
-      .setName('Relay URL (optional)')
-      .setDesc('A self-hosted `asp relay`, e.g. http://relay.example:8080. Blank uses the public relays.')
-      .addText((t) =>
-        t
-          .setPlaceholder('(default public relays)')
-          .setValue(this.plugin.settings.relayUrl)
-          .onChange(async (v) => {
-            this.plugin.settings.relayUrl = v.trim();
-            await this.plugin.saveData(this.plugin.settings);
-          }),
+      .setName('Use custom relay')
+      .setDesc('Off uses the public relays. On lets you point at a self-hosted `asp relay`.')
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.useCustomRelay).onChange(async (v) => {
+          this.plugin.settings.useCustomRelay = v;
+          await this.plugin.saveData(this.plugin.settings);
+          this.display(); // show/hide the relay field
+        }),
       );
+    if (this.plugin.settings.useCustomRelay) {
+      new Setting(root)
+        .setName('Relay URL')
+        .setDesc('A self-hosted `asp relay`, e.g. http://relay.example:8080.')
+        .addText((t) =>
+          t
+            .setPlaceholder('http://relay.example:8080')
+            .setValue(this.plugin.settings.relayUrl)
+            .onChange(async (v) => {
+              this.plugin.settings.relayUrl = v.trim();
+              await this.plugin.saveData(this.plugin.settings);
+            }),
+        );
+    }
 
     if (!connected) {
       // ---- Stage 1: connecting. The auth key is a one-time ENROLLMENT secret:
@@ -553,19 +563,6 @@ class AspSettingTab extends PluginSettingTab {
           if (v) void this.plugin.syncNow();
         }),
       );
-
-      // The device's node id — read-only + Copy. Shown above the public key so a
-      // user can match this device to what the hub reports (`peer=…` in logs,
-      // `asp auth list`).
-      new Setting(root)
-        .setName('Peer ID')
-        .addText((t) => t.setValue(this.plugin.peerId()).setDisabled(true))
-        .addButton((b) =>
-          b.setButtonText('Copy').onClick(() => {
-            void navigator.clipboard?.writeText(this.plugin.peerId());
-            new Notice('asp: peer id copied');
-          }),
-        );
 
       // The device's public identity — a read-only field (scrolls within the
       // input, so the long key can't overflow on mobile) + Copy.
