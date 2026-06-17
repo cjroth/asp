@@ -11,17 +11,11 @@ primary_region = "ewr"
 [env]
   ASP_DIR = "/mnt/workspace/vault"
   ASP_HOME = "/mnt/workspace/.asp-home"
-  # Fly's [http_service] terminates TLS at the edge and forwards plain
-  # HTTP/WS to internal_port — so the in-container hub binds plain ws and
-  # lets the edge handle TLS. Clients still connect via wss://.
-  ASP_NO_TLS = "true"
 
-[http_service]
-  internal_port = 9000
-  force_https = true
-  auto_stop_machines = "off"
-  auto_start_machines = true
-  min_machines_running = 1
+# Transport is iroh (QUIC, dial-by-key). The hub reaches peers OUTBOUND through
+# the iroh relays (or a hole-punched direct path), so there is no inbound HTTP
+# service to publish — peers dial the ticket the hub prints, not a hostname/port.
+# It runs as a pure always-on worker: no [http_service], no exposed ports.
 
 # This hub is stateful: one instance bound to one volume (vault history +
 # node identity). Never scale it past a single replica — a second instance
