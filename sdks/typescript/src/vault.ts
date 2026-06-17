@@ -15,12 +15,15 @@ function toBytes(c: Uint8Array | string): Uint8Array {
 
 /**
  * Normalize a pasted peer spec. With iroh, a peer is an opaque **ticket** (or a
- * bare node id) — there is no URL scheme to default. We just trim; empty stays
- * empty so callers can detect "no peer set". (Kept as a named export for callers
- * that previously normalized a URL.)
+ * bare node id) — there is no URL scheme to default. A ticket/node id is one
+ * unbroken token, so we strip ALL whitespace, not just the ends: a ticket pasted
+ * with a stray space or a line-wrap (common on mobile) would otherwise fail with
+ * "bad ticket: invalid symbol at N" instead of just connecting. Empty stays empty
+ * so callers can detect "no peer set". (Kept as a named export for callers that
+ * previously normalized a URL.)
  */
 export function normalizePeerUrl(spec: string): string {
-  return spec.trim();
+  return spec.replace(/\s+/g, '');
 }
 
 export interface SyncOptions {

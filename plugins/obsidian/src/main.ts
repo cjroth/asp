@@ -488,7 +488,9 @@ class AspSettingTab extends PluginSettingTab {
           .setPlaceholder('paste the hub ticket…')
           .setValue(this.plugin.settings.peerUrl)
           .onChange(async (v) => {
-            this.plugin.settings.peerUrl = v.trim();
+            // Strip ALL whitespace — a ticket is one unbroken token, so a stray
+            // space/line-wrap from a paste must not survive into a connect.
+            this.plugin.settings.peerUrl = v.replace(/\s+/g, '');
             await this.plugin.saveData(this.plugin.settings);
           }),
       );
