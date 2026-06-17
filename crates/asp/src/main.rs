@@ -73,6 +73,22 @@ struct Cli {
     /// post-v1.
     #[arg(long = "debug", global = true, env = "ASP_DEBUG")]
     debug: Option<String>,
+    /// Don't use the shared device-global (home) key (`$ASP_HOME/id_ed25519`); keep
+    /// this node's key self-contained in the vault at `<vault>/.asp/id_ed25519`.
+    /// Minted on first use by any command that opens the vault (init/clone/watch/
+    /// sync/…); afterwards it's detected automatically by presence. Lets several
+    /// nodes run on one machine with distinct identities. The env var accepts any
+    /// boolish value (1/true/yes/on, 0/false/no/off).
+    #[arg(
+        long = "no-home-key",
+        global = true,
+        env = "ASP_NO_HOME_KEY",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true"
+    )]
+    no_home_key: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -199,7 +215,10 @@ fn vault_dir(cli: &Cli) -> PathBuf {
 
 fn open_engine(cli: &Cli) -> Result<Engine> {
     let dir = vault_dir(cli);
-    let id = idstore::load_or_generate()?;
+    // Honor --no-home-key on any command that opens a vault (watch/sync/commit/…),
+    // not just init/clone: a vault-local key is minted on first use and detected by
+    // presence thereafter.
+    let id = idstore::load_or_generate(&dir, cli.no_home_key)?;
     Engine::open(&dir, id).map_err(|e| anyhow!("opening vault at {}: {e}", dir.display()))
 }
 
@@ -267,7 +286,7 @@ async fn run(cli: Cli) -> Result<()> {
     match &cli.cmd {
         Cmd::Init { path } => {
             let dir = path.clone().or_else(|| cli.dir.clone()).unwrap_or_else(|| std::env::current_dir().unwrap());
-            let id = idstore::load_or_generate()?;
+            let id = idstore::load_or_generate(&dir, cli.no_home_key)?;
             let engine = Engine::init(&dir, id).map_err(|e| anyhow!("init: {e}"))?;
             seed_authorized_keys(&cli, &engine)?;
             let vid = VaultConfig::new(&engine.store).vault_id()?.unwrap_or_default();
@@ -276,7 +295,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Key => {
-            println!("{}", idstore::public_line()?);
+            println!("{}", idstore::public_line(&vault_dir(&cli), cli.no_home_key)?);
             Ok(())
         }
         Cmd::Commit => {
@@ -519,7 +538,7 @@ fn scope_cmd(cli: &Cli) -> Result<()> {
 
 async fn clone_cmd(cli: &Cli, peer: &str, into: Option<PathBuf>, watch: bool) -> Result<()> {
     let dir = into.or_else(|| cli.dir.clone()).unwrap_or_else(|| PathBuf::from("asp-vault"));
-    let id = idstore::load_or_generate()?;
+    let id = idstore::load_or_generate(&dir, cli.no_home_key)?;
     let engine = Engine::open(&dir, id).map_err(|e| anyhow!("clone open: {e}"))?;
     seed_authorized_keys(cli, &engine)?;
     let auth = auth_opts(cli, &engine);
