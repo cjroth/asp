@@ -13,10 +13,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use asp_core::iroh_net;
-use asp_core::net::{self, AuthOpts, EngineRef};
+use asp_core::net::{AuthOpts, EngineRef};
 use asp_core::{Engine, Identity, Msg, VaultConfig, WireRow};
 use serde::{Deserialize, Serialize};
-use std::any::Any;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -100,11 +99,6 @@ struct Folder {
     /// The upstream peer ticket this folder stays connected to, if any.
     #[allow(dead_code)]
     peer: Option<String>,
-    /// Debounced filesystem watcher (the `asp watch` glue): external on-disk
-    /// edits → capture into the log → fan-out to live peers. Held only to keep
-    /// the watch alive (dropping it stops watching).
-    #[allow(dead_code)]
-    watcher: Option<Box<dyn Any + Send>>,
 }
 
 /// Persisted record of a managed folder (small app config — not protocol state).
@@ -192,7 +186,7 @@ impl DesktopEngine {
             Some(_) => Some(self.bind_ep().context("folder endpoint")?),
             None => None,
         };
-        let (watcher, connector) = self.start_services(&engine, &conns, endpoint.as_ref(), peer.as_deref());
+        let connector = self.maybe_connector(&engine, &conns, endpoint.as_ref(), peer.as_deref());
         let folder = Folder {
             id: id.clone(),
             path: path.to_path_buf(),
@@ -204,7 +198,6 @@ impl DesktopEngine {
             endpoint,
             connector,
             peer,
-            watcher,
         };
         let info = Self::info_of(&folder);
         self.folders.lock().unwrap().insert(id, folder);
@@ -218,20 +211,17 @@ impl DesktopEngine {
         self.rt.block_on(iroh_net::bind_endpoint(&seed, relays))
     }
 
-    /// Start a folder's live services: the debounced fs watcher (external edits →
-    /// capture → push) and, if `peer`+`ep` are set, a persistent reconnecting
-    /// connector to that upstream. Both fan out through the folder's shared `conns`,
-    /// and the connector reuses the folder's single shared endpoint.
-    fn start_services(&self, engine: &EngineRef, conns: &Conns, ep: Option<&iroh_net::Endpoint>, peer: Option<&str>) -> (Option<Box<dyn Any + Send>>, Option<tokio::task::JoinHandle<()>>) {
-        let _guard = self.rt.enter(); // spawn_watcher spawns a tokio task
-        let watcher = net::spawn_watcher(engine.clone(), conns.clone(), 250)
-            .ok()
-            .map(|w| Box::new(w) as Box<dyn Any + Send>);
-        let connector = match (peer, ep) {
+    /// If `peer`+`ep` are set, start a persistent reconnecting connector to that
+    /// upstream (reusing the folder's single shared endpoint). Note: in-app edits
+    /// capture via `record_*` and push via `broadcast`, so there is deliberately
+    /// no per-folder fs watcher — that would re-hash the whole folder on every
+    /// save. External on-disk edits are picked up on reopen or an explicit
+    /// `rescan`, not live.
+    fn maybe_connector(&self, engine: &EngineRef, conns: &Conns, ep: Option<&iroh_net::Endpoint>, peer: Option<&str>) -> Option<tokio::task::JoinHandle<()>> {
+        match (peer, ep) {
             (Some(ticket), Some(ep)) => Some(self.spawn_connector(engine.clone(), conns.clone(), ep.clone(), ticket.to_string())),
             _ => None,
-        };
-        (watcher, connector)
+        }
     }
 
     /// Persistent connector loop: dial the upstream and run a live (`oneshot=false`)
@@ -347,7 +337,7 @@ impl DesktopEngine {
         // Stay connected to the source so edits sync live both ways (not one-shot).
         let peer = Some(ticket.to_string());
         let endpoint = Some(ep);
-        let (watcher, connector) = self.start_services(&engine, &conns, endpoint.as_ref(), peer.as_deref());
+        let connector = self.maybe_connector(&engine, &conns, endpoint.as_ref(), peer.as_deref());
         let folder = Folder {
             id: id.clone(),
             path: dest.to_path_buf(),
@@ -359,7 +349,6 @@ impl DesktopEngine {
             endpoint,
             connector,
             peer,
-            watcher,
         };
         let info = Self::info_of(&folder);
         self.folders.lock().unwrap().insert(id, folder);
@@ -656,7 +645,6 @@ impl DesktopEngine {
             if let Some(h) = f.connector.take() {
                 h.abort();
             }
-            // `f.watcher` drops here, stopping the fs watch.
             self.forget_folder(&f.path);
         }
         Ok(())

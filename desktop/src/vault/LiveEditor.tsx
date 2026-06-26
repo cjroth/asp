@@ -21,6 +21,7 @@ export default function LiveEditor(props: LiveEditorProps) {
   const ref = useRef<HTMLDivElement | null>(null);
   const composing = useRef(false);
   const paintedKey = useRef<string>('');
+  const rehlTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Keep handler-visible values fresh without re-binding (avoids stale closures).
   const roRef = useRef(readOnly);
   const accentRef = useRef(accent);
@@ -36,6 +37,7 @@ export default function LiveEditor(props: LiveEditorProps) {
     paintedKey.current = paintKey;
     el.contentEditable = readOnly ? 'false' : 'true';
     el.style.opacity = readOnly ? '0.92' : '1';
+    if (rehlTimer.current) clearTimeout(rehlTimer.current);
     if (notExist) {
       el.innerHTML = '<div style="color:#b0aaa2; font-style:italic">This file did not exist at this point in time.</div>';
     } else {
@@ -44,18 +46,30 @@ export default function LiveEditor(props: LiveEditorProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paintKey, source, readOnly, notExist, accent]);
 
-  const onInput = () => {
+  // Clean up the pending re-highlight on unmount.
+  useEffect(() => () => { if (rehlTimer.current) clearTimeout(rehlTimer.current); }, []);
+
+  // Re-applying syntax highlighting rebuilds the whole document's DOM, which is
+  // O(document size) — far too slow to do on every keystroke. So while typing we
+  // let the browser insert characters natively (instant) and only re-highlight
+  // after a short pause. `readLive` still reconstructs the exact source from the
+  // DOM, so saves are correct in the meantime.
+  const rehighlight = () => {
     const el = ref.current;
-    if (!el || roRef.current) return;
-    if (composing.current) {
-      changeRef.current(readLive(el));
-      return;
-    }
+    if (!el || roRef.current || composing.current) return;
     const off = caretOffset(el);
     const src = readLive(el);
     el.innerHTML = renderLiveHtml(src, accentRef.current);
     if (off != null) setCaret(el, off);
-    changeRef.current(src);
+  };
+
+  const onInput = () => {
+    const el = ref.current;
+    if (!el || roRef.current) return;
+    changeRef.current(readLive(el));
+    if (composing.current) return;
+    if (rehlTimer.current) clearTimeout(rehlTimer.current);
+    rehlTimer.current = setTimeout(rehighlight, 320);
   };
 
   const onPaste = (e: React.ClipboardEvent<HTMLDivElement>) => {

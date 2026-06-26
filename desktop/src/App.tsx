@@ -210,11 +210,12 @@ export default function App() {
     })();
   }, [refreshVaults, refreshStatuses]);
 
-  // Poll status so peers / "last synced" stay fresh.
+  // Poll status so peers / "last synced" stay fresh. Kept infrequent because
+  // each status read folds the vault log; the live UI doesn't need it faster.
   useEffect(() => {
     const t = setInterval(() => {
       void refreshVaults().then(refreshStatuses);
-    }, 4000);
+    }, 10000);
     return () => clearInterval(t);
   }, [refreshVaults, refreshStatuses]);
 
@@ -290,8 +291,10 @@ export default function App() {
 
   const onEditorChange = useCallback(
     (src: string) => {
+      // Keep the working copy in a ref (no per-keystroke React re-render — that
+      // would re-render the whole editor screen on every key). `setSaving(true)`
+      // is a no-op once already saving, so it renders at most once per edit burst.
       bufferRef.current = src;
-      setDocText(src);
       setSaving(true);
       if (saveTimer.current) clearTimeout(saveTimer.current);
       saveTimer.current = setTimeout(() => {
@@ -302,6 +305,7 @@ export default function App() {
           .writeFile(id, path, bufferRef.current)
           .then(() => {
             setSaving(false);
+            setDocText(bufferRef.current); // refresh the word count once, after the save
             return refreshHistory(id);
           })
           .catch(() => setSaving(false));
