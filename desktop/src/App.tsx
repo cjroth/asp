@@ -526,11 +526,16 @@ export default function App() {
 
   // ---------- connect / share / remove ----------
   const onOpenFolder = useCallback(async () => {
-    const dir = await open({ directory: true });
-    if (typeof dir === 'string') {
-      const info = await api.addLocalFolder(dir);
-      await refreshVaults();
-      await openVault(info.id);
+    try {
+      const dir = await open({ directory: true });
+      if (typeof dir === 'string') {
+        const info = await api.addLocalFolder(dir);
+        await refreshVaults();
+        await openVault(info.id);
+      }
+    } catch (err) {
+      console.error('open folder failed', err);
+      alert('Could not open that folder: ' + String((err as Error)?.message ?? err));
     }
   }, [openVault, refreshVaults]);
 

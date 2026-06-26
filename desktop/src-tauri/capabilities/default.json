@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core IPC for the app's commands plus the native folder picker (dialog open).",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:allow-open"]
+}
