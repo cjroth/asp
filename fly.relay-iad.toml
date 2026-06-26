@@ -1,0 +1,28 @@
+# A standalone, stateless iroh RELAY box (`asp relay`) in iad. It forwards
+# end-to-end-encrypted ciphertext between peers for NAT traversal — holds no
+# vault, no identity, sees no plaintext. Used as the rendezvous between a local
+# machine and the RELAYED vault (asp-vault-relayed), demonstrating the classic
+# two-box split.
+#
+#   fly deploy --config fly.relay-iad.toml --dockerfile Dockerfile.relay
+#
+# Served over fly's HTTPS edge: peers reach it at wss://asp-relay-iad.fly.dev.
+
+app = "asp-relay-iad"
+primary_region = "iad"   # Ashburn, VA — closest fly region to Raleigh, NC
+
+[build]
+  dockerfile = "Dockerfile.relay"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+# Stateless: keep one instance up for availability, not data.
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256

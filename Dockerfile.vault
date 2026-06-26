@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1.7
+#
+# A stateful ASP VAULT node (`asp watch --listen`): it hosts a real vault and
+# serves clone/sync to authorized peers over iroh. Two deploy shapes, selected by
+# env (one image, two fly configs):
+#
+#   ALL-IN-ONE  (ASP_COHOST_RELAY=1, ASP_RELAY_URL=https://<this-app>.fly.dev)
+#       Co-hosts an iroh relay in-process and pins it as its own home relay, so
+#       the ticket routes peers straight to this box. One box does both roles —
+#       connect directly, no separate relay needed.
+#
+#   RELAYED     (ASP_RELAY_URL=https://<relay-app>.fly.dev, no ASP_COHOST_RELAY)
+#       Uses a SEPARATE `asp relay` box as its rendezvous. Peers reach this vault
+#       through that relay (the classic two-box split).
+#
+# Either way this box is a public listener, so TOFU is disabled and admission
+# requires ASP_AUTH_KEY (set it as a fly secret; clients present it on clone).
+
+FROM rust:1.91-slim-bookworm AS builder
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential pkg-config perl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY desktop/engine ./desktop/engine
+COPY tests ./tests
+
+RUN cargo build --release -p asp --bin asp
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/asp /usr/local/bin/asp
+
+ENV ASP_LOG=info
+# The co-hosted relay (ALL-IN-ONE) binds 8080; fly's HTTP edge forwards 443→8080.
+EXPOSE 8080
+
+# Startup: init the vault if absent, keep node identity on the volume ($ASP_HOME),
+# then `watch --listen` (+ `--relay` when ASP_COHOST_RELAY is set). --relay-url is
+# read from ASP_RELAY_URL automatically (clap env).
+CMD ["/bin/sh", "-c", "VAULT_DIR=\"${ASP_DIR:-/mnt/workspace/vault}\" && export ASP_HOME=\"${ASP_HOME:-/mnt/workspace/.asp-home}\" && { [ \"$ASP_RESET\" = \"1\" ] && echo 'ASP_RESET=1: wiping vault history' && rm -rf \"$VAULT_DIR\" || true; } && mkdir -p \"$VAULT_DIR\" \"$ASP_HOME\" && { [ -f \"$VAULT_DIR/.asp/asp.db\" ] || asp init \"$VAULT_DIR\"; } && exec asp watch --dir \"$VAULT_DIR\" --listen ${ASP_COHOST_RELAY:+--relay}"]

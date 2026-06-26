@@ -104,6 +104,17 @@ enum Cmd {
     Watch {
         #[arg(long)]
         listen: bool,
+        /// Co-host an iroh relay in this same process and pin it as this node's
+        /// home relay, so the ticket it prints routes peers through it. Combine
+        /// with `--listen` for an all-in-one box that serves its own vault AND
+        /// relays (no separate relay box). Advertise its public URL with
+        /// `--relay-url` (e.g. https://my-box.fly.dev); without one it advertises
+        /// the local bind (LAN/loopback only).
+        #[arg(long)]
+        relay: bool,
+        /// Bind address for the co-hosted relay (with `--relay`). Default 0.0.0.0:8080.
+        #[arg(long = "relay-listen-addr")]
+        relay_listen_addr: Option<String>,
         /// Peer(s) to connect to — iroh ticket or node id (repeatable).
         #[arg(long = "peer")]
         peers: Vec<String>,
@@ -168,6 +179,16 @@ enum AuthCmd {
 
 fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Whether a listener should force trust-on-first-use OFF. A node that both
+/// serves (`listen`) and is publicly reachable (`public`: relays/discovery on)
+/// must not silently TOFU-enroll the first stranger to dial it — admission then
+/// requires an auth key or a pre-authorized key. A non-listener, or a
+/// hermetic/LAN listener (`--no-relay`), is left as-is so easy pairing still
+/// works on a trusted network.
+fn listener_hardens_tofu(listen: bool, public: bool) -> bool {
+    listen && public
 }
 
 /// Ask a yes/no question on an interactive terminal. `y`/`yes` → true; any other
@@ -364,7 +385,9 @@ async fn run(cli: Cli) -> Result<()> {
             r
         }
         Cmd::Clone { peer, into, watch } => clone_cmd(&cli, peer, into.clone(), *watch).await,
-        Cmd::Watch { listen, peers } => watch_cmd(&cli, *listen, peers.clone()).await,
+        Cmd::Watch { listen, relay, relay_listen_addr, peers } => {
+            watch_cmd(&cli, *listen, *relay, relay_listen_addr.clone(), peers.clone()).await
+        }
         Cmd::Relay { bind } => {
             let bind = bind.clone().unwrap_or_else(|| "0.0.0.0:8080".into());
             let addr: std::net::SocketAddr = bind.parse().map_err(|_| anyhow!("bad relay bind address: {bind}"))?;
@@ -559,13 +582,19 @@ async fn clone_cmd(cli: &Cli, peer: &str, into: Option<PathBuf>, watch: bool) ->
     };
     println!("cloned vault {} into {}", &vid[..8.min(vid.len())], dir.display());
     if watch {
-        return run_watch_loop(cli, engine, ep, false, vec![peer.to_string()]).await;
+        return run_watch_loop(cli, engine, ep, false, cli.relay_url.clone(), vec![peer.to_string()]).await;
     }
     ep.close().await;
     Ok(())
 }
 
-async fn watch_cmd(cli: &Cli, listen: bool, peers: Vec<String>) -> Result<()> {
+async fn watch_cmd(
+    cli: &Cli,
+    listen: bool,
+    relay: bool,
+    relay_listen_addr: Option<String>,
+    peers: Vec<String>,
+) -> Result<()> {
     let engine = open_engine(cli)?;
     seed_authorized_keys(cli, &engine)?;
     let ttl_days = default_ttl_days(cli, &engine);
@@ -576,8 +605,34 @@ async fn watch_cmd(cli: &Cli, listen: bool, peers: Vec<String>) -> Result<()> {
     // No --peer → connect to the saved peer(s) (clone's `origin`); a supplied
     // --peer is offered for saving (consent), then used.
     let resolved = resolve_peers(&engine, &peers);
-    let ep = iroh_net::bind_endpoint_relay(&engine.identity.seed(), !cli.no_relay, cli.relay_url.as_deref()).await?;
-    run_watch_loop(cli, Arc::new(Mutex::new(engine)), ep, listen, resolved).await
+
+    // `--relay`: co-host an iroh relay in this same process and pin it as this
+    // node's home relay so the ticket routes peers through it (all-in-one box).
+    // The endpoint advertises the operator's public `--relay-url` if given, else
+    // the local bind (LAN/loopback only). Pinning a relay url overrides the
+    // public-vs-no-relay choice (bind_endpoint_relay uses RelayMode::Custom).
+    let home_relay = if relay {
+        let bind = relay_listen_addr.unwrap_or_else(|| "0.0.0.0:8080".into());
+        let addr: std::net::SocketAddr =
+            bind.parse().map_err(|_| anyhow!("bad relay bind address: {bind}"))?;
+        tokio::spawn(async move {
+            if let Err(e) = iroh_net::run_relay(addr).await {
+                tracing::error!("co-hosted relay stopped: {e}");
+            }
+        });
+        let url = cli
+            .relay_url
+            .clone()
+            .unwrap_or_else(|| format!("http://127.0.0.1:{}", addr.port()));
+        println!("co-hosting iroh relay on {addr} — advertising {url} as home relay");
+        Some(url)
+    } else {
+        cli.relay_url.clone()
+    };
+
+    let ep =
+        iroh_net::bind_endpoint_relay(&engine.identity.seed(), !cli.no_relay, home_relay.as_deref()).await?;
+    run_watch_loop(cli, Arc::new(Mutex::new(engine)), ep, listen, home_relay, resolved).await
 }
 
 async fn run_watch_loop(
@@ -585,12 +640,30 @@ async fn run_watch_loop(
     engine: EngineRef,
     ep: iroh_net::Endpoint,
     listen: bool,
+    relay_url: Option<String>,
     peers: Vec<String>,
 ) -> Result<()> {
     let conns = iroh_net::new_conns();
     let (auth, _vid, root, site, debounce) = {
         let e = engine.lock().unwrap();
-        let auth = auth_opts(cli, &e);
+        let mut auth = auth_opts(cli, &e);
+        // Secure-by-default for a publicly-reachable listener: TOFU silently
+        // enrolls the *first stranger* to dial, which is a land-grab risk once
+        // the node is reachable over public relays/discovery. So a public
+        // listener never falls back to open TOFU — admission requires an auth key
+        // or a pre-authorized key. Hermetic/LAN listeners (`--no-relay`) keep
+        // TOFU for easy pairing. An explicit `--no-tofu` is honored either way.
+        let public_listener = listen && !cli.no_relay;
+        if listener_hardens_tofu(listen, !cli.no_relay) {
+            auth.no_tofu = true;
+        }
+        if public_listener && auth.auth_keys.is_empty() && e.store.authkeys_empty().unwrap_or(true) {
+            eprintln!(
+                "warning: public listener has no auth key and an empty authorized set — \
+                 no new peer can enroll (TOFU is disabled when reachable over public relays).\n\
+                 Set --auth-key <secret> (or ASP_AUTH_KEY), or pre-authorize a key with `asp authorize`."
+            );
+        }
         let vid = VaultConfig::new(&e.store).vault_id()?.unwrap_or_default();
         let debounce = cli.debounce.unwrap_or_else(|| VaultConfig::new(&e.store).debounce_ms().unwrap_or(400));
         e.capture_rescan().map_err(|err| anyhow!("reconcile: {err}"))?;
@@ -599,7 +672,7 @@ async fn run_watch_loop(
 
     if listen {
         // A listening node is a hub: print its ticket + QR so peers can pair.
-        match iroh_net::ticket(&ep, !cli.no_relay).await {
+        match iroh_net::ticket_with_relay(&ep, !cli.no_relay, relay_url.as_deref()).await {
             Ok(ticket) => {
                 println!("listening as a hub — share this ticket with peers:");
                 print_ticket(&ticket, &site);
@@ -671,4 +744,20 @@ async fn run_watch_loop(
     println!("watching {} (node {})", root.display(), &site[..12.min(site.len())]);
     tokio::signal::ctrl_c().await.ok();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::listener_hardens_tofu;
+
+    #[test]
+    fn tofu_hardening_only_for_public_listeners() {
+        // A publicly-reachable listener never silently TOFU-enrolls a stranger.
+        assert!(listener_hardens_tofu(true, true), "public listener hardens TOFU");
+        // A hermetic/LAN listener (--no-relay) keeps TOFU for easy pairing.
+        assert!(!listener_hardens_tofu(true, false), "LAN listener keeps TOFU");
+        // A pure connector (no --listen) is never a TOFU surface either way.
+        assert!(!listener_hardens_tofu(false, true), "connector unaffected");
+        assert!(!listener_hardens_tofu(false, false), "connector unaffected");
+    }
 }

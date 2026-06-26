@@ -107,9 +107,28 @@ pub fn loopback_addr(ep: &Endpoint) -> EndpointAddr {
 /// the home relay so the ticket is dialable from anywhere; relay-less, it carries
 /// whatever direct addresses are known.
 pub async fn ticket(ep: &Endpoint, relays: bool) -> Result<String> {
+    ticket_with_relay(ep, relays, None).await
+}
+
+/// Like [`ticket`], but also injects an explicit relay URL into the ticket. Used
+/// by the co-hosted all-in-one box (`watch --listen --relay`): it registers with
+/// its OWN relay, reached via a cloud hairpin (e.g. the box dialing its own
+/// `https://app.fly.dev`). The relay *connection* comes up fine, but iroh's
+/// home-relay *selection* (netcheck) can stall over that hairpin and never
+/// complete — so we don't block on it, and we embed the known relay URL directly
+/// so the ticket is dialable regardless.
+pub async fn ticket_with_relay(
+    ep: &Endpoint,
+    relays: bool,
+    explicit_relay: Option<&str>,
+) -> Result<String> {
+    use std::str::FromStr;
     if relays {
-        // Ensure the home relay (and thus a globally-dialable address) is present.
-        ep.online().await;
+        // A reachable home relay is normally selected in ~1-2s, but the wait can
+        // hang indefinitely if selection stalls, so cap it. With an explicit
+        // relay we inject it below regardless, so a short cap is fine.
+        let secs = if explicit_relay.is_some() { 3 } else { 12 };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(secs), ep.online()).await;
     }
     // Wait (bounded) for at least one dialable address — direct addresses are
     // discovered asynchronously just after bind, so a ticket minted too eagerly
@@ -120,7 +139,12 @@ pub async fn ticket(ep: &Endpoint, relays: bool) -> Result<String> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    Ok(EndpointTicket::new(ep.addr()).to_string())
+    let mut addr = ep.addr();
+    if let Some(u) = explicit_relay {
+        let url = iroh::RelayUrl::from_str(u.trim()).map_err(|e| anyhow!("bad relay url: {e}"))?;
+        addr.addrs.insert(TransportAddr::Relay(url));
+    }
+    Ok(EndpointTicket::new(addr).to_string())
 }
 
 /// Parse a peer spec into a dial address: an iroh **ticket** (preferred — carries

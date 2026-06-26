@@ -1,0 +1,34 @@
+# The RELAY box (two-box topology). Deploy with:
+#   fly deploy --config fly.relay.toml --dockerfile Dockerfile.relay
+#
+# A pure iroh relay (forwards ciphertext, holds nothing). It is the ONLY
+# publicly-reachable box; the hub (asp-hub) dials OUT to it and exposes no
+# inbound port of its own.
+#
+# Served over fly's HTTPS edge: fly terminates TLS and forwards plain HTTP to the
+# relay on 8080, so peers reach it at  wss://asp-relay.fly.dev  (https). Browser /
+# wasm nodes (Obsidian) require wss:// — they refuse plain ws://, which is why the
+# raw-TCP plain-http version didn't work for them. This is the SAME shape as n0's
+# public relays, just ours. (Open question this deploy answers: does fly's HTTP
+# edge sustain the relay's long-lived WebSocket on a *separate* box, or terminate
+# it? The earlier failure was co-located + confounded.)
+
+app = "asp-relay"
+primary_region = "ewr"
+
+[build]
+  dockerfile = "Dockerfile.relay"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+# Keep one instance always up; the relay is stateless so this isn't about data,
+# just availability.
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256

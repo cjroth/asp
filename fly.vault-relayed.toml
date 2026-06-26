@@ -1,0 +1,33 @@
+# The RELAYED vault box: `asp watch --listen --relay-url https://asp-relay-iad.fly.dev`.
+# Hosts a vault and serves clone/sync, but uses the SEPARATE asp-relay-iad box as
+# its rendezvous instead of co-hosting one. Peers reach this vault THROUGH that
+# relay — the classic two-box split. No inbound service of its own; it dials OUT
+# to the relay and is never directly exposed.
+#
+#   fly deploy --config fly.vault-relayed.toml --dockerfile Dockerfile.vault
+#
+# Auth: set ASP_AUTH_KEY as a fly secret; clients present it on clone.
+
+app = "asp-vault-relayed"
+primary_region = "iad"   # Ashburn, VA — closest fly region to Raleigh, NC
+
+[build]
+  dockerfile = "Dockerfile.vault"
+
+[env]
+  ASP_DIR = "/mnt/workspace/vault"
+  ASP_HOME = "/mnt/workspace/.asp-home"
+  # Route through the standalone relay (no co-hosted relay here).
+  ASP_RELAY_URL = "https://asp-relay-iad.fly.dev"
+
+# Outbound worker: it connects OUT to the relay and is reached by peers through
+# it, so there is no [http_service] / exposed port.
+
+[[mounts]]
+  source = "asp_vault_relayed_data"
+  destination = "/mnt/workspace"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512

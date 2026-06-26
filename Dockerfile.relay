@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1.7
+#
+# The RELAY box of the two-box topology. A pure, stateless iroh relay
+# (`asp relay`): it forwards end-to-end-encrypted ciphertext between peers for
+# NAT traversal, holds NO vault, NO node identity, and sees NO plaintext. This is
+# the only publicly-reachable box — the hub dials OUT to it and is never exposed.
+#
+# Served over raw TCP (fly TCP passthrough, see fly.relay.toml) so fly's HTTP
+# proxy never terminates the relay's long-lived connections.
+
+FROM rust:1.91-slim-bookworm AS builder
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential pkg-config perl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY desktop/engine ./desktop/engine
+COPY tests ./tests
+
+RUN cargo build --release -p asp --bin asp
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/asp /usr/local/bin/asp
+
+ENV ASP_LOG=info
+EXPOSE 8080
+
+# Stateless: no volume, no $ASP_HOME, no vault. Just forward ciphertext.
+CMD ["asp", "relay", "--listen-addr", "0.0.0.0:8080"]
