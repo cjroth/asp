@@ -1,0 +1,72 @@
+name: build-mac
+
+# Builds the Tauri desktop app (desktop/) into a macOS .dmg on a hosted macOS
+# runner — the only way to assemble an Apple .app/.dmg without a local Mac
+# toolchain or VM (macOS targets can't be cross-compiled from Linux).
+#
+# The build is UNSIGNED: on first launch macOS Gatekeeper will warn about an
+# "unidentified developer". Right-click the app → Open (once) to get past it.
+# Proper signing would need an Apple Developer ID cert ($99/yr) wired in as
+# secrets + notarization — not worth it for personal/internal use.
+#
+# Trigger two ways:
+#   • Actions tab → build-mac → "Run workflow"   (workflow_dispatch)
+#   • git tag desktop-v0.1.0 && git push origin desktop-v0.1.0
+# A bare `v*` tag is intentionally NOT a trigger here — that one publishes the
+# Obsidian plugin (see release.yml), and we don't want every plugin release to
+# also build the desktop app.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['desktop-v*']
+
+env:
+  # Same crates.io flakiness hardening as ci.yml / release.yml.
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  RUSTUP_MAX_RETRIES: "10"
+
+jobs:
+  build:
+    name: Build macOS .dmg (universal)
+    # macos-14 is an Apple Silicon host; it builds the universal target (arm64 +
+    # x86_64) fine, so the .dmg runs on both Apple Silicon and Intel Macs.
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install Rust (both macOS arches for the universal build)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Install frontend deps
+        run: bun install
+
+      # tauri-action runs the beforeBuildCommand (bun run build:web) itself,
+      # then `tauri build`, and prints the produced artifact paths.
+      - name: Build the app bundle
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: desktop
+          args: --target universal-apple-darwin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload .dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: context-desktop-macos
+          path: desktop/src-tauri/target/universal-apple-darwin/release/bundle/**/*.dmg
+          if-no-files-found: error

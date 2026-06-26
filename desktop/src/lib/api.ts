@@ -18,6 +18,26 @@ export interface VaultStatus {
   head: string;
   listening_ticket: string | null;
   peers: string[];
+  // Wall-clock unix SECONDS of the most recent log row, or null for an empty vault.
+  last_ts: number | null;
+}
+export interface FileEntry {
+  path: string;
+  file_id: string;
+  is_dir: boolean;
+  merge_class: string;
+}
+export interface HistEvent {
+  id: string;
+  // Wall-clock unix SECONDS.
+  ts: number;
+  lamport: number;
+  kind: string; // create | edit | rename | delete | reclass
+  path: string;
+}
+export interface FileAt {
+  exists: boolean;
+  content: string;
 }
 
 export const api = {
@@ -34,4 +54,18 @@ export const api = {
   authorize: (id: string, pubkey: string) => invoke<void>('authorize', { id, pubkey }),
   createSnapshot: (id: string, name: string) => invoke<string>('create_snapshot', { id, name }),
   restore: (id: string, target: string) => invoke<void>('restore', { id, target }),
+
+  // ---- file surface ----
+  listFiles: (id: string) => invoke<FileEntry[]>('list_files', { id }),
+  readFile: (id: string, path: string) => invoke<string>('read_file', { id, path }),
+  writeFile: (id: string, path: string, content: string) => invoke<void>('write_file', { id, path, content }),
+  renameFile: (id: string, oldPath: string, newPath: string) =>
+    invoke<void>('rename_file', { id, old: oldPath, new: newPath }),
+  deleteFile: (id: string, path: string) => invoke<void>('delete_file', { id, path }),
+  history: (id: string) => invoke<HistEvent[]>('history', { id }),
+  // `ts` is wall-clock unix SECONDS.
+  readFileAt: (id: string, path: string, ts: number) => invoke<FileAt>('read_file_at', { id, path, ts }),
+  restoreFileAt: (id: string, path: string, ts: number) => invoke<void>('restore_file_at', { id, path, ts }),
+  rescan: (id: string) => invoke<void>('rescan', { id }),
+  removeVault: (id: string, trash: boolean) => invoke<void>('remove_vault', { id, trash }),
 };

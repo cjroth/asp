@@ -1,0 +1,52 @@
+/* Ported from the "Vault Editor" design canvas <style> block. */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+#root { height: 100%; }
+body {
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+::selection { background: rgba(61, 99, 221, 0.16); }
+textarea::placeholder, input::placeholder { color: #b8b3ac; }
+
+@keyframes aspPulse { 0%, 100% { opacity: 1 } 50% { opacity: .32 } }
+@keyframes aspSpin { to { transform: rotate(360deg) } }
+
+.asp-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+.asp-scroll::-webkit-scrollbar-thumb {
+  background: #00000016; border-radius: 8px;
+  border: 3px solid transparent; background-clip: padding-box;
+}
+.asp-scroll::-webkit-scrollbar-thumb:hover { background: #00000026; background-clip: padding-box; }
+
+/* Live (contentEditable) markdown WYSIWYG classes. */
+.cm-mark { display: none; }
+.cm-code {
+  font-family: 'JetBrains Mono', monospace; font-size: 0.86em;
+  background: #f3f1ec; padding: 1px 5px; border-radius: 5px;
+}
+.cm-link { color: var(--accent, #3d63dd); border-bottom: 1px solid var(--accent, #3d63dd); }
+.cm-ul { position: relative; padding-left: 1.5em; }
+.cm-ul::before {
+  content: '•'; position: absolute; left: 0.4em; top: -0.02em;
+  color: var(--accent, #3d63dd); font-weight: 700;
+}
+.cm-task { position: relative; padding-left: 1.85em; }
+.cm-task::before {
+  content: ''; position: absolute; left: 0.1em; top: 0.28em; width: 16px; height: 16px;
+  border: 1.6px solid #cfcbc3; border-radius: 4px; box-sizing: border-box;
+}
+.cm-task-done::before { background: var(--accent, #3d63dd); border-color: var(--accent, #3d63dd); }
+.cm-task-done::after {
+  content: ''; position: absolute; left: 0.52em; top: 0.46em; width: 5px; height: 9px;
+  border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(43deg);
+}
+.cm-task-done .cm-body { color: #a8a29e; text-decoration: line-through; }
+
+/* Hover affordances ported from the design's style-hover attributes. */
+.asp-hover-row:hover { background: #efece7; }
+.asp-hover-soft:hover { background: #f4f2ee; }
+.asp-hover-list:hover { background: #f0efec; }
+.asp-hover-danger:hover { background: #fbeeec; }
+.asp-icon-btn:hover { background: #e9e7e3 !important; color: #1c1917 !important; }
+.asp-zoom-btn:hover { background: #fff !important; color: #1c1917 !important; }

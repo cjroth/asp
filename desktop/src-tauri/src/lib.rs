@@ -36,6 +36,8 @@ fn load_identity() -> Identity {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let engine = DesktopEngine::new(load_identity()).expect("init desktop engine");
+    // Re-open folders managed in a previous session so vaults persist across launches.
+    let _ = engine.reopen_saved();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -53,6 +55,16 @@ pub fn run() {
             commands::list_authorized,
             commands::create_snapshot,
             commands::restore,
+            commands::list_files,
+            commands::read_file,
+            commands::write_file,
+            commands::rename_file,
+            commands::delete_file,
+            commands::history,
+            commands::read_file_at,
+            commands::restore_file_at,
+            commands::rescan,
+            commands::remove_vault,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Context Desktop");

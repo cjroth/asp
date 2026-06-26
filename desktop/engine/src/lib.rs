@@ -13,9 +13,10 @@
 
 use anyhow::{anyhow, Context, Result};
 use asp_core::iroh_net;
-use asp_core::net::{AuthOpts, EngineRef};
-use asp_core::{Engine, Identity, VaultConfig};
-use serde::Serialize;
+use asp_core::net::{self, AuthOpts, EngineRef};
+use asp_core::{Engine, Identity, Msg, VaultConfig, WireRow};
+use serde::{Deserialize, Serialize};
+use std::any::Any;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -41,6 +42,41 @@ pub struct VaultStatus {
     pub head: String,
     pub listening_ticket: Option<String>,
     pub peers: Vec<String>,
+    /// Wall-clock unix seconds of the most recent log row (for "last synced"
+    /// labels), or `None` for an empty vault.
+    pub last_ts: Option<i64>,
+}
+
+/// One live (non-deleted) file in a vault — what the file tree renders. A flat
+/// list of slash-separated paths; the UI assembles the tree.
+#[derive(Clone, Serialize)]
+pub struct FileEntry {
+    pub path: String,
+    pub file_id: String,
+    pub is_dir: bool,
+    pub merge_class: String,
+}
+
+/// One entry in a vault's append-only history, for the time-travel scrubber.
+/// A thin projection of an `asp-core` `LogRow` (no protocol logic added here).
+#[derive(Clone, Serialize)]
+pub struct HistEvent {
+    pub id: String,
+    pub ts: i64,
+    pub lamport: u64,
+    /// "create" | "edit" | "rename" | "delete" | "reclass" (from `LogRow.kind`).
+    pub kind: String,
+    /// Path the row applies to (resolved from the file_id's latest path for
+    /// rows that don't carry one, e.g. edits/deletes).
+    pub path: String,
+}
+
+/// Content of a file as of a point in time (for read-only time travel).
+#[derive(Clone, Serialize)]
+pub struct FileAt {
+    /// Whether the file existed (non-deleted) at the requested instant.
+    pub exists: bool,
+    pub content: String,
 }
 
 type Conns = Arc<AsyncMutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<asp_core::Msg>>>>;
@@ -53,6 +89,30 @@ struct Folder {
     enabled: bool,
     listening_ticket: Option<String>,
     listener: Option<tokio::task::JoinHandle<()>>,
+    /// The folder's single long-lived iroh endpoint (one device key, one socket),
+    /// shared by the listener (`serve`) and the connector (`connect`) — exactly
+    /// like the CLI's one `ep` per `asp watch`. `None` until the folder first
+    /// needs networking (share or upstream peer).
+    endpoint: Option<iroh_net::Endpoint>,
+    /// Persistent connector to an upstream peer (the literal `asp watch --peer`
+    /// dial loop), kept open so live edits push both ways without an explicit sync.
+    connector: Option<tokio::task::JoinHandle<()>>,
+    /// The upstream peer ticket this folder stays connected to, if any.
+    #[allow(dead_code)]
+    peer: Option<String>,
+    /// Debounced filesystem watcher (the `asp watch` glue): external on-disk
+    /// edits → capture into the log → fan-out to live peers. Held only to keep
+    /// the watch alive (dropping it stops watching).
+    #[allow(dead_code)]
+    watcher: Option<Box<dyn Any + Send>>,
+}
+
+/// Persisted record of a managed folder (small app config — not protocol state).
+#[derive(Clone, Serialize, Deserialize)]
+struct FolderCfg {
+    path: String,
+    #[serde(default)]
+    peer: Option<String>,
 }
 
 pub struct DesktopEngine {
@@ -105,8 +165,17 @@ impl DesktopEngine {
     }
 
     /// Add (and initialize/open) a local folder as a vault. Captures current disk
-    /// contents into the log.
+    /// contents into the log, and remembers the path so it reopens next launch.
     pub fn add_local_folder(&self, path: &Path) -> Result<VaultInfo> {
+        let info = self.add_folder_inner(path, None)?;
+        self.remember_folder(path, None);
+        Ok(info)
+    }
+
+    /// Open/init a folder and register it (with its live services), without
+    /// touching the persisted list. Shared by `add_local_folder`/`reopen_saved`.
+    /// `peer` is an optional upstream ticket to stay connected to.
+    fn add_folder_inner(&self, path: &Path, peer: Option<String>) -> Result<VaultInfo> {
         let eng = if path.join(".asp/asp.db").exists() {
             Engine::open(path, self.identity.clone())?
         } else {
@@ -114,18 +183,150 @@ impl DesktopEngine {
         };
         eng.capture_rescan()?;
         let id = random_id();
+        let engine = self.handle(eng);
+        let conns: Conns = Arc::new(AsyncMutex::new(HashMap::new()));
+        // A folder that follows an upstream peer needs its (single, shared)
+        // endpoint up front for the connector; a plain local folder binds lazily
+        // when first shared.
+        let endpoint = match &peer {
+            Some(_) => Some(self.bind_ep().context("folder endpoint")?),
+            None => None,
+        };
+        let (watcher, connector) = self.start_services(&engine, &conns, endpoint.as_ref(), peer.as_deref());
         let folder = Folder {
             id: id.clone(),
             path: path.to_path_buf(),
-            engine: self.handle(eng),
-            conns: Arc::new(AsyncMutex::new(HashMap::new())),
+            engine,
+            conns,
             enabled: false,
             listening_ticket: None,
             listener: None,
+            endpoint,
+            connector,
+            peer,
+            watcher,
         };
         let info = Self::info_of(&folder);
         self.folders.lock().unwrap().insert(id, folder);
         Ok(info)
+    }
+
+    /// Bind a fresh long-lived iroh endpoint for this device key.
+    fn bind_ep(&self) -> Result<iroh_net::Endpoint> {
+        let seed = self.identity.seed();
+        let relays = Self::use_relays();
+        self.rt.block_on(iroh_net::bind_endpoint(&seed, relays))
+    }
+
+    /// Start a folder's live services: the debounced fs watcher (external edits →
+    /// capture → push) and, if `peer`+`ep` are set, a persistent reconnecting
+    /// connector to that upstream. Both fan out through the folder's shared `conns`,
+    /// and the connector reuses the folder's single shared endpoint.
+    fn start_services(&self, engine: &EngineRef, conns: &Conns, ep: Option<&iroh_net::Endpoint>, peer: Option<&str>) -> (Option<Box<dyn Any + Send>>, Option<tokio::task::JoinHandle<()>>) {
+        let _guard = self.rt.enter(); // spawn_watcher spawns a tokio task
+        let watcher = net::spawn_watcher(engine.clone(), conns.clone(), 250)
+            .ok()
+            .map(|w| Box::new(w) as Box<dyn Any + Send>);
+        let connector = match (peer, ep) {
+            (Some(ticket), Some(ep)) => Some(self.spawn_connector(engine.clone(), conns.clone(), ep.clone(), ticket.to_string())),
+            _ => None,
+        };
+        (watcher, connector)
+    }
+
+    /// Persistent connector loop: dial the upstream and run a live (`oneshot=false`)
+    /// session on the folder's **shared** endpoint, reconnecting with a short
+    /// backoff if it drops — the desktop equivalent of `asp watch --peer <ticket>`.
+    /// Never closes the endpoint (the listener shares it).
+    fn spawn_connector(&self, engine: EngineRef, conns: Conns, ep: iroh_net::Endpoint, ticket: String) -> tokio::task::JoinHandle<()> {
+        // Reconnect needs no enrollment secret — the key is authorized after the
+        // first successful connect/clone.
+        let auth = self.auth_opts(Vec::new());
+        self.rt.spawn(async move {
+            let addr = match iroh_net::parse_peer(&ticket) {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            loop {
+                let _ = iroh_net::connect(engine.clone(), &ep, addr.clone(), &auth, false, conns.clone(), None).await;
+                tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            }
+        })
+    }
+
+    /// Fan a freshly-authored row out to every live peer of a folder (the
+    /// real-time push the `asp watch` watcher does for disk edits — here for the
+    /// app's own `record_*` edits, which materialize before the watcher sees them).
+    fn broadcast(&self, conns: &Conns, wr: WireRow) {
+        let conns = conns.clone();
+        self.rt.block_on(async move {
+            let map = conns.lock().await;
+            for tx in map.values() {
+                let _ = tx.send(Msg::Push { row: Box::new(wr.clone()) });
+            }
+        });
+    }
+
+    /// Path of the small app-config file listing managed folders (allowed
+    /// non-protocol app state; shares `~/.asp` with the CLI identity).
+    fn folders_config_path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join(".asp").join("desktop_folders.json")
+    }
+
+    fn saved_folders() -> Vec<FolderCfg> {
+        std::fs::read_to_string(Self::folders_config_path())
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<FolderCfg>>(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn write_saved_folders(list: &[FolderCfg]) {
+        let p = Self::folders_config_path();
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(s) = serde_json::to_string_pretty(list) {
+            let _ = std::fs::write(&p, s);
+        }
+    }
+
+    fn remember_folder(&self, path: &Path, peer: Option<String>) {
+        let p = path.to_string_lossy().to_string();
+        let mut list = Self::saved_folders();
+        match list.iter_mut().find(|c| c.path == p) {
+            Some(c) => c.peer = peer,
+            None => list.push(FolderCfg { path: p, peer }),
+        }
+        Self::write_saved_folders(&list);
+    }
+
+    fn forget_folder(&self, path: &Path) {
+        let p = path.to_string_lossy().to_string();
+        let mut list = Self::saved_folders();
+        if let Some(i) = list.iter().position(|c| c.path == p) {
+            list.remove(i);
+            Self::write_saved_folders(&list);
+        }
+    }
+
+    /// Re-open every folder remembered from a previous session (reconnecting any
+    /// persisted upstream peers). Call once at startup. Folders that no longer
+    /// exist on disk are skipped (and pruned).
+    pub fn reopen_saved(&self) -> Result<Vec<VaultInfo>> {
+        let mut infos = Vec::new();
+        let mut keep = Vec::new();
+        for cfg in Self::saved_folders() {
+            let path = PathBuf::from(&cfg.path);
+            if path.join(".asp/asp.db").exists() {
+                if let Ok(info) = self.add_folder_inner(&path, cfg.peer.clone()) {
+                    infos.push(info);
+                    keep.push(cfg);
+                }
+            }
+        }
+        Self::write_saved_folders(&keep);
+        Ok(infos)
     }
 
     /// Bootstrap a new folder by cloning from a listening peer (by iroh ticket /
@@ -135,26 +336,34 @@ impl DesktopEngine {
         let engine = self.handle(eng);
         let auth = self.auth_opts(auth_key.map(|s| vec![s.to_string()]).unwrap_or_default());
         let addr = iroh_net::parse_peer(ticket)?;
-        let seed = self.identity.seed();
+        // Bind the folder's single shared endpoint once, bootstrap the clone on
+        // it, then keep it for the persistent connector (don't close it).
+        let ep = self.bind_ep().context("clone endpoint")?;
         let ce = engine.clone();
-        self.rt.block_on(async move {
-            let ep = iroh_net::bind_endpoint(&seed, Self::use_relays()).await?;
-            let r = iroh_net::clone_bootstrap(ce, &ep, addr, &auth).await;
-            ep.close().await;
-            r.map(|_| ())
-        })?;
+        let (bep, baddr) = (ep.clone(), addr.clone());
+        self.rt.block_on(async move { iroh_net::clone_bootstrap(ce, &bep, baddr, &auth).await.map(|_| ()) })?;
         let id = random_id();
+        let conns: Conns = Arc::new(AsyncMutex::new(HashMap::new()));
+        // Stay connected to the source so edits sync live both ways (not one-shot).
+        let peer = Some(ticket.to_string());
+        let endpoint = Some(ep);
+        let (watcher, connector) = self.start_services(&engine, &conns, endpoint.as_ref(), peer.as_deref());
         let folder = Folder {
             id: id.clone(),
             path: dest.to_path_buf(),
             engine,
-            conns: Arc::new(AsyncMutex::new(HashMap::new())),
+            conns,
             enabled: false,
             listening_ticket: None,
             listener: None,
+            endpoint,
+            connector,
+            peer,
+            watcher,
         };
         let info = Self::info_of(&folder);
         self.folders.lock().unwrap().insert(id, folder);
+        self.remember_folder(dest, Some(ticket.to_string()));
         Ok(info)
     }
 
@@ -169,9 +378,17 @@ impl DesktopEngine {
             }
             let auth = self.auth_opts(auth_key.map(|s| vec![s.to_string()]).unwrap_or_default());
             let (engine, conns) = (f.engine.clone(), f.conns.clone());
-            let seed = self.identity.seed();
             let relays = Self::use_relays();
-            let ep = self.rt.block_on(iroh_net::bind_endpoint(&seed, relays)).context("listener bind")?;
+            // Reuse the folder's single shared endpoint (the connector may already
+            // hold it); bind it lazily on first share otherwise.
+            let ep = match &f.endpoint {
+                Some(ep) => ep.clone(),
+                None => {
+                    let ep = self.bind_ep().context("listener bind")?;
+                    f.endpoint = Some(ep.clone());
+                    ep
+                }
+            };
             let ticket = self.rt.block_on(iroh_net::ticket(&ep, relays)).context("ticket")?;
             let handle = self.rt.spawn(async move {
                 let _ = iroh_net::serve(engine, ep, auth, conns).await;
@@ -191,18 +408,26 @@ impl DesktopEngine {
     /// One-shot sync of a folder against a peer (used for catch-up + the UI's
     /// "sync now"; the same `Session` as the CLI).
     pub fn sync(&self, id: &str, ticket: &str, auth_key: Option<&str>) -> Result<()> {
-        let engine = {
+        let (engine, shared_ep) = {
             let folders = self.folders.lock().unwrap();
-            folders.get(id).ok_or_else(|| anyhow!("no such folder"))?.engine.clone()
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            (f.engine.clone(), f.endpoint.clone())
         };
         let auth = self.auth_opts(auth_key.map(|s| vec![s.to_string()]).unwrap_or_default());
         let addr = iroh_net::parse_peer(ticket)?;
         let seed = self.identity.seed();
         self.rt.block_on(async move {
-            let ep = iroh_net::bind_endpoint(&seed, Self::use_relays()).await?;
-            let r = iroh_net::sync_oneshot(engine, &ep, addr, &auth).await;
-            ep.close().await;
-            r
+            match shared_ep {
+                // Reuse the folder's standing endpoint (one device key, one socket).
+                Some(ep) => iroh_net::sync_oneshot(engine, &ep, addr, &auth).await,
+                // No standing endpoint (a plain local folder): a throwaway is fine.
+                None => {
+                    let ep = iroh_net::bind_endpoint(&seed, Self::use_relays()).await?;
+                    let r = iroh_net::sync_oneshot(engine, &ep, addr, &auth).await;
+                    ep.close().await;
+                    r
+                }
+            }
         })
     }
 
@@ -255,6 +480,7 @@ impl DesktopEngine {
         let files = eng.store.live_files()?.into_iter().filter(|f| !f.deleted).count();
         let head = std::fs::read_to_string(eng.git_dir.join("refs/heads/main")).map(|s| s.trim().to_string()).unwrap_or_default();
         let peers = eng.store.peers()?.into_iter().map(|(u, _)| u).collect();
+        let last_ts = eng.store.all_rows()?.iter().map(|r| r.ts).max();
         Ok(VaultStatus {
             id: id.to_string(),
             vault_id,
@@ -263,6 +489,176 @@ impl DesktopEngine {
             head,
             listening_ticket: f.listening_ticket.clone(),
             peers,
+            last_ts,
         })
+    }
+
+    // ---- File surface: thin forwarders to `asp-core` (no protocol logic) ----
+
+    /// List the vault's live files (flat; the UI builds the tree).
+    pub fn list_files(&self, id: &str) -> Result<Vec<FileEntry>> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let eng = f.engine.lock().unwrap();
+        Ok(eng
+            .store
+            .live_files()?
+            .into_iter()
+            .filter(|fr| !fr.deleted)
+            .map(|fr| FileEntry {
+                is_dir: fr.merge_class == asp_core::MergeClass::Dir,
+                merge_class: fr.merge_class.as_str().to_string(),
+                path: fr.path,
+                file_id: fr.file_id,
+            })
+            .collect())
+    }
+
+    /// Read a live file's current content (the materialized file on disk is the
+    /// ground truth `asp-core` renders to).
+    pub fn read_file(&self, id: &str, path: &str) -> Result<String> {
+        let full = {
+            let folders = self.folders.lock().unwrap();
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            f.path.join(path)
+        };
+        let bytes = std::fs::read(&full).with_context(|| format!("read {}", full.display()))?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Create or update a file by recording an edit (persists to the log + disk
+    /// via `asp-core` materialize). New paths author a `Create`. The authored row
+    /// is pushed live to every connected peer.
+    pub fn write_file(&self, id: &str, path: &str, content: &str) -> Result<()> {
+        let (conns, wr) = {
+            let folders = self.folders.lock().unwrap();
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            let eng = f.engine.lock().unwrap();
+            let wr = eng.record_write(path, content.as_bytes())?;
+            (f.conns.clone(), wr)
+        };
+        if let Some(wr) = wr {
+            self.broadcast(&conns, wr);
+        }
+        Ok(())
+    }
+
+    /// Rename/move a file (preserves its stable `file_id`); pushed live to peers.
+    pub fn rename_file(&self, id: &str, old: &str, new: &str) -> Result<()> {
+        let (conns, wr) = {
+            let folders = self.folders.lock().unwrap();
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            let eng = f.engine.lock().unwrap();
+            let wr = eng.record_rename(old, new)?;
+            (f.conns.clone(), wr)
+        };
+        if let Some(wr) = wr {
+            self.broadcast(&conns, wr);
+        }
+        Ok(())
+    }
+
+    /// Delete a file (authors a tombstone; removes it from disk on materialize);
+    /// pushed live to peers.
+    pub fn delete_file(&self, id: &str, path: &str) -> Result<()> {
+        let (conns, wr) = {
+            let folders = self.folders.lock().unwrap();
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            let eng = f.engine.lock().unwrap();
+            let wr = eng.record_remove(path)?;
+            (f.conns.clone(), wr)
+        };
+        if let Some(wr) = wr {
+            self.broadcast(&conns, wr);
+        }
+        Ok(())
+    }
+
+    /// Project the append-only log into wall-clock history events for the
+    /// time-travel scrubber. Resolves a path for every row (edits/deletes carry
+    /// none, so we track each `file_id`'s latest path in fold order).
+    pub fn history(&self, id: &str) -> Result<Vec<HistEvent>> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let eng = f.engine.lock().unwrap();
+        let mut latest: HashMap<String, String> = HashMap::new();
+        let mut out = Vec::new();
+        for r in eng.store.all_rows()? {
+            if let Some(p) = &r.path {
+                latest.insert(r.file_id.clone(), p.clone());
+            }
+            let path = r.path.clone().or_else(|| latest.get(&r.file_id).cloned()).unwrap_or_default();
+            out.push(HistEvent {
+                id: r.id,
+                ts: r.ts,
+                lamport: r.lamport,
+                kind: r.kind.as_str().to_string(),
+                path,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Content of a file as the vault was at wall-clock `ts` (read-only; folds
+    /// rows with `ts <= ts` via `asp-core::state_as_of`).
+    pub fn read_file_at(&self, id: &str, path: &str, ts: i64) -> Result<FileAt> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let eng = f.engine.lock().unwrap();
+        match eng.state_as_of(ts)?.get(path) {
+            Some(bytes) => Ok(FileAt { exists: true, content: String::from_utf8_lossy(bytes).into_owned() }),
+            None => Ok(FileAt { exists: false, content: String::new() }),
+        }
+    }
+
+    /// Restore one file to its content as of `ts` (records the historical bytes
+    /// as a new edit — the log stays append-only). No-op if it didn't exist then.
+    pub fn restore_file_at(&self, id: &str, path: &str, ts: i64) -> Result<()> {
+        let (conns, wr) = {
+            let folders = self.folders.lock().unwrap();
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            let eng = f.engine.lock().unwrap();
+            let wr = match eng.state_as_of(ts)?.get(path) {
+                Some(bytes) => eng.record_write(path, bytes)?,
+                None => None,
+            };
+            (f.conns.clone(), wr)
+        };
+        if let Some(wr) = wr {
+            self.broadcast(&conns, wr);
+        }
+        Ok(())
+    }
+
+    /// Re-capture on-disk changes into the log (manual refresh after external
+    /// edits). Mirrors the CLI's rescan.
+    pub fn rescan(&self, id: &str) -> Result<()> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let eng = f.engine.lock().unwrap();
+        eng.capture_rescan()?;
+        Ok(())
+    }
+
+    /// Stop managing a vault: tear down its listener and forget it (so it does
+    /// not reopen next launch). `trash` is accepted for the UI's "move folder to
+    /// Trash" toggle but OS-trash deletion is deferred — we never destroy data
+    /// here; the folder and its `.asp` history stay on disk.
+    pub fn remove_vault(&self, id: &str, _trash: bool) -> Result<()> {
+        let folder = {
+            let mut folders = self.folders.lock().unwrap();
+            folders.remove(id)
+        };
+        if let Some(mut f) = folder {
+            if let Some(h) = f.listener.take() {
+                h.abort();
+            }
+            if let Some(h) = f.connector.take() {
+                h.abort();
+            }
+            // `f.watcher` drops here, stopping the fs watch.
+            self.forget_folder(&f.path);
+        }
+        Ok(())
     }
 }
