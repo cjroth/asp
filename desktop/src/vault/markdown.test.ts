@@ -195,6 +195,52 @@ describe('tables, fences, quotes, rules, ordered lists', () => {
   });
 });
 
+describe('blockquote renders as one continuous accent bar', () => {
+  it('emits one .cm-quote div per quote line with NO inter-line vertical margin', () => {
+    const src = '> first\n> second\n> third';
+    const d = html(renderLiveHtml(src));
+    const quotes = d.querySelectorAll('.cm-quote');
+    // One top-level div per source line (the editor's line↔node mapping).
+    expect(quotes.length).toBe(3);
+    quotes.forEach((q) => {
+      // Styling lives in the CSS class — NO inline margin re-breaks the bar.
+      const style = (q as HTMLElement).getAttribute('style');
+      expect(style).toBeNull();
+      // The `>` marker is preserved inside the hidden cm-mark for round-tripping.
+      const mark = q.querySelector('.cm-mark');
+      expect(mark).not.toBeNull();
+      expect(mark!.textContent).toBe('> ');
+    });
+    // Source round-trips byte-exact through the rendered DOM.
+    expect(readLive(d)).toBe(src);
+  });
+
+  it('renders a single-line quote (one .cm-quote, marker preserved, round-trips)', () => {
+    const src = '> lonely';
+    const d = html(renderLiveHtml(src));
+    const quotes = d.querySelectorAll('.cm-quote');
+    expect(quotes.length).toBe(1);
+    expect((quotes[0] as HTMLElement).getAttribute('style')).toBeNull();
+    expect(quotes[0].querySelector('.cm-mark')!.textContent).toBe('> ');
+    expect(quotes[0].textContent).toBe('> lonely');
+    expect(readLive(d)).toBe(src);
+  });
+
+  it('renders an empty quote line (just ">") as a .cm-quote that round-trips', () => {
+    const src = '> a\n>\n> b';
+    const d = html(renderLiveHtml(src));
+    expect(d.querySelectorAll('.cm-quote').length).toBe(3);
+    expect(readLive(d)).toBe(src);
+  });
+
+  it('leaves non-quote lines untouched (no .cm-quote on plain prose)', () => {
+    const src = 'plain line\n> quote\nmore prose';
+    const d = html(renderLiveHtml(src));
+    expect(d.querySelectorAll('.cm-quote').length).toBe(1);
+    expect(readLive(d)).toBe(src);
+  });
+});
+
 describe('mermaid / diagram fences', () => {
   const SRC = '```mermaid\ngraph TD\nA --> B\n```';
 

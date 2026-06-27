@@ -77,6 +77,24 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
 }
 .cm-task-done .cm-body { color: var(--faint); text-decoration: line-through; }
 
+/* Blockquote. Each `> …` source line renders as one `.cm-quote` div. Consecutive
+   quote divs carry NO vertical margin BETWEEN them, so their left accent bars
+   abut and form ONE continuous vertical line down the whole quote (the old
+   per-line inline `margin:2px 0` is what split the bar into disconnected dashes).
+   The bar uses the theme accent (`--accent`, set on the editor root) softened to
+   ~33% so it reads as a quote rule. Comfortable breathing room is added only at
+   the FIRST and LAST line of a quote run — never between lines, which would
+   re-break the bar. */
+.cm-quote {
+  margin: 0;
+  border-left: 3px solid color-mix(in srgb, var(--accent, #3d63dd) 33%, transparent);
+  padding: 1px 0 1px 14px;
+  color: var(--text3);
+  font-style: italic;
+}
+.cm-quote:not(.cm-quote + .cm-quote) { margin-top: 8px; }
+.cm-quote:not(:has(+ .cm-quote)) { margin-bottom: 8px; }
+
 /* Markdown tables. A wide table scrolls horizontally as a unit inside its own
    `.tbl-scroll` region (so cells show full content instead of squashing) while
    the surrounding prose keeps its normal width. The inner `.tbl-grid` is a CSS

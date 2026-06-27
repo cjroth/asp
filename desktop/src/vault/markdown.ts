@@ -177,7 +177,11 @@ export function renderLiveHtml(src: string, accent = '#3d63dd', fmStyle: Frontma
       continue;
     }
     if ((m = ln.match(/^(>\s?)(.*)$/))) {
-      html += div('', 'border-left:3px solid ' + accent + '55;padding:1px 0 1px 14px;color:var(--text3);font-style:italic;margin:2px 0', mk(m[1]) + (inlineMd(m[2]) || '<br>'));
+      // One `.cm-quote` div per quote line (the `>` stays in a hidden cm-mark so
+      // the source round-trips). All styling — including the left accent bar — is
+      // in the `.cm-quote` CSS class, which carries NO vertical margin between
+      // consecutive quote lines, so their bars meet into ONE continuous line.
+      html += div('cm-quote', '', mk(m[1]) + (inlineMd(m[2]) || '<br>'));
       continue;
     }
     if (/^(-{3,}|\*{3,})\s*$/.test(ln)) {
