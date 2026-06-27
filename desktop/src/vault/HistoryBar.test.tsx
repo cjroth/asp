@@ -36,6 +36,8 @@ const props = (over: Partial<HistoryBarProps> = {}): HistoryBarProps => ({
   identity: 'ssh-ed25519 DEVICEKEY me@host',
   histOpen: true,
   logOpen: false,
+  barHeight: 150,
+  animate: true,
   onTabHistory: vi.fn(),
   onTabLog: vi.fn(),
   onNow: vi.fn(),
@@ -47,6 +49,18 @@ const rectTrack = (el: HTMLElement) => {
 };
 
 describe('HistoryBar', () => {
+  it('sizes the bar from barHeight and reflects animate in the transition', () => {
+    const { container, rerender } = render(<HistoryBar {...props({ barHeight: 220, animate: true })} />);
+    const bar = container.firstChild as HTMLElement;
+    expect(bar.style.height).toBe('220px');
+    expect(bar.style.transition).toBe('height .16s ease');
+
+    // While dragging (animate=false) the height jumps with no transition lag.
+    rerender(<HistoryBar {...props({ barHeight: 300, animate: false })} />);
+    expect(bar.style.height).toBe('300px');
+    expect(bar.style.transition).toBe('none');
+  });
+
   it('switches tabs and reports rows', () => {
     const onTabHistory = vi.fn();
     const onTabLog = vi.fn();

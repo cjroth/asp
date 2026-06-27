@@ -40,6 +40,8 @@ export interface HistoryBarProps {
   identity: string;
   histOpen: boolean;
   logOpen: boolean;
+  barHeight: number;
+  animate: boolean;
   onTabHistory: () => void;
   onTabLog: () => void;
   onNow: () => void;
@@ -200,10 +202,10 @@ export default function HistoryBar(props: HistoryBarProps) {
 
   const tabBase: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 6, height: 24, padding: '0 11px', border: 'none', background: 'transparent', color: 'var(--text3)', borderRadius: 6, cursor: 'pointer', fontFamily: 'inherit', fontSize: 12, fontWeight: 500 };
   const tabActive: React.CSSProperties = { ...tabBase, background: 'var(--bg)', color: 'var(--text)', boxShadow: '0 1px 2px rgba(0,0,0,0.08)' };
-  const barHeight = logOpen ? 196 : histOpen ? 108 : 38;
+  const barHeight = props.barHeight;
 
   return (
-    <div style={{ flex: 'none', height: barHeight, background: 'var(--bg-sub)', borderTop: '1px solid var(--line)', display: 'flex', flexDirection: 'column', userSelect: 'none', transition: 'height .16s ease' }}>
+    <div style={{ flex: 'none', height: barHeight, background: 'var(--bg-sub)', borderTop: '1px solid var(--line)', display: 'flex', flexDirection: 'column', userSelect: 'none', transition: props.animate ? 'height .16s ease' : 'none' }}>
       <div style={{ display: 'flex', alignItems: 'center', height: 38, padding: '0 9px 0 15px', gap: 10, flex: 'none' }}>
         <span style={{ display: 'inline-flex', flex: 'none', color: 'var(--faint2)' }}>
           {locationIsPath ? <Icon.FolderIcon size={12} stroke="var(--faint2)" /> : <Icon.GlobeIcon size={12} stroke="var(--faint2)" />}

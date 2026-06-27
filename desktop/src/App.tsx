@@ -16,7 +16,7 @@ import LiveEditor from './vault/LiveEditor';
 import { countLabel } from './vault/markdown';
 import { isDesktop } from './lib/platform';
 import { basename, freeName, makeAccessKey, relTime, shortFingerprint } from './vault/format';
-import { applyTheme, clampSidebar, fontFamilyOf, loadPrefs, type Prefs, savePrefs } from './vault/prefs';
+import { applyTheme, clampHistBar, clampSidebar, fontFamilyOf, HISTBAR_COLLAPSE, loadPrefs, type Prefs, savePrefs } from './vault/prefs';
 import { isHidden } from './vault/prettyNames';
 import { allDirPaths, buildTree, firstSelectable, flatten } from './vault/tree';
 import { avatarStyle, glyphOf, hueForId, loadVaultMeta, resolveMeta, saveVaultMeta, type VaultMetaMap } from './vault/vaultMeta';
@@ -108,6 +108,8 @@ export default function App() {
   const [crumbEditing, setCrumbEditing] = useState(false);
 
   const [sidebarW, setSidebarW] = useState(prefs.sidebarW);
+  const [histBarH, setHistBarH] = useState(prefs.histBarH);
+  const [resizingBar, setResizingBar] = useState(false);
 
   const [entry, setEntry] = useState<'new' | 'connect' | null>(null);
   const [newVaultName, setNewVaultName] = useState('');
@@ -667,6 +669,51 @@ export default function App() {
     [sidebarW, updatePrefs],
   );
 
+  // ---------- history/log bar resize ----------
+  // The bar lives at the bottom and grows UPWARD, so dragging up (clientY
+  // decreasing) makes it taller. One shared height drives whichever panel is
+  // open. Drag below the collapse threshold → snap fully shut; dragging back up
+  // within the same gesture re-opens the tab we started from.
+  const onHistBarResize = useCallback(
+    (e: React.PointerEvent) => {
+      e.preventDefault();
+      const startY = e.clientY;
+      const h0 = histBarH;
+      const wasHist = histOpen;
+      const wasLog = logOpen;
+      let collapsed = false;
+      let latest = h0;
+      setResizingBar(true);
+      const move = (ev: PointerEvent) => {
+        const proposed = h0 - (ev.clientY - startY);
+        if (proposed < HISTBAR_COLLAPSE) {
+          collapsed = true;
+          setHistOpen(false);
+          setLogOpen(false);
+        } else {
+          if (collapsed) {
+            collapsed = false;
+            setHistOpen(wasHist);
+            setLogOpen(wasLog);
+          }
+          latest = clampHistBar(proposed);
+          setHistBarH(latest);
+        }
+      };
+      const up = () => {
+        document.removeEventListener('pointermove', move);
+        document.removeEventListener('pointerup', up);
+        document.body.style.cursor = '';
+        setResizingBar(false);
+        if (!collapsed) updatePrefs({ histBarH: latest });
+      };
+      document.body.style.cursor = 'row-resize';
+      document.addEventListener('pointermove', move);
+      document.addEventListener('pointerup', up);
+    },
+    [histBarH, histOpen, logOpen, updatePrefs],
+  );
+
   // ---------- theme / font ----------
   const onToggleTheme = useCallback(() => {
     const next = prefs.theme === 'dark' ? 'light' : 'dark';
@@ -1173,6 +1220,12 @@ export default function App() {
           </main>
         </div>
 
+        {(histOpen || logOpen) && (
+          <div onPointerDown={onHistBarResize} className="hb-resize" style={{ height: 7, flex: 'none', cursor: 'row-resize', margin: '-3px 0', zIndex: 6, position: 'relative', display: 'flex', alignItems: 'center' }}>
+            <div className="hb-line" style={{ height: 1, alignSelf: 'center', width: '100%', background: 'var(--line)' }} />
+          </div>
+        )}
+
         <HistoryBar
           events={events}
           histRaw={histRaw}
@@ -1191,6 +1244,8 @@ export default function App() {
           identity={identity}
           histOpen={histOpen}
           logOpen={logOpen}
+          barHeight={histOpen || logOpen ? histBarH : 38}
+          animate={!resizingBar}
           onTabHistory={onTabHistory}
           onTabLog={onTabLog}
           onNow={onNow}

@@ -237,6 +237,48 @@ describe('App — editor', () => {
     expect(screen.getByText(/endpoint bound/)).toBeTruthy();
   });
 
+  it('resizes the history bar by dragging its top edge and persists the height', async () => {
+    await screen.findByTestId('live-editor');
+    fireEvent.click(screen.getByText('History'));
+    await screen.findByTestId('history-track');
+
+    // Default shared height is 150 (DEFAULT_PREFS.histBarH).
+    const barOf = () => document.querySelector('[style*="row-resize"]')!.nextElementSibling as HTMLElement;
+    expect(barOf().style.height).toBe('150px');
+
+    // Drag the top edge UP (clientY decreasing) → the bar grows taller.
+    const handle = document.querySelector('.hb-resize') as HTMLElement;
+    fireEvent(handle, new MouseEvent('pointerdown', { clientY: 500, bubbles: true, cancelable: true }));
+    fireEvent(document, new MouseEvent('pointermove', { clientY: 400, bubbles: true }));
+    fireEvent(document, new MouseEvent('pointerup', { clientY: 400, bubbles: true }));
+    expect(barOf().style.height).toBe('250px');
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('asp.prefs.v1')!).histBarH).toBe(250));
+
+    // Switching History ↔ Log keeps the same shared height.
+    fireEvent.click(screen.getByText('Log'));
+    await screen.findByText(/events$/);
+    expect(barOf().style.height).toBe('250px');
+    fireEvent.click(screen.getByText('History'));
+    await screen.findByTestId('history-track');
+    expect(barOf().style.height).toBe('250px');
+  });
+
+  it('collapses the history bar when dragged below the threshold', async () => {
+    await screen.findByTestId('live-editor');
+    fireEvent.click(screen.getByText('History'));
+    await screen.findByTestId('history-track');
+
+    const handle = document.querySelector('.hb-resize') as HTMLElement;
+    // Drag DOWN far enough that proposed (150 - 100 = 50) < HISTBAR_COLLAPSE (72).
+    fireEvent(handle, new MouseEvent('pointerdown', { clientY: 500, bubbles: true, cancelable: true }));
+    fireEvent(document, new MouseEvent('pointermove', { clientY: 600, bubbles: true }));
+    fireEvent(document, new MouseEvent('pointerup', { clientY: 600, bubbles: true }));
+
+    // Panel snapped shut: the track is gone and the resize handle disappears.
+    await waitFor(() => expect(screen.queryByTestId('history-track')).toBeNull());
+    expect(document.querySelector('.hb-resize')).toBeNull();
+  });
+
   it('deletes a file via its context menu', async () => {
     fireEvent.contextMenu(screen.getByText('TODO.md'));
     // menu shows Rename + Delete, but no filename header (TODO.md stays a single tree row)

@@ -115,6 +115,9 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
 /* Sidebar resize handle. */
 .sb-resize:hover .sb-line { background: var(--accent, #3d63dd); }
 
+/* History/log bar resize handle (drag its top edge to grow upward). */
+.hb-resize:hover .hb-line { background: var(--accent, #3d63dd); }
+
 /* Frontmatter — Card (default for `frontmatterStyle: Card`). */
 .fm-line {
   background: var(--bg-input); border-left: 1px solid var(--line); border-right: 1px solid var(--line);
