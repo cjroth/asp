@@ -152,6 +152,14 @@ describe('FileTree', () => {
     expect(onMove).toHaveBeenCalledWith(['a.md'], 'folder');
   });
 
+  it('tags the dragged path on dataTransfer so the tab strip can open it', () => {
+    const onMove = vi.fn();
+    const dt = dnd();
+    const { container } = render(<FileTree {...props(rowsFor(['a.md', 'folder/b.md'], {}), 'a.md', {}, { onMove })} />);
+    fireEvent.dragStart(rowOf(container, 'a.md'), { dataTransfer: dt });
+    expect(dt.setData).toHaveBeenCalledWith('application/x-asp-path', 'a.md');
+  });
+
   it('toggles the drop-target highlight on dragOver / dragLeave', () => {
     const onMove = vi.fn();
     const { container } = render(<FileTree {...props(rowsFor(['a.md', 'folder/b.md'], {}), 'a.md', {}, { onMove })} />);

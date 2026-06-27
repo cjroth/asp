@@ -59,10 +59,10 @@ vi.mock('./lib/api', () => ({
   },
 }));
 
-import App from './App';
+import App, { __resetUrlRestore } from './App';
 
 afterEach(cleanup);
-beforeEach(() => { vi.clearAllMocks(); reset(); localStorage.clear(); document.documentElement.removeAttribute('data-theme'); });
+beforeEach(() => { vi.clearAllMocks(); reset(); localStorage.clear(); document.documentElement.removeAttribute('data-theme'); __resetUrlRestore(); window.history.replaceState(null, '', '/'); });
 
 const openVault = async () => {
   fireEvent.click(await screen.findByText('notes')); // the v1 row (basename of /home/me/notes)
@@ -173,11 +173,13 @@ describe('App — editor', () => {
     await waitFor(() => expect(renameFile).toHaveBeenCalledWith('v1', 'untitled', 'docs'));
   });
 
-  it('renames the open file via the breadcrumb (double-click)', async () => {
+  it('renames the open file via the tab context menu', async () => {
     const editor = await screen.findByTestId('live-editor');
     await waitFor(() => expect(editor.textContent).toContain('Readme'));
-    fireEvent.doubleClick(screen.getByTitle('Double-click to rename'));
-    const input = screen.getByDisplayValue('README.md');
+    const readmeTab = screen.getAllByTestId('tab').find((t) => t.getAttribute('data-path') === 'README.md')!;
+    fireEvent.contextMenu(readmeTab);
+    fireEvent.click(await screen.findByText('Rename'));
+    const input = screen.getByTestId('tab-rename-input');
     fireEvent.change(input, { target: { value: 'GUIDE.md' } });
     fireEvent.keyDown(input, { key: 'Enter' });
     await waitFor(() => expect(renameFile).toHaveBeenCalledWith('v1', 'README.md', 'GUIDE.md'));
@@ -495,11 +497,13 @@ describe('App — empty + edge states', () => {
     fireEvent.contextMenu(treeScroll, { clientX: 10, clientY: 10 });
     fireEvent.click(zdiv(60)); // overlay closes the ctx menu
 
-    // breadcrumb rename committed via blur
+    // tab rename committed via blur (no-op rename → just exercises the handler)
     const editor = await screen.findByTestId('live-editor');
     await waitFor(() => expect(editor.textContent).toContain('Readme'));
-    fireEvent.doubleClick(screen.getByTitle('Double-click to rename'));
-    fireEvent.blur(screen.getByDisplayValue('README.md'));
+    const readmeTab = screen.getAllByTestId('tab').find((t) => t.getAttribute('data-path') === 'README.md')!;
+    fireEvent.contextMenu(readmeTab);
+    fireEvent.click(await screen.findByText('Rename'));
+    fireEvent.blur(screen.getByTestId('tab-rename-input'));
   });
 
   it('fills both entry modals (name + access key fields) and dismisses via overlay', async () => {

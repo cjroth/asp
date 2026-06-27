@@ -19,6 +19,8 @@ import { basename, freeName, makeAccessKey, relTime, shortFingerprint } from './
 import { applyTheme, clampHistBar, clampSidebar, fontFamilyOf, HISTBAR_COLLAPSE, loadPrefs, type Prefs, savePrefs } from './vault/prefs';
 import { isHidden } from './vault/prettyNames';
 import { allDirPaths, buildTree, firstSelectable, flatten } from './vault/tree';
+import TabBar from './vault/TabBar';
+import { buildHash, closeTab, loadOpenTabs, parseHash, remapTabs, removeTabs, reorderTabs, saveOpenTabs, withTab } from './vault/tabs';
 import { WELCOME_MD } from './vault/welcome';
 import { avatarStyle, glyphOf, hueForId, loadVaultMeta, resolveMeta, saveVaultMeta, type VaultMetaMap } from './vault/vaultMeta';
 
@@ -46,6 +48,18 @@ interface CtxMenu {
   isDir?: boolean;
   name?: string;
 }
+
+// One-shot guard: restore the vault+file from the URL hash only on the FIRST App
+// mount after a genuine page load. A real refresh re-executes this module (reset
+// to false → restore runs); within a single test session the module persists, so
+// later <App/> mounts in the same file don't spuriously re-restore from a stale
+// (in-session) hash. Tests reset it via __resetUrlRestore() in beforeEach.
+let URL_RESTORE_DONE = false;
+export function __resetUrlRestore(): void {
+  URL_RESTORE_DONE = false;
+}
+
+const currentHash = (): string => (typeof window !== 'undefined' && window.location ? window.location.hash : '');
 
 export default function App() {
   const desktop = isDesktop();
@@ -88,6 +102,9 @@ export default function App() {
   // plainly-clicked file — the fixed end of a shift-range.
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
   const [anchorPath, setAnchorPath] = useState<string | null>(null);
+  // Open tabs for the ACTIVE vault (file paths). Additive to selection:
+  // `selectedPath` stays the active/editor file; tabs just remember what's open.
+  const [openTabs, setOpenTabs] = useState<string[]>([]);
 
   const [paint, setPaint] = useState<Paint | null>(null);
   const [docText, setDocText] = useState('');
@@ -106,7 +123,12 @@ export default function App() {
   const [ctxMenu, setCtxMenu] = useState<CtxMenu | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
-  const [crumbEditing, setCrumbEditing] = useState(false);
+  // Inline rename of an open TAB (kept separate from the file-tree `renaming`
+  // state so a tab rename never also turns the tree row into an input).
+  const [tabRenaming, setTabRenaming] = useState<string | null>(null);
+  const [tabRenameValue, setTabRenameValue] = useState('');
+  // Right-click-a-tab context menu (Rename / Close / Delete).
+  const [tabCtx, setTabCtx] = useState<{ x: number; y: number; path: string } | null>(null);
 
   const [sidebarW, setSidebarW] = useState(prefs.sidebarW);
   const [histBarH, setHistBarH] = useState(prefs.histBarH);
@@ -138,9 +160,14 @@ export default function App() {
   const filesRef = useRef<FileEntry[]>([]);
   const contentRef = useRef<Record<string, string>>({});
   const paintSeq = useRef(0);
+  const vaultsRef = useRef<VaultInfo[]>([]);
+  const openTabsRef = useRef<string[]>([]);
+  const openVaultRef = useRef<(id: string) => Promise<void>>(async () => {});
+  const urlHadSelection = useRef(false);
   activeIdRef.current = activeId;
   selectedRef.current = selectedPath;
   selectedPathsRef.current = selectedPaths;
+  openTabsRef.current = openTabs;
   playheadRef.current = playhead;
   viewRef.current = view;
   nowRef.current = now;
@@ -153,8 +180,16 @@ export default function App() {
   // ---------- data loading ----------
   const refreshVaults = useCallback(async () => {
     const vs = await api.listVaults();
+    vaultsRef.current = vs; // keep fresh synchronously for openVault/url-sync
     setVaults(vs);
     return vs;
+  }, []);
+
+  // The stable cross-session vault identity used in the URL hash + tabs storage
+  // key. Falls back to the local handle if the vault isn't loaded yet.
+  const vidOf = useCallback((id: string | null): string | null => {
+    if (!id) return null;
+    return vaultsRef.current.find((v) => v.id === id)?.vault_id ?? id;
   }, []);
 
   const refreshStatuses = useCallback(async (vs: VaultInfo[]) => {
@@ -202,9 +237,52 @@ export default function App() {
     void api.getIdentity().then(setIdentity).catch(() => {});
     void (async () => {
       const vs = await refreshVaults();
+      // Refresh-restore: on the first mount after a real page load, if the URL
+      // hash names a known vault, open it (openVault then picks the hashed file).
+      // Works identically on desktop and web — the hash is read the same way.
+      if (!URL_RESTORE_DONE) {
+        URL_RESTORE_DONE = true;
+        const parsed = parseHash(currentHash());
+        if (parsed) {
+          const match = vs.find((v) => v.vault_id === parsed.vaultId);
+          if (match) {
+            try {
+              await openVaultRef.current(match.id);
+            } catch {
+              /* fall through to the default connect screen */
+            }
+          }
+        }
+      }
       await refreshStatuses(vs);
     })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshVaults, refreshStatuses]);
+
+  // Persist the active vault's open tabs whenever they change.
+  useEffect(() => {
+    const vid = vidOf(activeId);
+    if (vid) saveOpenTabs(vid, openTabs);
+  }, [openTabs, activeId, vidOf]);
+
+  // Keep the active vault+file in the URL hash (replaceState — never spam
+  // history). The clear branch only fires on a real transition AWAY from a
+  // selection, so it can't wipe the page-load hash before the initial restore
+  // (which runs in the mount effect above) has read it.
+  useEffect(() => {
+    try {
+      const vid = vidOf(activeId);
+      if (vid && selectedPath) {
+        window.history.replaceState(null, '', buildHash(vid, selectedPath));
+        urlHadSelection.current = true;
+      } else if (urlHadSelection.current) {
+        window.history.replaceState(null, '', window.location.pathname + window.location.search);
+        urlHadSelection.current = false;
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [activeId, selectedPath, vidOf]);
 
   useEffect(() => {
     const t = setInterval(() => {
@@ -338,6 +416,28 @@ export default function App() {
   const openVault = useCallback(
     async (id: string) => {
       await flushSave();
+      const fs = await refreshFiles(id);
+      const tree = buildTree(fs);
+      const vid = vaultsRef.current.find((v) => v.id === id)?.vault_id ?? id;
+      const fileSet = new Set(fs.filter((f) => !f.is_dir).map((f) => f.path));
+      // Restore this vault's previously-open tabs (dropping any now-missing file).
+      const stored = loadOpenTabs(vid).filter((p) => fileSet.has(p));
+      // Pick the active file: the URL hash (if it points at THIS vault and the
+      // file still exists), else the first restored tab, else today's default.
+      const parsed = parseHash(currentHash());
+      let active: string | null = null;
+      if (parsed && parsed.vaultId === vid && fileSet.has(parsed.path)) active = parsed.path;
+      else if (stored.length) active = stored[0];
+      else active = firstSelectable(tree);
+      const tabs = active ? withTab(stored, active) : stored;
+      const exp: Record<string, boolean> = {};
+      if (active) {
+        const parts = active.split('/');
+        for (let i = 1; i < parts.length; i++) exp[parts.slice(0, i).join('/')] = true;
+      }
+      // All state lands in ONE batched update (after the awaits) so the active
+      // vault id and its tab list never disagree — otherwise the tab-persistence
+      // effect would briefly save the previous vault's tabs under the new key.
       contentRef.current = {};
       setActiveId(id);
       setScreen('editor');
@@ -345,26 +445,21 @@ export default function App() {
       setPlayhead(null);
       setView(defaultView(Date.now()));
       setNow(Date.now());
-      const fs = await refreshFiles(id);
-      const tree = buildTree(fs);
-      const sel = firstSelectable(tree);
-      const exp: Record<string, boolean> = {};
-      if (sel) {
-        const parts = sel.split('/');
-        for (let i = 1; i < parts.length; i++) exp[parts.slice(0, i).join('/')] = true;
-      }
       setExpanded(exp);
-      setSelectedPath(sel);
-      setSelectedPaths(sel ? new Set([sel]) : new Set());
-      setAnchorPath(sel);
+      setOpenTabs(tabs);
+      setSelectedPath(active);
+      setSelectedPaths(active ? new Set([active]) : new Set());
+      setAnchorPath(active);
       scheduleHistory(id);
     },
     [flushSave, refreshFiles, scheduleHistory],
   );
+  openVaultRef.current = openVault;
 
   const selectFile = useCallback(
     async (path: string) => {
       await flushSave();
+      setOpenTabs((t) => withTab(t, path));
       setSelectedPath(path);
     },
     [flushSave],
@@ -411,6 +506,7 @@ export default function App() {
       setFiles(next);
       contentRef.current[`${id}::${path}`] = content;
       if (parent) setExpanded((e) => ({ ...e, [parent]: true }));
+      setOpenTabs((t) => withTab(t, path));
       setSelectedPath(path);
       setSelectedPaths(new Set([path]));
       setAnchorPath(path);
@@ -463,7 +559,7 @@ export default function App() {
     (oldPath: string, rawName: string) => {
       const id = activeIdRef.current;
       setRenaming(null);
-      setCrumbEditing(false);
+      setTabRenaming(null);
       const name = rawName.trim();
       if (!id || !name) return;
       const parts = oldPath.split('/');
@@ -500,6 +596,7 @@ export default function App() {
       const remapSel = (p: string) => (p === oldPath || p.startsWith(oldPath + '/') ? remap(p) : p);
       setSelectedPaths((prev) => new Set(Array.from(prev, remapSel)));
       setAnchorPath((p) => (p ? remapSel(p) : p));
+      setOpenTabs((t) => remapTabs(t, oldPath, newPath));
 
       void (async () => {
         try {
@@ -572,6 +669,11 @@ export default function App() {
       if (flushSel) setSelectedPath(remap(flushSel));
       setSelectedPaths((prev) => new Set(Array.from(prev, remap)));
       setAnchorPath((p) => (p ? remap(p) : p));
+      setOpenTabs((t) => {
+        let nt = t;
+        for (const { src, dst } of moves) nt = remapTabs(nt, src, dst);
+        return nt;
+      });
 
       void (async () => {
         try {
@@ -609,13 +711,27 @@ export default function App() {
       filesRef.current = next;
       setFiles(next);
       for (const p of victimSet) delete contentRef.current[`${id}::${p}`];
+      const victims = Array.from(victimSet);
+      const oldTabs = openTabsRef.current;
+      const tabsAfter = removeTabs(oldTabs, victims);
       const sel = selectedRef.current;
       if (sel && victimSet.has(sel)) {
-        const fallback = firstSelectable(buildTree(next));
-        setSelectedPath(fallback);
-        setSelectedPaths(fallback ? new Set([fallback]) : new Set());
-        setAnchorPath(fallback);
+        // The active file is being deleted → switch to a surviving neighbor tab
+        // (prefer the next, then previous); if none remain, fall back to the
+        // vault's default file (and adopt it as the sole open tab).
+        let na: string | null = null;
+        const idx = oldTabs.indexOf(sel);
+        if (idx >= 0) {
+          for (let i = idx + 1; i < oldTabs.length && na == null; i++) if (tabsAfter.includes(oldTabs[i])) na = oldTabs[i];
+          for (let i = idx - 1; i >= 0 && na == null; i--) if (tabsAfter.includes(oldTabs[i])) na = oldTabs[i];
+        }
+        if (na == null) na = tabsAfter.length ? tabsAfter[0] : firstSelectable(buildTree(next));
+        setOpenTabs(na ? withTab(tabsAfter, na) : tabsAfter);
+        setSelectedPath(na);
+        setSelectedPaths(na ? new Set([na]) : new Set());
+        setAnchorPath(na);
       } else {
+        setOpenTabs(tabsAfter);
         setSelectedPaths((prev) => {
           const np = new Set(prev);
           for (const p of victimSet) np.delete(p);
@@ -945,6 +1061,7 @@ export default function App() {
       setSelectedPath(null);
       setSelectedPaths(new Set());
       setAnchorPath(null);
+      setOpenTabs([]);
     }
   }, [removeVaultState, refreshVaults]);
 
@@ -1008,11 +1125,64 @@ export default function App() {
     [rows, anchorPath, selectedPaths, selectedPath, selectFile],
   );
 
+  // ---------- tab bar ----------
+  // Clicking a tab makes it the active/editor file (collapsing any multi-select).
+  const onTabSelect = useCallback(
+    (path: string) => {
+      setSelectedPaths(new Set([path]));
+      setAnchorPath(path);
+      void selectFile(path);
+    },
+    [selectFile],
+  );
+
+  // Closing a tab. If it's the active file, switch to closeTab's chosen neighbor
+  // (or the empty state when it was the last tab).
+  const onTabClose = useCallback(
+    (path: string) => {
+      const res = closeTab(openTabsRef.current, selectedRef.current, path);
+      setOpenTabs(res.tabs);
+      if (selectedRef.current === path) {
+        if (res.active) {
+          void flushSave();
+          setSelectedPath(res.active);
+          setSelectedPaths(new Set([res.active]));
+          setAnchorPath(res.active);
+        } else {
+          setSelectedPath(null);
+          setSelectedPaths(new Set());
+          setAnchorPath(null);
+        }
+      }
+    },
+    [flushSave],
+  );
+
+  // Right-click a tab → Rename / Close / Delete menu (App renders it).
+  const onTabContext = useCallback((path: string, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setVaultMenuOpen(false);
+    setCtxMenu(null);
+    setTabCtx({ x: Math.min(e.clientX, window.innerWidth - 164), y: Math.min(e.clientY, window.innerHeight - 130), path });
+  }, []);
+
+  // Drag-reorder within the strip → persist the new order (the per-vault
+  // localStorage save fires off the openTabs change).
+  const onTabReorder = useCallback((from: number, to: number) => {
+    setOpenTabs((t) => reorderTabs(t, from, to));
+  }, []);
+
+  // A file dragged from the tree onto the strip OPENS it as a tab (no move).
+  const onTabDropOpen = useCallback(
+    (path: string) => {
+      if (filesRef.current.some((f) => f.path === path && !f.is_dir)) onTabSelect(path);
+    },
+    [onTabSelect],
+  );
+
   const ctxTargetPath = ctxMenu && !ctxMenu.root ? ctxMenu.path ?? null : null;
 
-  const selParts = selectedPath ? selectedPath.split('/') : [];
-  const crumbFile = selParts.length ? selParts[selParts.length - 1] : '';
-  const crumbDir = selParts.length > 1 ? selParts.slice(0, -1).join(' / ') + ' / ' : '';
   const count = selectedPath ? countLabel(docText, selectedPath) : '';
   // Submit is blocked until the modal has what it needs — desktop additionally
   // requires a chosen destination folder; web needs none (it writes to OPFS).
@@ -1237,23 +1407,26 @@ export default function App() {
           <main style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
             {hasSelection ? (
               <>
-                <div style={{ height: 48, flex: 'none', display: 'flex', alignItems: 'center', gap: 10, padding: '0 16px', borderBottom: '1px solid var(--line)' }}>
-                  <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 13 }}>
-                    <span style={{ color: 'var(--faint2)' }}>{crumbDir}</span>
-                    {crumbEditing ? (
-                      <input
-                        autoFocus
-                        value={renameValue}
-                        spellCheck={false}
-                        onChange={(e) => setRenameValue(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); if (selectedPath) void commitRename(selectedPath, renameValue); } else if (e.key === 'Escape') setCrumbEditing(false); }}
-                        onBlur={() => { if (selectedPath) void commitRename(selectedPath, renameValue); }}
-                        style={{ fontSize: 13, fontWeight: 500, fontFamily: 'inherit', color: 'var(--text)', background: 'var(--bg)', border: `1px solid ${accent}`, borderRadius: 5, padding: '1px 6px', outline: 'none', minWidth: 180 }}
-                      />
-                    ) : (
-                      <span onDoubleClick={() => { setRenameValue(crumbFile); setCrumbEditing(true); }} title="Double-click to rename" style={{ color: 'var(--text)', fontWeight: 500, cursor: 'text' }}>{crumbFile}</span>
-                    )}
-                  </div>
+                {/* Merged header row: the tab strip (left, scrollable) shares one
+                    row with the save/count/font/theme cluster (right). */}
+                <div style={{ height: 48, flex: 'none', display: 'flex', alignItems: 'center', gap: 10, padding: '0 16px 0 0', borderBottom: '1px solid var(--line)' }}>
+                  <TabBar
+                    tabs={openTabs}
+                    active={selectedPath}
+                    prettyNames={prefs.prettyNames}
+                    accent={accent}
+                    accentSoft={accentSoft}
+                    onSelect={onTabSelect}
+                    onClose={onTabClose}
+                    onContext={onTabContext}
+                    onReorder={onTabReorder}
+                    onDropOpenPath={onTabDropOpen}
+                    renamingPath={tabRenaming}
+                    renameValue={tabRenameValue}
+                    onRenameChange={setTabRenameValue}
+                    onRenameKeyDown={(e, path) => { if (e.key === 'Enter') { e.preventDefault(); void commitRename(path, tabRenameValue); } else if (e.key === 'Escape') setTabRenaming(null); }}
+                    onRenameCommit={(path) => void commitRename(path, tabRenameValue)}
+                  />
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 'none' }}>
                     <span style={{ width: 7, height: 7, borderRadius: '50%', flex: 'none', background: saving ? '#d9a93d' : '#3fa45a', transition: 'background .2s' }} />
                     <span style={{ fontSize: 12, color: 'var(--faint)', whiteSpace: 'nowrap' }}>{saving ? 'Saving…' : 'Saved'}</span>
@@ -1365,6 +1538,27 @@ export default function App() {
                   </div>
                 </>
               )}
+            </div>
+          </>
+        )}
+
+        {/* tab context menu — Rename / Close / Delete */}
+        {tabCtx && (
+          <>
+            <div onClick={() => setTabCtx(null)} onContextMenu={(e) => { e.preventDefault(); setTabCtx(null); }} style={{ position: 'fixed', inset: 0, zIndex: 60 }} />
+            <div style={{ position: 'fixed', left: tabCtx.x, top: tabCtx.y, zIndex: 61, width: 156, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, boxShadow: '0 12px 32px rgba(28,25,23,0.16)', padding: 5 }}>
+              <div className="asp-hover-soft" onClick={() => { setTabRenaming(tabCtx.path); setTabRenameValue(basename(tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                <Icon.PencilIcon style={{ flex: 'none' }} />
+                <span>Rename</span>
+              </div>
+              <div className="asp-hover-soft" onClick={() => { onTabClose(tabCtx.path); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
+                <span>Close</span>
+              </div>
+              <div className="asp-hover-soft" onClick={() => { deleteNode(tabCtx.path, false); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                <Icon.TrashIcon stroke="var(--text2)" style={{ flex: 'none' }} />
+                <span>Delete</span>
+              </div>
             </div>
           </>
         )}

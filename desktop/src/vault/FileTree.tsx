@@ -170,6 +170,10 @@ export default function FileTree(props: FileTreeProps) {
                 if (e.dataTransfer) {
                   e.dataTransfer.effectAllowed = 'move';
                   try { e.dataTransfer.setData('text/plain', node.path); } catch { /* jsdom */ }
+                  // Also tag the path so the tab strip (a separate component) can
+                  // read it on drop and OPEN the file as a tab — distinct from the
+                  // folder-row drop that MOVES it.
+                  try { e.dataTransfer.setData('application/x-asp-path', node.path); } catch { /* jsdom */ }
                 }
               }}
               onDragEnd={endDrag}

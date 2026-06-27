@@ -30,10 +30,18 @@ vi.mock('./lib/api', () => ({
   },
 }));
 
-import App from './App';
+import App, { __resetUrlRestore } from './App';
+import { buildHash, parseHash } from './vault/tabs';
 
 const w = window as unknown as Record<string, unknown>;
-beforeEach(() => { vi.clearAllMocks(); delete w.__TAURI_INTERNALS__; delete w.__TAURI__; });
+beforeEach(() => {
+  vi.clearAllMocks();
+  delete w.__TAURI_INTERNALS__;
+  delete w.__TAURI__;
+  localStorage.clear();
+  __resetUrlRestore();
+  window.history.replaceState(null, '', '/');
+});
 afterEach(() => { cleanup(); w.__TAURI_INTERNALS__ = {}; });
 
 describe('App on the web (OPFS, no Tauri)', () => {
@@ -67,5 +75,27 @@ describe('App on the web (OPFS, no Tauri)', () => {
     await waitFor(() => expect(createVault).toHaveBeenCalledWith('Browser Notes'));
     // It opens straight into the editor.
     await screen.findByText('Files');
+  });
+
+  // The URL-hash restore path must behave identically on web (no Tauri) — same
+  // location.hash read, no path-based routing. The seeded vault is wv0/README.md.
+  it('restores the vault + file from the URL hash on mount (refresh, web)', async () => {
+    window.history.replaceState(null, '', buildHash('wv0', 'README.md'));
+    render(<App />);
+    // Without a click it lands directly in the editor (a plain load shows the
+    // connect screen until a vault is chosen) and writes the active file back.
+    await screen.findByText('Files');
+    await screen.findByTestId('tab-bar');
+    expect(parseHash(window.location.hash)).toEqual({ vaultId: 'wv0', path: 'README.md' });
+    expect(screen.getByTestId('tab').getAttribute('data-path')).toBe('README.md');
+  });
+
+  it('opens a tab and reflects the active file in the hash (web)', async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByText('Using browser storage')); // open wv0
+    await screen.findByText('Files');
+    await screen.findByTestId('tab-bar');
+    expect(screen.getByTestId('tab').getAttribute('data-path')).toBe('README.md');
+    await waitFor(() => expect(parseHash(window.location.hash)).toEqual({ vaultId: 'wv0', path: 'README.md' }));
   });
 });
