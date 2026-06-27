@@ -155,6 +155,11 @@ export default function App() {
   const histTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dirtyRef = useRef(false);
   const filesRef = useRef<FileEntry[]>([]);
+  // In-memory working copy of file content, keyed `${vaultId}::${path}`. This is
+  // the source of truth for the editor: optimistic creates/edits land here, so we
+  // never re-read a file from the (possibly lagging) backend and show stale or
+  // empty content while a write is still in flight.
+  const contentRef = useRef<Record<string, string>>({});
   const trackRef = useRef<HTMLDivElement | null>(null);
   const paintSeq = useRef(0);
   activeIdRef.current = activeId;
@@ -290,15 +295,28 @@ export default function App() {
       setPaint(null);
       return;
     }
-    let cancelled = false;
     const seq = ++paintSeq.current;
     const ph = playhead;
     const live = ph == null || ph >= nowRef.current;
+    const key = `${id}::${path}`;
+
+    if (live && key in contentRef.current) {
+      // We already hold this file's working copy — show it instantly, no backend
+      // read (which could be stale while a write is still draining).
+      const content = contentRef.current[key];
+      bufferRef.current = content;
+      setDocText(content);
+      setPaint({ source: content, readOnly: false, notExist: false, key: `${path}#live#${seq}` });
+      return;
+    }
+
+    let cancelled = false;
     void (async () => {
       try {
         if (live) {
           const content = await api.readFile(id, path);
           if (cancelled || seq !== paintSeq.current) return;
+          contentRef.current[key] = content;
           bufferRef.current = content;
           dirtyRef.current = false; // freshly loaded from disk = clean
           setDocText(content);
@@ -325,6 +343,7 @@ export default function App() {
       // would re-render the whole editor screen on every key). `setSaving(true)`
       // is a no-op once already saving, so it renders at most once per edit burst.
       bufferRef.current = src;
+      if (activeIdRef.current && selectedRef.current) contentRef.current[`${activeIdRef.current}::${selectedRef.current}`] = src;
       dirtyRef.current = true;
       setSaving(true);
       if (saveTimer.current) clearTimeout(saveTimer.current);
@@ -350,6 +369,7 @@ export default function App() {
   const openVault = useCallback(
     async (id: string) => {
       await flushSave();
+      contentRef.current = {}; // working copies are per-open-vault; start fresh
       setActiveId(id);
       setScreen('editor');
       setVaultMenuOpen(false);
@@ -401,6 +421,7 @@ export default function App() {
     const next = [...filesRef.current, { path: name, file_id: name, is_dir: false, merge_class: 'text' }];
     filesRef.current = next;
     setFiles(next);
+    contentRef.current[`${id}::${name}`] = content; // editor reads this, not the not-yet-written backend
     setSelectedPath(name);
     dirtyRef.current = false;
     bufferRef.current = content;
@@ -439,6 +460,14 @@ export default function App() {
       );
       filesRef.current = next;
       setFiles(next);
+      // Move the working copies to the new keys.
+      for (const [o, n] of pairs) {
+        const ok = `${id}::${o}`;
+        if (ok in contentRef.current) {
+          contentRef.current[`${id}::${n}`] = contentRef.current[ok];
+          delete contentRef.current[ok];
+        }
+      }
       setExpanded((e) => {
         const out: Record<string, boolean> = {};
         for (const k of Object.keys(e)) {
@@ -477,6 +506,7 @@ export default function App() {
       const next = filesRef.current.filter((f) => !(f.path === path || f.path.startsWith(path + '/')));
       filesRef.current = next;
       setFiles(next);
+      for (const p of victims) delete contentRef.current[`${id}::${p}`];
       if (sel && (sel === path || sel.startsWith(path + '/'))) {
         setSelectedPath(firstSelectable(buildTree(next)));
       }
@@ -598,8 +628,9 @@ export default function App() {
     } catch {
       /* ignore */
     }
-    // Returning to "now" (playhead → null) re-runs the content resolver, which
-    // reads the freshly-restored file from disk and repaints it editable.
+    // Drop the stale working copy so the resolver re-reads the restored content
+    // from the backend; then return to "now" (playhead → null) to re-run it.
+    delete contentRef.current[`${id}::${path}`];
     setPlayhead(null);
     await refreshFiles(id);
     scheduleHistory(id);

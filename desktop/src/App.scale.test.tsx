@@ -129,6 +129,21 @@ describe('App at scale (~1000 files)', () => {
     await waitFor(() => targets.forEach((nm) => expect(CONTENT[nm]).toBeUndefined()));
   });
 
+  // ---- editor content correctness (the "random stuff / stale content" class) ----
+  // These failed before the in-memory working-copy cache: the resolver re-read the
+  // backend on every selection, returning stale/empty content while a write was
+  // still draining (worst on the slow debug build).
+
+  it('a newly created file shows its template content, not an empty/stale backend read', async () => {
+    await openMassiveVault();
+    fireEvent.click(document.querySelector('button[title="New note"]') as HTMLElement);
+    const editor = await screen.findByTestId('live-editor');
+    // The optimistic template ("# untitled") must show even though the backend
+    // write (40ms) hasn't landed when the resolver runs.
+    await waitFor(() => expect(editor.textContent || '').toContain('untitled'));
+    expect(editor.textContent || '').not.toBe('');
+  });
+
   it('renames a file via the context menu (optimistic, old name leaves the tree)', async () => {
     await openMassiveVault();
     await waitFor(() => expect(renderedNotes().length).toBeGreaterThan(0));

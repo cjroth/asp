@@ -91,12 +91,18 @@ async function main() {
     ok('rehighlight-settle', { ms: settleMs });
     if (settleMs > 250) bad('rehighlight-slow', { ms: settleMs });
 
-    // Create a file → it appears (in breadcrumb + scrolled-to tree row).
+    // Create a file → it appears (in breadcrumb + scrolled-to tree row) AND the
+    // editor shows its template content (not a stale/empty backend read).
     t = Date.now();
     await driver.findElement(By.css('button[title="New note"]')).click();
     const created = await driver.wait(until.elementLocated(xtext('untitled.md')), 8000).then(() => true).catch(() => false);
-    ok('create-file', { ms: Date.now() - t, created });
+    const hasTemplate = await driver
+      .wait(async () => (await driver.findElement(By.css('[data-testid="live-editor"]')).getText()).includes('untitled'), 8000)
+      .then(() => true)
+      .catch(() => false);
+    ok('create-file', { ms: Date.now() - t, created, editorShowsContent: hasTemplate });
     if (!created) bad('create-missing', {});
+    if (!hasTemplate) bad('create-editor-empty', {});
 
     // Create a second quickly → distinct name (no collision).
     await driver.findElement(By.css('button[title="New note"]')).click();
