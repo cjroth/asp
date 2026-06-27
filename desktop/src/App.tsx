@@ -1,96 +1,30 @@
-// Vault Editor — the Context Desktop app. A faithful React port of the
+// Vault Editor — the Context Desktop app. A faithful React port of the new
 // "Vault Editor" design canvas, wired to the real backend (Tauri commands →
 // asp-desktop-engine → asp-core). No protocol logic lives here; every vault,
-// file, history and sync behavior is a command call.
+// file, history and sync behavior is a command call. Cosmetic vault metadata
+// (name/color/emoji) and view prefs (theme, font, sidebar, hidden/pretty) are
+// local-only and never touch the protocol.
 import { open } from '@tauri-apps/plugin-dialog';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type FileEntry, type VaultInfo, type VaultStatus } from './lib/api';
+import { api, type FileEntry, type HistEvent, type VaultInfo, type VaultStatus } from './lib/api';
+import CustomizeModal, { type CustomizeInit } from './vault/CustomizeModal';
 import FileTree from './vault/FileTree';
-import LiveEditor from './vault/LiveEditor';
-import {
-  axisTicksFor,
-  buildEvents,
-  clampView,
-  colorOf,
-  createTsByPath,
-  DAY,
-  defaultView,
-  fmtFull,
-  toPct,
-  type TrackEvent,
-  type View,
-  viewForNow,
-  zoomAround,
-  zoomKeepingFocus,
-} from './vault/history';
+import HistoryBar from './vault/HistoryBar';
+import { buildEvents, createTsByPath, defaultView, type TrackEvent, type View, viewForNow } from './vault/history';
 import * as Icon from './vault/icons';
-import { wordCountOf } from './vault/markdown';
-import { buildTree, firstSelectable, flatten, freeUntitledName } from './vault/tree';
-
-// ---------- small helpers ----------
-const basename = (p: string) => p.split('/').filter(Boolean).pop() || p;
-
-function hueOf(s: string): number {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-  return h % 360;
-}
-const dotStyle = (hue: number, size = 9): React.CSSProperties => ({
-  width: size,
-  height: size,
-  borderRadius: '50%',
-  background: `hsl(${hue}deg 52% 55%)`,
-  flex: 'none',
-});
-
-function relTime(sec: number | null | undefined): string {
-  if (!sec) return '—';
-  const d = Math.max(0, Math.floor(Date.now() / 1000) - sec);
-  if (d < 5) return 'just now';
-  if (d < 60) return d + 's ago';
-  if (d < 3600) return Math.floor(d / 60) + 'm ago';
-  if (d < 86400) return Math.floor(d / 3600) + 'h ago';
-  if (d < 172800) return 'yesterday';
-  return Math.floor(d / 86400) + 'd ago';
-}
-
-function shortFingerprint(identity: string): string {
-  const cleaned = identity.replace(/^ssh-\S+\s+/, '').trim();
-  if (cleaned.length <= 14) return cleaned;
-  return cleaned.slice(0, 8) + '…' + cleaned.slice(-4);
-}
-
-function makeAccessKey(): string {
-  const alpha = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const grp = () =>
-    Array.from({ length: 4 }, () => alpha[Math.floor(Math.random() * alpha.length)]).join('');
-  return [grp(), grp(), grp(), grp()].join('-');
-}
-
-const FONT_FAMILIES: Record<string, string> = {
-  Sans: "system-ui, -apple-system, 'Segoe UI', sans-serif",
-  Serif: "'Newsreader', Georgia, serif",
-  Mono: "'JetBrains Mono', ui-monospace, Menlo, monospace",
-};
-
-// Persisted UI prefs (the design's props become in-app settings).
-interface Prefs {
-  accent: string;
-  font: 'Sans' | 'Serif' | 'Mono';
-  writingColumn: boolean;
-}
-function loadPrefs(): Prefs {
-  try {
-    const raw = localStorage.getItem('asp.prefs.v1');
-    if (raw) return { accent: '#3d63dd', font: 'Sans', writingColumn: true, ...JSON.parse(raw) };
-  } catch {
-    /* ignore */
-  }
-  return { accent: '#3d63dd', font: 'Sans', writingColumn: true };
-}
+import LiveEditor from './vault/LiveEditor';
+import { countLabel } from './vault/markdown';
+import { isDesktop } from './lib/platform';
+import { basename, freeName, makeAccessKey, relTime, shortFingerprint } from './vault/format';
+import { applyTheme, clampSidebar, fontFamilyOf, loadPrefs, type Prefs, savePrefs } from './vault/prefs';
+import { isHidden } from './vault/prettyNames';
+import { allDirPaths, buildTree, firstSelectable, flatten } from './vault/tree';
+import { avatarStyle, glyphOf, hueForId, loadVaultMeta, resolveMeta, saveVaultMeta, type VaultMetaMap } from './vault/vaultMeta';
 
 interface VaultMeta extends VaultInfo {
-  name: string;
+  displayName: string;
+  hue: number;
+  emoji: string | null;
   peers: number;
   lastTs: number | null;
   ticket: string | null;
@@ -103,12 +37,41 @@ interface Paint {
   key: string;
 }
 
+interface CtxMenu {
+  x: number;
+  y: number;
+  root?: boolean;
+  path?: string;
+  isDir?: boolean;
+  name?: string;
+}
+
 export default function App() {
-  const prefs = useMemo(loadPrefs, []);
+  const desktop = isDesktop();
+  const [prefs, setPrefsState] = useState<Prefs>(loadPrefs);
   const accent = prefs.accent;
   const accentSoft = accent + '22';
-  const fontFamily = FONT_FAMILIES[prefs.font];
+  const fontFamily = fontFamilyOf(prefs);
   const centered = prefs.writingColumn !== false;
+  const updatePrefs = useCallback((patch: Partial<Prefs>) => {
+    setPrefsState((p) => {
+      const next = { ...p, ...patch };
+      savePrefs(next);
+      return next;
+    });
+  }, []);
+
+  // Apply the persisted theme to <html> on mount.
+  useEffect(() => applyTheme(prefs.theme), []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const [metaMap, setMetaMap] = useState<VaultMetaMap>(loadVaultMeta);
+  const updateMeta = useCallback((vaultId: string, entry: { name?: string; hue: number; emoji?: string | null }) => {
+    setMetaMap((m) => {
+      const next = { ...m, [vaultId]: entry };
+      saveVaultMeta(next);
+      return next;
+    });
+  }, []);
 
   const [identity, setIdentity] = useState('');
   const [screen, setScreen] = useState<'connect' | 'editor'>('connect');
@@ -124,24 +87,33 @@ export default function App() {
   const [docText, setDocText] = useState('');
   const [saving, setSaving] = useState(false);
 
-  const [events, setEvents] = useState<TrackEvent[]>([]);
+  const [histRaw, setHistRaw] = useState<HistEvent[]>([]);
   const [now, setNow] = useState(() => Date.now());
   const [view, setView] = useState<View | null>(null);
   const [playhead, setPlayhead] = useState<number | null>(null);
+  const [histOpen, setHistOpen] = useState(false);
+  const [logOpen, setLogOpen] = useState(false);
 
   const [vaultMenuOpen, setVaultMenuOpen] = useState(false);
-  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; path: string; isDir: boolean; name: string } | null>(null);
+  const [newMenuOpen, setNewMenuOpen] = useState(false);
+  const [filesMenuOpen, setFilesMenuOpen] = useState(false);
+  const [ctxMenu, setCtxMenu] = useState<CtxMenu | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
+  const [crumbEditing, setCrumbEditing] = useState(false);
 
-  const [codeOpen, setCodeOpen] = useState(false);
+  const [sidebarW, setSidebarW] = useState(prefs.sidebarW);
+
+  const [entry, setEntry] = useState<'new' | 'connect' | null>(null);
+  const [newVaultName, setNewVaultName] = useState('');
   const [ticket, setTicket] = useState('');
   const [authKey, setAuthKey] = useState('');
   const [connecting, setConnecting] = useState(false);
   const [connectDest, setConnectDest] = useState<string | null>(null);
 
   const [share, setShare] = useState<{ id: string; code: string; requireKey: boolean; accessKey: string; copied: boolean } | null>(null);
-  const [vaultCtx, setVaultCtx] = useState<{ x: number; y: number; id: string; name: string } | null>(null);
+  const [vaultCtx, setVaultCtx] = useState<{ x: number; y: number; id: string; vaultId: string; name: string } | null>(null);
+  const [customize, setCustomize] = useState<CustomizeInit | null>(null);
   const [removeVaultState, setRemoveVaultState] = useState<{ id: string; name: string; path: string; trash: boolean } | null>(null);
 
   // refs for values used inside imperative handlers / async flows
@@ -155,12 +127,7 @@ export default function App() {
   const histTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dirtyRef = useRef(false);
   const filesRef = useRef<FileEntry[]>([]);
-  // In-memory working copy of file content, keyed `${vaultId}::${path}`. This is
-  // the source of truth for the editor: optimistic creates/edits land here, so we
-  // never re-read a file from the (possibly lagging) backend and show stale or
-  // empty content while a write is still in flight.
   const contentRef = useRef<Record<string, string>>({});
-  const trackRef = useRef<HTMLDivElement | null>(null);
   const paintSeq = useRef(0);
   activeIdRef.current = activeId;
   selectedRef.current = selectedPath;
@@ -170,6 +137,8 @@ export default function App() {
 
   const curView = useCallback((): View => view || defaultView(now), [view, now]);
   const timeTravel = playhead != null && playhead < now;
+
+  const events: TrackEvent[] = useMemo(() => buildEvents(histRaw), [histRaw]);
 
   // ---------- data loading ----------
   const refreshVaults = useCallback(async () => {
@@ -197,18 +166,13 @@ export default function App() {
 
   const refreshHistory = useCallback(async (id: string) => {
     try {
-      const h = await api.history(id);
-      setEvents(buildEvents(h));
+      setHistRaw(await api.history(id));
     } catch {
-      setEvents([]);
+      setHistRaw([]);
     }
     setNow(Date.now());
   }, []);
 
-  // history() folds the whole log under the engine lock, so it's kept OFF the
-  // critical path: mutations schedule it (debounced) instead of awaiting it, so
-  // the file list / selection / content update immediately and the history track
-  // catches up a moment later without blocking other engine calls.
   const scheduleHistory = useCallback(
     (id: string) => {
       if (histTimer.current) clearTimeout(histTimer.current);
@@ -232,17 +196,11 @@ export default function App() {
     })();
   }, [refreshVaults, refreshStatuses]);
 
-  // Poll status so peers / "last synced" stay fresh. Kept infrequent because
-  // each status read folds the vault log. While editing, poll only the active
-  // vault (one fold) instead of every vault.
   useEffect(() => {
     const t = setInterval(() => {
       if (screen === 'editor' && activeIdRef.current) {
         const id = activeIdRef.current;
-        void api
-          .getStatus(id)
-          .then((st) => setStatuses((p) => ({ ...p, [id]: st })))
-          .catch(() => {});
+        void api.getStatus(id).then((st) => setStatuses((p) => ({ ...p, [id]: st }))).catch(() => {});
       } else {
         void refreshVaults().then(refreshStatuses);
       }
@@ -250,21 +208,30 @@ export default function App() {
     return () => clearInterval(t);
   }, [screen, refreshVaults, refreshStatuses]);
 
+  const metaOf = useCallback(
+    (v: VaultInfo) => resolveMeta(metaMap, v.vault_id, basename(v.path)),
+    [metaMap],
+  );
+
   const vaultMetas: VaultMeta[] = useMemo(
     () =>
       vaults.map((v) => {
         const st = statuses[v.id];
+        const m = resolveMeta(metaMap, v.vault_id, basename(v.path));
         return {
           ...v,
-          name: basename(v.path),
+          displayName: m.name,
+          hue: m.hue,
+          emoji: m.emoji,
           peers: st?.peers.length ?? 0,
           lastTs: st?.last_ts ?? null,
           ticket: st?.listening_ticket ?? v.listening_ticket,
         };
       }),
-    [vaults, statuses],
+    [vaults, statuses, metaMap],
   );
   const activeMeta = vaultMetas.find((v) => v.id === activeId) || null;
+  const activeStatus = activeId ? statuses[activeId] : undefined;
 
   // ---------- selection + content resolution ----------
   const flushSave = useCallback(async () => {
@@ -274,8 +241,6 @@ export default function App() {
     }
     const id = activeIdRef.current;
     const path = selectedRef.current;
-    // Only write if the buffer actually changed — clicking between files with no
-    // edits must not trigger a write (IPC + engine lock) every time.
     if (dirtyRef.current && id && path && !(playheadRef.current != null && playheadRef.current < nowRef.current)) {
       try {
         await api.writeFile(id, path, bufferRef.current);
@@ -287,7 +252,6 @@ export default function App() {
     setSaving(false);
   }, []);
 
-  // Resolve displayed content whenever the vault / file / playhead changes.
   useEffect(() => {
     const id = activeId;
     const path = selectedPath;
@@ -301,8 +265,6 @@ export default function App() {
     const key = `${id}::${path}`;
 
     if (live && key in contentRef.current) {
-      // We already hold this file's working copy — show it instantly, no backend
-      // read (which could be stale while a write is still draining).
       const content = contentRef.current[key];
       bufferRef.current = content;
       setDocText(content);
@@ -318,7 +280,7 @@ export default function App() {
           if (cancelled || seq !== paintSeq.current) return;
           contentRef.current[key] = content;
           bufferRef.current = content;
-          dirtyRef.current = false; // freshly loaded from disk = clean
+          dirtyRef.current = false;
           setDocText(content);
           setPaint({ source: content, readOnly: false, notExist: false, key: `${path}#live#${seq}` });
         } else {
@@ -339,9 +301,6 @@ export default function App() {
 
   const onEditorChange = useCallback(
     (src: string) => {
-      // Keep the working copy in a ref (no per-keystroke React re-render — that
-      // would re-render the whole editor screen on every key). `setSaving(true)`
-      // is a no-op once already saving, so it renders at most once per edit burst.
       bufferRef.current = src;
       if (activeIdRef.current && selectedRef.current) contentRef.current[`${activeIdRef.current}::${selectedRef.current}`] = src;
       dirtyRef.current = true;
@@ -356,8 +315,8 @@ export default function App() {
           .then(() => {
             dirtyRef.current = false;
             setSaving(false);
-            setDocText(bufferRef.current); // refresh the word count once, after the save
-            scheduleHistory(id); // update the history track off the critical path
+            setDocText(bufferRef.current);
+            scheduleHistory(id);
           })
           .catch(() => setSaving(false));
       }, 650);
@@ -369,7 +328,7 @@ export default function App() {
   const openVault = useCallback(
     async (id: string) => {
       await flushSave();
-      contentRef.current = {}; // working copies are per-open-vault; start fresh
+      contentRef.current = {};
       setActiveId(id);
       setScreen('editor');
       setVaultMenuOpen(false);
@@ -378,8 +337,6 @@ export default function App() {
       setNow(Date.now());
       const fs = await refreshFiles(id);
       const tree = buildTree(fs);
-      // Start collapsed (a vault may have thousands of files); only expand the
-      // folders leading to the auto-selected file so it's visible.
       const sel = firstSelectable(tree);
       const exp: Record<string, boolean> = {};
       if (sel) {
@@ -405,40 +362,94 @@ export default function App() {
     setExpanded((e) => ({ ...e, [path]: !e[path] }));
   }, []);
 
+  const onToggleExpandAll = useCallback(() => {
+    setExpanded((e) => {
+      const anyOpen = Object.keys(e).some((k) => e[k]);
+      if (anyOpen) return {};
+      const out: Record<string, boolean> = {};
+      for (const p of allDirPaths(buildTree(filesRef.current))) out[p] = true;
+      return out;
+    });
+  }, []);
+
   // ---------- file ops ----------
-  const newFile = useCallback(async () => {
-    const id = activeIdRef.current;
-    if (!id) return;
-    // Reserve the name + show the file SYNCHRONOUSLY (before any await), so a
-    // rapid second click sees it and picks a different name instead of colliding
-    // on the same "untitled.md" (the "adds every other time" bug). Capture the
-    // outgoing file's edits to flush, since we're changing the selection now.
-    const name = freeUntitledName(filesRef.current.map((f) => f.path));
-    const prevPath = selectedRef.current;
-    const prevDirty = dirtyRef.current;
-    const prevBuf = bufferRef.current;
-    const content = `# ${name.replace(/\.md$/, '')}\n\n`;
-    const next = [...filesRef.current, { path: name, file_id: name, is_dir: false, merge_class: 'text' }];
-    filesRef.current = next;
-    setFiles(next);
-    contentRef.current[`${id}::${name}`] = content; // editor reads this, not the not-yet-written backend
-    setSelectedPath(name);
-    dirtyRef.current = false;
-    bufferRef.current = content;
-    // Persist: flush the previous file's edits, then create the new one.
-    try {
-      if (prevDirty && prevPath) await api.writeFile(id, prevPath, prevBuf);
-      await api.writeFile(id, name, content);
-    } catch (err) {
-      console.error('new file failed', err);
-    }
-    scheduleHistory(id);
-  }, [scheduleHistory]);
+  // Create a file (optionally inside `parent`). Reserves the name + shows the row
+  // SYNCHRONOUSLY (before any await) so a rapid second click picks a distinct name.
+  const createFile = useCallback(
+    async (parent = '') => {
+      const id = activeIdRef.current;
+      if (!id) return;
+      setNewMenuOpen(false);
+      setCtxMenu(null);
+      const prefix = parent ? parent + '/' : '';
+      const siblings = new Set(
+        filesRef.current
+          .map((f) => f.path)
+          .filter((p) => (parent ? p.startsWith(prefix) && !p.slice(prefix.length).includes('/') : !p.includes('/')))
+          .map((p) => p.slice(prefix.length)),
+      );
+      const name = freeName(siblings, '.md');
+      const path = prefix + name;
+      const prevPath = selectedRef.current;
+      const prevDirty = dirtyRef.current;
+      const prevBuf = bufferRef.current;
+      const content = `# ${name.replace(/\.md$/, '')}\n\n`;
+      const next = [...filesRef.current, { path, file_id: path, is_dir: false, merge_class: 'text' }];
+      filesRef.current = next;
+      setFiles(next);
+      contentRef.current[`${id}::${path}`] = content;
+      if (parent) setExpanded((e) => ({ ...e, [parent]: true }));
+      setSelectedPath(path);
+      dirtyRef.current = false;
+      bufferRef.current = content;
+      try {
+        if (prevDirty && prevPath) await api.writeFile(id, prevPath, prevBuf);
+        await api.writeFile(id, path, content);
+      } catch (err) {
+        console.error('new file failed', err);
+      }
+      scheduleHistory(id);
+    },
+    [scheduleHistory],
+  );
+
+  // Create an empty folder (first-class dir entity) and inline-rename it.
+  const createFolder = useCallback(
+    async (parent = '') => {
+      const id = activeIdRef.current;
+      if (!id) return;
+      setNewMenuOpen(false);
+      setCtxMenu(null);
+      const prefix = parent ? parent + '/' : '';
+      const siblings = new Set(
+        filesRef.current
+          .map((f) => f.path)
+          .filter((p) => (parent ? p.startsWith(prefix) && !p.slice(prefix.length).includes('/') : !p.includes('/')))
+          .map((p) => p.slice(prefix.length)),
+      );
+      const name = freeName(siblings, '');
+      const path = prefix + name;
+      const next = [...filesRef.current, { path, file_id: path, is_dir: true, merge_class: 'dir' }];
+      filesRef.current = next;
+      setFiles(next);
+      setExpanded((e) => ({ ...e, ...(parent ? { [parent]: true } : {}), [path]: true }));
+      setRenaming(path);
+      setRenameValue(name);
+      try {
+        await api.createDir(id, path);
+      } catch (err) {
+        console.error('new folder failed', err);
+      }
+      scheduleHistory(id);
+    },
+    [scheduleHistory],
+  );
 
   const commitRename = useCallback(
     (oldPath: string, rawName: string) => {
       const id = activeIdRef.current;
       setRenaming(null);
+      setCrumbEditing(false);
       const name = rawName.trim();
       if (!id || !name) return;
       const parts = oldPath.split('/');
@@ -446,21 +457,14 @@ export default function App() {
       const newPath = parts.join('/');
       if (newPath === oldPath) return;
       const remap = (p: string) => newPath + p.slice(oldPath.length);
-      // A dir rename moves the Dir entity + every descendant (backend renames by
-      // exact path). Capture the (old → new) pairs, then apply the tree change
-      // SYNCHRONOUSLY and persist in the background.
       const affected = filesRef.current.filter((f) => f.path === oldPath || f.path.startsWith(oldPath + '/')).map((f) => f.path);
       const pairs: [string, string][] = (affected.length ? affected : [oldPath]).map((p) => [p, remap(p)]);
-      // Flush the renamed file's unsaved edits to the OLD path before it moves.
       const flushOld = dirtyRef.current && selectedRef.current === oldPath ? bufferRef.current : null;
       dirtyRef.current = false;
 
-      const next = filesRef.current.map((f) =>
-        f.path === oldPath || f.path.startsWith(oldPath + '/') ? { ...f, path: remap(f.path) } : f,
-      );
+      const next = filesRef.current.map((f) => (f.path === oldPath || f.path.startsWith(oldPath + '/') ? { ...f, path: remap(f.path) } : f));
       filesRef.current = next;
       setFiles(next);
-      // Move the working copies to the new keys.
       for (const [o, n] of pairs) {
         const ok = `${id}::${o}`;
         if (ok in contentRef.current) {
@@ -499,17 +503,12 @@ export default function App() {
       if (!id) return;
       setCtxMenu(null);
       const sel = selectedRef.current;
-      // Update the tree SYNCHRONOUSLY (read + modify + write `filesRef` with no
-      // await in between, so concurrent ops can't clobber each other — the cause
-      // of "delete doesn't remove it"). Persist to the backend in the background.
-      const victims = (isDir ? filesRef.current.filter((f) => f.path === path || f.path.startsWith(path + '/')).map((f) => f.path) : [path]);
+      const victims = isDir ? filesRef.current.filter((f) => f.path === path || f.path.startsWith(path + '/')).map((f) => f.path) : [path];
       const next = filesRef.current.filter((f) => !(f.path === path || f.path.startsWith(path + '/')));
       filesRef.current = next;
       setFiles(next);
       for (const p of victims) delete contentRef.current[`${id}::${p}`];
-      if (sel && (sel === path || sel.startsWith(path + '/'))) {
-        setSelectedPath(firstSelectable(buildTree(next)));
-      }
+      if (sel && (sel === path || sel.startsWith(path + '/'))) setSelectedPath(firstSelectable(buildTree(next)));
       void (async () => {
         for (const p of victims) {
           try {
@@ -521,95 +520,30 @@ export default function App() {
         scheduleHistory(id);
       })();
     },
-    [scheduleHistory],
+    [],
   );
 
   const openCtx = useCallback((e: React.MouseEvent, node: { path: string; isDir: boolean; name: string }) => {
     e.preventDefault();
     e.stopPropagation();
     setVaultMenuOpen(false);
-    setCtxMenu({
-      x: Math.min(e.clientX, window.innerWidth - 184),
-      y: Math.min(e.clientY, window.innerHeight - 110),
-      path: node.path,
-      isDir: node.isDir,
-      name: node.name,
-    });
+    setCtxMenu({ x: Math.min(e.clientX, window.innerWidth - 184), y: Math.min(e.clientY, window.innerHeight - 110), path: node.path, isDir: node.isDir, name: node.name });
   }, []);
 
-  // ---------- history track interaction ----------
-  const onTrackDown = useCallback(
-    (e: React.PointerEvent) => {
-      const el = trackRef.current;
-      if (!el) return;
-      const startX = e.clientX;
-      const v0 = viewRef.current || defaultView(nowRef.current);
-      const span0 = v0.end - v0.start;
-      let moved = false;
-      const move = (ev: PointerEvent) => {
-        const dx = ev.clientX - startX;
-        if (Math.abs(dx) > 3) moved = true;
-        if (moved) {
-          const r = el.getBoundingClientRect();
-          const dt = -(dx / r.width) * span0;
-          setView(clampView(v0.start + dt, v0.end + dt, nowRef.current));
-        }
-      };
-      const up = (ev: PointerEvent) => {
-        document.removeEventListener('pointermove', move);
-        document.removeEventListener('pointerup', up);
-        if (!moved) {
-          const r = el.getBoundingClientRect();
-          const t = v0.start + ((ev.clientX - r.left) / r.width) * span0;
-          setPlayhead(Math.min(t, nowRef.current));
-        }
-      };
-      document.addEventListener('pointermove', move);
-      document.addEventListener('pointerup', up);
-    },
-    [],
-  );
-
-  const onHandleDown = useCallback((e: React.PointerEvent) => {
-    e.stopPropagation();
-    const el = trackRef.current;
-    if (!el) return;
-    const move = (ev: PointerEvent) => {
-      const v = viewRef.current || defaultView(nowRef.current);
-      const r = el.getBoundingClientRect();
-      const t = v.start + ((ev.clientX - r.left) / r.width) * (v.end - v.start);
-      setPlayhead(Math.max(nowRef.current - 90 * DAY, Math.min(t, nowRef.current)));
-    };
-    const up = () => {
-      document.removeEventListener('pointermove', move);
-      document.removeEventListener('pointerup', up);
-    };
-    document.addEventListener('pointermove', move);
-    document.addEventListener('pointerup', up);
+  const openTreeCtx = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    setVaultMenuOpen(false);
+    setCtxMenu({ x: Math.min(e.clientX, window.innerWidth - 184), y: Math.min(e.clientY, window.innerHeight - 130), root: true });
   }, []);
 
-  // Non-passive wheel listener so we can preventDefault and zoom.
-  useEffect(() => {
-    const el = trackRef.current;
-    if (!el) return;
-    const handler = (e: WheelEvent) => {
-      e.preventDefault();
-      const v = viewRef.current || defaultView(nowRef.current);
-      const r = el.getBoundingClientRect();
-      const f = (e.clientX - r.left) / r.width;
-      const factor = e.deltaY > 0 ? 1.2 : 0.82;
-      setView(zoomKeepingFocus(v, f, factor, nowRef.current));
-    };
-    el.addEventListener('wheel', handler, { passive: false });
-    return () => el.removeEventListener('wheel', handler);
-  }, [screen]);
-
-  const zoomBtn = useCallback((factor: number) => {
-    const v = viewRef.current || defaultView(nowRef.current);
-    const c = playheadRef.current != null ? playheadRef.current : nowRef.current;
-    setView(zoomAround(v, c, factor, nowRef.current));
+  // The directory a context-menu "New …" should create into.
+  const ctxTargetDir = useCallback((c: CtxMenu): string => {
+    if (c.root || !c.path) return '';
+    if (c.isDir) return c.path;
+    return c.path.includes('/') ? c.path.slice(0, c.path.lastIndexOf('/')) : '';
   }, []);
 
+  // ---------- history track ----------
   const onNow = useCallback(() => {
     setPlayhead(null);
     setView((v) => viewForNow(v || defaultView(nowRef.current), nowRef.current));
@@ -628,15 +562,58 @@ export default function App() {
     } catch {
       /* ignore */
     }
-    // Drop the stale working copy so the resolver re-reads the restored content
-    // from the backend; then return to "now" (playhead → null) to re-run it.
     delete contentRef.current[`${id}::${path}`];
     setPlayhead(null);
     await refreshFiles(id);
     scheduleHistory(id);
   }, [refreshFiles, scheduleHistory]);
 
-  // ---------- connect / share / remove ----------
+  const onTabHistory = useCallback(() => {
+    setHistOpen((h) => !h);
+    setLogOpen(false);
+  }, []);
+  const onTabLog = useCallback(() => {
+    setLogOpen((l) => !l);
+    setHistOpen(false);
+  }, []);
+
+  // ---------- sidebar resize ----------
+  const onSidebarResize = useCallback(
+    (e: React.PointerEvent) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const w0 = sidebarW;
+      let latest = w0;
+      const move = (ev: PointerEvent) => {
+        latest = clampSidebar(w0 + (ev.clientX - startX));
+        setSidebarW(latest);
+      };
+      const up = () => {
+        document.removeEventListener('pointermove', move);
+        document.removeEventListener('pointerup', up);
+        document.body.style.cursor = '';
+        updatePrefs({ sidebarW: latest });
+      };
+      document.body.style.cursor = 'col-resize';
+      document.addEventListener('pointermove', move);
+      document.addEventListener('pointerup', up);
+    },
+    [sidebarW, updatePrefs],
+  );
+
+  // ---------- theme / font ----------
+  const onToggleTheme = useCallback(() => {
+    const next = prefs.theme === 'dark' ? 'light' : 'dark';
+    applyTheme(next);
+    updatePrefs({ theme: next });
+  }, [prefs.theme, updatePrefs]);
+  const onToggleFont = useCallback(() => {
+    const cur = prefs.fontOverride || prefs.font;
+    updatePrefs({ fontOverride: cur === 'Serif' ? 'Sans' : 'Serif' });
+  }, [prefs.font, prefs.fontOverride, updatePrefs]);
+  const fontIsSerif = (prefs.fontOverride || prefs.font) === 'Serif';
+
+  // ---------- connect / new / share / remove / customize ----------
   const onOpenFolder = useCallback(async () => {
     try {
       const dir = await open({ directory: true });
@@ -656,25 +633,43 @@ export default function App() {
     if (typeof dir === 'string') setConnectDest(dir);
   }, []);
 
-  const onConnect = useCallback(async () => {
-    if (connecting) return;
-    const t = ticket.trim();
-    if (!t || !connectDest) return;
-    setConnecting(true);
-    try {
-      const info = await api.cloneRemote(connectDest, t, authKey || undefined);
-      setTicket('');
-      setAuthKey('');
-      setConnectDest(null);
-      setCodeOpen(false);
-      await refreshVaults();
-      await openVault(info.id);
-    } catch (err) {
-      console.error('clone failed', err);
-    } finally {
-      setConnecting(false);
+  const onEntrySubmit = useCallback(async () => {
+    if (entry === 'connect') {
+      if (connecting) return;
+      const t = ticket.trim();
+      // Desktop needs a destination folder; web clones straight into OPFS.
+      if (!t || (desktop && !connectDest)) return;
+      setConnecting(true);
+      try {
+        const info = await api.cloneRemote(connectDest || '', t, authKey || undefined);
+        setTicket('');
+        setAuthKey('');
+        setConnectDest(null);
+        setEntry(null);
+        await refreshVaults();
+        await openVault(info.id);
+      } catch (err) {
+        console.error('clone failed', err);
+      } finally {
+        setConnecting(false);
+      }
+    } else {
+      // New vault: desktop adds a chosen folder; web creates a browser (OPFS) vault.
+      if (desktop && !connectDest) return;
+      try {
+        const nm = newVaultName.trim();
+        const info = desktop ? await api.addLocalFolder(connectDest!) : await api.createVault(nm || 'Untitled vault');
+        if (nm) updateMeta(info.vault_id, { name: nm, hue: hueForId(info.vault_id), emoji: null });
+        setNewVaultName('');
+        setConnectDest(null);
+        setEntry(null);
+        await refreshVaults();
+        await openVault(info.id);
+      } catch (err) {
+        console.error('create vault failed', err);
+      }
     }
-  }, [authKey, connectDest, connecting, openVault, refreshVaults, ticket]);
+  }, [entry, connecting, ticket, connectDest, authKey, newVaultName, desktop, updateMeta, openVault, refreshVaults]);
 
   const onShareVault = useCallback(async (id: string) => {
     setVaultMenuOpen(false);
@@ -726,6 +721,16 @@ export default function App() {
     setTimeout(() => setShare((x) => (x ? { ...x, copied: false } : x)), 1400);
   }, [share]);
 
+  const openCustomize = useCallback(
+    (v: VaultInfo) => {
+      const m = metaOf(v);
+      setVaultMenuOpen(false);
+      setVaultCtx(null);
+      setCustomize({ id: v.vault_id, name: m.name, hue: m.hue, emoji: m.emoji });
+    },
+    [metaOf],
+  );
+
   const confirmRemove = useCallback(async () => {
     const rm = removeVaultState;
     if (!rm) return;
@@ -746,126 +751,95 @@ export default function App() {
   // ---------- derived view-model ----------
   const tree = useMemo(() => buildTree(files), [files]);
   const view2 = curView();
-  const span = view2.end - view2.start;
   const playT = playhead == null ? now : playhead;
   const filterTs = timeTravel ? playhead : null;
-  const axisTicks = useMemo(() => axisTicksFor(view2), [view2]);
   const createTs = useMemo(() => createTsByPath(events), [events]);
 
   const fileVisible = (path: string) => filterTs == null || (createTs[path] != null && createTs[path] <= filterTs);
-  const dirVisible = (path: string) =>
-    filterTs == null || files.some((f) => !f.is_dir && (f.path === path || f.path.startsWith(path + '/')) && fileVisible(f.path));
+  const dirVisible = (path: string) => filterTs == null || files.some((f) => !f.is_dir && (f.path === path || f.path.startsWith(path + '/')) && fileVisible(f.path));
 
   const rows = useMemo(() => {
     const flat = flatten(tree, expanded);
-    return flat.filter((r) => (r.node.type === 'dir' ? dirVisible(r.node.path) : fileVisible(r.node.path)));
+    return flat.filter((r) => {
+      if (!prefs.showHidden && isHidden(r.node.name)) return false;
+      return r.node.type === 'dir' ? dirVisible(r.node.path) : fileVisible(r.node.path);
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tree, expanded, filterTs, files]);
+  }, [tree, expanded, filterTs, files, prefs.showHidden]);
 
-  const visibleRows = filterTs == null ? events.length : events.filter((e) => e.ts <= filterTs).length;
-
-  // Cap the number of rendered tick DOM nodes: a vault import creates one event
-  // per file (thousands), all clustered at the same instant — rendering them all
-  // is a needless render bomb (they overlap into the same pixel anyway).
-  const inView = events.filter((e) => e.ts >= view2.start - span * 0.03 && e.ts <= view2.end + span * 0.03);
-  const MAX_TICKS = 240;
-  const sampled = inView.length > MAX_TICKS ? inView.filter((_, i) => i % Math.ceil(inView.length / MAX_TICKS) === 0) : inView;
-  const ticks = sampled.map((e) => ({
-    title: `${e.kind} · ${e.path} · ${fmtFull(e.ts)}`,
-    pct: toPct(e.ts, view2),
-    color: colorOf(e.kind),
-    past: e.ts <= playT,
-  }));
-
-  const playPct = Math.max(0, Math.min(100, toPct(playT, view2)));
-  const nowPct = Math.max(0, Math.min(100, toPct(now, view2)));
-  const phColor = timeTravel ? accent : '#1c1917';
+  const ctxTargetPath = ctxMenu && !ctxMenu.root ? ctxMenu.path ?? null : null;
 
   const selParts = selectedPath ? selectedPath.split('/') : [];
   const crumbFile = selParts.length ? selParts[selParts.length - 1] : '';
   const crumbDir = selParts.length > 1 ? selParts.slice(0, -1).join(' / ') + ' / ' : '';
-  const wordCount = wordCountOf(docText);
+  const count = selectedPath ? countLabel(docText, selectedPath) : '';
+  // Submit is blocked until the modal has what it needs — desktop additionally
+  // requires a chosen destination folder; web needs none (it writes to OPFS).
+  const entryBlocked = entry === 'connect' ? connecting || !ticket.trim() || (desktop && !connectDest) : desktop && !connectDest;
 
   // ===================================================================
   // RENDER
   // ===================================================================
+  const themeBtn = (style: React.CSSProperties) => (
+    <button onClick={onToggleTheme} title="Toggle theme" className="asp-icon-btn" style={style}>
+      <Icon.ThemeIcon dark={prefs.theme === 'dark'} />
+    </button>
+  );
+
   const renderConnect = () => {
     const saved = vaultMetas;
     return (
-      <div style={{ position: 'fixed', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#fafaf8', color: '#1c1917', padding: 32, overflow: 'auto' }}>
+      <div style={{ position: 'fixed', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-sub)', color: 'var(--text)', padding: 32, overflow: 'auto' }}>
         <div style={{ width: 'min(452px, 94vw)', display: 'flex', flexDirection: 'column' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 11, marginBottom: 34 }}>
             <div style={{ width: 26, height: 26, borderRadius: 7, background: accent, display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}>
-              <div style={{ width: 9, height: 9, borderRadius: '50%', background: '#fff' }} />
+              <div style={{ width: 9, height: 9, borderRadius: '50%', background: 'var(--bg)' }} />
             </div>
             <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 16, letterSpacing: '-0.01em' }}>asp</div>
             <span style={{ flex: 1 }} />
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#a8a29e' }}>
-              <Icon.DesktopIcon />
-              <span>Desktop</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--faint)' }}>
+              <span style={{ width: 8, height: 8, borderRadius: 2, background: desktop ? accent : 'var(--faint2)', display: 'inline-block', flex: 'none' }} />
+              <span>{desktop ? 'On this computer' : 'Saved in this browser'}</span>
             </div>
+            {themeBtn({ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 28, height: 28, flex: 'none', border: '1px solid var(--line)', background: 'var(--bg)', color: 'var(--text3)', borderRadius: 8, cursor: 'pointer', padding: 0 })}
           </div>
 
           <h1 style={{ fontSize: 25, fontWeight: 600, letterSpacing: '-0.02em', margin: '0 0 22px' }}>Your vaults</h1>
 
           <div style={{ display: 'flex', gap: 10 }}>
-            <button onClick={onOpenFolder} style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 9, height: 46, border: 'none', borderRadius: 12, background: '#1c1917', color: '#fff', fontSize: 14, fontWeight: 500, fontFamily: 'inherit', cursor: 'pointer' }}>
-              <Icon.FolderIcon stroke="#fff" />
-              <span>Open a folder</span>
+            <button onClick={() => { setEntry('new'); setNewVaultName(''); setConnectDest(null); }} style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, height: 46, border: 'none', borderRadius: 11, background: 'var(--text)', color: 'var(--bg)', fontSize: 14, fontWeight: 500, fontFamily: 'inherit', cursor: 'pointer', boxShadow: '0 1px 2px rgba(28,25,23,0.18)' }}>
+              <Icon.PlusIcon size={16} stroke="currentColor" />
+              <span>New Vault</span>
             </button>
-            <button onClick={() => setCodeOpen((v) => !v)} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, height: 46, padding: '0 16px', border: '1px solid #e0ddd8', borderRadius: 12, background: '#fff', color: '#57534e', fontSize: 14, fontWeight: 500, fontFamily: 'inherit', cursor: 'pointer', flex: 'none' }}>
-              <Icon.LinkIcon size={16} />
-              <span>Connect with a code</span>
+            <button onClick={() => { setEntry('connect'); setTicket(''); setAuthKey(''); setConnectDest(null); }} style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, height: 46, padding: '0 14px', border: '1px solid var(--line)', borderRadius: 11, background: 'var(--bg)', color: 'var(--text2)', fontSize: 14, fontWeight: 500, fontFamily: 'inherit', cursor: 'pointer' }}>
+              <Icon.ConnectIcon size={15} stroke="currentColor" />
+              <span>Connect Vault</span>
             </button>
           </div>
 
-          {codeOpen && (
-            <div style={{ marginTop: 14, background: '#fff', border: '1px solid #e7e5e4', borderRadius: 14, padding: 16, display: 'flex', flexDirection: 'column', gap: 13 }}>
-              <label style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-                <span style={{ fontSize: 12, fontWeight: 500, color: '#57534e' }}>Invite code</span>
-                <textarea value={ticket} onChange={(e) => setTicket(e.target.value)} rows={2} spellCheck={false} placeholder="Paste the code someone shared with you" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12.5, lineHeight: 1.5, color: '#1c1917', background: '#faf9f7', border: '1px solid #e7e5e4', borderRadius: 10, padding: '11px 13px', resize: 'none', outline: 'none', width: '100%' }} />
-              </label>
-              <label style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-                <span style={{ fontSize: 12, fontWeight: 500, color: '#57534e' }}>Access key <span style={{ color: '#a8a29e', fontWeight: 400 }}>— if required</span></span>
-                <input value={authKey} onChange={(e) => setAuthKey(e.target.value)} type="password" spellCheck={false} placeholder="Leave blank if you weren't given one" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12.5, color: '#1c1917', background: '#faf9f7', border: '1px solid #e7e5e4', borderRadius: 10, padding: '11px 13px', outline: 'none', width: '100%' }} />
-              </label>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-                <span style={{ fontSize: 12, fontWeight: 500, color: '#57534e' }}>Save to</span>
-                <div onClick={onChooseDest} style={{ display: 'flex', alignItems: 'center', gap: 9, background: '#faf9f7', border: '1px solid #e7e5e4', borderRadius: 10, padding: '10px 13px', cursor: 'pointer' }}>
-                  <Icon.FolderIcon />
-                  <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: connectDest ? '#1c1917' : '#a8a29e', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{connectDest || 'No folder chosen'}</span>
-                  <span style={{ fontSize: 12, color: '#a8a29e' }}>Choose…</span>
-                </div>
-              </div>
-              <button onClick={onConnect} disabled={connecting || !ticket.trim() || !connectDest} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, height: 44, border: 'none', borderRadius: 11, background: connecting || !ticket.trim() || !connectDest ? '#c9c5be' : accent, color: '#fff', fontSize: 14, fontWeight: 500, fontFamily: 'inherit', cursor: connecting || !ticket.trim() || !connectDest ? 'default' : 'pointer' }}>
-                {connecting && <span style={{ width: 13, height: 13, border: '2px solid #ffffff66', borderTopColor: '#fff', borderRadius: '50%', display: 'inline-block', animation: 'aspSpin 0.7s linear infinite' }} />}
-                <span>{connecting ? 'Connecting…' : 'Connect'}</span>
-              </button>
-            </div>
-          )}
-
           {saved.length > 0 && (
-            <div style={{ marginTop: 26, display: 'flex', flexDirection: 'column', gap: 2 }}>
-              {saved.map((v) => (
-                <div key={v.id} className="asp-hover-list" onClick={() => void openVault(v.id)} onContextMenu={(e) => { e.preventDefault(); setVaultCtx({ x: Math.min(e.clientX, window.innerWidth - 180), y: Math.min(e.clientY, window.innerHeight - 70), id: v.id, name: v.name }); }} style={{ display: 'flex', alignItems: 'center', gap: 13, padding: '11px 12px', borderRadius: 12, cursor: 'pointer' }}>
-                  <div style={dotStyle(hueOf(v.vault_id || v.id))} />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 14, fontWeight: 500, color: '#1c1917', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v.name}</div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 2, minWidth: 0 }}>
-                      <Icon.FolderIcon size={12} stroke="#bdb8b0" />
-                      <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: '#a8a29e', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v.path}</span>
+            <>
+              <div style={{ marginTop: 26, marginBottom: 9, paddingLeft: 3, fontSize: 11, fontWeight: 600, letterSpacing: '0.07em', textTransform: 'uppercase', color: 'var(--faint2)' }}>Recent vaults</div>
+              <div style={{ border: '1px solid var(--line)', borderRadius: 14, overflow: 'hidden', background: 'var(--bg)' }}>
+                {saved.map((v, i) => (
+                  <div key={v.id} className="asp-hover-list" onClick={() => void openVault(v.id)} onContextMenu={(e) => { e.preventDefault(); setVaultCtx({ x: Math.min(e.clientX, window.innerWidth - 188), y: Math.min(e.clientY, window.innerHeight - 70), id: v.id, vaultId: v.vault_id, name: v.displayName }); }} style={{ display: 'flex', alignItems: 'center', gap: 13, padding: '13px 15px', cursor: 'pointer', borderTop: i > 0 ? '1px solid var(--line)' : 'none' }}>
+                    <div style={avatarStyle({ hue: v.hue, emoji: v.emoji }, 34, 10)}>{glyphOf({ emoji: v.emoji, name: v.displayName })}</div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 14.5, fontWeight: 500, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v.displayName}</div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 3, minWidth: 0 }}>
+                        {desktop ? <Icon.FolderIcon size={12} stroke="var(--faint2)" /> : <Icon.GlobeIcon size={12} stroke="var(--faint2)" />}
+                        <span style={{ fontFamily: desktop ? "'JetBrains Mono', monospace" : 'inherit', fontSize: 11, color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{desktop ? v.path : 'Using browser storage'}</span>
+                      </div>
                     </div>
+                    <span style={{ fontSize: 11.5, color: 'var(--faint)', flex: 'none' }}>{relTime(v.lastTs)}</span>
+                    <Icon.ChevronRight size={15} stroke="#cfc9c1" style={{ flex: 'none' }} />
                   </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 9, flex: 'none' }}>
-                    <span style={{ fontSize: 11.5, color: '#a8a29e' }}>{relTime(v.lastTs)}</span>
-                    <Icon.ChevronRight size={14} stroke="#c4bfb8" />
-                  </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            </>
           )}
 
-          <div style={{ marginTop: 28, fontSize: 11.5, color: '#bdb8b0', display: 'flex', alignItems: 'center', gap: 7 }}>
+          <div style={{ marginTop: 28, fontSize: 11.5, color: 'var(--faint2)', display: 'flex', alignItems: 'center', gap: 7 }}>
             <Icon.UserIcon />
             <span>This device · {shortFingerprint(identity)}</span>
           </div>
@@ -877,22 +851,21 @@ export default function App() {
   const renderEditor = () => {
     const hasSelection = !!selectedPath;
     const syncSummary = activeMeta && activeMeta.peers > 0 ? `Synced · ${activeMeta.peers} peer${activeMeta.peers === 1 ? '' : 's'}` : 'Synced';
-    const peersLabel = activeMeta && activeMeta.peers > 0 ? `${activeMeta.peers} online` : 'Only you';
-    const otherVaults = vaultMetas;
+    const anyExpanded = Object.keys(expanded).some((k) => expanded[k]);
 
     return (
-      <div style={{ position: 'fixed', inset: 0, display: 'flex', flexDirection: 'column', background: '#fff', color: '#1c1917', fontSize: 14 }}>
+      <div style={{ position: 'fixed', inset: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)', color: 'var(--text)', fontSize: 14 }}>
         <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
           {/* sidebar */}
-          <aside style={{ width: 266, flex: 'none', display: 'flex', flexDirection: 'column', background: '#fafaf8', borderRight: '1px solid #ededea' }}>
-            <div style={{ position: 'relative', borderBottom: '1px solid #f0efec' }}>
-              <div className="asp-hover-list" data-testid="vault-switcher" onClick={() => setVaultMenuOpen((v) => !v)} style={{ display: 'flex', alignItems: 'center', gap: 11, height: 47, padding: '0 14px', boxSizing: 'border-box', cursor: 'pointer' }}>
-                <div style={dotStyle(hueOf(activeMeta?.vault_id || activeId || ''))} />
+          <aside style={{ width: sidebarW, flex: 'none', display: 'flex', flexDirection: 'column', background: 'var(--bg-sub)' }}>
+            <div style={{ position: 'relative', borderBottom: '1px solid var(--line)' }}>
+              <div className="asp-hover-row" data-testid="vault-switcher" onClick={() => setVaultMenuOpen((v) => !v)} style={{ display: 'flex', alignItems: 'center', gap: 11, height: 47, padding: '0 14px', boxSizing: 'border-box', cursor: 'pointer' }}>
+                <div style={avatarStyle({ hue: activeMeta?.hue ?? 222, emoji: activeMeta?.emoji }, 28, 8)}>{glyphOf({ emoji: activeMeta?.emoji, name: activeMeta?.displayName })}</div>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 14, fontWeight: 600, letterSpacing: '-0.01em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{activeMeta?.name || 'Vault'}</div>
+                  <div style={{ fontSize: 14, fontWeight: 600, letterSpacing: '-0.01em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{activeMeta?.displayName || 'Vault'}</div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 2 }}>
                     <span style={{ width: 6, height: 6, borderRadius: '50%', background: accent, animation: 'aspPulse 2.4s ease-in-out infinite', flex: 'none' }} />
-                    <span style={{ fontSize: 11, color: '#a8a29e', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{syncSummary}</span>
+                    <span style={{ fontSize: 11, color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{syncSummary}</span>
                   </div>
                 </div>
                 <Icon.CaretDown style={{ flex: 'none', transition: 'transform .15s', transform: vaultMenuOpen ? 'rotate(180deg)' : 'rotate(0deg)' }} />
@@ -901,44 +874,89 @@ export default function App() {
               {vaultMenuOpen && (
                 <>
                   <div onClick={() => setVaultMenuOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 40 }} />
-                  <div style={{ position: 'absolute', top: 'calc(100% - 4px)', left: 8, right: 8, zIndex: 41, background: '#fff', border: '1px solid #e7e5e4', borderRadius: 12, boxShadow: '0 12px 32px rgba(28,25,23,0.13)', padding: 6, display: 'flex', flexDirection: 'column', gap: 2 }}>
-                    <div style={{ fontSize: 10.5, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: '#b0aaa2', padding: '7px 9px 4px' }}>Switch vault</div>
-                    {otherVaults.map((v) => (
+                  <div style={{ position: 'absolute', top: 'calc(100% - 4px)', left: 8, right: 8, zIndex: 41, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 12, boxShadow: '0 12px 32px rgba(28,25,23,0.13)', padding: 6, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                    <div style={{ fontSize: 10.5, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--faint2)', padding: '7px 9px 4px' }}>Switch vault</div>
+                    {vaultMetas.map((v) => (
                       <div key={v.id} className="asp-hover-soft" onClick={() => void openVault(v.id)} style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '8px 9px', borderRadius: 8, cursor: 'pointer' }}>
-                        <div style={dotStyle(hueOf(v.vault_id || v.id))} />
+                        <div style={avatarStyle({ hue: v.hue, emoji: v.emoji }, 26, 8)}>{glyphOf({ emoji: v.emoji, name: v.displayName })}</div>
                         <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ fontSize: 13.5, fontWeight: 500, color: '#1c1917', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v.name}</div>
+                          <div style={{ fontSize: 13.5, fontWeight: 500, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v.displayName}</div>
                           <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 1, minWidth: 0 }}>
-                            <Icon.FolderIcon size={12} stroke="#bdb8b0" />
-                            <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10.5, color: '#b0aaa2', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v.path}</span>
+                            <Icon.FolderIcon size={12} stroke="var(--faint2)" />
+                            <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10.5, color: 'var(--faint2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v.path}</span>
                           </div>
                         </div>
                         {v.id === activeId && <Icon.CheckIcon stroke={accent} style={{ flex: 'none' }} />}
                       </div>
                     ))}
-                    <div style={{ height: 1, background: '#f0efec', margin: '4px 6px' }} />
-                    <div className="asp-hover-soft" onClick={() => activeId && void onShareVault(activeId)} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 9px', borderRadius: 8, cursor: 'pointer', color: '#57534e' }}>
+                    <div style={{ height: 1, background: 'var(--line)', margin: '4px 6px' }} />
+                    <div className="asp-hover-soft" onClick={() => activeMeta && openCustomize(activeMeta)} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 9px', borderRadius: 8, cursor: 'pointer', color: 'var(--text2)' }}>
+                      <Icon.WandIcon style={{ flex: 'none' }} />
+                      <span style={{ fontSize: 13.5 }}>Customize this vault…</span>
+                    </div>
+                    <div className="asp-hover-soft" onClick={() => activeId && void onShareVault(activeId)} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 9px', borderRadius: 8, cursor: 'pointer', color: 'var(--text2)' }}>
                       <Icon.ShareIcon style={{ flex: 'none' }} />
                       <span style={{ fontSize: 13.5 }}>Share this vault…</span>
                     </div>
-                    <div className="asp-hover-soft" onClick={() => { setVaultMenuOpen(false); void onOpenFolder(); }} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 9px', borderRadius: 8, cursor: 'pointer', color: '#57534e' }}>
-                      <Icon.FolderIcon stroke="#57534e" />
-                      <span style={{ fontSize: 13.5 }}>Open another folder…</span>
-                    </div>
-                    <div className="asp-hover-danger" onClick={() => { setVaultMenuOpen(false); if (activeMeta) setRemoveVaultState({ id: activeMeta.id, name: activeMeta.name, path: activeMeta.path, trash: false }); }} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 9px', borderRadius: 8, cursor: 'pointer', color: '#c0392b' }}>
+                    <div className="asp-hover-danger" onClick={() => { setVaultMenuOpen(false); if (activeMeta) setRemoveVaultState({ id: activeMeta.id, name: activeMeta.displayName, path: activeMeta.path, trash: false }); }} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 9px', borderRadius: 8, cursor: 'pointer', color: '#c0392b' }}>
                       <Icon.TrashIcon stroke="#c0392b" style={{ flex: 'none' }} />
                       <span style={{ fontSize: 13.5 }}>Remove this vault…</span>
+                    </div>
+                    <div style={{ height: 1, background: 'var(--line)', margin: '4px 6px' }} />
+                    <div className="asp-hover-soft" onClick={() => { setVaultMenuOpen(false); if (desktop) void onOpenFolder(); else { setEntry('new'); setNewVaultName(''); setConnectDest(null); } }} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 9px', borderRadius: 8, cursor: 'pointer', color: 'var(--text2)' }}>
+                      {desktop ? <Icon.FolderIcon stroke="var(--text2)" /> : <Icon.PlusIcon size={15} stroke="var(--text2)" />}
+                      <span style={{ fontSize: 13.5 }}>{desktop ? 'Open another folder…' : 'New vault…'}</span>
                     </div>
                   </div>
                 </>
               )}
             </div>
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px 7px' }}>
-              <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: '#b0aaa2', flex: 1 }}>Files</span>
-              <button className="asp-icon-btn" onClick={() => void newFile()} title="New note" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 24, height: 24, border: 'none', background: 'transparent', color: '#78716c', borderRadius: 6, cursor: 'pointer', padding: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 1, padding: '9px 9px 7px', position: 'relative' }}>
+              <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--faint2)', flex: 1, paddingLeft: 3 }}>Files</span>
+              <button className="asp-icon-btn" onClick={() => setNewMenuOpen((v) => !v)} title="New note" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 24, height: 24, border: 'none', background: newMenuOpen ? 'var(--line)' : 'transparent', color: newMenuOpen ? 'var(--text)' : 'var(--text3)', borderRadius: 6, cursor: 'pointer', padding: 0 }}>
                 <Icon.PlusIcon />
               </button>
+              {newMenuOpen && (
+                <>
+                  <div onClick={() => setNewMenuOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 44 }} />
+                  <div style={{ position: 'absolute', top: 34, right: 38, zIndex: 45, width: 168, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 11, boxShadow: '0 12px 32px rgba(28,25,23,0.14)', padding: 5 }}>
+                    <div className="asp-hover-soft" onClick={() => void createFile('')} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '8px 10px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                      <Icon.NewFileIcon style={{ flex: 'none' }} />
+                      <span>New file</span>
+                    </div>
+                    <div className="asp-hover-soft" onClick={() => void createFolder('')} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '8px 10px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                      <Icon.NewFolderIcon style={{ flex: 'none' }} />
+                      <span>New folder</span>
+                    </div>
+                  </div>
+                </>
+              )}
+              <button className="asp-icon-btn" onClick={onToggleExpandAll} title={anyExpanded ? 'Collapse all' : 'Expand all'} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 24, height: 24, border: 'none', background: 'transparent', color: 'var(--text3)', borderRadius: 6, cursor: 'pointer', padding: 0 }}>
+                <Icon.ExpandCollapseIcon expanded={anyExpanded} />
+              </button>
+              <button className="asp-icon-btn" onClick={() => setFilesMenuOpen((v) => !v)} title="More" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 24, height: 24, border: 'none', background: filesMenuOpen ? 'var(--line)' : 'transparent', color: filesMenuOpen ? 'var(--text)' : 'var(--text3)', borderRadius: 6, cursor: 'pointer', padding: 0 }}>
+                <Icon.DotsIcon />
+              </button>
+              {filesMenuOpen && (
+                <>
+                  <div onClick={() => setFilesMenuOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 44 }} />
+                  <div style={{ position: 'absolute', top: 34, right: 8, zIndex: 45, width: 186, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 11, boxShadow: '0 12px 32px rgba(28,25,23,0.14)', padding: 5 }}>
+                    <div className="asp-hover-soft" onClick={() => { updatePrefs({ showHidden: !prefs.showHidden }); setFilesMenuOpen(false); }} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                      <span style={{ width: 15, display: 'inline-flex', justifyContent: 'center', flex: 'none' }}>
+                        {prefs.showHidden ? <Icon.EyeIcon off={false} stroke={accent} /> : <Icon.EyeIcon off stroke="var(--text2)" />}
+                      </span>
+                      <span>Show hidden files</span>
+                    </div>
+                    <div className="asp-hover-soft" onClick={() => { updatePrefs({ prettyNames: !prefs.prettyNames }); setFilesMenuOpen(false); }} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                      <span style={{ width: 15, display: 'inline-flex', justifyContent: 'center', flex: 'none' }}>
+                        {prefs.prettyNames ? <Icon.CheckIcon size={15} stroke={accent} /> : <span style={{ width: 15 }} />}
+                      </span>
+                      <span>Pretty filenames</span>
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
 
             <FileTree
@@ -949,6 +967,9 @@ export default function App() {
               renameValue={renameValue}
               accent={accent}
               accentSoft={accentSoft}
+              prettyNames={prefs.prettyNames}
+              ctxTargetPath={ctxTargetPath}
+              onEmptyContext={openTreeCtx}
               onRowClick={({ node }) => {
                 if (renaming === node.path) return;
                 if (node.type === 'dir') toggleDir(node.path);
@@ -962,123 +983,138 @@ export default function App() {
               }}
               onRenameCommit={(path) => void commitRename(path, renameValue)}
             />
-
-            <div style={{ borderTop: '1px solid #f0efec', padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: 5 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                <Icon.FolderIcon size={13} stroke="#b0aaa2" />
-                <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10.5, color: '#a8a29e', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{activeMeta?.path}</span>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Icon.UserIcon stroke="#b8b3ac" style={{ flex: 'none' }} />
-                <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10, color: '#b0aaa2', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{shortFingerprint(identity)}</span>
-                <span style={{ fontSize: 11, color: '#a8a29e', flex: 'none' }}>{peersLabel}</span>
-              </div>
-            </div>
           </aside>
+
+          {/* resize handle */}
+          <div onPointerDown={onSidebarResize} className="sb-resize" style={{ width: 7, flex: 'none', cursor: 'col-resize', margin: '0 -3px', zIndex: 6, position: 'relative', display: 'flex', justifyContent: 'center' }}>
+            <div className="sb-line" style={{ width: 1, alignSelf: 'stretch', background: 'var(--line)' }} />
+          </div>
 
           {/* main */}
           <main style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
             {hasSelection ? (
               <>
-                <div style={{ height: 47, flex: 'none', display: 'flex', alignItems: 'center', gap: 14, padding: '0 18px', borderBottom: '1px solid #f0efec' }}>
+                <div style={{ height: 48, flex: 'none', display: 'flex', alignItems: 'center', gap: 10, padding: '0 16px', borderBottom: '1px solid var(--line)' }}>
                   <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 13 }}>
-                    <span style={{ color: '#b0aaa2' }}>{crumbDir}</span>
-                    <span style={{ color: '#292524', fontWeight: 500 }}>{crumbFile}</span>
+                    <span style={{ color: 'var(--faint2)' }}>{crumbDir}</span>
+                    {crumbEditing ? (
+                      <input
+                        autoFocus
+                        value={renameValue}
+                        spellCheck={false}
+                        onChange={(e) => setRenameValue(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); if (selectedPath) void commitRename(selectedPath, renameValue); } else if (e.key === 'Escape') setCrumbEditing(false); }}
+                        onBlur={() => { if (selectedPath) void commitRename(selectedPath, renameValue); }}
+                        style={{ fontSize: 13, fontWeight: 500, fontFamily: 'inherit', color: 'var(--text)', background: 'var(--bg)', border: `1px solid ${accent}`, borderRadius: 5, padding: '1px 6px', outline: 'none', minWidth: 180 }}
+                      />
+                    ) : (
+                      <span onDoubleClick={() => { setRenameValue(crumbFile); setCrumbEditing(true); }} title="Double-click to rename" style={{ color: 'var(--text)', fontWeight: 500, cursor: 'text' }}>{crumbFile}</span>
+                    )}
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 'none' }}>
                     <span style={{ width: 7, height: 7, borderRadius: '50%', flex: 'none', background: saving ? '#d9a93d' : '#3fa45a', transition: 'background .2s' }} />
-                    <span style={{ fontSize: 12, color: '#a8a29e', width: 62 }}>{saving ? 'Saving…' : 'Saved'}</span>
+                    <span style={{ fontSize: 12, color: 'var(--faint)', whiteSpace: 'nowrap' }}>{saving ? 'Saving…' : 'Saved'}</span>
                   </div>
-                  <div style={{ width: 1, height: 18, background: '#ececea', flex: 'none' }} />
-                  <span style={{ fontSize: 12, color: '#b0aaa2', fontVariantNumeric: 'tabular-nums', flex: 'none' }}>{wordCount}</span>
+                  <div style={{ width: 1, height: 16, background: 'var(--line)', flex: 'none' }} />
+                  <span style={{ fontSize: 12, color: 'var(--faint2)', fontVariantNumeric: 'tabular-nums', flex: 'none' }}>{count}</span>
+                  <div style={{ width: 1, height: 16, background: 'var(--line)', flex: 'none', marginLeft: 2 }} />
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 1, flex: 'none' }}>
+                    <button className="asp-icon-btn" onClick={onToggleFont} title={fontIsSerif ? 'Reading font: Serif' : 'Reading font: Sans'} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 28, height: 26, flex: 'none', border: 'none', background: 'transparent', borderRadius: 6, cursor: 'pointer', padding: 0, color: 'var(--text3)', opacity: fontIsSerif ? 1 : 0.45 }}>
+                      <span style={{ fontFamily: "'Newsreader',Georgia,serif", fontSize: 16, fontWeight: 500, lineHeight: 1, display: 'block' }}>A</span>
+                    </button>
+                    {themeBtn({ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 28, height: 26, flex: 'none', border: 'none', background: 'transparent', color: 'var(--text3)', borderRadius: 7, cursor: 'pointer', padding: 0 })}
+                  </div>
                 </div>
 
                 {timeTravel && (
                   <div style={{ flex: 'none', display: 'flex', alignItems: 'center', gap: 12, padding: '9px 18px', background: accentSoft, borderBottom: `1px solid ${accent}33` }}>
                     <Icon.ClockIcon stroke={accent} style={{ flex: 'none' }} />
-                    <div style={{ flex: 1, minWidth: 0, fontSize: 12.5, color: '#44403c' }}>
-                      Viewing this vault as it was on <b style={{ fontWeight: 600, color: '#1c1917' }}>{fmtFull(playT)}</b> · read-only
+                    <div style={{ flex: 1, minWidth: 0, fontSize: 12.5, color: 'var(--text2)' }}>
+                      Viewing this vault as it was on <b style={{ fontWeight: 600, color: 'var(--text)' }}>{new Date(playT).toLocaleString()}</b> · read-only
                     </div>
-                    <button onClick={() => void onRestoreHere()} style={{ fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: '#fff', background: accent, border: 'none', borderRadius: 7, padding: '6px 12px', cursor: 'pointer', flex: 'none' }}>Restore this version</button>
-                    <button onClick={onNow} style={{ fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: '#57534e', background: '#fff', border: '1px solid #e0ddd8', borderRadius: 7, padding: '6px 12px', cursor: 'pointer', flex: 'none' }}>Return to now</button>
+                    <button onClick={() => void onRestoreHere()} style={{ fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: 'var(--bg)', background: accent, border: 'none', borderRadius: 7, padding: '6px 12px', cursor: 'pointer', flex: 'none' }}>Restore this version</button>
+                    <button onClick={onNow} style={{ fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: 'var(--text2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 7, padding: '6px 12px', cursor: 'pointer', flex: 'none' }}>Return to now</button>
                   </div>
                 )}
 
-                <div className="asp-scroll" style={{ flex: 1, minHeight: 0, overflowY: 'auto', display: 'flex', justifyContent: 'center', alignItems: 'flex-start' }}>
+                <div className="asp-scroll" style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', display: 'flex', justifyContent: 'center', alignItems: 'flex-start' }}>
                   {paint && (
                     <LiveEditor
                       source={paint.source}
                       paintKey={paint.key}
+                      path={selectedPath || ''}
                       readOnly={paint.readOnly}
                       notExist={paint.notExist}
                       accent={accent}
                       centered={centered}
                       fontFamily={fontFamily}
+                      frontmatterStyle={prefs.frontmatterStyle}
                       onChange={onEditorChange}
                     />
                   )}
                 </div>
               </>
             ) : (
-              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 14, color: '#c4bfb8' }}>
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 14, color: 'var(--faint2)' }}>
                 <Icon.FileIcon size={40} stroke="currentColor" />
-                <div style={{ fontSize: 14, color: '#a8a29e' }}>Select a note to start editing</div>
+                <div style={{ fontSize: 14, color: 'var(--faint)' }}>Select a note to start editing</div>
               </div>
             )}
           </main>
         </div>
 
-        {/* history bar */}
-        <div style={{ flex: 'none', height: 80, background: '#fafaf8', borderTop: '1px solid #ededea', display: 'flex', flexDirection: 'column', userSelect: 'none' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 16px 4px' }}>
-            <Icon.ClockIcon style={{ flex: 'none' }} />
-            <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: '#a8a29e' }}>History</span>
-            <span style={{ fontSize: 11, fontFamily: "'JetBrains Mono', monospace", padding: '2px 9px', borderRadius: 20, flex: 'none', background: timeTravel ? accentSoft : '#e9f2ec', color: timeTravel ? accent : '#3a9357', fontWeight: 500 }}>{timeTravel ? fmtFull(playT) : 'Live · now'}</span>
-            <span style={{ flex: 1 }} />
-            <span style={{ fontSize: 11, color: '#b0aaa2', fontVariantNumeric: 'tabular-nums', flex: 'none' }}>{filterTs == null ? `${events.length} rows` : `${visibleRows} / ${events.length} rows`}</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 2, background: '#efece7', borderRadius: 7, padding: 2, flex: 'none' }}>
-              <button className="asp-zoom-btn" onClick={() => zoomBtn(1.8)} title="Zoom out" style={{ width: 24, height: 22, border: 'none', background: 'transparent', color: '#78716c', borderRadius: 5, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 }}>
-                <Icon.MinusIcon />
-              </button>
-              <button className="asp-zoom-btn" onClick={() => zoomBtn(0.55)} title="Zoom in" style={{ width: 24, height: 22, border: 'none', background: 'transparent', color: '#78716c', borderRadius: 5, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 }}>
-                <Icon.PlusIcon size={14} />
-              </button>
-            </div>
-            <button onClick={onNow} style={{ fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: timeTravel ? '#57534e' : '#bdb8b0', background: '#fff', border: '1px solid #e7e4df', borderRadius: 7, padding: '4px 12px', cursor: 'pointer', flex: 'none', transition: 'border-color .12s' }}>Now</button>
-          </div>
+        <HistoryBar
+          events={events}
+          histRaw={histRaw}
+          view={view2}
+          setView={setView}
+          playhead={playhead}
+          setPlayhead={setPlayhead}
+          now={now}
+          accent={accent}
+          accentSoft={accentSoft}
+          timeTravel={timeTravel}
+          location={desktop ? activeMeta?.path || '' : 'Using browser storage'}
+          locationIsPath={desktop}
+          fingerprint={shortFingerprint(identity)}
+          status={activeStatus}
+          identity={identity}
+          histOpen={histOpen}
+          logOpen={logOpen}
+          onTabHistory={onTabHistory}
+          onTabLog={onTabLog}
+          onNow={onNow}
+        />
 
-          <div ref={trackRef} data-testid="history-track" onPointerDown={onTrackDown} style={{ position: 'relative', flex: 1, margin: '0 16px 9px', cursor: 'crosshair', touchAction: 'none' }}>
-            <div style={{ position: 'absolute', inset: 0, borderBottom: '1px solid #e7e4df' }} />
-            {axisTicks.map((a, i) => (
-              <React.Fragment key={i}>
-                <div style={{ position: 'absolute', left: a.pct + '%', top: 0, bottom: 0, width: 1, background: '#efece7' }} />
-                <div style={{ position: 'absolute', left: a.pct + '%', bottom: -2, transform: 'translateX(4px)', fontSize: 9.5, color: '#bdb8b0', fontFamily: "'JetBrains Mono', monospace", whiteSpace: 'nowrap' }}>{a.label}</div>
-              </React.Fragment>
-            ))}
-            {ticks.map((t, i) => (
-              <div key={i} title={t.title} style={{ position: 'absolute', left: t.pct + '%', top: '16%', height: '68%', width: 2, marginLeft: -1, borderRadius: 1, background: t.color, opacity: t.past ? 0.85 : 0.28 }} />
-            ))}
-            <div style={{ position: 'absolute', left: nowPct + '%', top: 0, bottom: 0, width: 0, borderLeft: '1px dashed #cfcbc4' }} />
-            <div style={{ position: 'absolute', left: playPct + '%', top: -3, bottom: -3, width: 2, marginLeft: -1, background: phColor, zIndex: 5 }}>
-              <div onPointerDown={onHandleDown} style={{ position: 'absolute', left: -6, top: -8, width: 14, height: 14, borderRadius: 4, background: phColor, cursor: 'ew-resize', boxShadow: '0 1px 4px rgba(28,25,23,0.3)' }} />
-            </div>
-          </div>
-        </div>
-
-        {/* file context menu */}
+        {/* file / root context menu */}
         {ctxMenu && (
           <>
             <div onClick={() => setCtxMenu(null)} onContextMenu={(e) => { e.preventDefault(); setCtxMenu(null); }} style={{ position: 'fixed', inset: 0, zIndex: 60 }} />
-            <div style={{ position: 'fixed', left: ctxMenu.x, top: ctxMenu.y, zIndex: 61, width: 172, background: '#fff', border: '1px solid #e7e5e4', borderRadius: 10, boxShadow: '0 12px 32px rgba(28,25,23,0.16)', padding: 5 }}>
-              <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: '#b8b3ac', padding: '5px 11px 3px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ctxMenu.name}</div>
-              <div className="asp-hover-soft" onClick={() => { setRenaming(ctxMenu.path); setRenameValue(ctxMenu.name); setCtxMenu(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: '#1c1917' }}>
-                <Icon.PencilIcon style={{ flex: 'none' }} />
-                <span>Rename</span>
-              </div>
-              <div className="asp-hover-danger" onClick={() => void deleteNode(ctxMenu.path, ctxMenu.isDir)} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: '#c0392b' }}>
-                <Icon.TrashIcon stroke="#c0392b" style={{ flex: 'none' }} />
-                <span>Delete</span>
-              </div>
+            <div style={{ position: 'fixed', left: ctxMenu.x, top: ctxMenu.y, zIndex: 61, width: 172, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, boxShadow: '0 12px 32px rgba(28,25,23,0.16)', padding: 5 }}>
+              {ctxMenu.root ? (
+                <>
+                  <div className="asp-hover-soft" onClick={() => void createFile(ctxTargetDir(ctxMenu))} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                    <Icon.NewFileIcon size={14} style={{ flex: 'none' }} />
+                    <span>New file</span>
+                  </div>
+                  <div className="asp-hover-soft" onClick={() => void createFolder(ctxTargetDir(ctxMenu))} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                    <Icon.NewFolderIcon size={14} style={{ flex: 'none' }} />
+                    <span>New folder</span>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)', padding: '5px 11px 3px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ctxMenu.name}</div>
+                  <div className="asp-hover-soft" onClick={() => { setRenaming(ctxMenu.path!); setRenameValue(ctxMenu.name!); setCtxMenu(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                    <Icon.PencilIcon style={{ flex: 'none' }} />
+                    <span>Rename</span>
+                  </div>
+                  <div className="asp-hover-danger" onClick={() => deleteNode(ctxMenu.path!, !!ctxMenu.isDir)} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: '#c0392b' }}>
+                    <Icon.TrashIcon stroke="#c0392b" style={{ flex: 'none' }} />
+                    <span>Delete</span>
+                  </div>
+                </>
+              )}
             </div>
           </>
         )}
@@ -1094,44 +1130,105 @@ export default function App() {
       {vaultCtx && (
         <>
           <div onClick={() => setVaultCtx(null)} onContextMenu={(e) => { e.preventDefault(); setVaultCtx(null); }} style={{ position: 'fixed', inset: 0, zIndex: 62 }} />
-          <div style={{ position: 'fixed', left: vaultCtx.x, top: vaultCtx.y, zIndex: 63, width: 168, background: '#fff', border: '1px solid #e7e5e4', borderRadius: 10, boxShadow: '0 12px 32px rgba(28,25,23,0.16)', padding: 5 }}>
-            <div className="asp-hover-danger" onClick={() => { const v = vaultMetas.find((x) => x.id === vaultCtx.id); setVaultCtx(null); if (v) setRemoveVaultState({ id: v.id, name: v.name, path: v.path, trash: false }); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: '#c0392b' }}>
-              <Icon.TrashIcon stroke="#c0392b" style={{ flex: 'none' }} />
+          <div style={{ position: 'fixed', left: vaultCtx.x, top: vaultCtx.y, zIndex: 63, width: 176, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, boxShadow: '0 10px 28px rgba(28,25,23,0.15)', padding: 4 }}>
+            <div className="asp-hover-soft" onClick={() => { const v = vaults.find((x) => x.id === vaultCtx.id); setVaultCtx(null); if (v) openCustomize(v); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text2)' }}>
+              <Icon.WandIcon size={14} style={{ flex: 'none' }} />
+              <span>Customize…</span>
+            </div>
+            <div className="asp-hover-danger" onClick={() => { const v = vaultMetas.find((x) => x.id === vaultCtx.id); setVaultCtx(null); if (v) setRemoveVaultState({ id: v.id, name: v.displayName, path: v.path, trash: false }); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: '#c0392b' }}>
+              <Icon.TrashIcon stroke="#c0392b" size={14} style={{ flex: 'none' }} />
               <span>Remove vault…</span>
             </div>
           </div>
         </>
       )}
 
+      {/* entry modal — New vault / Connect a vault */}
+      {entry && (
+        <>
+          <div onClick={() => { if (!connecting) setEntry(null); }} style={{ position: 'fixed', inset: 0, zIndex: 58, background: 'var(--overlay)', backdropFilter: 'blur(2px)' }} />
+          <div style={{ position: 'fixed', zIndex: 59, top: '50%', left: '50%', transform: 'translate(-50%,-50%)', width: 'min(424px,92vw)', background: 'var(--bg)', borderRadius: 16, boxShadow: '0 24px 60px rgba(28,25,23,0.28)', padding: 20, display: 'flex', flexDirection: 'column', gap: 15 }}>
+            <div>
+              <div style={{ fontSize: 16, fontWeight: 600, letterSpacing: '-0.01em' }}>{entry === 'connect' ? 'Connect a vault' : 'New vault'}</div>
+              <div style={{ fontSize: 12.5, color: 'var(--text3)', marginTop: 3 }}>{entry === 'connect' ? 'Paste a code someone shared with you.' : desktop ? 'Name it and choose a folder — everything syncs automatically.' : 'Name it and start writing — it saves in this browser and syncs automatically.'}</div>
+            </div>
+            {entry === 'new' && (
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>Name</span>
+                <input value={newVaultName} onChange={(e) => setNewVaultName(e.target.value)} spellCheck={false} placeholder="My vault" style={{ fontFamily: 'inherit', fontSize: 14, color: 'var(--text)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '10px 12px', outline: 'none', width: '100%', boxSizing: 'border-box' }} />
+              </label>
+            )}
+            {entry === 'connect' && (
+              <>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                  <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>Invite code</span>
+                  <textarea value={ticket} onChange={(e) => setTicket(e.target.value)} rows={2} spellCheck={false} placeholder="Paste the code someone shared with you" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12.5, lineHeight: 1.5, color: 'var(--text)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '11px 13px', resize: 'none', outline: 'none', width: '100%', boxSizing: 'border-box' }} />
+                </label>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                  <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>Access key <span style={{ textTransform: 'none', letterSpacing: 0, fontWeight: 400, color: 'var(--faint)' }}>— if required</span></span>
+                  <input value={authKey} onChange={(e) => setAuthKey(e.target.value)} type="password" spellCheck={false} placeholder="Leave blank if you weren't given one" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12.5, color: 'var(--text)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '11px 13px', outline: 'none', width: '100%', boxSizing: 'border-box' }} />
+                </label>
+              </>
+            )}
+            {desktop && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>{entry === 'connect' ? 'Save to' : 'Location'}</span>
+                <div onClick={() => void onChooseDest()} style={{ display: 'flex', alignItems: 'center', gap: 9, background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '10px 13px', cursor: 'pointer' }}>
+                  <Icon.FolderIcon size={15} stroke="var(--faint)" style={{ flex: 'none' }} />
+                  <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: connectDest ? 'var(--text)' : 'var(--faint)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{connectDest || 'Choose a folder…'}</span>
+                  <span style={{ fontSize: 12, color: 'var(--faint)' }}>Choose…</span>
+                </div>
+              </div>
+            )}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 2 }}>
+              <button onClick={() => { if (!connecting) setEntry(null); }} style={{ fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: 'var(--text2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 9, padding: '8px 16px', cursor: 'pointer' }}>Cancel</button>
+              <button onClick={() => void onEntrySubmit()} disabled={entryBlocked} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, minWidth: 108, height: 38, padding: '0 18px', border: 'none', borderRadius: 9, background: entryBlocked ? 'var(--faint2)' : 'var(--text)', color: 'var(--bg)', fontSize: 13, fontWeight: 500, fontFamily: 'inherit', cursor: entryBlocked ? 'default' : 'pointer' }}>
+                {connecting && <span style={{ width: 13, height: 13, border: '2px solid #ffffff66', borderTopColor: 'var(--bg)', borderRadius: '50%', display: 'inline-block', animation: 'aspSpin 0.7s linear infinite' }} />}
+                <span>{entry === 'connect' ? (connecting ? 'Connecting…' : 'Connect') : 'Create vault'}</span>
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* customize modal */}
+      {customize && (
+        <CustomizeModal
+          initial={customize}
+          onCancel={() => setCustomize(null)}
+          onSave={(m) => { updateMeta(m.id, { name: m.name, hue: m.hue, emoji: m.emoji }); setCustomize(null); }}
+        />
+      )}
+
       {/* share modal */}
       {share && (
         <>
-          <div onClick={() => setShare(null)} style={{ position: 'fixed', inset: 0, zIndex: 70, background: 'rgba(28,25,23,0.30)' }} />
-          <div style={{ position: 'fixed', zIndex: 71, top: '50%', left: '50%', transform: 'translate(-50%,-50%)', width: 'min(420px,92vw)', background: '#fff', borderRadius: 16, boxShadow: '0 24px 60px rgba(28,25,23,0.28)', padding: 20, display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div onClick={() => setShare(null)} style={{ position: 'fixed', inset: 0, zIndex: 70, background: 'var(--overlay)', backdropFilter: 'blur(2px)' }} />
+          <div style={{ position: 'fixed', zIndex: 71, top: '50%', left: '50%', transform: 'translate(-50%,-50%)', width: 'min(420px,92vw)', background: 'var(--bg)', borderRadius: 16, boxShadow: '0 24px 60px rgba(28,25,23,0.28)', padding: 20, display: 'flex', flexDirection: 'column', gap: 14 }}>
             <div>
               <div style={{ fontSize: 16, fontWeight: 600, letterSpacing: '-0.01em' }}>Share this vault</div>
-              <div style={{ fontSize: 13, color: '#78716c', marginTop: 3 }}>Anyone you give this code to can connect and sync.</div>
+              <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 3 }}>Anyone you give this code to can connect and sync.</div>
             </div>
             <div style={{ display: 'flex', alignItems: 'stretch', gap: 8 }}>
-              <div style={{ flex: 1, minWidth: 0, fontFamily: "'JetBrains Mono', monospace", fontSize: 12, lineHeight: 1.5, color: '#44403c', background: '#faf9f7', border: '1px solid #e7e5e4', borderRadius: 10, padding: '11px 13px', wordBreak: 'break-all', maxHeight: 64, overflow: 'hidden' }}>{share.code || 'Generating…'}</div>
-              <button onClick={() => void onCopyCode()} style={{ flex: 'none', alignSelf: 'stretch', display: 'flex', alignItems: 'center', fontFamily: 'inherit', fontSize: 12.5, fontWeight: 500, color: share.copied ? '#3a9357' : '#57534e', background: '#fff', border: '1px solid #e0ddd8', borderRadius: 10, padding: '0 14px', cursor: 'pointer' }}>{share.copied ? 'Copied' : 'Copy'}</button>
+              <div style={{ flex: 1, minWidth: 0, fontFamily: "'JetBrains Mono', monospace", fontSize: 12, lineHeight: 1.5, color: 'var(--text2)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '11px 13px', wordBreak: 'break-all', maxHeight: 64, overflow: 'hidden' }}>{share.code || 'Generating…'}</div>
+              <button onClick={() => void onCopyCode()} style={{ flex: 'none', alignSelf: 'stretch', display: 'flex', alignItems: 'center', fontFamily: 'inherit', fontSize: 12.5, fontWeight: 500, color: share.copied ? '#3a9357' : 'var(--text2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, padding: '0 14px', cursor: 'pointer' }}>{share.copied ? 'Copied' : 'Copy'}</button>
             </div>
             <div onClick={() => void onToggleRequireKey()} style={{ display: 'flex', alignItems: 'center', gap: 11, cursor: 'pointer', padding: 2 }}>
-              <span style={{ width: 34, height: 20, borderRadius: 12, flex: 'none', background: share.requireKey ? accent : '#d6d3cd', position: 'relative', transition: 'background .15s' }}>
-                <span style={{ position: 'absolute', top: 2, left: share.requireKey ? 16 : 2, width: 16, height: 16, borderRadius: '50%', background: '#fff', transition: 'left .15s', boxShadow: '0 1px 2px rgba(0,0,0,0.2)' }} />
+              <span style={{ width: 34, height: 20, borderRadius: 12, flex: 'none', background: share.requireKey ? accent : 'var(--faint2)', position: 'relative', transition: 'background .15s' }}>
+                <span style={{ position: 'absolute', top: 2, left: share.requireKey ? 16 : 2, width: 16, height: 16, borderRadius: '50%', background: 'var(--bg)', transition: 'left .15s', boxShadow: '0 1px 2px rgba(0,0,0,0.2)' }} />
               </span>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 13.5, fontWeight: 500, color: '#1c1917' }}>Require an access key</div>
-                <div style={{ fontSize: 12, color: '#a8a29e' }}>Adds a second secret they must enter too.</div>
+                <div style={{ fontSize: 13.5, fontWeight: 500, color: 'var(--text)' }}>Require an access key</div>
+                <div style={{ fontSize: 12, color: 'var(--faint)' }}>Adds a second secret they must enter too.</div>
               </div>
             </div>
             {share.requireKey && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: '#faf9f7', border: '1px solid #e7e5e4', borderRadius: 10, padding: '11px 13px' }}>
-                <span style={{ fontSize: 11.5, color: '#a8a29e', flex: 'none' }}>Access key</span>
-                <span style={{ flex: 1, fontFamily: "'JetBrains Mono', monospace", fontSize: 13, letterSpacing: '0.04em', color: '#1c1917', textAlign: 'right' }}>{share.accessKey}</span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '11px 13px' }}>
+                <span style={{ fontSize: 11.5, color: 'var(--faint)', flex: 'none' }}>Access key</span>
+                <span style={{ flex: 1, fontFamily: "'JetBrains Mono', monospace", fontSize: 13, letterSpacing: '0.04em', color: 'var(--text)', textAlign: 'right' }}>{share.accessKey}</span>
               </div>
             )}
-            <button onClick={() => setShare(null)} style={{ alignSelf: 'flex-end', fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: '#fff', background: '#1c1917', border: 'none', borderRadius: 9, padding: '8px 18px', cursor: 'pointer' }}>Done</button>
+            <button onClick={() => setShare(null)} style={{ alignSelf: 'flex-end', fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: 'var(--bg)', background: 'var(--text)', border: 'none', borderRadius: 9, padding: '8px 18px', cursor: 'pointer' }}>Done</button>
           </div>
         </>
       )}
@@ -1139,28 +1236,28 @@ export default function App() {
       {/* remove modal */}
       {removeVaultState && (
         <>
-          <div onClick={() => setRemoveVaultState(null)} style={{ position: 'fixed', inset: 0, zIndex: 72, background: 'rgba(28,25,23,0.30)' }} />
-          <div style={{ position: 'fixed', zIndex: 73, top: '50%', left: '50%', transform: 'translate(-50%,-50%)', width: 'min(412px,92vw)', background: '#fff', borderRadius: 16, boxShadow: '0 24px 60px rgba(28,25,23,0.28)', padding: 20, display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div onClick={() => setRemoveVaultState(null)} style={{ position: 'fixed', inset: 0, zIndex: 72, background: 'var(--overlay)', backdropFilter: 'blur(2px)' }} />
+          <div style={{ position: 'fixed', zIndex: 73, top: '50%', left: '50%', transform: 'translate(-50%,-50%)', width: 'min(412px,92vw)', background: 'var(--bg)', borderRadius: 16, boxShadow: '0 24px 60px rgba(28,25,23,0.28)', padding: 20, display: 'flex', flexDirection: 'column', gap: 14 }}>
             <div>
               <div style={{ fontSize: 16, fontWeight: 600, letterSpacing: '-0.01em' }}>Remove “{removeVaultState.name}”?</div>
-              <div style={{ fontSize: 13, color: '#78716c', marginTop: 4, lineHeight: 1.5 }}>{removeVaultState.trash ? 'The folder and its notes will be moved to the Trash.' : 'The folder stays on your computer — it’s only removed from asp.'}</div>
+              <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 4, lineHeight: 1.5 }}>{removeVaultState.trash ? 'The folder and its notes will be moved to the Trash.' : 'The folder stays on your computer — it’s only removed from asp.'}</div>
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 9, background: '#faf9f7', border: '1px solid #ededea', borderRadius: 10, padding: '9px 12px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 9, background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '9px 12px' }}>
               <Icon.FolderIcon style={{ flex: 'none' }} />
-              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: '#57534e', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{removeVaultState.path}</span>
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: 'var(--text2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{removeVaultState.path}</span>
             </div>
             <div onClick={() => setRemoveVaultState((r) => (r ? { ...r, trash: !r.trash } : r))} style={{ display: 'flex', alignItems: 'flex-start', gap: 11, cursor: 'pointer', padding: 2 }}>
-              <span style={{ width: 34, height: 20, borderRadius: 12, flex: 'none', background: removeVaultState.trash ? '#c0392b' : '#d6d3cd', position: 'relative', transition: 'background .15s', marginTop: 1 }}>
-                <span style={{ position: 'absolute', top: 2, left: removeVaultState.trash ? 16 : 2, width: 16, height: 16, borderRadius: '50%', background: '#fff', transition: 'left .15s', boxShadow: '0 1px 2px rgba(0,0,0,0.2)' }} />
+              <span style={{ width: 34, height: 20, borderRadius: 12, flex: 'none', background: removeVaultState.trash ? '#c0392b' : 'var(--faint2)', position: 'relative', transition: 'background .15s', marginTop: 1 }}>
+                <span style={{ position: 'absolute', top: 2, left: removeVaultState.trash ? 16 : 2, width: 16, height: 16, borderRadius: '50%', background: 'var(--bg)', transition: 'left .15s', boxShadow: '0 1px 2px rgba(0,0,0,0.2)' }} />
               </span>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 13.5, fontWeight: 500, color: '#1c1917' }}>Also move the folder to the Trash</div>
-                <div style={{ fontSize: 12, color: '#a8a29e', marginTop: 1 }}>{removeVaultState.trash ? 'It will appear in your system Trash.' : 'Nothing on disk changes.'}</div>
+                <div style={{ fontSize: 13.5, fontWeight: 500, color: 'var(--text)' }}>Also move the folder to the Trash</div>
+                <div style={{ fontSize: 12, color: 'var(--faint)', marginTop: 1 }}>{removeVaultState.trash ? 'It will appear in your system Trash.' : 'Nothing on disk changes.'}</div>
               </div>
             </div>
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 2 }}>
-              <button onClick={() => setRemoveVaultState(null)} style={{ fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: '#57534e', background: '#fff', border: '1px solid #e0ddd8', borderRadius: 9, padding: '8px 16px', cursor: 'pointer' }}>Cancel</button>
-              <button onClick={() => void confirmRemove()} style={{ fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: '#fff', background: '#c0392b', border: 'none', borderRadius: 9, padding: '8px 16px', cursor: 'pointer' }}>{removeVaultState.trash ? 'Remove & Trash folder' : 'Remove from asp'}</button>
+              <button onClick={() => setRemoveVaultState(null)} style={{ fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: 'var(--text2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 9, padding: '8px 16px', cursor: 'pointer' }}>Cancel</button>
+              <button onClick={() => void confirmRemove()} style={{ fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: 'var(--bg)', background: '#c0392b', border: 'none', borderRadius: 9, padding: '8px 16px', cursor: 'pointer' }}>{removeVaultState.trash ? 'Remove & Trash folder' : 'Remove from asp'}</button>
             </div>
           </div>
         </>

@@ -41,6 +41,7 @@ vi.mock('./lib/api', () => ({
     readFile: (id: string, p: string) => readFile(id, p),
     writeFile: (id: string, p: string, c: string) => writeFile(id, p, c),
     renameFile: (id: string, o: string, n: string) => renameFile(id, o, n),
+    createDir: vi.fn(async () => {}),
     deleteFile: (id: string, p: string) => deleteFile(id, p),
     history: (id: string) => history(id),
     readFileAt: vi.fn(async () => ({ exists: true, content: 'old' })),
@@ -65,6 +66,12 @@ async function openMassiveVault() {
   await waitFor(() => expect(listFiles).toHaveBeenCalledWith('v1'));
 }
 
+// The "+" opens a menu in the new design; create a file via New file.
+async function clickNewFile() {
+  fireEvent.click(document.querySelector('button[title="New note"]') as HTMLElement);
+  fireEvent.click(await screen.findByText('New file'));
+}
+
 describe('App at scale (~1000 files)', () => {
   it('virtualizes the file tree (bounded DOM rows despite 1000 files)', async () => {
     await openMassiveVault();
@@ -74,13 +81,12 @@ describe('App at scale (~1000 files)', () => {
     expect(rowCount).toBeLessThan(80);
   });
 
-  it('creates a file on every click — no collisions on rapid double-click', async () => {
+  it('creates a file each time — no collisions on back-to-back New file', async () => {
     await openMassiveVault();
-    const plus = document.querySelector('button[title="New note"]') as HTMLElement;
-    // Two rapid clicks (the "every other time" repro).
-    fireEvent.click(plus);
-    fireEvent.click(plus);
-    // Both distinct files must be written — not the same name twice.
+    // Two New file actions in a row (the synchronous name reservation prevents the
+    // "every other time" collision even while the slow backend write is in flight).
+    await clickNewFile();
+    await clickNewFile();
     await waitFor(() => {
       expect(CONTENT['untitled.md']).toBeDefined();
       expect(CONTENT['untitled-1.md']).toBeDefined();
@@ -89,7 +95,7 @@ describe('App at scale (~1000 files)', () => {
 
   it('shows a newly created file as the selection immediately (optimistic)', async () => {
     await openMassiveVault();
-    fireEvent.click(document.querySelector('button[title="New note"]') as HTMLElement);
+    await clickNewFile();
     // It becomes the selected file → appears (breadcrumb + scrolled-to tree row).
     await waitFor(() => expect(screen.getAllByText('untitled.md').length).toBeGreaterThanOrEqual(1));
   });
@@ -136,7 +142,7 @@ describe('App at scale (~1000 files)', () => {
 
   it('a newly created file shows its template content, not an empty/stale backend read', async () => {
     await openMassiveVault();
-    fireEvent.click(document.querySelector('button[title="New note"]') as HTMLElement);
+    await clickNewFile();
     const editor = await screen.findByTestId('live-editor');
     // The optimistic template ("# untitled") must show even though the backend
     // write (40ms) hasn't landed when the resolver runs.

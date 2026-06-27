@@ -25,6 +25,7 @@ vi.mock('./lib/api', () => ({
     writeFile: (id: string, p: string, c: string) => writeFile(id, p, c),
     deleteFile: async (_id: string, p: string) => { delete CONTENT[p]; },
     renameFile: async () => {},
+    createDir: async () => {},
     history: async () => [],
     readFileAt: async (_id: string, p: string) => ({ exists: true, content: CONTENT[p] ?? '' }),
     restoreFileAt: async () => {},
@@ -50,6 +51,7 @@ describe('editor content integrity (small vault, slow backend)', () => {
   it('a newly created file shows its template, not an empty backend read', async () => {
     const editor = await openVault();
     fireEvent.click(document.querySelector('button[title="New note"]') as HTMLElement);
+    fireEvent.click(await screen.findByText('New file'));
     await waitFor(() => expect(editor.textContent || '').toContain('untitled'));
   });
 

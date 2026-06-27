@@ -47,6 +47,10 @@ async function main() {
     ok('virtualized-rows', { count: rows });
     if (rows >= 200) bad('not-virtualized', { count: rows });
 
+    // The bottom bar starts collapsed in the new design — expand the History tab
+    // so the time-travel track renders.
+    await (await driver.wait(until.elementLocated(By.xpath("//button[contains(.,'History')]")), 5000)).click();
+
     // History track must cap its rendered tick DOM nodes regardless of event count.
     await sleep(900); // history loads on a ~700ms debounce
     const ticks = await driver.executeScript("const tr=document.querySelector('[data-testid=\"history-track\"]');return tr?tr.querySelectorAll('div[title]').length:-1;");
@@ -91,10 +95,14 @@ async function main() {
     ok('rehighlight-settle', { ms: settleMs });
     if (settleMs > 250) bad('rehighlight-slow', { ms: settleMs });
 
-    // Create a file → it appears (in breadcrumb + scrolled-to tree row) AND the
-    // editor shows its template content (not a stale/empty backend read).
+    // Create a file via the "+" menu → New file. It appears (breadcrumb +
+    // scrolled-to tree row) AND the editor shows its template content.
+    const newFile = async () => {
+      await driver.findElement(By.css('button[title="New note"]')).click();
+      await (await driver.wait(until.elementLocated(xtext('New file')), 5000)).click();
+    };
     t = Date.now();
-    await driver.findElement(By.css('button[title="New note"]')).click();
+    await newFile();
     const created = await driver.wait(until.elementLocated(xtext('untitled.md')), 8000).then(() => true).catch(() => false);
     const hasTemplate = await driver
       .wait(async () => (await driver.findElement(By.css('[data-testid="live-editor"]')).getText()).includes('untitled'), 8000)
@@ -105,7 +113,7 @@ async function main() {
     if (!hasTemplate) bad('create-editor-empty', {});
 
     // Create a second quickly → distinct name (no collision).
-    await driver.findElement(By.css('button[title="New note"]')).click();
+    await newFile();
     const created2 = await driver.wait(until.elementLocated(xtext('untitled-1.md')), 8000).then(() => true).catch(() => false);
     ok('create-file-2', { created2 });
     if (!created2) bad('create-2-missing', {});

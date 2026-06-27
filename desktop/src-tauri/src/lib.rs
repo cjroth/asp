@@ -59,6 +59,7 @@ pub fn run() {
             commands::read_file,
             commands::write_file,
             commands::rename_file,
+            commands::create_dir,
             commands::delete_file,
             commands::history,
             commands::read_file_at,

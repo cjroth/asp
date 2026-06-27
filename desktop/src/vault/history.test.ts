@@ -9,6 +9,8 @@ import {
   createTsByPath,
   DAY,
   defaultView,
+  fmtFull,
+  fmtTick,
   HOUR,
   MIN,
   toPct,
@@ -115,7 +117,21 @@ describe('buildEvents / createTsByPath / colorOf', () => {
   });
   it('colors events by kind', () => {
     expect(colorOf('create')).toBe('#3fa45a');
+    expect(colorOf('edit')).toBe('#3d63dd');
     expect(colorOf('rename')).toBe('#d9a93d');
     expect(colorOf('delete')).toBe('#d96a6a');
+  });
+});
+
+describe('time formatting', () => {
+  it('fmtFull formats a full timestamp (pads single-digit time parts)', () => {
+    // 2021-11-14T22:13:20Z — exercise pad on both single- and double-digit fields.
+    const full = fmtFull(1_636_927_400_000);
+    expect(full).toMatch(/^[A-Z][a-z]{2} \d{1,2}, \d\d:\d\d$/);
+  });
+  it('fmtTick shows a date for day-scale steps and a clock otherwise', () => {
+    const ts = 1_636_927_400_000;
+    expect(fmtTick(ts, DAY)).toMatch(/^[A-Z][a-z]{2} \d{1,2}$/);
+    expect(fmtTick(ts, HOUR)).toMatch(/^\d\d:\d\d$/);
   });
 });

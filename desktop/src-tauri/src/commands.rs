@@ -103,6 +103,11 @@ pub fn rename_file(state: State<AppState>, id: String, old: String, new: String)
 }
 
 #[tauri::command(async)]
+pub fn create_dir(state: State<AppState>, id: String, path: String) -> R<()> {
+    e(state.engine.create_dir(&id, &path))
+}
+
+#[tauri::command(async)]
 pub fn delete_file(state: State<AppState>, id: String, path: String) -> R<()> {
     e(state.engine.delete_file(&id, &path))
 }

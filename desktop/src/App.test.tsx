@@ -44,6 +44,7 @@ vi.mock('./lib/api', () => ({
     readFile: (id: string, p: string) => readFile(id, p),
     writeFile: (id: string, p: string, c: string) => writeFile(id, p, c),
     renameFile: vi.fn(),
+    createDir: vi.fn(),
     deleteFile: vi.fn(),
     history: (id: string) => history(id),
     readFileAt: (id: string, p: string, ts: number) => readFileAt(id, p, ts),
@@ -67,8 +68,11 @@ describe('App end-to-end wiring', () => {
     // 1. Connect screen.
     expect(await screen.findByText('Your vaults')).toBeTruthy();
 
-    // 2. Open a folder → addLocalFolder + openVault(listFiles/history).
-    fireEvent.click(screen.getByText('Open a folder'));
+    // 2. New Vault → choose a folder (native dialog) → Create → addLocalFolder + openVault.
+    fireEvent.click(screen.getByText('New Vault'));
+    fireEvent.click(await screen.findByText('Choose…'));
+    await screen.findByText('/home/me/vault');
+    fireEvent.click(screen.getByText('Create vault'));
     await waitFor(() => expect(addLocalFolder).toHaveBeenCalledWith('/home/me/vault'));
     await waitFor(() => expect(listFiles).toHaveBeenCalledWith('v1'));
     // history() is intentionally debounced off the critical path now.
@@ -95,16 +99,18 @@ describe('App end-to-end wiring', () => {
     fireEvent.click(screen.getByText('a.md'));
     await waitFor(() => expect(readFile).toHaveBeenCalledWith('v1', 'notes/a.md'));
 
-    // 7. Time travel: drag the history playhead handle → readFileAt drives a
-    //    read-only view. (Simulate by clicking a point on the track.)
+    // 7. Expand the History tab → the time-travel track + playhead handle render.
+    fireEvent.click(screen.getByText('History'));
+    const track = await screen.findByTestId('history-track');
+    expect(track).toBeTruthy();
     const handle = container.querySelector('[style*="ew-resize"]') as HTMLElement;
     expect(handle).toBeTruthy();
   });
 
-  it('shows the device fingerprint and supports the connect-with-code panel', async () => {
+  it('shows the device fingerprint and supports the connect-with-code modal', async () => {
     render(<App />);
     expect(await screen.findByText(/This device ·/)).toBeTruthy();
-    fireEvent.click(screen.getByText('Connect with a code'));
+    fireEvent.click(screen.getByText('Connect Vault'));
     expect(await screen.findByText('Invite code')).toBeTruthy();
     expect(screen.getByText('Save to')).toBeTruthy();
   });

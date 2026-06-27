@@ -1,13 +1,30 @@
-/* Ported from the "Vault Editor" design canvas <style> block. */
+/* Ported from the new "Vault Editor" design canvas <style> block. All color is
+   driven by CSS variables with a [data-theme="dark"] override, so the whole app
+   themes from one switch (set on <html> by prefs.applyTheme). */
+:root {
+  --bg: #ffffff; --bg-sub: #fafaf8; --bg-input: #faf9f7;
+  --text: #1c1917; --text2: #57534e; --text3: #78716c;
+  --faint: #a8a29e; --faint2: #b0aaa2; --line: #ededea;
+  --overlay: rgba(28, 25, 23, 0.30);
+}
+[data-theme="dark"] {
+  --bg: #1b1b1e; --bg-sub: #161618; --bg-input: #232327;
+  --text: #ececec; --text2: #b6b2ab; --text3: #9b968d;
+  --faint: #827d74; --faint2: #6f6a62; --line: #2d2d31;
+  --overlay: rgba(0, 0, 0, 0.62);
+}
+
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; }
 #root { height: 100%; }
 body {
   font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
+  background: var(--bg);
+  color: var(--text);
 }
 ::selection { background: rgba(61, 99, 221, 0.16); }
-textarea::placeholder, input::placeholder { color: #b8b3ac; }
+textarea::placeholder, input::placeholder { color: var(--faint); }
 
 @keyframes aspPulse { 0%, 100% { opacity: 1 } 50% { opacity: .32 } }
 @keyframes aspSpin { to { transform: rotate(360deg) } }
@@ -17,13 +34,22 @@ textarea::placeholder, input::placeholder { color: #b8b3ac; }
   background: #00000016; border-radius: 8px;
   border: 3px solid transparent; background-clip: padding-box;
 }
+[data-theme="dark"] .asp-scroll::-webkit-scrollbar-thumb { background: #ffffff1f; background-clip: padding-box; }
 .asp-scroll::-webkit-scrollbar-thumb:hover { background: #00000026; background-clip: padding-box; }
+
+/* Hover affordances — the design applies these via `style-hover`; in React they
+   are CSS classes so the same elements light up on hover, theme-aware. */
+.asp-hover-row:hover { background: var(--line); }
+.asp-hover-soft:hover { background: var(--line); }
+.asp-hover-list:hover { background: var(--bg-sub); }
+.asp-hover-danger:hover { background: rgba(192, 57, 43, 0.10); }
+.asp-icon-btn:hover { background: var(--line) !important; color: var(--text) !important; }
 
 /* Live (contentEditable) markdown WYSIWYG classes. */
 .cm-mark { display: none; }
 .cm-code {
   font-family: 'JetBrains Mono', monospace; font-size: 0.86em;
-  background: #f3f1ec; padding: 1px 5px; border-radius: 5px;
+  background: var(--bg-input); padding: 1px 5px; border-radius: 5px;
 }
 .cm-link { color: var(--accent, #3d63dd); border-bottom: 1px solid var(--accent, #3d63dd); }
 .cm-ul { position: relative; padding-left: 1.5em; }
@@ -34,19 +60,61 @@ textarea::placeholder, input::placeholder { color: #b8b3ac; }
 .cm-task { position: relative; padding-left: 1.85em; }
 .cm-task::before {
   content: ''; position: absolute; left: 0.1em; top: 0.28em; width: 16px; height: 16px;
-  border: 1.6px solid #cfcbc3; border-radius: 4px; box-sizing: border-box;
+  border: 1.6px solid var(--faint2); border-radius: 4px; box-sizing: border-box;
 }
 .cm-task-done::before { background: var(--accent, #3d63dd); border-color: var(--accent, #3d63dd); }
 .cm-task-done::after {
-  content: ''; position: absolute; left: 0.52em; top: 0.46em; width: 5px; height: 9px;
-  border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(43deg);
+  content: ''; position: absolute; left: calc(0.1em + 5.5px); top: calc(0.28em + 2.5px);
+  width: 4px; height: 8px; border: solid var(--bg); border-width: 0 2px 2px 0;
+  transform: rotate(43deg); box-sizing: border-box;
 }
-.cm-task-done .cm-body { color: #a8a29e; text-decoration: line-through; }
+.cm-task-done .cm-body { color: var(--faint); text-decoration: line-through; }
 
-/* Hover affordances ported from the design's style-hover attributes. */
-.asp-hover-row:hover { background: #efece7; }
-.asp-hover-soft:hover { background: #f4f2ee; }
-.asp-hover-list:hover { background: #f0efec; }
-.asp-hover-danger:hover { background: #fbeeec; }
-.asp-icon-btn:hover { background: #e9e7e3 !important; color: #1c1917 !important; }
-.asp-zoom-btn:hover { background: #fff !important; color: #1c1917 !important; }
+/* Markdown tables. */
+.tbl-row { display: flex; border-left: 1px solid var(--line); }
+.tbl-row .tcell {
+  flex: 1 1 0; min-width: 0; padding: 6px 13px; border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line); font-size: 14px; line-height: 1.5;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.tbl-head { border-top: 1px solid var(--line); margin-top: 16px; }
+.tbl-head .tcell { font-weight: 600; background: var(--bg-input); }
+.tbl-sep { height: 0; line-height: 0; overflow: hidden; border: none; }
+
+/* Sidebar resize handle. */
+.sb-resize:hover .sb-line { background: var(--accent, #3d63dd); }
+
+/* Frontmatter — Card (default for `frontmatterStyle: Card`). */
+.fm-line {
+  background: var(--bg-input); border-left: 1px solid var(--line); border-right: 1px solid var(--line);
+  margin-left: -16px; margin-right: -16px; padding: 3px 16px; font-size: 13.5px; line-height: 1.95;
+}
+.fm-top { border-top: 1px solid var(--line); border-radius: 11px 11px 0 0; margin-top: 4px; padding-top: 10px; }
+.fm-top::before {
+  content: 'Properties'; display: block; font-family: system-ui, sans-serif; font-size: 10px;
+  font-weight: 600; letter-spacing: 0.07em; text-transform: uppercase; color: var(--faint2); margin-bottom: 7px;
+}
+.fm-bot { border-bottom: 1px solid var(--line); border-radius: 0 0 11px 11px; padding-bottom: 10px; margin-bottom: 34px; }
+.fm-row { display: flex; align-items: baseline; }
+.fm-key { flex: none; min-width: 104px; color: var(--faint); font-weight: 500; font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; }
+.fm-val { color: var(--text); }
+.fm-arr { color: var(--accent, #3d63dd); }
+
+/* Frontmatter — Banner (title + meta as a header section, full-bleed divider). */
+.fmb-start { height: 0; line-height: 0; overflow: hidden; }
+.fmb-title { font-size: 23px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.25; margin: 2px 0 6px; }
+.fmb-title .fmb-key { display: none; }
+.fmb-meta { display: inline-block; margin: 0 18px 4px 0; font-size: 12.5px; color: var(--text3); }
+.fmb-meta .fmb-key { color: var(--faint); font-size: 10.5px; letter-spacing: 0.04em; text-transform: uppercase; margin-right: 5px; }
+.fmb-end { height: 0; line-height: 0; overflow: hidden; border-bottom: 1px solid var(--line); margin: 16px -600px 26px; }
+.fmb-end .cm-mark { display: none; }
+
+/* Frontmatter — Below (large page title, meta beneath, full-bleed divider). */
+.fmd-start { height: 0; line-height: 0; overflow: hidden; }
+.fmd-title { font-size: 30px; font-weight: 600; letter-spacing: -0.025em; line-height: 1.15; margin: 2px 0 14px; }
+.fmd-title .fmd-key { display: none; }
+.fmd-meta { display: flex; align-items: baseline; font-size: 13px; color: var(--text3); line-height: 1.85; }
+.fmd-meta .fmd-key { flex: none; min-width: 92px; color: var(--faint); font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; }
+.fmd-end { height: 0; line-height: 0; overflow: hidden; border-bottom: 1px solid var(--line); margin: 18px -600px 28px; }
+.fmd-end .cm-mark { display: none; }
+.fmb-arr, .fmd-arr { color: var(--accent, #3d63dd); }

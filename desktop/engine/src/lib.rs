@@ -563,6 +563,25 @@ impl DesktopEngine {
         Ok(())
     }
 
+    /// Create an empty directory. A physically-empty in-scope directory is a
+    /// first-class, content-free entity in `asp-core` (materialized via real
+    /// `mkdir`), so we `mkdir` then `capture_rescan`, which authors the `Dir`
+    /// row(s); each is pushed live to every connected peer.
+    pub fn create_dir(&self, id: &str, path: &str) -> Result<()> {
+        let (conns, rows) = {
+            let folders = self.folders.lock().unwrap();
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            std::fs::create_dir_all(f.path.join(path)).with_context(|| format!("mkdir {}", path))?;
+            let eng = f.engine.lock().unwrap();
+            let rows = eng.capture_rescan()?;
+            (f.conns.clone(), rows)
+        };
+        for wr in rows {
+            self.broadcast(&conns, wr);
+        }
+        Ok(())
+    }
+
     /// Project the append-only log into wall-clock history events for the
     /// time-travel scrubber. Resolves a path for every row (edits/deletes carry
     /// none, so we track each `file_id`'s latest path in fold order).

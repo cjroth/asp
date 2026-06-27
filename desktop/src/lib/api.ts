@@ -1,6 +1,9 @@
-// Thin wrapper over the Tauri command surface (which is itself a thin
-// pass-through to asp-desktop-engine → asp-core). No protocol logic in the app.
+// The backend surface, abstracted over platform. On desktop it's a thin
+// pass-through to the Tauri command layer (→ asp-desktop-engine → asp-core). On
+// web it's the same asp-core engine compiled to wasm, persisted to OPFS (see
+// webApi.ts). No protocol logic lives in the app either way.
 import { invoke } from '@tauri-apps/api/core';
+import { isDesktop } from './platform';
 
 export interface VaultInfo {
   id: string;
@@ -40,32 +43,70 @@ export interface FileAt {
   content: string;
 }
 
-export const api = {
-  listVaults: () => invoke<VaultInfo[]>('list_vaults'),
-  addLocalFolder: (path: string) => invoke<VaultInfo>('add_local_folder', { path }),
-  // `ticket` is an iroh ticket or bare node id (replaces the old ws:// URL).
-  cloneRemote: (dest: string, ticket: string, authKey?: string) =>
-    invoke<VaultInfo>('clone_remote', { dest, ticket, authKey }),
-  setAllowConnections: (id: string, on: boolean, authKey?: string) =>
-    invoke<string | null>('set_allow_connections', { id, on, authKey }),
-  syncNow: (id: string, ticket: string, authKey?: string) => invoke<void>('sync_now', { id, ticket, authKey }),
-  getStatus: (id: string) => invoke<VaultStatus>('get_status', { id }),
-  getIdentity: () => invoke<string>('get_identity'),
-  authorize: (id: string, pubkey: string) => invoke<void>('authorize', { id, pubkey }),
-  createSnapshot: (id: string, name: string) => invoke<string>('create_snapshot', { id, name }),
-  restore: (id: string, target: string) => invoke<void>('restore', { id, target }),
+export interface Api {
+  listVaults(): Promise<VaultInfo[]>;
+  addLocalFolder(path: string): Promise<VaultInfo>;
+  // Create a fresh browser-storage (OPFS) vault. Web-only.
+  createVault(name: string): Promise<VaultInfo>;
+  cloneRemote(dest: string, ticket: string, authKey?: string): Promise<VaultInfo>;
+  setAllowConnections(id: string, on: boolean, authKey?: string): Promise<string | null>;
+  syncNow(id: string, ticket: string, authKey?: string): Promise<void>;
+  getStatus(id: string): Promise<VaultStatus>;
+  getIdentity(): Promise<string>;
+  authorize(id: string, pubkey: string): Promise<void>;
+  createSnapshot(id: string, name: string): Promise<string>;
+  restore(id: string, target: string): Promise<void>;
+  listFiles(id: string): Promise<FileEntry[]>;
+  readFile(id: string, path: string): Promise<string>;
+  writeFile(id: string, path: string, content: string): Promise<void>;
+  renameFile(id: string, oldPath: string, newPath: string): Promise<void>;
+  createDir(id: string, path: string): Promise<void>;
+  deleteFile(id: string, path: string): Promise<void>;
+  history(id: string): Promise<HistEvent[]>;
+  readFileAt(id: string, path: string, ts: number): Promise<FileAt>;
+  restoreFileAt(id: string, path: string, ts: number): Promise<void>;
+  rescan(id: string): Promise<void>;
+  removeVault(id: string, trash: boolean): Promise<void>;
+}
 
-  // ---- file surface ----
-  listFiles: (id: string) => invoke<FileEntry[]>('list_files', { id }),
-  readFile: (id: string, path: string) => invoke<string>('read_file', { id, path }),
-  writeFile: (id: string, path: string, content: string) => invoke<void>('write_file', { id, path, content }),
-  renameFile: (id: string, oldPath: string, newPath: string) =>
-    invoke<void>('rename_file', { id, old: oldPath, new: newPath }),
-  deleteFile: (id: string, path: string) => invoke<void>('delete_file', { id, path }),
-  history: (id: string) => invoke<HistEvent[]>('history', { id }),
-  // `ts` is wall-clock unix SECONDS.
-  readFileAt: (id: string, path: string, ts: number) => invoke<FileAt>('read_file_at', { id, path, ts }),
-  restoreFileAt: (id: string, path: string, ts: number) => invoke<void>('restore_file_at', { id, path, ts }),
-  rescan: (id: string) => invoke<void>('rescan', { id }),
-  removeVault: (id: string, trash: boolean) => invoke<void>('remove_vault', { id, trash }),
+// ---- desktop backend: Tauri commands (a thin pass-through) ----
+const tauriApi: Api = {
+  listVaults: () => invoke<VaultInfo[]>('list_vaults'),
+  addLocalFolder: (path) => invoke<VaultInfo>('add_local_folder', { path }),
+  createVault: () => Promise.reject(new Error('createVault is web-only')),
+  cloneRemote: (dest, ticket, authKey) => invoke<VaultInfo>('clone_remote', { dest, ticket, authKey }),
+  setAllowConnections: (id, on, authKey) => invoke<string | null>('set_allow_connections', { id, on, authKey }),
+  syncNow: (id, ticket, authKey) => invoke<void>('sync_now', { id, ticket, authKey }),
+  getStatus: (id) => invoke<VaultStatus>('get_status', { id }),
+  getIdentity: () => invoke<string>('get_identity'),
+  authorize: (id, pubkey) => invoke<void>('authorize', { id, pubkey }),
+  createSnapshot: (id, name) => invoke<string>('create_snapshot', { id, name }),
+  restore: (id, target) => invoke<void>('restore', { id, target }),
+  listFiles: (id) => invoke<FileEntry[]>('list_files', { id }),
+  readFile: (id, path) => invoke<string>('read_file', { id, path }),
+  writeFile: (id, path, content) => invoke<void>('write_file', { id, path, content }),
+  renameFile: (id, oldPath, newPath) => invoke<void>('rename_file', { id, old: oldPath, new: newPath }),
+  createDir: (id, path) => invoke<void>('create_dir', { id, path }),
+  deleteFile: (id, path) => invoke<void>('delete_file', { id, path }),
+  history: (id) => invoke<HistEvent[]>('history', { id }),
+  readFileAt: (id, path, ts) => invoke<FileAt>('read_file_at', { id, path, ts }),
+  restoreFileAt: (id, path, ts) => invoke<void>('restore_file_at', { id, path, ts }),
+  rescan: (id) => invoke<void>('rescan', { id }),
+  removeVault: (id, trash) => invoke<void>('remove_vault', { id, trash }),
 };
+
+// The web backend (wasm + OPFS) is heavy, so it's loaded lazily only when we're
+// actually running in a browser.
+let webApiPromise: Promise<Api> | null = null;
+function backend(): Promise<Api> {
+  if (isDesktop()) return Promise.resolve(tauriApi);
+  if (!webApiPromise) webApiPromise = import('./webApi').then((m) => m.createWebApi());
+  return webApiPromise;
+}
+
+// `api` dispatches every call to the active backend at call time.
+export const api: Api = new Proxy({} as Api, {
+  get(_t, prop: string) {
+    return (...args: unknown[]) => backend().then((b) => (b as unknown as Record<string, (...a: unknown[]) => unknown>)[prop](...args));
+  },
+});

@@ -11,11 +11,13 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "e2e:web": "bun run build:web && bash e2e/web-run.sh",
+    "e2e:webapp": "xvfb-run -a node e2e/webapp-check.mjs",
     "bench": "cargo run --release -p asp-desktop-engine --example bench_ops --"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2",
+    "asp-wasm": "file:../crates/asp-wasm/pkg-web",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
@@ -27,6 +29,7 @@
     "@types/react-dom": "^18.3.1",
     "@types/selenium-webdriver": "^4.35.6",
     "@vitejs/plugin-react": "^4.3.1",
+    "@vitest/coverage-v8": "^2",
     "jsdom": "^25",
     "selenium-webdriver": "^4.45.0",
     "typescript": "^5.6.3",

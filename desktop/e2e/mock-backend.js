@@ -35,9 +35,14 @@
     v2: { info: { id: 'v2', path: '/home/me/second', vault_id: 'vid2', enabled: false, listening_ticket: null }, content: mk('Second') },
   };
   function files(id) {
-    return Object.keys(VAULTS[id].content).map(function (p) {
+    var out = Object.keys(VAULTS[id].content).map(function (p) {
       return { path: p, file_id: p, is_dir: false, merge_class: 'text' };
     });
+    var dirs = VAULTS[id].dirs || {};
+    Object.keys(dirs).forEach(function (p) {
+      out.push({ path: p, file_id: p, is_dir: true, merge_class: 'dir' });
+    });
+    return out;
   }
   var H = {
     list_vaults: function () { return [VAULTS.v1.info, VAULTS.v2.info]; },
@@ -48,6 +53,7 @@
     write_file: function (a) { VAULTS[a.id].content[a.path] = a.content; return null; },
     delete_file: function (a) { delete VAULTS[a.id].content[a.path]; return null; },
     rename_file: function (a) { var c = VAULTS[a.id].content; c[a['new']] = c[a.old]; delete c[a.old]; return null; },
+    create_dir: function (a) { VAULTS[a.id].dirs = VAULTS[a.id].dirs || {}; VAULTS[a.id].dirs[a.path] = true; return null; },
     history: function () { return histEvents(); },
     read_file_at: function (a) { var c = VAULTS[a.id].content; return { exists: true, content: c[a.path] != null ? c[a.path] : '' }; },
     restore_file_at: function () { return null; },

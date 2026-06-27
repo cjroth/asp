@@ -46,15 +46,25 @@ export function buildTree(files: FileEntry[]): TreeNode[] {
 
   const sortRec = (n: TreeNode) => {
     if (!n.children) return;
-    // Directories first, then files; alphabetical within each — like a sidebar.
-    n.children.sort((a, b) => {
-      if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
-      return a.name.localeCompare(b.name);
-    });
+    n.children.sort(compareNodes);
     n.children.forEach(sortRec);
   };
   sortRec(root);
   return root.children!;
+}
+
+// The design's row order: ALL-CAPS note stems (e.g. README.md) float to the top,
+// then everything else — dirs and files intermixed — by natural (numeric) name.
+const stemOf = (s: string): string => {
+  const i = s.lastIndexOf('.');
+  return i > 0 ? s.slice(0, i) : s;
+};
+const capRank = (n: TreeNode): number => {
+  const st = stemOf(n.name);
+  return n.type === 'file' && /[A-Za-z]/.test(st) && st === st.toUpperCase() ? 0 : 1;
+};
+export function compareNodes(a: TreeNode, b: TreeNode): number {
+  return capRank(a) - capRank(b) || a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
 }
 
 export interface FlatRow {
@@ -88,7 +98,8 @@ export function allDirPaths(tree: TreeNode[]): string[] {
   return out;
 }
 
-// First README (any depth) else the first file — the default selection.
+// First README (any depth) else the first file — the default selection. (Free
+// "untitled" naming now lives in format.ts as `freeName`.)
 export function firstSelectable(tree: TreeNode[]): string | null {
   let firstFile: string | null = null;
   let readme: string | null = null;
@@ -104,14 +115,4 @@ export function firstSelectable(tree: TreeNode[]): string | null {
   };
   walk(tree);
   return readme || firstFile;
-}
-
-// A free "untitled[-n].md" name at the vault root, given existing paths.
-export function freeUntitledName(paths: string[]): string {
-  const set = new Set(paths);
-  if (!set.has('untitled.md')) return 'untitled.md';
-  for (let i = 1; ; i++) {
-    const cand = `untitled-${i}.md`;
-    if (!set.has(cand)) return cand;
-  }
 }

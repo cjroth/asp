@@ -8,4 +8,5 @@ crates/asp-wasm/pkg-web
 node_modules
 **/node_modules
 dist
+desktop/coverage
 plugins/obsidian/main.js
