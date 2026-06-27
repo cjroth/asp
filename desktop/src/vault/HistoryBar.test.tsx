@@ -135,7 +135,6 @@ describe('HistoryBar', () => {
     const { getByText, queryByText } = render(<HistoryBar {...props({ location: '/home/me/vault' })} />);
 
     fireEvent.click(getByText('/home/me/vault'));
-    act(() => vi.advanceTimersByTime(250)); // single-click timer fires (no dblclick cancelled it)
     expect(writeText).toHaveBeenCalledWith('/home/me/vault');
     expect(revealPath).not.toHaveBeenCalled();
     expect(getByText('Copied path')).toBeTruthy();
@@ -145,32 +144,47 @@ describe('HistoryBar', () => {
     expect(getByText('/home/me/vault')).toBeTruthy();
   });
 
-  it('double-clicks the location path to reveal it in the file manager (no copy)', () => {
-    vi.useFakeTimers();
+  it('clicking the folder icon opens the file manager (no copy)', () => {
     revealPath.mockClear();
     const writeText = vi.fn();
     Object.assign(navigator, { clipboard: { writeText } });
-    const { getByText } = render(<HistoryBar {...props({ location: '/home/me/vault' })} />);
+    const { getByTitle } = render(<HistoryBar {...props({ location: '/home/me/vault' })} />);
 
-    const span = getByText('/home/me/vault');
-    fireEvent.click(span);
-    fireEvent.doubleClick(span); // cancels the pending single-click copy
-    act(() => vi.advanceTimersByTime(500));
+    fireEvent.click(getByTitle('Open in file manager'));
     expect(revealPath).toHaveBeenCalledWith('/home/me/vault');
     expect(writeText).not.toHaveBeenCalled();
   });
 
-  it('does not attach copy/reveal behavior in web mode (locationIsPath=false)', () => {
-    vi.useFakeTimers();
+  it('right-clicks the location to open a menu whose items copy and reveal', () => {
     revealPath.mockClear();
     const writeText = vi.fn();
     Object.assign(navigator, { clipboard: { writeText } });
-    const { getByText } = render(<HistoryBar {...props({ locationIsPath: false, location: 'web vault' })} />);
+    const { getByText, getByTitle, queryByText } = render(<HistoryBar {...props({ location: '/home/me/vault' })} />);
+
+    // Right-click the folder icon → context menu appears with both actions.
+    fireEvent.contextMenu(getByTitle('Open in file manager'), { clientX: 20, clientY: 20 });
+    fireEvent.click(getByText('Open in file manager'));
+    expect(revealPath).toHaveBeenCalledWith('/home/me/vault');
+    expect(queryByText('Open in file manager')).toBeNull(); // menu closes after a choice
+
+    // Reopen via the path text and copy.
+    fireEvent.contextMenu(getByText('/home/me/vault'), { clientX: 20, clientY: 20 });
+    fireEvent.click(getByText('Copy path'));
+    expect(writeText).toHaveBeenCalledWith('/home/me/vault');
+  });
+
+  it('does not attach copy/reveal behavior in web mode (locationIsPath=false)', () => {
+    revealPath.mockClear();
+    const writeText = vi.fn();
+    Object.assign(navigator, { clipboard: { writeText } });
+    const { getByText, queryByTitle } = render(<HistoryBar {...props({ locationIsPath: false, location: 'web vault' })} />);
 
     const span = getByText('web vault');
     fireEvent.click(span);
-    fireEvent.doubleClick(span);
-    act(() => vi.advanceTimersByTime(500));
+    fireEvent.contextMenu(span, { clientX: 20, clientY: 20 });
+    expect(queryByTitle('Open in file manager')).toBeNull();
+    expect(queryByTitle('Click to copy path')).toBeNull();
+    expect(getByText('web vault')).toBeTruthy(); // no context menu opened
     expect(writeText).not.toHaveBeenCalled();
     expect(revealPath).not.toHaveBeenCalled();
   });

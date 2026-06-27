@@ -65,26 +65,23 @@ export default function HistoryBar(props: HistoryBarProps) {
   const [logCopied, setLogCopied] = useState(false);
   const [logCtx, setLogCtx] = useState<{ x: number; y: number; line: string } | null>(null);
 
-  // Location path: single click copies the full path (with brief feedback),
-  // double click reveals it in the OS file manager. A short timer on the single
-  // click lets a following dblclick cancel it so a reveal never also copies.
+  // Location (desktop only): the folder ICON opens the OS file manager; a single
+  // click on the path TEXT copies the full path (with brief feedback); a
+  // right-click anywhere on the location opens a small context menu with both.
   const [pathCopied, setPathCopied] = useState(false);
-  const clickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const onPathClick = () => {
-    if (clickTimer.current) clearTimeout(clickTimer.current);
-    clickTimer.current = setTimeout(() => {
-      clickTimer.current = null;
-      copy(location);
-      setPathCopied(true);
-      setTimeout(() => setPathCopied(false), 1200);
-    }, 250);
+  const [locCtx, setLocCtx] = useState<{ x: number; y: number } | null>(null);
+  const copyPath = () => {
+    copy(location);
+    setPathCopied(true);
+    setTimeout(() => setPathCopied(false), 1200);
   };
-  const onPathDouble = () => {
-    if (clickTimer.current) {
-      clearTimeout(clickTimer.current);
-      clickTimer.current = null;
-    }
+  const revealLoc = () => {
     void api.revealPath(location);
+  };
+  const openLocCtx = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setLocCtx({ x: Math.min(e.clientX, window.innerWidth - 212), y: Math.min(e.clientY, window.innerHeight - 90) });
   };
 
   // ---- geometry ----
@@ -207,13 +204,18 @@ export default function HistoryBar(props: HistoryBarProps) {
   return (
     <div style={{ flex: 'none', height: barHeight, background: 'var(--bg-sub)', borderTop: '1px solid var(--line)', display: 'flex', flexDirection: 'column', userSelect: 'none', transition: props.animate ? 'height .16s ease' : 'none' }}>
       <div style={{ display: 'flex', alignItems: 'center', height: 38, padding: '0 9px 0 15px', gap: 10, flex: 'none' }}>
-        <span style={{ display: 'inline-flex', flex: 'none', color: 'var(--faint2)' }}>
+        <span
+          onClick={locationIsPath ? revealLoc : undefined}
+          onContextMenu={locationIsPath ? openLocCtx : undefined}
+          title={locationIsPath ? 'Open in file manager' : undefined}
+          style={{ display: 'inline-flex', flex: 'none', color: 'var(--faint2)', cursor: locationIsPath ? 'pointer' : 'default' }}
+        >
           {locationIsPath ? <Icon.FolderIcon size={12} stroke="var(--faint2)" /> : <Icon.GlobeIcon size={12} stroke="var(--faint2)" />}
         </span>
         <span
-          onClick={locationIsPath ? onPathClick : undefined}
-          onDoubleClick={locationIsPath ? onPathDouble : undefined}
-          title={locationIsPath ? 'Click to copy path · double-click to reveal in file manager' : undefined}
+          onClick={locationIsPath ? copyPath : undefined}
+          onContextMenu={locationIsPath ? openLocCtx : undefined}
+          title={locationIsPath ? 'Click to copy path' : undefined}
           style={{ fontFamily: locationIsPath ? "'JetBrains Mono', monospace" : 'inherit', fontSize: 12, color: pathCopied ? accent : 'var(--text2)', maxWidth: 190, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: locationIsPath ? 'pointer' : 'default' }}
         >{locationIsPath && pathCopied ? 'Copied path' : location}</span>
         <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10.5, color: 'var(--faint2)', flex: 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{fingerprint}</span>
@@ -299,6 +301,22 @@ export default function HistoryBar(props: HistoryBarProps) {
             ))}
           </div>
         </div>
+      )}
+
+      {locCtx && (
+        <>
+          <div onClick={() => setLocCtx(null)} onContextMenu={(e) => { e.preventDefault(); setLocCtx(null); }} style={{ position: 'fixed', inset: 0, zIndex: 64 }} />
+          <div style={{ position: 'fixed', left: locCtx.x, top: locCtx.y, zIndex: 65, width: 200, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, boxShadow: '0 10px 28px rgba(28,25,23,0.15)', padding: 4 }}>
+            <div className="asp-hover-soft" onClick={() => { copyPath(); setLocCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+              <Icon.CopyIcon size={14} stroke="#78716c" style={{ flex: 'none' }} />
+              <span>Copy path</span>
+            </div>
+            <div className="asp-hover-soft" onClick={() => { revealLoc(); setLocCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+              <Icon.FolderIcon size={14} stroke="#78716c" style={{ flex: 'none' }} />
+              <span>Open in file manager</span>
+            </div>
+          </div>
+        </>
       )}
 
       {logCtx && (
