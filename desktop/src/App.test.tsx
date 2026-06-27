@@ -74,11 +74,12 @@ describe('App end-to-end wiring', () => {
     // history() is intentionally debounced off the critical path now.
     await waitFor(() => expect(history).toHaveBeenCalledWith('v1'), { timeout: 2000 });
 
-    // 3. Editor renders the file tree (README + the notes dir, expanded).
-    //    "README.md" appears twice on purpose: the tree row and the breadcrumb.
+    // 3. Editor renders the file tree. Dirs start collapsed (vaults can be huge),
+    //    so expand "notes" to reveal a.md. "README.md" appears twice on purpose:
+    //    the tree row and the breadcrumb.
     expect((await screen.findAllByText('README.md')).length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText('notes')).toBeTruthy();
-    expect(screen.getByText('a.md')).toBeTruthy();
+    fireEvent.click(screen.getByText('notes'));
+    expect(await screen.findByText('a.md')).toBeTruthy();
 
     // 4. README is auto-selected and its content read + painted.
     await waitFor(() => expect(readFile).toHaveBeenCalledWith('v1', 'README.md'));

@@ -5,6 +5,7 @@
 import { open } from '@tauri-apps/plugin-dialog';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, type FileEntry, type VaultInfo, type VaultStatus } from './lib/api';
+import FileTree from './vault/FileTree';
 import LiveEditor from './vault/LiveEditor';
 import {
   axisTicksFor,
@@ -24,7 +25,7 @@ import {
 } from './vault/history';
 import * as Icon from './vault/icons';
 import { wordCountOf } from './vault/markdown';
-import { allDirPaths, buildTree, firstSelectable, flatten, freeUntitledName } from './vault/tree';
+import { buildTree, firstSelectable, flatten, freeUntitledName } from './vault/tree';
 
 // ---------- small helpers ----------
 const basename = (p: string) => p.split('/').filter(Boolean).pop() || p;
@@ -153,6 +154,7 @@ export default function App() {
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const histTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dirtyRef = useRef(false);
+  const filesRef = useRef<FileEntry[]>([]);
   const trackRef = useRef<HTMLDivElement | null>(null);
   const paintSeq = useRef(0);
   activeIdRef.current = activeId;
@@ -212,6 +214,7 @@ export default function App() {
 
   const refreshFiles = useCallback(async (id: string) => {
     const fs = await api.listFiles(id);
+    filesRef.current = fs;
     setFiles(fs);
     return fs;
   }, []);
@@ -355,10 +358,16 @@ export default function App() {
       setNow(Date.now());
       const fs = await refreshFiles(id);
       const tree = buildTree(fs);
+      // Start collapsed (a vault may have thousands of files); only expand the
+      // folders leading to the auto-selected file so it's visible.
+      const sel = firstSelectable(tree);
       const exp: Record<string, boolean> = {};
-      for (const d of allDirPaths(tree)) exp[d] = true;
+      if (sel) {
+        const parts = sel.split('/');
+        for (let i = 1; i < parts.length; i++) exp[parts.slice(0, i).join('/')] = true;
+      }
       setExpanded(exp);
-      setSelectedPath(firstSelectable(tree));
+      setSelectedPath(sel);
       scheduleHistory(id);
     },
     [flushSave, refreshFiles, scheduleHistory],
@@ -381,12 +390,12 @@ export default function App() {
     const id = activeIdRef.current;
     if (!id) return;
     await flushSave();
-    const name = freeUntitledName(files.map((f) => f.path));
+    const name = freeUntitledName(filesRef.current.map((f) => f.path));
     await api.writeFile(id, name, `# ${name.replace(/\.md$/, '')}\n\n`);
     setSelectedPath(name);
     await refreshFiles(id);
     scheduleHistory(id);
-  }, [files, flushSave, refreshFiles, scheduleHistory]);
+  }, [flushSave, refreshFiles, scheduleHistory]);
 
   const commitRename = useCallback(
     async (oldPath: string, rawName: string) => {
@@ -401,7 +410,7 @@ export default function App() {
       await flushSave();
       // The backend renames by exact path, so a directory rename must move every
       // descendant entry (the Dir entity + each child file) to its new prefix.
-      const affected = files.filter((f) => f.path === oldPath || f.path.startsWith(oldPath + '/'));
+      const affected = filesRef.current.filter((f) => f.path === oldPath || f.path.startsWith(oldPath + '/'));
       if (affected.length === 0) affected.push({ path: oldPath } as FileEntry);
       for (const a of affected) {
         await api.renameFile(id, a.path, newPath + a.path.slice(oldPath.length));
@@ -422,7 +431,7 @@ export default function App() {
         setSelectedPath(newPath + selectedRef.current.slice(oldPath.length));
       }
     },
-    [files, flushSave, refreshFiles, scheduleHistory],
+    [flushSave, refreshFiles, scheduleHistory],
   );
 
   const deleteNode = useCallback(
@@ -435,7 +444,7 @@ export default function App() {
       const sel = selectedRef.current;
       if (sel && (sel === path || sel.startsWith(path + '/'))) setSelectedPath(null);
       if (isDir) {
-        const victims = files.filter((f) => f.path === path || f.path.startsWith(path + '/'));
+        const victims = filesRef.current.filter((f) => f.path === path || f.path.startsWith(path + '/'));
         for (const v of victims) await api.deleteFile(id, v.path);
       } else {
         await api.deleteFile(id, path);
@@ -446,7 +455,7 @@ export default function App() {
         setSelectedPath(firstSelectable(buildTree(fs)));
       }
     },
-    [files, refreshFiles, scheduleHistory],
+    [refreshFiles, scheduleHistory],
   );
 
   const openCtx = useCallback((e: React.MouseEvent, node: { path: string; isDir: boolean; name: string }) => {
@@ -861,48 +870,27 @@ export default function App() {
               </button>
             </div>
 
-            <div className="asp-scroll" style={{ flex: 1, overflowY: 'auto', padding: '2px 8px 12px' }}>
-              {rows.map(({ node, depth }) => {
-                const isActive = node.type === 'file' && node.path === selectedPath;
-                const isRenaming = renaming === node.path;
-                return (
-                  <div
-                    key={node.path}
-                    className="asp-hover-row"
-                    onClick={() => { if (isRenaming) return; if (node.type === 'dir') toggleDir(node.path); else void selectFile(node.path); }}
-                    onContextMenu={(e) => openCtx(e, { path: node.path, isDir: node.type === 'dir', name: node.name })}
-                    style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '5px 7px', paddingLeft: 7 + depth * 15, borderRadius: 7, cursor: 'pointer', fontSize: 13.5, background: isActive ? accentSoft : 'transparent', color: isActive ? '#1c1917' : '#44403c' }}
-                  >
-                    <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none' }}>
-                      {node.type === 'dir' && (
-                        <span style={{ display: 'inline-flex', color: '#a8a29e', transition: 'transform .12s', transform: expanded[node.path] ? 'rotate(90deg)' : 'rotate(0deg)' }}>
-                          <Icon.ChevronRight />
-                        </span>
-                      )}
-                    </span>
-                    {node.type === 'file' && (
-                      <span style={{ display: 'inline-flex', flex: 'none', color: isActive ? accent : '#a8a29e' }}>
-                        <Icon.FileIcon />
-                      </span>
-                    )}
-                    {isRenaming ? (
-                      <input
-                        autoFocus
-                        value={renameValue}
-                        spellCheck={false}
-                        onChange={(e) => setRenameValue(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void commitRename(node.path, renameValue); } else if (e.key === 'Escape') setRenaming(null); }}
-                        onBlur={() => void commitRename(node.path, renameValue)}
-                        onClick={(e) => e.stopPropagation()}
-                        style={{ flex: 1, minWidth: 0, fontFamily: 'inherit', fontSize: 13.5, border: `1px solid ${accent}`, borderRadius: 4, padding: '1px 5px', outline: 'none', background: '#fff', color: '#1c1917' }}
-                      />
-                    ) : (
-                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{node.name}</span>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
+            <FileTree
+              rows={rows}
+              selectedPath={selectedPath}
+              expanded={expanded}
+              renaming={renaming}
+              renameValue={renameValue}
+              accent={accent}
+              accentSoft={accentSoft}
+              onRowClick={({ node }) => {
+                if (renaming === node.path) return;
+                if (node.type === 'dir') toggleDir(node.path);
+                else void selectFile(node.path);
+              }}
+              onRowContext={openCtx}
+              onRenameChange={setRenameValue}
+              onRenameKey={(e, path) => {
+                if (e.key === 'Enter') { e.preventDefault(); void commitRename(path, renameValue); }
+                else if (e.key === 'Escape') setRenaming(null);
+              }}
+              onRenameCommit={(path) => void commitRename(path, renameValue)}
+            />
 
             <div style={{ borderTop: '1px solid #f0efec', padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: 5 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>

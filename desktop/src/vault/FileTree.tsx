@@ -1,0 +1,123 @@
+// Virtualized file tree. Vaults can hold thousands of files, so rendering every
+// row as a DOM node freezes the webview. This renders only the rows in (and just
+// around) the viewport, with spacer divs preserving scroll height. Fixed row
+// height keeps the math simple and the scrollbar accurate.
+import React, { useEffect, useRef, useState } from 'react';
+import { ChevronRight, FileIcon } from './icons';
+import type { FlatRow } from './tree';
+
+const ROW_H = 28;
+const OVERSCAN = 8;
+
+export interface FileTreeProps {
+  rows: FlatRow[];
+  selectedPath: string | null;
+  expanded: Record<string, boolean>;
+  renaming: string | null;
+  renameValue: string;
+  accent: string;
+  accentSoft: string;
+  onRowClick: (row: FlatRow) => void;
+  onRowContext: (e: React.MouseEvent, node: { path: string; isDir: boolean; name: string }) => void;
+  onRenameChange: (v: string) => void;
+  onRenameKey: (e: React.KeyboardEvent, path: string) => void;
+  onRenameCommit: (path: string) => void;
+}
+
+export default function FileTree(props: FileTreeProps) {
+  const { rows, selectedPath, expanded, renaming, renameValue, accent, accentSoft } = props;
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [height, setHeight] = useState(400);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const measure = () => setHeight(el.clientHeight || 400);
+    measure();
+    // ResizeObserver isn't available in every environment (e.g. jsdom); fall
+    // back to a window resize listener so the tree still renders.
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(measure);
+      ro.observe(el);
+      return () => ro.disconnect();
+    }
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, []);
+
+  const total = rows.length;
+  const start = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
+  const end = Math.min(total, Math.ceil((scrollTop + height) / ROW_H) + OVERSCAN);
+  const visible = rows.slice(start, end);
+
+  return (
+    <div
+      ref={containerRef}
+      className="asp-scroll"
+      style={{ flex: 1, overflowY: 'auto', padding: '2px 8px 12px' }}
+      onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+    >
+      <div style={{ height: total * ROW_H, position: 'relative' }}>
+        {visible.map(({ node, depth }, i) => {
+          const top = (start + i) * ROW_H;
+          const isActive = node.type === 'file' && node.path === selectedPath;
+          const isRenaming = renaming === node.path;
+          return (
+            <div
+              key={node.path}
+              className="asp-hover-row"
+              onClick={() => props.onRowClick({ node, depth })}
+              onContextMenu={(e) => props.onRowContext(e, { path: node.path, isDir: node.type === 'dir', name: node.name })}
+              style={{
+                position: 'absolute',
+                top,
+                left: 0,
+                right: 0,
+                height: ROW_H,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                padding: '0 7px',
+                paddingLeft: 7 + depth * 15,
+                borderRadius: 7,
+                cursor: 'pointer',
+                fontSize: 13.5,
+                boxSizing: 'border-box',
+                background: isActive ? accentSoft : 'transparent',
+                color: isActive ? '#1c1917' : '#44403c',
+              }}
+            >
+              <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none' }}>
+                {node.type === 'dir' && (
+                  <span style={{ display: 'inline-flex', color: '#a8a29e', transition: 'transform .12s', transform: expanded[node.path] ? 'rotate(90deg)' : 'rotate(0deg)' }}>
+                    <ChevronRight />
+                  </span>
+                )}
+              </span>
+              {node.type === 'file' && (
+                <span style={{ display: 'inline-flex', flex: 'none', color: isActive ? accent : '#a8a29e' }}>
+                  <FileIcon />
+                </span>
+              )}
+              {isRenaming ? (
+                <input
+                  autoFocus
+                  value={renameValue}
+                  spellCheck={false}
+                  onChange={(e) => props.onRenameChange(e.target.value)}
+                  onKeyDown={(e) => props.onRenameKey(e, node.path)}
+                  onBlur={() => props.onRenameCommit(node.path)}
+                  onClick={(e) => e.stopPropagation()}
+                  style={{ flex: 1, minWidth: 0, fontFamily: 'inherit', fontSize: 13.5, border: `1px solid ${accent}`, borderRadius: 4, padding: '1px 5px', outline: 'none', background: '#fff', color: '#1c1917' }}
+                />
+              ) : (
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{node.name}</span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
