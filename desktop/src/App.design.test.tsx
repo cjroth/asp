@@ -264,6 +264,16 @@ describe('App — editor', () => {
     fireEvent.click(screen.getByText('Done'));
   });
 
+  it('Share on desktop generates a code (not the browser-unavailable message)', async () => {
+    fireEvent.click(screen.getByTestId('vault-switcher'));
+    fireEvent.click(await screen.findByText('Share this vault…'));
+    // Desktop opens a listening socket and shows the generated ticket.
+    await waitFor(() => expect(setAllowConnections).toHaveBeenCalledWith('v1', true));
+    expect(await screen.findByText('asp1sharecode')).toBeTruthy();
+    expect(screen.queryByText(/Sharing isn’t available for browser vaults/)).toBeNull();
+    expect(screen.queryByText('Generating…')).toBeNull();
+  });
+
   it('Share modal auto-focuses the Copy button and closes on Escape', async () => {
     Object.assign(navigator, { clipboard: { writeText: vi.fn() } });
     fireEvent.click(screen.getByTestId('vault-switcher'));

@@ -141,7 +141,7 @@ export default function App() {
   const [connecting, setConnecting] = useState(false);
   const [connectDest, setConnectDest] = useState<string | null>(null);
 
-  const [share, setShare] = useState<{ id: string; code: string; requireKey: boolean; accessKey: string; copied: boolean } | null>(null);
+  const [share, setShare] = useState<{ id: string; code: string; requireKey: boolean; accessKey: string; copied: boolean; unavailable?: boolean } | null>(null);
   const [vaultCtx, setVaultCtx] = useState<{ x: number; y: number; id: string; vaultId: string; name: string } | null>(null);
   const [customize, setCustomize] = useState<CustomizeInit | null>(null);
   const [removeVaultState, setRemoveVaultState] = useState<{ id: string; name: string; path: string; trash: boolean } | null>(null);
@@ -987,6 +987,13 @@ export default function App() {
 
   const onShareVault = useCallback(async (id: string) => {
     setVaultMenuOpen(false);
+    // Browser (wasm/OPFS) vaults can't open a listening socket, so there's no
+    // ticket to generate — show an honest "unavailable" state instead of an
+    // endless "Generating…" spinner.
+    if (!desktop) {
+      setShare({ id, code: '', requireKey: false, accessKey: '', copied: false, unavailable: true });
+      return;
+    }
     setShare({ id, code: '', requireKey: false, accessKey: '', copied: false });
     try {
       const tkt = await api.setAllowConnections(id, true);
@@ -995,7 +1002,7 @@ export default function App() {
     } catch (err) {
       console.error('share failed', err);
     }
-  }, []);
+  }, [desktop]);
 
   const onToggleRequireKey = useCallback(async () => {
     const s = share;
@@ -1669,28 +1676,37 @@ export default function App() {
           >
             <div>
               <div style={{ fontSize: 16, fontWeight: 600, letterSpacing: '-0.01em' }}>Share this vault</div>
-              <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 3 }}>Anyone you give this code to can connect and sync.</div>
+              <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 3 }}>{share.unavailable ? 'Sharing needs the desktop app.' : 'Anyone you give this code to can connect and sync.'}</div>
             </div>
-            <div style={{ display: 'flex', alignItems: 'stretch', gap: 8 }}>
-              <div style={{ flex: 1, minWidth: 0, fontFamily: "'JetBrains Mono', monospace", fontSize: 12, lineHeight: 1.5, color: 'var(--text2)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '11px 13px', wordBreak: 'break-all', maxHeight: 64, overflow: 'hidden' }}>{share.code || 'Generating…'}</div>
-              <button autoFocus onClick={() => void onCopyCode()} style={{ flex: 'none', alignSelf: 'stretch', display: 'flex', alignItems: 'center', fontFamily: 'inherit', fontSize: 12.5, fontWeight: 500, color: share.copied ? '#3a9357' : 'var(--text2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, padding: '0 14px', cursor: 'pointer' }}>{share.copied ? 'Copied' : 'Copy'}</button>
-            </div>
-            <div onClick={() => void onToggleRequireKey()} style={{ display: 'flex', alignItems: 'center', gap: 11, cursor: 'pointer', padding: 2 }}>
-              <span style={{ width: 34, height: 20, borderRadius: 12, flex: 'none', background: share.requireKey ? accent : 'var(--faint2)', position: 'relative', transition: 'background .15s' }}>
-                <span style={{ position: 'absolute', top: 2, left: share.requireKey ? 16 : 2, width: 16, height: 16, borderRadius: '50%', background: 'var(--bg)', transition: 'left .15s', boxShadow: '0 1px 2px rgba(0,0,0,0.2)' }} />
-              </span>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 13.5, fontWeight: 500, color: 'var(--text)' }}>Require an access key</div>
-                <div style={{ fontSize: 12, color: 'var(--faint)' }}>Adds a second secret they must enter too.</div>
+            {share.unavailable ? (
+              <div style={{ fontSize: 12.5, lineHeight: 1.6, color: 'var(--text2)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '13px 14px' }}>
+                Sharing isn’t available for browser vaults — a vault stored in your browser can’t accept connections from other devices.
+                <div style={{ fontSize: 12, color: 'var(--faint)', marginTop: 6 }}>Open this vault in the desktop app to share it.</div>
               </div>
-            </div>
-            {share.requireKey && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '11px 13px' }}>
-                <span style={{ fontSize: 11.5, color: 'var(--faint)', flex: 'none' }}>Access key</span>
-                <span style={{ flex: 1, fontFamily: "'JetBrains Mono', monospace", fontSize: 13, letterSpacing: '0.04em', color: 'var(--text)', textAlign: 'right' }}>{share.accessKey}</span>
-              </div>
+            ) : (
+              <>
+                <div style={{ display: 'flex', alignItems: 'stretch', gap: 8 }}>
+                  <div style={{ flex: 1, minWidth: 0, fontFamily: "'JetBrains Mono', monospace", fontSize: 12, lineHeight: 1.5, color: 'var(--text2)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '11px 13px', wordBreak: 'break-all', maxHeight: 64, overflow: 'hidden' }}>{share.code || 'Generating…'}</div>
+                  <button autoFocus onClick={() => void onCopyCode()} style={{ flex: 'none', alignSelf: 'stretch', display: 'flex', alignItems: 'center', fontFamily: 'inherit', fontSize: 12.5, fontWeight: 500, color: share.copied ? '#3a9357' : 'var(--text2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, padding: '0 14px', cursor: 'pointer' }}>{share.copied ? 'Copied' : 'Copy'}</button>
+                </div>
+                <div onClick={() => void onToggleRequireKey()} style={{ display: 'flex', alignItems: 'center', gap: 11, cursor: 'pointer', padding: 2 }}>
+                  <span style={{ width: 34, height: 20, borderRadius: 12, flex: 'none', background: share.requireKey ? accent : 'var(--faint2)', position: 'relative', transition: 'background .15s' }}>
+                    <span style={{ position: 'absolute', top: 2, left: share.requireKey ? 16 : 2, width: 16, height: 16, borderRadius: '50%', background: 'var(--bg)', transition: 'left .15s', boxShadow: '0 1px 2px rgba(0,0,0,0.2)' }} />
+                  </span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13.5, fontWeight: 500, color: 'var(--text)' }}>Require an access key</div>
+                    <div style={{ fontSize: 12, color: 'var(--faint)' }}>Adds a second secret they must enter too.</div>
+                  </div>
+                </div>
+                {share.requireKey && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '11px 13px' }}>
+                    <span style={{ fontSize: 11.5, color: 'var(--faint)', flex: 'none' }}>Access key</span>
+                    <span style={{ flex: 1, fontFamily: "'JetBrains Mono', monospace", fontSize: 13, letterSpacing: '0.04em', color: 'var(--text)', textAlign: 'right' }}>{share.accessKey}</span>
+                  </div>
+                )}
+              </>
             )}
-            <button onClick={() => setShare(null)} style={{ alignSelf: 'flex-end', fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: 'var(--bg)', background: 'var(--text)', border: 'none', borderRadius: 9, padding: '8px 18px', cursor: 'pointer' }}>Done</button>
+            <button autoFocus={share.unavailable} onClick={() => setShare(null)} style={{ alignSelf: 'flex-end', fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: 'var(--bg)', background: 'var(--text)', border: 'none', borderRadius: 9, padding: '8px 18px', cursor: 'pointer' }}>Done</button>
           </div>
         </>
       )}

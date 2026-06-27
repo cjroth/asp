@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const createVault = vi.fn(async (name: string) => ({ id: 'w1', path: '', vault_id: 'wv1', enabled: true, listening_ticket: null }));
 const listFiles = vi.fn(async () => [{ path: 'README.md', file_id: 'README.md', is_dir: false, merge_class: 'text' }]);
+const setAllowConnections = vi.fn(async () => null);
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => null) }));
 vi.mock('./lib/api', () => ({
@@ -25,7 +26,7 @@ vi.mock('./lib/api', () => ({
     restoreFileAt: vi.fn(),
     removeVault: vi.fn(),
     cloneRemote: vi.fn(),
-    setAllowConnections: vi.fn(async () => null),
+    setAllowConnections: () => setAllowConnections(),
     addLocalFolder: vi.fn(),
   },
 }));
@@ -88,6 +89,24 @@ describe('App on the web (OPFS, no Tauri)', () => {
     await screen.findByTestId('tab-bar');
     expect(parseHash(window.location.hash)).toEqual({ vaultId: 'wv0', path: 'README.md' });
     expect(screen.getByTestId('tab').getAttribute('data-path')).toBe('README.md');
+  });
+
+  it('Share shows an unavailable message (no socket on browser vaults) and never hangs on Generating…', async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByText('Using browser storage')); // open wv0
+    await screen.findByText('Files');
+    fireEvent.click(screen.getByTestId('vault-switcher'));
+    fireEvent.click(await screen.findByText('Share this vault…'));
+    // Honest unavailable copy is shown — no listening ticket is requested.
+    expect(await screen.findByText(/Sharing isn’t available for browser vaults/)).toBeTruthy();
+    expect(screen.getByText(/Open this vault in the desktop app to share it/)).toBeTruthy();
+    expect(screen.queryByText('Generating…')).toBeNull();
+    expect(screen.queryByText('Copy')).toBeNull();
+    expect(screen.queryByText('Require an access key')).toBeNull();
+    expect(setAllowConnections).not.toHaveBeenCalled();
+    // Modal still closes on Escape.
+    fireEvent.keyDown(screen.getByText('Done'), { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByText('Share this vault')).toBeNull());
   });
 
   it('opens a tab and reflects the active file in the hash (web)', async () => {
