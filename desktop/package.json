@@ -23,8 +23,10 @@
     "@testing-library/react": "^16",
     "@types/react": "^18.3.1",
     "@types/react-dom": "^18.3.1",
+    "@types/selenium-webdriver": "^4.35.6",
     "@vitejs/plugin-react": "^4.3.1",
     "jsdom": "^25",
+    "selenium-webdriver": "^4.45.0",
     "typescript": "^5.6.3",
     "vite": "^5.4.0",
     "vitest": "^2"

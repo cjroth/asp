@@ -415,7 +415,7 @@ export default function App() {
   }, [scheduleHistory]);
 
   const commitRename = useCallback(
-    async (oldPath: string, rawName: string) => {
+    (oldPath: string, rawName: string) => {
       const id = activeIdRef.current;
       setRenaming(null);
       const name = rawName.trim();
@@ -424,61 +424,72 @@ export default function App() {
       parts[parts.length - 1] = name;
       const newPath = parts.join('/');
       if (newPath === oldPath) return;
-      await flushSave();
-      // The backend renames by exact path, so a directory rename must move every
-      // descendant entry (the Dir entity + each child file) to its new prefix.
-      const affected = filesRef.current.filter((f) => f.path === oldPath || f.path.startsWith(oldPath + '/'));
-      if (affected.length === 0) affected.push({ path: oldPath } as FileEntry);
-      for (const a of affected) {
-        await api.renameFile(id, a.path, newPath + a.path.slice(oldPath.length));
-      }
-      // Optimistic: remap the affected paths in place instead of refetching all.
+      const remap = (p: string) => newPath + p.slice(oldPath.length);
+      // A dir rename moves the Dir entity + every descendant (backend renames by
+      // exact path). Capture the (old → new) pairs, then apply the tree change
+      // SYNCHRONOUSLY and persist in the background.
+      const affected = filesRef.current.filter((f) => f.path === oldPath || f.path.startsWith(oldPath + '/')).map((f) => f.path);
+      const pairs: [string, string][] = (affected.length ? affected : [oldPath]).map((p) => [p, remap(p)]);
+      // Flush the renamed file's unsaved edits to the OLD path before it moves.
+      const flushOld = dirtyRef.current && selectedRef.current === oldPath ? bufferRef.current : null;
+      dirtyRef.current = false;
+
       const next = filesRef.current.map((f) =>
-        f.path === oldPath || f.path.startsWith(oldPath + '/') ? { ...f, path: newPath + f.path.slice(oldPath.length) } : f,
+        f.path === oldPath || f.path.startsWith(oldPath + '/') ? { ...f, path: remap(f.path) } : f,
       );
       filesRef.current = next;
       setFiles(next);
-      scheduleHistory(id);
       setExpanded((e) => {
-        const next: Record<string, boolean> = {};
+        const out: Record<string, boolean> = {};
         for (const k of Object.keys(e)) {
-          if (k === oldPath) next[newPath] = e[k];
-          else if (k.startsWith(oldPath + '/')) next[newPath + k.slice(oldPath.length)] = e[k];
-          else next[k] = e[k];
+          if (k === oldPath) out[newPath] = e[k];
+          else if (k.startsWith(oldPath + '/')) out[remap(k)] = e[k];
+          else out[k] = e[k];
         }
-        return next;
+        return out;
       });
       if (selectedRef.current === oldPath) setSelectedPath(newPath);
-      else if (selectedRef.current && selectedRef.current.startsWith(oldPath + '/')) {
-        setSelectedPath(newPath + selectedRef.current.slice(oldPath.length));
-      }
+      else if (selectedRef.current && selectedRef.current.startsWith(oldPath + '/')) setSelectedPath(remap(selectedRef.current));
+
+      void (async () => {
+        try {
+          if (flushOld != null) await api.writeFile(id, oldPath, flushOld);
+          for (const [o, n] of pairs) await api.renameFile(id, o, n);
+        } catch (err) {
+          console.error('rename failed', err);
+        }
+        scheduleHistory(id);
+      })();
     },
-    [flushSave, refreshFiles, scheduleHistory],
+    [scheduleHistory],
   );
 
   const deleteNode = useCallback(
-    async (path: string, isDir: boolean) => {
+    (path: string, isDir: boolean) => {
       const id = activeIdRef.current;
       if (!id) return;
       setCtxMenu(null);
-      // If the selected file is being deleted, drop the selection first so the
-      // editor doesn't keep showing (or try to re-read) a file that's gone.
       const sel = selectedRef.current;
-      if (sel && (sel === path || sel.startsWith(path + '/'))) setSelectedPath(null);
-      if (isDir) {
-        const victims = filesRef.current.filter((f) => f.path === path || f.path.startsWith(path + '/'));
-        for (const v of victims) await api.deleteFile(id, v.path);
-      } else {
-        await api.deleteFile(id, path);
-      }
-      // Optimistic: drop the deleted subtree from the in-memory list.
+      // Update the tree SYNCHRONOUSLY (read + modify + write `filesRef` with no
+      // await in between, so concurrent ops can't clobber each other — the cause
+      // of "delete doesn't remove it"). Persist to the backend in the background.
+      const victims = (isDir ? filesRef.current.filter((f) => f.path === path || f.path.startsWith(path + '/')).map((f) => f.path) : [path]);
       const next = filesRef.current.filter((f) => !(f.path === path || f.path.startsWith(path + '/')));
       filesRef.current = next;
       setFiles(next);
-      scheduleHistory(id);
       if (sel && (sel === path || sel.startsWith(path + '/'))) {
         setSelectedPath(firstSelectable(buildTree(next)));
       }
+      void (async () => {
+        for (const p of victims) {
+          try {
+            await api.deleteFile(id, p);
+          } catch (err) {
+            console.error('delete failed', p, err);
+          }
+        }
+        scheduleHistory(id);
+      })();
     },
     [scheduleHistory],
   );

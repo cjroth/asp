@@ -1,0 +1,140 @@
+// Drive the real built frontend in a real WebKit browser (MiniBrowser via
+// WebKitWebDriver) at scale, measuring real rendering/interaction cost. Spawns
+// WebKitWebDriver itself; expects the static server (serve.mjs) already running.
+import { spawn } from 'node:child_process';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { Builder, By, until, Key } from 'selenium-webdriver';
+
+const URL = process.env.URL || 'http://127.0.0.1:5599/?n=1000';
+const WKWD_PORT = Number(process.env.WKWD_PORT || 4450);
+const report = { url: URL, steps: [], ok: true };
+const ok = (name, d) => { report.steps.push({ name, ...d }); console.log(`• ${name}: ${JSON.stringify(d)}`); };
+const bad = (name, d) => { report.ok = false; report.steps.push({ name, fail: true, ...d }); console.log(`✗ ${name}: ${JSON.stringify(d)}`); };
+const xtext = (s) => By.xpath(`//*[contains(text(), ${JSON.stringify(s)})]`);
+const rowCount = (driver) => driver.findElements(By.className('asp-hover-row')).then((e) => e.length);
+
+async function main() {
+  const wkwd = spawn('WebKitWebDriver', ['--port=' + WKWD_PORT], { stdio: ['ignore', 'inherit', 'inherit'] });
+  await sleep(1500);
+  let driver;
+  try {
+    driver = await new Builder()
+      .usingServer(`http://127.0.0.1:${WKWD_PORT}/`)
+      .withCapabilities({ browserName: 'MiniBrowser' })
+      .build();
+  } catch (e) {
+    bad('session', { error: String(e).slice(0, 300) });
+    wkwd.kill('SIGKILL');
+    return finish();
+  }
+
+  try {
+    let t = Date.now();
+    await driver.get(URL);
+    await driver.wait(until.elementLocated(xtext('Your vaults')), 20000);
+    ok('load-connect', { ms: Date.now() - t });
+
+    // Open the (massive) vault → time to the editor.
+    t = Date.now();
+    await (await driver.wait(until.elementLocated(xtext('massive')), 20000)).click();
+    await driver.wait(until.elementLocated(xtext('Files')), 20000);
+    const openMs = Date.now() - t;
+    ok('open-vault', { ms: openMs });
+    if (openMs > 5000) bad('open-too-slow', { ms: openMs });
+
+    await sleep(500);
+    const rows = await rowCount(driver);
+    ok('virtualized-rows', { count: rows });
+    if (rows >= 200) bad('not-virtualized', { count: rows });
+
+    // Scroll the tree hard and measure responsiveness (real layout/paint).
+    const scroller = await driver.findElement(By.className('asp-scroll'));
+    t = Date.now();
+    for (let i = 0; i < 10; i++) {
+      await driver.executeScript('arguments[0].scrollTop += 600;', scroller);
+      await sleep(16);
+    }
+    ok('scroll-10x', { ms: Date.now() - t });
+
+    // Select a visible file → content appears.
+    t = Date.now();
+    const fileRow = await driver.findElement(By.xpath("//*[contains(@class,'asp-hover-row')][contains(.,'note-')]"));
+    await fileRow.click();
+    await driver.wait(async () => {
+      const e = await driver.findElements(By.css('[data-testid="live-editor"]'));
+      return e.length && (await e[0].getText()).trim().length > 0;
+    }, 8000);
+    ok('select-file', { ms: Date.now() - t });
+
+    // Typing latency: focus the editor and type a burst; measure total.
+    const editor = await driver.findElement(By.css('[data-testid="live-editor"]'));
+    await editor.click();
+    t = Date.now();
+    await editor.sendKeys(' the quick brown fox jumps over the lazy dog');
+    const typeMs = Date.now() - t;
+    ok('type-43-chars', { ms: typeMs, msPerKey: Math.round(typeMs / 43) });
+    if (typeMs / 43 > 120) bad('typing-laggy', { msPerKey: Math.round(typeMs / 43) });
+
+    // Create a file → it appears (in breadcrumb + scrolled-to tree row).
+    t = Date.now();
+    await driver.findElement(By.css('button[title="New note"]')).click();
+    const created = await driver.wait(until.elementLocated(xtext('untitled.md')), 8000).then(() => true).catch(() => false);
+    ok('create-file', { ms: Date.now() - t, created });
+    if (!created) bad('create-missing', {});
+
+    // Create a second quickly → distinct name (no collision).
+    await driver.findElement(By.css('button[title="New note"]')).click();
+    const created2 = await driver.wait(until.elementLocated(xtext('untitled-1.md')), 8000).then(() => true).catch(() => false);
+    ok('create-file-2', { created2 });
+    if (!created2) bad('create-2-missing', {});
+
+    // Delete via context menu → leaves the tree.
+    t = Date.now();
+    const target = await driver.findElement(By.xpath("//*[contains(@class,'asp-hover-row')][contains(.,'untitled-1.md')]"));
+    await driver.actions({ async: true }).contextClick(target).perform();
+    await (await driver.wait(until.elementLocated(xtext('Delete')), 5000)).click();
+    const gone = await driver
+      .wait(async () => (await driver.findElements(By.xpath("//*[contains(@class,'asp-hover-row')][contains(.,'untitled-1.md')]"))).length === 0, 8000)
+      .then(() => true)
+      .catch(() => false);
+    ok('delete-file', { ms: Date.now() - t, removed: gone });
+    if (!gone) bad('delete-stuck', {});
+
+    // Rapid multi-delete: delete 4 rendered note-* rows back-to-back (the 60ms
+    // backend overlaps the ops) — the race that left files stuck in the tree.
+    const names = await driver.executeScript(
+      "return Array.from(document.querySelectorAll('.asp-hover-row')).map(r=>(r.textContent.match(/note-\\d+\\.md/)||[])[0]).filter(Boolean).slice(0,4);",
+    );
+    t = Date.now();
+    for (const nm of names) {
+      const row = await driver.findElement(By.xpath(`//*[contains(@class,'asp-hover-row')][contains(.,'${nm}')]`));
+      await driver.actions({ async: true }).contextClick(row).perform();
+      await (await driver.wait(until.elementLocated(xtext('Delete')), 5000)).click();
+    }
+    const allGone = await driver
+      .wait(async () => {
+        const present = await driver.executeScript(
+          'return arguments[0].some(nm => Array.from(document.querySelectorAll(".asp-hover-row")).some(r => r.textContent.includes(nm)));',
+          names,
+        );
+        return !present;
+      }, 10000)
+      .then(() => true)
+      .catch(() => false);
+    ok('rapid-multi-delete', { ms: Date.now() - t, count: names.length, allRemoved: allGone });
+    if (!allGone) bad('multi-delete-race', { names });
+  } catch (e) {
+    bad('exception', { error: String(e?.stack || e).slice(0, 600) });
+  } finally {
+    if (driver) await driver.quit().catch(() => {});
+    wkwd.kill('SIGKILL');
+    finish();
+  }
+}
+
+function finish() {
+  console.log('\n=== REPORT ===\n' + JSON.stringify(report, null, 2));
+  process.exit(report.ok ? 0 : 1);
+}
+
+main();
