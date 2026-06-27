@@ -47,6 +47,12 @@ async function main() {
     ok('virtualized-rows', { count: rows });
     if (rows >= 200) bad('not-virtualized', { count: rows });
 
+    // History track must cap its rendered tick DOM nodes regardless of event count.
+    await sleep(900); // history loads on a ~700ms debounce
+    const ticks = await driver.executeScript("const tr=document.querySelector('[data-testid=\"history-track\"]');return tr?tr.querySelectorAll('div[title]').length:-1;");
+    ok('history-tick-cap', { ticks });
+    if (ticks > 260) bad('history-ticks-uncapped', { ticks });
+
     // Scroll the tree hard and measure responsiveness (real layout/paint).
     const scroller = await driver.findElement(By.className('asp-scroll'));
     t = Date.now();

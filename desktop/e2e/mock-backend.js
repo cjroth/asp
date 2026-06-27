@@ -6,6 +6,8 @@
   var qs = new URLSearchParams(location.search);
   var N = parseInt(qs.get('n') || '1000', 10);
   var BIG = parseInt(qs.get('big') || '0', 10); // lines in README, to test large-file editing
+  var NEST = qs.get('nest') === '1'; // put all notes under one dir, to test expanding a big folder
+  var HIST = parseInt(qs.get('hist') || '0', 10); // synthetic history events, to test the track at scale
   function bigBody(prefix) {
     if (!BIG) return '# ' + prefix + ' vault\n\nSeeded for perf testing.\n';
     var out = '# ' + prefix + ' (large file, ' + BIG + ' lines)\n\n';
@@ -14,8 +16,18 @@
   }
   function mk(prefix) {
     var c = { 'README.md': bigBody(prefix) };
-    for (var i = 0; i < N; i++) c['note-' + String(i).padStart(5, '0') + '.md'] = '# ' + prefix + ' note ' + i + '\n\n- one\n- two\n\nBody **text** ' + i + '.\n';
+    var dir = NEST ? 'allnotes/' : '';
+    for (var i = 0; i < N; i++) c[dir + 'note-' + String(i).padStart(5, '0') + '.md'] = '# ' + prefix + ' note ' + i + '\n\n- one\n- two\n\nBody **text** ' + i + '.\n';
     return c;
+  }
+  function histEvents() {
+    var nowSec = Math.floor(Date.now() / 1000);
+    if (!HIST) return [{ id: 'r', ts: nowSec - 3600, lamport: 1, kind: 'create', path: 'README.md' }];
+    // Recent events spread over the last ~HIST minutes so they fall in the view.
+    var ev = [];
+    var kinds = ['create', 'edit', 'rename', 'delete'];
+    for (var i = 0; i < HIST; i++) ev.push({ id: 'r' + i, ts: nowSec - (HIST - i) * 60, lamport: i, kind: kinds[i % 4], path: 'note-' + String(i % N).padStart(5, '0') + '.md' });
+    return ev;
   }
   // Two vaults so we can exercise switching (the "opening another vault froze" path).
   var VAULTS = {
@@ -36,7 +48,7 @@
     write_file: function (a) { VAULTS[a.id].content[a.path] = a.content; return null; },
     delete_file: function (a) { delete VAULTS[a.id].content[a.path]; return null; },
     rename_file: function (a) { var c = VAULTS[a.id].content; c[a['new']] = c[a.old]; delete c[a.old]; return null; },
-    history: function () { return [{ id: 'r', ts: 1700000000, lamport: 1, kind: 'create', path: 'README.md' }]; },
+    history: function () { return histEvents(); },
     read_file_at: function (a) { var c = VAULTS[a.id].content; return { exists: true, content: c[a.path] != null ? c[a.path] : '' }; },
     restore_file_at: function () { return null; },
     rescan: function () { return null; },
