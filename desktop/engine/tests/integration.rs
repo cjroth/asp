@@ -4,7 +4,16 @@
 
 use asp_core::Identity;
 use asp_desktop_engine::DesktopEngine;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+// These tests mutate process-global env (HOME, ASP_NO_RELAY) and do real iroh
+// networking, so they must not run concurrently. Serialize them with a guard so
+// the suite is correct under a plain `cargo test` (no --test-threads=1 needed).
+static SERIAL: Mutex<()> = Mutex::new(());
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
@@ -19,6 +28,7 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 
 #[test]
 fn two_managed_folders_converge_in_process() {
+    let _serial = serial();
     // Hermetic: direct/LAN dialing only (no public relays), like the CLI e2e.
     std::env::set_var("ASP_NO_RELAY", "1");
     // Two devices (distinct identities → distinct iroh NodeIds), one folder each —
@@ -59,6 +69,7 @@ fn two_managed_folders_converge_in_process() {
 
 #[test]
 fn list_and_authorize() {
+    let _serial = serial();
     let root = tempfile::tempdir().unwrap();
     std::env::set_var("HOME", root.path());
     let de = DesktopEngine::new(Identity::from_seed(&[2; 32])).unwrap();
@@ -77,6 +88,7 @@ fn list_and_authorize() {
 /// time travel + per-file restore — all through the engine forwarders.
 #[test]
 fn file_surface_crud_history_and_time_travel() {
+    let _serial = serial();
     let root = tempfile::tempdir().unwrap();
     std::env::set_var("HOME", root.path());
     let de = DesktopEngine::new(Identity::from_seed(&[3; 32])).unwrap();
@@ -155,6 +167,7 @@ fn file_surface_crud_history_and_time_travel() {
 /// and the auto-started persistent connector that `clone_remote` opens.
 #[test]
 fn live_push_propagates_edits_without_explicit_sync() {
+    let _serial = serial();
     std::env::set_var("ASP_NO_RELAY", "1");
     let root = tempfile::tempdir().unwrap();
     std::env::set_var("HOME", root.path());
@@ -199,6 +212,7 @@ fn live_push_propagates_edits_without_explicit_sync() {
 /// Folders managed in one session reopen in the next (persisted folder list).
 #[test]
 fn reopen_saved_persists_folders() {
+    let _serial = serial();
     let root = tempfile::tempdir().unwrap();
     // Isolate the per-user config file ($HOME/.asp/desktop_folders.json).
     let home = root.path().join("home");
