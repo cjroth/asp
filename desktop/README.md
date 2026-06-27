@@ -70,6 +70,29 @@ bun run build:web      # static web build (dist/)
 bun run tauri build    # desktop app (requires the Tauri toolchain + system webkit)
 ```
 
+The web build inlines the asp wasm engine (`crates/asp-wasm/pkg-web`), which is
+**generated** (gitignored). Build it once first:
+
+```sh
+bun run build:wasm     # requires wasm-pack: cargo install wasm-pack
+```
+
+### macOS: the wasm build needs Homebrew LLVM
+
+`ring` (a TLS crate iroh pulls) compiles C for `wasm32-unknown-unknown`. Apple's
+bundled `clang` (Xcode) lacks the wasm32 target, so the link fails with
+`undefined symbol: ring_core_0_17_14__limbs_mul_add_limb`. Install Homebrew
+LLVM and point the C compiler at it:
+
+```sh
+brew install llvm
+export CC_wasm32_unknown_unknown="$(brew --prefix llvm)/bin/clang"
+bun run build:wasm
+```
+
+(Linux works with the default `clang`/`gcc`; the project's CI builds the wasm
+on `ubuntu-latest`.)
+
 ## Test
 
 ```sh
