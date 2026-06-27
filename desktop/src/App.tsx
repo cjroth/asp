@@ -151,6 +151,8 @@ export default function App() {
   const viewRef = useRef<View | null>(null);
   const nowRef = useRef(now);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const histTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const dirtyRef = useRef(false);
   const trackRef = useRef<HTMLDivElement | null>(null);
   const paintSeq = useRef(0);
   activeIdRef.current = activeId;
@@ -196,6 +198,18 @@ export default function App() {
     setNow(Date.now());
   }, []);
 
+  // history() folds the whole log under the engine lock, so it's kept OFF the
+  // critical path: mutations schedule it (debounced) instead of awaiting it, so
+  // the file list / selection / content update immediately and the history track
+  // catches up a moment later without blocking other engine calls.
+  const scheduleHistory = useCallback(
+    (id: string) => {
+      if (histTimer.current) clearTimeout(histTimer.current);
+      histTimer.current = setTimeout(() => void refreshHistory(id), 700);
+    },
+    [refreshHistory],
+  );
+
   const refreshFiles = useCallback(async (id: string) => {
     const fs = await api.listFiles(id);
     setFiles(fs);
@@ -211,13 +225,22 @@ export default function App() {
   }, [refreshVaults, refreshStatuses]);
 
   // Poll status so peers / "last synced" stay fresh. Kept infrequent because
-  // each status read folds the vault log; the live UI doesn't need it faster.
+  // each status read folds the vault log. While editing, poll only the active
+  // vault (one fold) instead of every vault.
   useEffect(() => {
     const t = setInterval(() => {
-      void refreshVaults().then(refreshStatuses);
+      if (screen === 'editor' && activeIdRef.current) {
+        const id = activeIdRef.current;
+        void api
+          .getStatus(id)
+          .then((st) => setStatuses((p) => ({ ...p, [id]: st })))
+          .catch(() => {});
+      } else {
+        void refreshVaults().then(refreshStatuses);
+      }
     }, 10000);
     return () => clearInterval(t);
-  }, [refreshVaults, refreshStatuses]);
+  }, [screen, refreshVaults, refreshStatuses]);
 
   const vaultMetas: VaultMeta[] = useMemo(
     () =>
@@ -243,13 +266,16 @@ export default function App() {
     }
     const id = activeIdRef.current;
     const path = selectedRef.current;
-    if (id && path && !(playheadRef.current != null && playheadRef.current < nowRef.current)) {
+    // Only write if the buffer actually changed — clicking between files with no
+    // edits must not trigger a write (IPC + engine lock) every time.
+    if (dirtyRef.current && id && path && !(playheadRef.current != null && playheadRef.current < nowRef.current)) {
       try {
         await api.writeFile(id, path, bufferRef.current);
       } catch {
         /* ignore */
       }
     }
+    dirtyRef.current = false;
     setSaving(false);
   }, []);
 
@@ -271,6 +297,7 @@ export default function App() {
           const content = await api.readFile(id, path);
           if (cancelled || seq !== paintSeq.current) return;
           bufferRef.current = content;
+          dirtyRef.current = false; // freshly loaded from disk = clean
           setDocText(content);
           setPaint({ source: content, readOnly: false, notExist: false, key: `${path}#live#${seq}` });
         } else {
@@ -295,6 +322,7 @@ export default function App() {
       // would re-render the whole editor screen on every key). `setSaving(true)`
       // is a no-op once already saving, so it renders at most once per edit burst.
       bufferRef.current = src;
+      dirtyRef.current = true;
       setSaving(true);
       if (saveTimer.current) clearTimeout(saveTimer.current);
       saveTimer.current = setTimeout(() => {
@@ -304,14 +332,15 @@ export default function App() {
         void api
           .writeFile(id, path, bufferRef.current)
           .then(() => {
+            dirtyRef.current = false;
             setSaving(false);
             setDocText(bufferRef.current); // refresh the word count once, after the save
-            return refreshHistory(id);
+            scheduleHistory(id); // update the history track off the critical path
           })
           .catch(() => setSaving(false));
       }, 650);
     },
-    [refreshHistory],
+    [scheduleHistory],
   );
 
   // ---------- vault open / switch ----------
@@ -330,9 +359,9 @@ export default function App() {
       for (const d of allDirPaths(tree)) exp[d] = true;
       setExpanded(exp);
       setSelectedPath(firstSelectable(tree));
-      await refreshHistory(id);
+      scheduleHistory(id);
     },
-    [flushSave, refreshFiles, refreshHistory],
+    [flushSave, refreshFiles, scheduleHistory],
   );
 
   const selectFile = useCallback(
@@ -354,10 +383,10 @@ export default function App() {
     await flushSave();
     const name = freeUntitledName(files.map((f) => f.path));
     await api.writeFile(id, name, `# ${name.replace(/\.md$/, '')}\n\n`);
-    await refreshFiles(id);
-    await refreshHistory(id);
     setSelectedPath(name);
-  }, [files, flushSave, refreshFiles, refreshHistory]);
+    await refreshFiles(id);
+    scheduleHistory(id);
+  }, [files, flushSave, refreshFiles, scheduleHistory]);
 
   const commitRename = useCallback(
     async (oldPath: string, rawName: string) => {
@@ -378,7 +407,7 @@ export default function App() {
         await api.renameFile(id, a.path, newPath + a.path.slice(oldPath.length));
       }
       await refreshFiles(id);
-      await refreshHistory(id);
+      scheduleHistory(id);
       setExpanded((e) => {
         const next: Record<string, boolean> = {};
         for (const k of Object.keys(e)) {
@@ -393,7 +422,7 @@ export default function App() {
         setSelectedPath(newPath + selectedRef.current.slice(oldPath.length));
       }
     },
-    [files, flushSave, refreshFiles, refreshHistory],
+    [files, flushSave, refreshFiles, scheduleHistory],
   );
 
   const deleteNode = useCallback(
@@ -401,6 +430,10 @@ export default function App() {
       const id = activeIdRef.current;
       if (!id) return;
       setCtxMenu(null);
+      // If the selected file is being deleted, drop the selection first so the
+      // editor doesn't keep showing (or try to re-read) a file that's gone.
+      const sel = selectedRef.current;
+      if (sel && (sel === path || sel.startsWith(path + '/'))) setSelectedPath(null);
       if (isDir) {
         const victims = files.filter((f) => f.path === path || f.path.startsWith(path + '/'));
         for (const v of victims) await api.deleteFile(id, v.path);
@@ -408,13 +441,12 @@ export default function App() {
         await api.deleteFile(id, path);
       }
       const fs = await refreshFiles(id);
-      await refreshHistory(id);
-      const sel = selectedRef.current;
+      scheduleHistory(id);
       if (sel && (sel === path || sel.startsWith(path + '/'))) {
         setSelectedPath(firstSelectable(buildTree(fs)));
       }
     },
-    [files, refreshFiles, refreshHistory],
+    [files, refreshFiles, scheduleHistory],
   );
 
   const openCtx = useCallback((e: React.MouseEvent, node: { path: string; isDir: boolean; name: string }) => {
@@ -525,8 +557,8 @@ export default function App() {
     // reads the freshly-restored file from disk and repaints it editable.
     setPlayhead(null);
     await refreshFiles(id);
-    await refreshHistory(id);
-  }, [refreshFiles, refreshHistory]);
+    scheduleHistory(id);
+  }, [refreshFiles, scheduleHistory]);
 
   // ---------- connect / share / remove ----------
   const onOpenFolder = useCallback(async () => {

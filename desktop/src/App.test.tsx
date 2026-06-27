@@ -71,7 +71,8 @@ describe('App end-to-end wiring', () => {
     fireEvent.click(screen.getByText('Open a folder'));
     await waitFor(() => expect(addLocalFolder).toHaveBeenCalledWith('/home/me/vault'));
     await waitFor(() => expect(listFiles).toHaveBeenCalledWith('v1'));
-    expect(history).toHaveBeenCalledWith('v1');
+    // history() is intentionally debounced off the critical path now.
+    await waitFor(() => expect(history).toHaveBeenCalledWith('v1'), { timeout: 2000 });
 
     // 3. Editor renders the file tree (README + the notes dir, expanded).
     //    "README.md" appears twice on purpose: the tree row and the breadcrumb.
