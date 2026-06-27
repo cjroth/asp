@@ -47,6 +47,28 @@ describe('CustomizeModal', () => {
     expect(onSave).toHaveBeenCalledWith({ id: 'vid', name: 'Untitled vault', hue: 222, emoji: null });
   });
 
+  it('auto-focuses the name input, Enter saves, Escape cancels', () => {
+    const onSave = vi.fn();
+    const onCancel = vi.fn();
+    const { container } = render(<CustomizeModal initial={init()} onSave={onSave} onCancel={onCancel} />);
+    const name = screen.getByDisplayValue('Notes');
+    expect(document.activeElement).toBe(name);
+
+    // A non-handled key does nothing.
+    fireEvent.keyDown(name, { key: 'a' });
+    expect(onSave).not.toHaveBeenCalled();
+    expect(onCancel).not.toHaveBeenCalled();
+
+    // Enter saves the current values.
+    fireEvent.change(name, { target: { value: 'Journal' } });
+    fireEvent.keyDown(name, { key: 'Enter' });
+    expect(onSave).toHaveBeenCalledWith({ id: 'vid', name: 'Journal', hue: 222, emoji: null });
+
+    // Escape cancels.
+    fireEvent.keyDown(container.querySelector('input')!, { key: 'Escape' });
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
   it('cancels via button and overlay', () => {
     const onCancel = vi.fn();
     const { container } = render(<CustomizeModal initial={init()} onSave={vi.fn()} onCancel={onCancel} />);

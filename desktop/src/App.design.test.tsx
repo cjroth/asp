@@ -122,6 +122,56 @@ describe('App — connect screen', () => {
     fireEvent.click(screen.getByText('Connect'));
     await waitFor(() => expect(cloneRemote).toHaveBeenCalledWith('/home/me/picked', 'asp1ticket', undefined));
   });
+
+  it('New Vault modal auto-focuses the name input; Enter creates (respecting blocked); Escape closes', async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByText('New Vault'));
+    const name = screen.getByPlaceholderText('My vault');
+    expect(document.activeElement).toBe(name);
+    // Desktop needs a destination folder — Enter must NOT submit while blocked.
+    fireEvent.change(name, { target: { value: 'Named' } });
+    fireEvent.keyDown(name, { key: 'Enter' });
+    expect(addLocalFolder).not.toHaveBeenCalled();
+    // Choose a folder → Enter now creates.
+    fireEvent.click(screen.getByText('Choose…'));
+    await screen.findByText('/home/me/picked');
+    fireEvent.keyDown(name, { key: 'Enter' });
+    await waitFor(() => expect(addLocalFolder).toHaveBeenCalledWith('/home/me/picked'));
+  });
+
+  it('New Vault modal closes on Escape', async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByText('New Vault'));
+    const name = screen.getByPlaceholderText('My vault');
+    fireEvent.keyDown(name, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByPlaceholderText('My vault')).toBeNull());
+    expect(addLocalFolder).not.toHaveBeenCalled();
+  });
+
+  it('Connect modal auto-focuses the invite field; plain Enter is a newline, Cmd/Ctrl+Enter submits', async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByText('Connect Vault'));
+    const code = screen.getByPlaceholderText(/Paste the code/);
+    expect(document.activeElement).toBe(code);
+    fireEvent.change(code, { target: { value: 'asp1ticket' } });
+    fireEvent.click(screen.getByText('Choose…'));
+    await screen.findByText('/home/me/picked');
+    // Plain Enter in the textarea inserts a newline — it must NOT submit.
+    fireEvent.keyDown(code, { key: 'Enter' });
+    expect(cloneRemote).not.toHaveBeenCalled();
+    // Cmd/Ctrl+Enter submits when valid.
+    fireEvent.keyDown(code, { key: 'Enter', metaKey: true });
+    await waitFor(() => expect(cloneRemote).toHaveBeenCalledWith('/home/me/picked', 'asp1ticket', undefined));
+  });
+
+  it('Connect modal closes on Escape', async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByText('Connect Vault'));
+    const code = screen.getByPlaceholderText(/Paste the code/);
+    fireEvent.keyDown(code, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByPlaceholderText(/Paste the code/)).toBeNull());
+    expect(cloneRemote).not.toHaveBeenCalled();
+  });
 });
 
 describe('App — editor', () => {
@@ -212,6 +262,30 @@ describe('App — editor', () => {
     await waitFor(() => expect(setAllowConnections).toHaveBeenCalledWith('v1', true, expect.any(String)));
     fireEvent.click(screen.getByText('Require an access key')); // toggle back off
     fireEvent.click(screen.getByText('Done'));
+  });
+
+  it('Share modal auto-focuses the Copy button and closes on Escape', async () => {
+    Object.assign(navigator, { clipboard: { writeText: vi.fn() } });
+    fireEvent.click(screen.getByTestId('vault-switcher'));
+    fireEvent.click(await screen.findByText('Share this vault…'));
+    const copy = await screen.findByText('Copy');
+    expect(document.activeElement).toBe(copy);
+    fireEvent.keyDown(copy, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByText('Share this vault')).toBeNull());
+  });
+
+  it('Remove modal auto-focuses Cancel; Enter does NOT remove; Escape cancels', async () => {
+    fireEvent.click(screen.getByTestId('vault-switcher'));
+    fireEvent.click(await screen.findByText('Remove this vault…'));
+    const cancel = await screen.findByText('Cancel');
+    expect(document.activeElement).toBe(cancel);
+    // Destructive action must never auto-fire on Enter.
+    fireEvent.keyDown(cancel, { key: 'Enter' });
+    expect(removeVault).not.toHaveBeenCalled();
+    // Escape cancels without removing.
+    fireEvent.keyDown(cancel, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByText('Remove from asp')).toBeNull());
+    expect(removeVault).not.toHaveBeenCalled();
   });
 
   it('switches vault via the switcher menu', async () => {

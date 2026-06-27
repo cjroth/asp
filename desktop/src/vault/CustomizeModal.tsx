@@ -35,7 +35,13 @@ export default function CustomizeModal({ initial, onSave, onCancel }: CustomizeM
   return (
     <>
       <div onClick={onCancel} style={{ position: 'fixed', inset: 0, zIndex: 74, background: 'var(--overlay)', backdropFilter: 'blur(2px)' }} />
-      <div style={{ position: 'fixed', zIndex: 75, top: '50%', left: '50%', transform: 'translate(-50%,-50%)', width: 'min(424px,92vw)', maxHeight: '92vh', overflowY: 'auto', background: 'var(--bg)', borderRadius: 16, boxShadow: '0 24px 60px rgba(28,25,23,0.28)', padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') { e.preventDefault(); onCancel(); }
+          else if (e.key === 'Enter') { e.preventDefault(); save(); }
+        }}
+        style={{ position: 'fixed', zIndex: 75, top: '50%', left: '50%', transform: 'translate(-50%,-50%)', width: 'min(424px,92vw)', maxHeight: '92vh', overflowY: 'auto', background: 'var(--bg)', borderRadius: 16, boxShadow: '0 24px 60px rgba(28,25,23,0.28)', padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}
+      >
         <div style={{ display: 'flex', alignItems: 'center', gap: 13 }}>
           <div style={avatarStyle({ hue, emoji }, 46, 13)}>{glyphOf({ emoji, name })}</div>
           <div style={{ flex: 1, minWidth: 0 }}>
@@ -47,6 +53,7 @@ export default function CustomizeModal({ initial, onSave, onCancel }: CustomizeM
         <label style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
           <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>Name</span>
           <input
+            autoFocus
             value={name}
             onChange={(e) => setName(e.target.value)}
             spellCheck={false}
