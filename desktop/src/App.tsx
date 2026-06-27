@@ -19,6 +19,7 @@ import { basename, freeName, makeAccessKey, relTime, shortFingerprint } from './
 import { applyTheme, clampHistBar, clampSidebar, fontFamilyOf, HISTBAR_COLLAPSE, loadPrefs, type Prefs, savePrefs } from './vault/prefs';
 import { isHidden } from './vault/prettyNames';
 import { allDirPaths, buildTree, firstSelectable, flatten } from './vault/tree';
+import { WELCOME_MD } from './vault/welcome';
 import { avatarStyle, glyphOf, hueForId, loadVaultMeta, resolveMeta, saveVaultMeta, type VaultMetaMap } from './vault/vaultMeta';
 
 interface VaultMeta extends VaultInfo {
@@ -852,6 +853,11 @@ export default function App() {
         const nm = newVaultName.trim();
         const info = desktop ? await api.addLocalFolder(connectDest!) : await api.createVault(nm || 'Untitled vault');
         if (nm) updateMeta(info.vault_id, { name: nm, hue: hueForId(info.vault_id), emoji: null });
+        // Seed a welcome README into a genuinely EMPTY vault only — a desktop
+        // folder that already holds files must never be clobbered. openVault()
+        // below then selects it as the first file.
+        const seedFiles = await api.listFiles(info.id);
+        if (!seedFiles.length) await api.writeFile(info.id, 'README.md', WELCOME_MD);
         setNewVaultName('');
         setConnectDest(null);
         setEntry(null);

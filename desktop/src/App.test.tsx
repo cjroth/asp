@@ -125,4 +125,42 @@ describe('App end-to-end wiring', () => {
     // restore state for other tests
     listVaults.mockResolvedValue([]);
   });
+
+  it('seeds a welcome README.md into a brand-new EMPTY vault', async () => {
+    // The post-create seed check sees an empty vault; openVault's later
+    // listFiles falls back to the default non-empty FILES list.
+    listFiles.mockResolvedValueOnce([]);
+    render(<App />);
+    expect(await screen.findByText('Your vaults')).toBeTruthy();
+    fireEvent.click(screen.getByText('New Vault'));
+    fireEvent.click(await screen.findByText('Choose…'));
+    await screen.findByText('/home/me/vault');
+    fireEvent.click(screen.getByText('Create vault'));
+    await waitFor(() => expect(addLocalFolder).toHaveBeenCalledWith('/home/me/vault'));
+    await waitFor(() => {
+      const call = writeFile.mock.calls.find((c) => c[1] === 'README.md');
+      expect(call).toBeTruthy();
+      const content = call![2];
+      expect(content).toContain('---'); // YAML frontmatter
+      expect(content).toContain('```mermaid'); // mermaid diagram
+      expect(content).toContain('|'); // table
+      expect(content).toContain('- [ ]'); // unchecked task
+      expect(content).toContain('- [x]'); // checked task
+      expect(content).toMatch(/^> /m); // blockquote
+      expect(content).toMatch(/```(tsx|bash)/); // highlighted code fence
+    });
+  });
+
+  it('does NOT seed a vault that already contains files', async () => {
+    // Default listFiles returns a non-empty FILES list → no README is written.
+    render(<App />);
+    expect(await screen.findByText('Your vaults')).toBeTruthy();
+    fireEvent.click(screen.getByText('New Vault'));
+    fireEvent.click(await screen.findByText('Choose…'));
+    await screen.findByText('/home/me/vault');
+    fireEvent.click(screen.getByText('Create vault'));
+    await waitFor(() => expect(addLocalFolder).toHaveBeenCalledWith('/home/me/vault'));
+    await waitFor(() => expect(listFiles).toHaveBeenCalledWith('v1'));
+    expect(writeFile.mock.calls.some((c) => c[1] === 'README.md')).toBe(false);
+  });
 });
