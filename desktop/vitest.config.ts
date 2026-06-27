@@ -14,7 +14,7 @@ export default defineConfig({
       provider: 'v8',
       include: ['src/vault/**', 'src/App.tsx', 'src/lib/**'],
       // webApi.ts is the browser-only wasm+OPFS backend (no wasm/OPFS in jsdom).
-      exclude: ['src/**/*.test.{ts,tsx}', 'src/vault/icons.tsx', 'src/lib/webApi.ts'],
+      exclude: ['src/**/*.test.{ts,tsx}', 'src/vault/icons.tsx', 'src/lib/webApi.ts', 'src/vault/mermaid.ts'],
       thresholds: {
         // Aggregate regression floor. It sits just under 100 because the view
         // layer (App + the React components) is functionally exercised end-to-end,

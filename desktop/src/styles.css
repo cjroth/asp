@@ -61,6 +61,13 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
 .cm-task::before {
   content: ''; position: absolute; left: 0.1em; top: 0.28em; width: 16px; height: 16px;
   border: 1.6px solid var(--faint2); border-radius: 4px; box-sizing: border-box;
+  cursor: pointer;
+}
+/* Clickable hit-zone overlaying the checkbox (the ::before box can't catch its
+   own click). Carries no source text, so readLive round-trips unchanged. */
+.cm-task-box {
+  position: absolute; left: 0; top: 0; width: 1.75em; height: 1.55em;
+  cursor: pointer; user-select: none;
 }
 .cm-task-done::before { background: var(--accent, #3d63dd); border-color: var(--accent, #3d63dd); }
 .cm-task-done::after {
@@ -70,16 +77,35 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
 }
 .cm-task-done .cm-body { color: var(--faint); text-decoration: line-through; }
 
-/* Markdown tables. */
-.tbl-row { display: flex; border-left: 1px solid var(--line); }
+/* Markdown tables. A wide table scrolls horizontally inside its own `.tbl-wrap`
+   region so cells show full content instead of squashing, while the surrounding
+   prose keeps its normal width. */
+.tbl-wrap { overflow-x: auto; max-width: 100%; margin-top: 16px; }
+.tbl-row { display: flex; width: max-content; min-width: 100%; border-left: 1px solid var(--line); }
 .tbl-row .tcell {
-  flex: 1 1 0; min-width: 0; padding: 6px 13px; border-right: 1px solid var(--line);
+  flex: 1 0 auto; min-width: 120px; padding: 6px 13px; border-right: 1px solid var(--line);
   border-bottom: 1px solid var(--line); font-size: 14px; line-height: 1.5;
-  overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.tbl-head { border-top: 1px solid var(--line); margin-top: 16px; }
+.tbl-head { border-top: 1px solid var(--line); }
 .tbl-head .tcell { font-weight: 600; background: var(--bg-input); }
 .tbl-sep { height: 0; line-height: 0; overflow: hidden; border: none; }
+
+/* Rendered diagram preview. A ```mermaid / ```diagram fence keeps its editable
+   source above; this contenteditable=false block (skipped by the line walkers)
+   shows the rendered SVG below it, centered and constrained to the column. Until
+   it renders — or if mermaid is unavailable — the `<pre>` source fallback shows. */
+.md-diagram {
+  display: block; margin: 4px 0 18px; padding: 14px;
+  background: var(--bg-input); border: 1px solid var(--line);
+  border-radius: 0 0 9px 9px; overflow-x: auto; text-align: center;
+  user-select: none;
+}
+.md-diagram svg { max-width: 100%; height: auto; }
+.md-diagram-fallback {
+  margin: 0; text-align: left; font-family: 'JetBrains Mono', monospace;
+  font-size: 13px; color: var(--faint); white-space: pre-wrap; word-break: break-word;
+}
 
 /* Sidebar resize handle. */
 .sb-resize:hover .sb-line { background: var(--accent, #3d63dd); }
