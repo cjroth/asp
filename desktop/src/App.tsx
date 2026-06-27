@@ -513,6 +513,85 @@ export default function App() {
     [scheduleHistory],
   );
 
+  // Move one or more paths into `destDir` (''=vault root). A move is a rename that
+  // swaps the PARENT directory while keeping the base name — so the heavy lifting
+  // mirrors commitRename (remap files/content/expanded/selection for whole folder
+  // subtrees), just across several sources at once. Guards drop: no-ops (already
+  // in dest), a folder dropped into itself/its own descendant, and name
+  // collisions at the destination. Skipped sources are silently ignored.
+  const movePaths = useCallback(
+    (srcPaths: string[], destDir: string) => {
+      const id = activeIdRef.current;
+      if (!id) return;
+      // Drop sources nested under another source — the ancestor's move carries
+      // them — and de-dupe.
+      const uniq = Array.from(new Set(srcPaths));
+      const roots = uniq.filter((p) => !uniq.some((q) => q !== p && p.startsWith(q + '/')));
+      const existing = new Set(filesRef.current.map((f) => f.path));
+      const moves: { src: string; dst: string }[] = [];
+      for (const src of roots) {
+        const base = src.includes('/') ? src.slice(src.lastIndexOf('/') + 1) : src;
+        const dst = destDir ? destDir + '/' + base : base;
+        if (dst === src) continue; // already lives in destDir — no-op
+        if (destDir === src || destDir.startsWith(src + '/')) continue; // into itself / a descendant
+        if (existing.has(dst)) continue; // name already taken at the destination
+        moves.push({ src, dst });
+      }
+      if (moves.length === 0) return;
+      setCtxMenu(null);
+
+      const remap = (p: string): string => {
+        for (const { src, dst } of moves) {
+          if (p === src || p.startsWith(src + '/')) return dst + p.slice(src.length);
+        }
+        return p;
+      };
+      const affected = filesRef.current.filter((f) => remap(f.path) !== f.path).map((f) => f.path);
+      const pairs: [string, string][] = affected.map((p) => [p, remap(p)]);
+      const flushSel = selectedRef.current;
+      const flushOld = dirtyRef.current && flushSel && remap(flushSel) !== flushSel ? bufferRef.current : null;
+      dirtyRef.current = false;
+
+      const next = filesRef.current.map((f) => (remap(f.path) !== f.path ? { ...f, path: remap(f.path) } : f));
+      filesRef.current = next;
+      setFiles(next);
+      for (const [o, n] of pairs) {
+        const ok = `${id}::${o}`;
+        if (ok in contentRef.current) {
+          contentRef.current[`${id}::${n}`] = contentRef.current[ok];
+          delete contentRef.current[ok];
+        }
+      }
+      setExpanded((e) => {
+        const out: Record<string, boolean> = {};
+        for (const k of Object.keys(e)) out[remap(k)] = e[k];
+        if (destDir) out[destDir] = true; // reveal where things landed
+        return out;
+      });
+      if (flushSel) setSelectedPath(remap(flushSel));
+      setSelectedPaths((prev) => new Set(Array.from(prev, remap)));
+      setAnchorPath((p) => (p ? remap(p) : p));
+
+      void (async () => {
+        try {
+          if (flushOld != null && flushSel) await api.writeFile(id, flushSel, flushOld);
+          for (const [o, n] of pairs) await api.renameFile(id, o, n);
+        } catch (err) {
+          console.error('move failed', err);
+        }
+        scheduleHistory(id);
+      })();
+    },
+    [scheduleHistory],
+  );
+
+  // Drag-and-drop entry point from the file tree: move the dragged node (or the
+  // whole multi-selection if it's part of one) into `destDir`.
+  const onMove = useCallback(
+    (srcPaths: string[], destDir: string) => movePaths(srcPaths, destDir),
+    [movePaths],
+  );
+
   // Delete one or more paths (folders delete their whole subtree). Drives both the
   // single-file delete and the batch delete of a multi-selection.
   const deletePaths = useCallback(
@@ -1126,6 +1205,7 @@ export default function App() {
               accentSoft={accentSoft}
               prettyNames={prefs.prettyNames}
               ctxTargetPath={ctxTargetPath}
+              onMove={onMove}
               onEmptyContext={openTreeCtx}
               onRowClick={({ node }, e) => {
                 if (renaming === node.path) return;

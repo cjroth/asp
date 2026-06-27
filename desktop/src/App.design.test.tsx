@@ -396,6 +396,66 @@ describe('App — multi-selection', () => {
   });
 });
 
+describe('App — drag-and-drop move', () => {
+  // A subfolder so we can exercise the "into a descendant" guard.
+  beforeEach(async () => {
+    FILES.push({ path: 'notes/sub', file_id: 'notes/sub', is_dir: true, merge_class: 'dir' });
+    FILES.push({ path: 'notes/sub/c.md', file_id: 'notes/sub/c.md', is_dir: false, merge_class: 'text' });
+    render(<App />);
+    await openVault();
+    await screen.findByTestId('live-editor');
+  });
+
+  const dt = () => ({ effectAllowed: '', setData: vi.fn(), getData: vi.fn() });
+  const treeRow = (name: string) =>
+    (Array.from(document.querySelectorAll('.asp-hover-row')) as HTMLElement[]).find((r) => r.textContent === name)!;
+
+  it('moves a file into a folder by dropping it on the folder row', async () => {
+    fireEvent.dragStart(treeRow('TODO.md'), { dataTransfer: dt() });
+    fireEvent.dragOver(treeRow('notes'));
+    fireEvent.drop(treeRow('notes'));
+    await waitFor(() => expect(renameFile).toHaveBeenCalledWith('v1', 'TODO.md', 'notes/TODO.md'));
+    // The dropped file now lives under the (auto-expanded) destination folder.
+    await waitFor(() => expect(treeRow('TODO.md')).toBeTruthy());
+  });
+
+  it('moves a nested file to the root by dropping on the empty tree area', async () => {
+    fireEvent.click(treeRow('notes')); // expand to reveal notes/a.md
+    await screen.findByText('a.md');
+    const treeScroll = document.querySelectorAll('.asp-scroll')[0] as HTMLElement;
+    fireEvent.dragStart(treeRow('a.md'), { dataTransfer: dt() });
+    fireEvent.drop(treeScroll);
+    await waitFor(() => expect(renameFile).toHaveBeenCalledWith('v1', 'notes/a.md', 'a.md'));
+  });
+
+  it('rejects dropping a folder into its own descendant (no rename)', async () => {
+    fireEvent.click(treeRow('notes')); // expand to reveal the sub folder
+    await screen.findByText('sub');
+    fireEvent.dragStart(treeRow('notes'), { dataTransfer: dt() });
+    fireEvent.dragOver(treeRow('sub'));
+    fireEvent.drop(treeRow('sub'));
+    expect(renameFile).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op when dropping a file onto its own current folder', async () => {
+    fireEvent.click(treeRow('notes'));
+    await screen.findByText('a.md');
+    fireEvent.dragStart(treeRow('a.md'), { dataTransfer: dt() });
+    fireEvent.drop(treeRow('notes')); // a.md already lives in notes/
+    // Give the async move a tick; it should bail before any rename.
+    await Promise.resolve();
+    expect(renameFile).not.toHaveBeenCalled();
+  });
+
+  it('moves an entire multi-selection in one drop', async () => {
+    fireEvent.click(treeRow('TODO.md'), { metaKey: true }); // README (active) + TODO selected
+    fireEvent.dragStart(treeRow('TODO.md'), { dataTransfer: dt() });
+    fireEvent.drop(treeRow('notes'));
+    await waitFor(() => expect(renameFile).toHaveBeenCalledWith('v1', 'README.md', 'notes/README.md'));
+    await waitFor(() => expect(renameFile).toHaveBeenCalledWith('v1', 'TODO.md', 'notes/TODO.md'));
+  });
+});
+
 describe('App — empty + edge states', () => {
   it('shows the empty editor state and saving indicator', async () => {
     render(<App />);

@@ -26,6 +26,9 @@ export interface FileTreeProps {
   accentSoft: string;
   prettyNames: boolean;
   ctxTargetPath: string | null;
+  // Move dragged paths into destDir ('' = vault root). Omitted in tests/callers
+  // that don't enable drag-and-drop.
+  onMove?: (srcPaths: string[], destDir: string) => void;
   onEmptyContext?: (e: React.MouseEvent) => void;
   onRowClick: (row: FlatRow, e: React.MouseEvent) => void;
   onRowContext: (e: React.MouseEvent, node: { path: string; isDir: boolean; name: string }) => void;
@@ -42,6 +45,28 @@ export default function FileTree(props: FileTreeProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [height, setHeight] = useState(400);
+
+  // Drag-and-drop move state. `dragPath` is the row the user grabbed; the actual
+  // source set is resolved at drop time (the whole multi-selection if the grabbed
+  // row is part of it, else just that row). `dropTarget` is the folder path under
+  // the cursor (null = none); `rootOver` highlights the empty area = drop-to-root.
+  const dragPathRef = useRef<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const [rootOver, setRootOver] = useState(false);
+
+  const srcPathsFor = (path: string): string[] =>
+    selectedPaths.has(path) && selectedPaths.size > 1 ? Array.from(selectedPaths) : [path];
+
+  const endDrag = () => {
+    dragPathRef.current = null;
+    setDropTarget(null);
+    setRootOver(false);
+  };
+  const doMove = (destDir: string) => {
+    const src = dragPathRef.current;
+    if (src != null) props.onMove?.(srcPathsFor(src), destDir);
+    endDrag();
+  };
 
   useEffect(() => {
     const el = containerRef.current;
@@ -94,9 +119,30 @@ export default function FileTree(props: FileTreeProps) {
     <div
       ref={containerRef}
       className="asp-scroll"
-      style={{ flex: 1, overflowY: 'auto', padding: '2px 8px 12px' }}
+      style={{
+        flex: 1,
+        overflowY: 'auto',
+        padding: '2px 8px 12px',
+        boxShadow: rootOver ? `inset 0 0 0 2px ${accent}` : 'none',
+      }}
       onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
       onContextMenu={props.onEmptyContext}
+      // Empty-area / root drop. A folder row stops propagation in its own
+      // dragOver, so this only fires over blank space or non-folder rows.
+      onDragOver={(e) => {
+        if (!props.onMove || dragPathRef.current == null) return;
+        e.preventDefault();
+        if (!rootOver) setRootOver(true);
+        if (dropTarget !== null) setDropTarget(null);
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget === e.target) setRootOver(false);
+      }}
+      onDrop={(e) => {
+        if (dragPathRef.current == null) return;
+        e.preventDefault();
+        doMove('');
+      }}
     >
       <div style={{ height: total * ROW_H, position: 'relative' }}>
         {visible.map(({ node, depth }, i) => {
@@ -110,12 +156,51 @@ export default function FileTree(props: FileTreeProps) {
           const hidden = isHidden(node.name);
           const pretty = prettyNames ? prettyName(node.name, isDir) : { label: node.name, italic: false };
           const color = hidden ? 'var(--faint2)' : isDir ? 'var(--text2)' : isActive ? 'var(--text)' : 'var(--text2)';
+          const isDropTarget = isDir && node.path === dropTarget;
           return (
             <div
               key={node.path}
               className="asp-hover-row"
+              draggable={!isRenaming}
               onClick={(e) => props.onRowClick({ node, depth }, e)}
               onContextMenu={(e) => props.onRowContext(e, { path: node.path, isDir, name: node.name })}
+              onDragStart={(e) => {
+                if (!props.onMove || isRenaming) return;
+                dragPathRef.current = node.path;
+                if (e.dataTransfer) {
+                  e.dataTransfer.effectAllowed = 'move';
+                  try { e.dataTransfer.setData('text/plain', node.path); } catch { /* jsdom */ }
+                }
+              }}
+              onDragEnd={endDrag}
+              // Folder rows are the move targets; stop propagation so the root
+              // (container) handler doesn't also claim the drop.
+              onDragOver={
+                isDir && props.onMove
+                  ? (e) => {
+                      if (dragPathRef.current == null) return;
+                      e.preventDefault();
+                      e.stopPropagation();
+                      if (dropTarget !== node.path) setDropTarget(node.path);
+                      if (rootOver) setRootOver(false);
+                    }
+                  : undefined
+              }
+              onDragLeave={
+                isDir && props.onMove
+                  ? () => { if (dropTarget === node.path) setDropTarget(null); }
+                  : undefined
+              }
+              onDrop={
+                isDir && props.onMove
+                  ? (e) => {
+                      if (dragPathRef.current == null) return;
+                      e.preventDefault();
+                      e.stopPropagation();
+                      doMove(node.path);
+                    }
+                  : undefined
+              }
               style={{
                 position: 'absolute',
                 top,
@@ -135,8 +220,12 @@ export default function FileTree(props: FileTreeProps) {
                 fontStyle: hidden || pretty.italic ? 'italic' : 'normal',
                 boxSizing: 'border-box',
                 color,
-                background: isSelected ? accentSoft : 'transparent',
-                boxShadow: node.path === ctxTargetPath ? `inset 0 0 0 1.5px ${accent}` : 'none',
+                background: isDropTarget ? accentSoft : isSelected ? accentSoft : 'transparent',
+                boxShadow: isDropTarget
+                  ? `inset 0 0 0 2px ${accent}`
+                  : node.path === ctxTargetPath
+                    ? `inset 0 0 0 1.5px ${accent}`
+                    : 'none',
               }}
             >
               <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none' }}>

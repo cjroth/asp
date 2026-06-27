@@ -137,4 +137,61 @@ describe('FileTree', () => {
     render(<FileTree {...props(rowsFor(['a.md'], {}), 'a.md', {})} />);
     expect(() => window.dispatchEvent(new Event('resize'))).not.toThrow();
   });
+
+  // ---- drag-and-drop move ----
+  const dnd = () => ({ effectAllowed: '', setData: vi.fn(), getData: vi.fn() });
+  const rowOf = (container: HTMLElement, name: string) =>
+    (Array.from(container.querySelectorAll('.asp-hover-row')) as HTMLElement[]).find((r) => r.textContent === name)!;
+
+  it('drags a file onto a folder and calls onMove with that destination dir', () => {
+    const onMove = vi.fn();
+    const { container } = render(<FileTree {...props(rowsFor(['a.md', 'folder/b.md'], {}), 'a.md', {}, { onMove })} />);
+    fireEvent.dragStart(rowOf(container, 'a.md'), { dataTransfer: dnd() });
+    fireEvent.dragOver(rowOf(container, 'folder'));
+    fireEvent.drop(rowOf(container, 'folder'));
+    expect(onMove).toHaveBeenCalledWith(['a.md'], 'folder');
+  });
+
+  it('toggles the drop-target highlight on dragOver / dragLeave', () => {
+    const onMove = vi.fn();
+    const { container } = render(<FileTree {...props(rowsFor(['a.md', 'folder/b.md'], {}), 'a.md', {}, { onMove })} />);
+    fireEvent.dragStart(rowOf(container, 'a.md'), { dataTransfer: dnd() });
+    expect(rowOf(container, 'folder').style.boxShadow).not.toContain('2px');
+    fireEvent.dragOver(rowOf(container, 'folder'));
+    expect(rowOf(container, 'folder').style.boxShadow).toContain('inset 0 0 0 2px');
+    fireEvent.dragLeave(rowOf(container, 'folder'));
+    expect(rowOf(container, 'folder').style.boxShadow).not.toContain('2px');
+  });
+
+  it('drops on the empty tree area to move a path to the root', () => {
+    const onMove = vi.fn();
+    const { container } = render(<FileTree {...props(rowsFor(['a.md', 'folder/b.md'], {}), 'a.md', {}, { onMove })} />);
+    const scroll = container.querySelector('.asp-scroll') as HTMLElement;
+    fireEvent.dragStart(rowOf(container, 'a.md'), { dataTransfer: dnd() });
+    fireEvent.dragOver(scroll);
+    expect(scroll.style.boxShadow).toContain('inset 0 0 0 2px');
+    fireEvent.drop(scroll);
+    expect(onMove).toHaveBeenCalledWith(['a.md'], '');
+  });
+
+  it('drags a multi-selection — moves every selected path', () => {
+    const onMove = vi.fn();
+    const { container } = render(
+      <FileTree {...props(rowsFor(['a.md', 'c.md', 'folder/b.md'], {}), 'a.md', {}, { selectedPaths: new Set(['a.md', 'c.md']), onMove })} />,
+    );
+    fireEvent.dragStart(rowOf(container, 'a.md'), { dataTransfer: dnd() });
+    fireEvent.drop(rowOf(container, 'folder'));
+    expect(onMove).toHaveBeenCalledWith(['a.md', 'c.md'], 'folder');
+  });
+
+  it('does not start a drag while a row is being renamed', () => {
+    const onMove = vi.fn();
+    const { container } = render(
+      <FileTree {...props(rowsFor(['a.md', 'folder/b.md'], {}), 'a.md', {}, { renaming: 'a.md', renameValue: 'a.md', onMove })} />,
+    );
+    const renameRow = (container.querySelector('input') as HTMLInputElement).closest('.asp-hover-row') as HTMLElement;
+    fireEvent.dragStart(renameRow, { dataTransfer: dnd() });
+    fireEvent.drop(rowOf(container, 'folder'));
+    expect(onMove).not.toHaveBeenCalled();
+  });
 });
