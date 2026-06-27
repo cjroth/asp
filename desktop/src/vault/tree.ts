@@ -54,7 +54,7 @@ export function buildTree(files: FileEntry[]): TreeNode[] {
 }
 
 // The design's row order: ALL-CAPS note stems (e.g. README.md) float to the top,
-// then everything else — dirs and files intermixed — by natural (numeric) name.
+// then folders, then files — each group ordered by natural (numeric) name.
 const stemOf = (s: string): string => {
   const i = s.lastIndexOf('.');
   return i > 0 ? s.slice(0, i) : s;
@@ -63,8 +63,15 @@ const capRank = (n: TreeNode): number => {
   const st = stemOf(n.name);
   return n.type === 'file' && /[A-Za-z]/.test(st) && st === st.toUpperCase() ? 0 : 1;
 };
+// Folders before files. The ALL-CAPS notes are the documented exception — they
+// outrank everything (including folders) via capRank above.
+const dirRank = (n: TreeNode): number => (n.type === 'dir' ? 0 : 1);
 export function compareNodes(a: TreeNode, b: TreeNode): number {
-  return capRank(a) - capRank(b) || a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+  return (
+    capRank(a) - capRank(b) ||
+    dirRank(a) - dirRank(b) ||
+    a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+  );
 }
 
 export interface FlatRow {
