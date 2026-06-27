@@ -4,33 +4,37 @@
 // measures FRONTEND rendering cost, not backend latency.
 (function () {
   var N = parseInt(new URLSearchParams(location.search).get('n') || '1000', 10);
-  var CONTENT = { 'README.md': '# Massive vault\n\nSeeded for perf testing.\n' };
-  for (var i = 0; i < N; i++) {
-    var k = 'note-' + String(i).padStart(5, '0') + '.md';
-    CONTENT[k] = '# Note ' + i + '\n\n- one\n- two\n\nBody **text** ' + i + '.\n';
+  function mk(prefix) {
+    var c = { 'README.md': '# ' + prefix + ' vault\n\nSeeded for perf testing.\n' };
+    for (var i = 0; i < N; i++) c['note-' + String(i).padStart(5, '0') + '.md'] = '# ' + prefix + ' note ' + i + '\n\n- one\n- two\n\nBody **text** ' + i + '.\n';
+    return c;
   }
-  var vault = { id: 'v1', path: '/home/me/massive', vault_id: 'vid', enabled: false, listening_ticket: null };
-  function files() {
-    return Object.keys(CONTENT).map(function (p) {
+  // Two vaults so we can exercise switching (the "opening another vault froze" path).
+  var VAULTS = {
+    v1: { info: { id: 'v1', path: '/home/me/massive', vault_id: 'vid1', enabled: false, listening_ticket: null }, content: mk('Massive') },
+    v2: { info: { id: 'v2', path: '/home/me/second', vault_id: 'vid2', enabled: false, listening_ticket: null }, content: mk('Second') },
+  };
+  function files(id) {
+    return Object.keys(VAULTS[id].content).map(function (p) {
       return { path: p, file_id: p, is_dir: false, merge_class: 'text' };
     });
   }
   var H = {
-    list_vaults: function () { return [vault]; },
+    list_vaults: function () { return [VAULTS.v1.info, VAULTS.v2.info]; },
     get_identity: function () { return 'ssh-ed25519 AAAAExampleKeyMaterial me@host'; },
-    get_status: function (a) { return { id: a.id, vault_id: 'vid', rows: N, files: N, head: 'h', listening_ticket: null, peers: [], last_ts: 1700000000 }; },
-    list_files: function () { return files(); },
-    read_file: function (a) { return CONTENT[a.path] != null ? CONTENT[a.path] : ''; },
-    write_file: function (a) { CONTENT[a.path] = a.content; return null; },
-    delete_file: function (a) { delete CONTENT[a.path]; return null; },
-    rename_file: function (a) { CONTENT[a['new']] = CONTENT[a.old]; delete CONTENT[a.old]; return null; },
+    get_status: function (a) { return { id: a.id, vault_id: VAULTS[a.id].info.vault_id, rows: N, files: N, head: 'h', listening_ticket: null, peers: [], last_ts: 1700000000 }; },
+    list_files: function (a) { return files(a.id); },
+    read_file: function (a) { var c = VAULTS[a.id].content; return c[a.path] != null ? c[a.path] : ''; },
+    write_file: function (a) { VAULTS[a.id].content[a.path] = a.content; return null; },
+    delete_file: function (a) { delete VAULTS[a.id].content[a.path]; return null; },
+    rename_file: function (a) { var c = VAULTS[a.id].content; c[a['new']] = c[a.old]; delete c[a.old]; return null; },
     history: function () { return [{ id: 'r', ts: 1700000000, lamport: 1, kind: 'create', path: 'README.md' }]; },
-    read_file_at: function (a) { return { exists: true, content: CONTENT[a.path] != null ? CONTENT[a.path] : '' }; },
+    read_file_at: function (a) { var c = VAULTS[a.id].content; return { exists: true, content: c[a.path] != null ? c[a.path] : '' }; },
     restore_file_at: function () { return null; },
     rescan: function () { return null; },
     remove_vault: function () { return null; },
-    add_local_folder: function (a) { return { id: 'v1', path: a.path, vault_id: 'vid', enabled: false, listening_ticket: null }; },
-    clone_remote: function (a) { return { id: 'v1', path: a.dest, vault_id: 'vid', enabled: false, listening_ticket: null }; },
+    add_local_folder: function (a) { return VAULTS.v1.info; },
+    clone_remote: function (a) { return VAULTS.v1.info; },
     set_allow_connections: function () { return 'tkt'; },
     sync_now: function () { return null; },
     'plugin:dialog|open': function () { return '/home/me/massive'; },

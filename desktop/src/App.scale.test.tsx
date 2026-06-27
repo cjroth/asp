@@ -18,6 +18,7 @@ const tick = (ms = 5) => new Promise((r) => setTimeout(r, ms)); // simulate IPC 
 // Mutations are slow (like the real O(N) materialize) to expose races.
 const writeFile = vi.fn(async (_id: string, path: string, content: string) => { await tick(40); CONTENT[path] = content; });
 const deleteFile = vi.fn(async (_id: string, path: string) => { await tick(40); delete CONTENT[path]; });
+const renameFile = vi.fn(async (_id: string, oldP: string, newP: string) => { await tick(40); CONTENT[newP] = CONTENT[oldP]; delete CONTENT[oldP]; });
 const listFiles = vi.fn(async () => {
   await tick();
   return Object.keys(CONTENT).map((p) => ({ path: p, file_id: p, is_dir: false, merge_class: 'text' }));
@@ -39,7 +40,7 @@ vi.mock('./lib/api', () => ({
     listFiles: (id: string) => listFiles(id),
     readFile: (id: string, p: string) => readFile(id, p),
     writeFile: (id: string, p: string, c: string) => writeFile(id, p, c),
-    renameFile: vi.fn(async () => {}),
+    renameFile: (id: string, o: string, n: string) => renameFile(id, o, n),
     deleteFile: (id: string, p: string) => deleteFile(id, p),
     history: (id: string) => history(id),
     readFileAt: vi.fn(async () => ({ exists: true, content: 'old' })),
@@ -126,5 +127,20 @@ describe('App at scale (~1000 files)', () => {
     }
     for (const nm of targets) expect(present(nm)).toBe(false);
     await waitFor(() => targets.forEach((nm) => expect(CONTENT[nm]).toBeUndefined()));
+  });
+
+  it('renames a file via the context menu (optimistic, old name leaves the tree)', async () => {
+    await openMassiveVault();
+    await waitFor(() => expect(renderedNotes().length).toBeGreaterThan(0));
+    const name = renderedNotes()[0];
+    fireEvent.contextMenu(rowFor(name));
+    fireEvent.click(await screen.findByText('Rename'));
+    const input = document.querySelector('.asp-hover-row input') as HTMLInputElement;
+    expect(input).toBeTruthy();
+    fireEvent.change(input, { target: { value: 'aaa-renamed.md' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    // Optimistic: the old name is gone from the tree synchronously.
+    expect(present(name)).toBe(false);
+    await waitFor(() => expect(renameFile).toHaveBeenCalledWith('v1', name, 'aaa-renamed.md'));
   });
 });

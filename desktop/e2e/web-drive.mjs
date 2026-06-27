@@ -123,6 +123,68 @@ async function main() {
       .catch(() => false);
     ok('rapid-multi-delete', { ms: Date.now() - t, count: names.length, allRemoved: allGone });
     if (!allGone) bad('multi-delete-race', { names });
+
+    await sleep(400); // let the tree settle after the deletes
+
+    // Re-find a row fresh right before acting to avoid stale references (the
+    // virtualized list recreates row nodes on every render).
+    const rowByName = async (nm) => driver.findElement(By.xpath(`//*[contains(@class,'asp-hover-row')][contains(.,'${nm}')]`));
+
+    // Rename a rendered note file via context menu.
+    try {
+      t = Date.now();
+      const rnName = await driver.executeScript("return Array.from(document.querySelectorAll('.asp-hover-row')).map(r=>(r.textContent.match(/note-\\d+\\.md/)||[])[0]).filter(Boolean)[0] || null;");
+      if (rnName) {
+        await driver.actions({ async: true }).contextClick(await rowByName(rnName)).perform();
+        await (await driver.wait(until.elementLocated(xtext('Rename')), 5000)).click();
+        const input = await driver.wait(until.elementLocated(By.css('.asp-hover-row input')), 5000);
+        // Drive React's controlled input via the native setter + a real Enter.
+        await driver.executeScript(
+          "const el=arguments[0];const set=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;set.call(el,'aaa-renamed.md');el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));",
+          input,
+        );
+        const renamed = await driver.wait(until.elementLocated(xtext('aaa-renamed.md')), 8000).then(() => true).catch(() => false);
+        const oldGone = (await driver.findElements(By.xpath(`//*[contains(@class,'asp-hover-row')][contains(.,'${rnName}')]`))).length === 0;
+        ok('rename-file', { ms: Date.now() - t, renamed, oldGone });
+        if (!renamed || !oldGone) bad('rename-broken', { rnName, renamed, oldGone });
+      }
+    } catch (e) {
+      bad('rename-file', { error: String(e).slice(0, 200) });
+    }
+
+    // Switch to the other vault (the "opening another vault froze" path).
+    try {
+      t = Date.now();
+      await driver.findElement(By.css('[data-testid="vault-switcher"]')).click();
+      await (await driver.wait(until.elementLocated(xtext('second')), 5000)).click();
+      const switched = await driver
+        .wait(async () => {
+          const e = await driver.findElements(By.css('[data-testid="live-editor"]'));
+          return e.length && (await e[0].getText()).includes('Second');
+        }, 10000)
+        .then(() => true)
+        .catch(() => false);
+      ok('switch-vault', { ms: Date.now() - t, switched });
+      if (!switched) bad('switch-vault-broken', {});
+    } catch (e) {
+      bad('switch-vault', { error: String(e).slice(0, 200) });
+    }
+
+    // History scrub: click on the track → time-travel (read-only) → back to Now.
+    t = Date.now();
+    const track = await driver.findElement(By.css('[data-testid="history-track"]'));
+    // A no-move pointerdown→pointerup sets the playhead (a move would pan). Dispatch
+    // directly so selenium's between-event motion can't turn the click into a pan.
+    await driver.executeScript(
+      "const t=arguments[0];const r=t.getBoundingClientRect();const o={bubbles:true,cancelable:true,clientX:r.x+r.width*0.3,clientY:r.y+r.height/2,pointerId:1,button:0};t.dispatchEvent(new PointerEvent('pointerdown',o));document.dispatchEvent(new PointerEvent('pointerup',o));",
+      track,
+    );
+    // "read-only" lives in a non-first text node, so match on innerText, not XPath text().
+    const hasRO = () => driver.executeScript("return document.body.innerText.includes('read-only')");
+    const tt = await driver.wait(async () => await hasRO(), 6000).then(() => true).catch(() => false);
+    if (tt) await (await driver.findElement(By.xpath("//button[contains(.,'Now')]"))).click();
+    const backToNow = await driver.wait(async () => !(await hasRO()), 6000).then(() => true).catch(() => false);
+    ok('history-scrub', { ms: Date.now() - t, enteredTimeTravel: tt, returnedToNow: backToNow });
   } catch (e) {
     bad('exception', { error: String(e?.stack || e).slice(0, 600) });
   } finally {

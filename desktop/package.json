@@ -9,7 +9,9 @@
     "dev": "tauri dev",
     "build": "tauri build",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "e2e:web": "bun run build:web && bash e2e/web-run.sh",
+    "bench": "cargo run --release -p asp-desktop-engine --example bench_ops --"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

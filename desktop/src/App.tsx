@@ -855,7 +855,7 @@ export default function App() {
           {/* sidebar */}
           <aside style={{ width: 266, flex: 'none', display: 'flex', flexDirection: 'column', background: '#fafaf8', borderRight: '1px solid #ededea' }}>
             <div style={{ position: 'relative', borderBottom: '1px solid #f0efec' }}>
-              <div className="asp-hover-list" onClick={() => setVaultMenuOpen((v) => !v)} style={{ display: 'flex', alignItems: 'center', gap: 11, height: 47, padding: '0 14px', boxSizing: 'border-box', cursor: 'pointer' }}>
+              <div className="asp-hover-list" data-testid="vault-switcher" onClick={() => setVaultMenuOpen((v) => !v)} style={{ display: 'flex', alignItems: 'center', gap: 11, height: 47, padding: '0 14px', boxSizing: 'border-box', cursor: 'pointer' }}>
                 <div style={dotStyle(hueOf(activeMeta?.vault_id || activeId || ''))} />
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontSize: 14, fontWeight: 600, letterSpacing: '-0.01em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{activeMeta?.name || 'Vault'}</div>
@@ -1016,7 +1016,7 @@ export default function App() {
             <button onClick={onNow} style={{ fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: timeTravel ? '#57534e' : '#bdb8b0', background: '#fff', border: '1px solid #e7e4df', borderRadius: 7, padding: '4px 12px', cursor: 'pointer', flex: 'none', transition: 'border-color .12s' }}>Now</button>
           </div>
 
-          <div ref={trackRef} onPointerDown={onTrackDown} style={{ position: 'relative', flex: 1, margin: '0 16px 9px', cursor: 'crosshair', touchAction: 'none' }}>
+          <div ref={trackRef} data-testid="history-track" onPointerDown={onTrackDown} style={{ position: 'relative', flex: 1, margin: '0 16px 9px', cursor: 'crosshair', touchAction: 'none' }}>
             <div style={{ position: 'absolute', inset: 0, borderBottom: '1px solid #e7e4df' }} />
             {axisTicks.map((a, i) => (
               <React.Fragment key={i}>
