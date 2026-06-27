@@ -1,84 +1,407 @@
 name: release
 
-# Publish the Obsidian plugin on a `v<semver>` tag. The plugin's `main.js` is a
-# single self-contained bundle (the wasm engine is inlined as base64 — see
-# plugins/obsidian/esbuild.config.mjs), so the GitHub Release carries exactly
-# the two files BRAT / the Obsidian community store read by exact name:
-# `main.js` + `manifest.json`. (This mirrors how the csp repo ships its plugin.)
+# One button ships everything. A manual run (Actions ▸ release ▸ "Run workflow"):
+#   1. bumps every release-bearing manifest to a single shared version,
+#   2. commits "release: vX.Y.Z" to main and pushes an annotated tag vX.Y.Z,
+#   3. opens a DRAFT GitHub Release,
+#   4. builds — in parallel, from the tagged commit —
+#        • the desktop app for macOS / Windows / Linux (Tauri installers),
+#        • the `asp` Rust CLI for those same platforms,
+#        • the TypeScript SDK tarball + the wasm packages (nodejs + web),
+#        • the Obsidian plugin (main.js + manifest.json),
+#      uploading each artifact to the draft release,
+#   5. publishes the release once every build is green.
 #
-# Tag → publish:
-#   git tag v0.1.0 && git push origin v0.1.0
+# Security posture:
+#   • every third-party action is pinned to a full commit SHA (trailing
+#     `# vX.Y.Z` is a human hint only);
+#   • the default token is read-only at the top level — only the jobs that
+#     write the bump commit, the tag, or release assets request `contents:
+#     write`, and nothing else;
+#   • no `--locked`/lockfiles are committed (Cargo.lock is generated), and JS
+#     installs are `--frozen-lockfile`.
+#
+# Note on branch protection: the `prepare` job pushes the version commit + tag
+# straight to main using the built-in GITHUB_TOKEN. If main is protected against
+# direct pushes, grant the GitHub Actions bot a bypass, or swap in a PAT / app
+# token with bypass via a repo secret and reference it in the `prepare` checkout.
 
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Explicit version X.Y.Z (leave blank to use the bump below)"
+        required: false
+        type: string
+      bump:
+        description: "Semver bump when no explicit version is given"
+        required: true
+        default: patch
+        type: choice
+        options: [patch, minor, major]
+      publish_npm:
+        description: "Also publish the TypeScript SDK to npm (needs NPM_TOKEN secret)"
+        required: true
+        default: false
+        type: boolean
+
+# Top-level default: read only. Jobs opt up to write where they must.
+permissions:
+  contents: read
+
+# Never run two releases at once — they would race on the main push.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
+  CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
   RUSTUP_MAX_RETRIES: "10"
 
 jobs:
-  release:
-    name: Build plugin + GitHub Release
+  # ---------------------------------------------------------------------------
+  # Bump versions, commit to main, tag, open the draft release.
+  # ---------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          fetch-depth: 0
+          # Keep the token so the subsequent git push authenticates.
+          persist-credentials: true
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Bump all manifests
+        id: bump
+        # Inputs are passed through env (never interpolated into the script body)
+        # to avoid shell-injection via the dispatch inputs.
+        env:
+          IN_VERSION: ${{ inputs.version }}
+          IN_BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          arg="$IN_VERSION"
+          [ -z "$arg" ] && arg="$IN_BUMP"
+          new="$(bash scripts/bump-version.sh "$arg")"
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+          echo "tag=v$new"   >> "$GITHUB_OUTPUT"
+          echo "Resolved release version: v$new"
+
+      - name: Commit, tag, push
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "release: ${TAG}"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin HEAD:main
+          git push origin "${TAG}"
+
+      - name: Open draft release
+        uses: softprops/action-gh-release@6da8fa9354ddfdc4aeace5fc48d7f679b5214090 # v2.4.1
+        with:
+          tag_name: ${{ steps.bump.outputs.tag }}
+          name: ${{ steps.bump.outputs.tag }}
+          draft: true
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # Desktop app — Tauri installers for macOS, Windows, Linux.
+  # ---------------------------------------------------------------------------
+  desktop:
+    needs: prepare
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-22.04
+            rust_targets: wasm32-unknown-unknown
+            tauri_args: ""
+            bundle_glob: |
+              desktop/src-tauri/target/release/bundle/deb/*.deb
+              desktop/src-tauri/target/release/bundle/rpm/*.rpm
+              desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+          - name: macos
+            os: macos-14
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin,wasm32-unknown-unknown
+            tauri_args: "--target universal-apple-darwin"
+            # Only the .dmg is produced by a default `bundle: all` build; the
+            # .app.tar.gz updater artifact needs `createUpdaterArtifacts`, which
+            # isn't configured, so don't require it here.
+            bundle_glob: |
+              desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          - name: windows
+            os: windows-latest
+            rust_targets: wasm32-unknown-unknown
+            tauri_args: ""
+            bundle_glob: |
+              desktop/src-tauri/target/release/bundle/msi/*.msi
+              desktop/src-tauri/target/release/bundle/nsis/*.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: "Linux: Tauri system deps"
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libfuse2
+
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+
+      - uses: actions-rust-lang/setup-rust-toolchain@fb51252c7ba57d633bc668f941da052e410add48 # v1.13.0
+        with:
+          target: ${{ matrix.rust_targets }}
+
+      - name: Cache the Tauri crate build
+        uses: swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@d0f4f69b07c0804d1003ca9a5a5f853423872ed9 # v2.62.13
+        with:
+          tool: wasm-pack
+
+      # The desktop WebView bundle imports the asp-core engine compiled to wasm
+      # (desktop/package.json depends on the generated crates/asp-wasm/pkg-web),
+      # so the wasm packages must exist before `bun install` resolves them.
+      - name: Build the engine to wasm (nodejs + web)
+        shell: bash
+        run: cd sdks/typescript && bun run build:wasm
+
+      - name: Install desktop frontend deps
+        shell: bash
+        run: cd desktop && bun install --frozen-lockfile
+
+      - name: Build the desktop bundle
+        uses: tauri-apps/tauri-action@e834788a94591d81e3ae0bd9ec06366f5afb8994 # v0.5.23
+        with:
+          projectPath: desktop
+          args: ${{ matrix.tauri_args }}
+        env:
+          # tauri-action only needs this if it touches releases; we upload
+          # separately, but it expects the var to be present.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload installers to the draft release
+        uses: softprops/action-gh-release@6da8fa9354ddfdc4aeace5fc48d7f679b5214090 # v2.4.1
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          draft: true
+          fail_on_unmatched_files: true
+          files: ${{ matrix.bundle_glob }}
+
+  # ---------------------------------------------------------------------------
+  # Rust CLI — `asp` binary per platform, archived.
+  # ---------------------------------------------------------------------------
+  cli:
+    needs: prepare
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@fb51252c7ba57d633bc668f941da052e410add48 # v1.13.0
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build asp (release)
+        run: cargo build --release -p asp --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="asp-${VERSION}-${{ matrix.target }}"
+          mkdir -p "$dist"
+          cp "target/${{ matrix.target }}/release/asp" "$dist/"
+          cp README.md "$dist/" 2>/dev/null || true
+          tar czf "${dist}.tar.gz" "$dist"
+          echo "ASSET=${dist}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dist = "asp-$env:VERSION-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/asp.exe" $dist
+          Copy-Item README.md $dist -ErrorAction SilentlyContinue
+          Compress-Archive -Path $dist -DestinationPath "$dist.zip" -Force
+          "ASSET=$dist.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload CLI archive to the draft release
+        uses: softprops/action-gh-release@6da8fa9354ddfdc4aeace5fc48d7f679b5214090 # v2.4.1
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          draft: true
+          fail_on_unmatched_files: true
+          files: ${{ env.ASSET }}
+
+  # ---------------------------------------------------------------------------
+  # TypeScript SDK tarball + wasm packages (nodejs + web).
+  # ---------------------------------------------------------------------------
+  sdk-wasm:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@fb51252c7ba57d633bc668f941da052e410add48 # v1.13.0
+        with:
+          target: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@d0f4f69b07c0804d1003ca9a5a5f853423872ed9 # v2.62.13
+        with:
+          tool: wasm-pack
+
+      - name: Build the engine to wasm (nodejs + web)
+        run: cd sdks/typescript && bun run build:wasm
+
+      - name: Stage artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # wasm: ship both targets in one archive.
+          tar czf "dist/asp-wasm-${VERSION}.tar.gz" -C crates/asp-wasm pkg pkg-web
+          # SDK: an npm-installable tarball (asp-sdk-<version>.tgz).
+          cd sdks/typescript
+          npm pack --pack-destination "${GITHUB_WORKSPACE}/dist"
+
+      - name: Publish SDK to npm
+        if: ${{ inputs.publish_npm && env.NPM_TOKEN != '' }}
+        run: cd sdks/typescript && npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Upload SDK + wasm to the draft release
+        uses: softprops/action-gh-release@6da8fa9354ddfdc4aeace5fc48d7f679b5214090 # v2.4.1
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          draft: true
+          fail_on_unmatched_files: true
+          files: dist/*
+
+  # ---------------------------------------------------------------------------
+  # Obsidian plugin — self-contained main.js + manifest.json.
+  # ---------------------------------------------------------------------------
+  obsidian:
+    needs: prepare
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
 
-      - name: Install Rust + wasm target
-        run: rustup toolchain install stable --profile minimal && rustup target add wasm32-unknown-unknown
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+
+      - uses: actions-rust-lang/setup-rust-toolchain@fb51252c7ba57d633bc668f941da052e410add48 # v1.13.0
+        with:
+          target: wasm32-unknown-unknown
 
       - name: Install wasm-pack
-        # Prebuilt binary via a maintained installer — the upstream
-        # `curl … init.sh | sh` script flakes on GitHub release fetches.
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@d0f4f69b07c0804d1003ca9a5a5f853423872ed9 # v2.62.13
         with:
           tool: wasm-pack
 
       - name: Install binaryen (wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
 
-      - uses: oven-sh/setup-bun@v2
-
-      - name: Stamp plugin version from the tag
-        run: |
-          version="${GITHUB_REF_NAME#v}"          # v0.1.0 -> 0.1.0
-          node -e '
-            const fs = require("fs");
-            const v = process.argv[1];
-            for (const f of ["plugins/obsidian/manifest.json", "plugins/obsidian/package.json"]) {
-              const j = JSON.parse(fs.readFileSync(f, "utf8"));
-              j.version = v;
-              fs.writeFileSync(f, JSON.stringify(j, null, 2) + "\n");
-            }
-          ' "$version"
-          echo "Stamped version ${version}"
-
-      - name: Build the one engine to wasm (nodejs + web targets)
+      - name: Build the engine to wasm (nodejs + web)
         run: cd sdks/typescript && bun run build:wasm
 
-      - name: Install plugin deps
-        run: cd plugins/obsidian && bun install --frozen-lockfile
-
       - name: Build the plugin (self-contained main.js)
-        run: cd plugins/obsidian && bun run build
+        run: cd plugins/obsidian && bun install --frozen-lockfile && bun run build
 
-      - name: Stage release files
+      - name: Stage plugin files
         run: |
+          set -euo pipefail
           mkdir -p release
           # BRAT / the community store read these by exact name — do NOT rename.
           cp plugins/obsidian/main.js release/main.js
           cp plugins/obsidian/manifest.json release/manifest.json
-          ls -la release/
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload plugin to the draft release
+        uses: softprops/action-gh-release@6da8fa9354ddfdc4aeace5fc48d7f679b5214090 # v2.4.1
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          generate_release_notes: true
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          draft: true
           fail_on_unmatched_files: true
           files: release/*
+
+  # ---------------------------------------------------------------------------
+  # Flip the draft to a published release once every build uploaded cleanly.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [prepare, desktop, cli, sdk-wasm, obsidian]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Publish the release
+        run: gh release edit "${TAG}" --draft=false --latest

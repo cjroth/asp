@@ -3,11 +3,24 @@ name: ci
 # The headline gates are CI-blocking (§Testing): merge determinism + identity
 # convergence, the multi-process e2e matrix, and the derived-git coherence check
 # must all run green before any release.
+#
+# Security posture: every third-party action is pinned to a full commit SHA (the
+# trailing `# vX.Y.Z` is a human hint only — GitHub resolves the SHA, not the
+# tag), and the workflow token is read-only (see `permissions:`).
 on:
   push:
     branches: [main, "claude/**"]
   pull_request:
     branches: [main]
+
+# Least privilege: CI only reads the repo.
+permissions:
+  contents: read
+
+# One in-flight run per ref; new pushes cancel the stale run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,11 +34,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: |
             ~/.cargo/registry
@@ -45,10 +58,10 @@ jobs:
     # regress as the engine grows. Informational per-file table in the log.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install Rust + llvm-tools
         run: rustup toolchain install stable --profile minimal && rustup component add llvm-tools-preview
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@d0f4f69b07c0804d1003ca9a5a5f853423872ed9 # v2.62.13
         with:
           tool: cargo-llvm-cov
       - name: Coverage (floor enforced)
@@ -57,14 +70,14 @@ jobs:
   sdk:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install Rust + wasm target
         run: rustup toolchain install stable --profile minimal && rustup target add wasm32-unknown-unknown
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
       - name: Install wasm-pack
         # Prebuilt binary via a maintained installer — the upstream
         # `curl … init.sh | sh` script flakes on GitHub release fetches.
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@d0f4f69b07c0804d1003ca9a5a5f853423872ed9 # v2.62.13
         with:
           tool: wasm-pack
       - name: Build native asp binary (for the parity e2e)
