@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   applyTheme,
+  clampHistBar,
   clampSidebar,
   DEFAULT_PREFS,
   FONT_FAMILIES,
   fontFamilyOf,
+  HISTBAR_MAX,
+  HISTBAR_MIN,
   loadPrefs,
   savePrefs,
   SIDEBAR_MAX,
@@ -56,6 +59,16 @@ describe('prefs', () => {
     expect(clampSidebar(10)).toBe(SIDEBAR_MIN);
     expect(clampSidebar(9999)).toBe(SIDEBAR_MAX);
     expect(clampSidebar(300)).toBe(300);
+  });
+
+  it('clampHistBar bounds the height', () => {
+    expect(clampHistBar(10)).toBe(HISTBAR_MIN);
+    expect(clampHistBar(9999)).toBe(HISTBAR_MAX);
+    expect(clampHistBar(200)).toBe(200);
+  });
+
+  it('defaults the history bar height', () => {
+    expect(DEFAULT_PREFS.histBarH).toBe(150);
   });
 
   it('savePrefs swallows storage errors', () => {

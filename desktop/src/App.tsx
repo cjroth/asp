@@ -16,7 +16,7 @@ import LiveEditor from './vault/LiveEditor';
 import { countLabel } from './vault/markdown';
 import { isDesktop } from './lib/platform';
 import { basename, freeName, makeAccessKey, relTime, shortFingerprint } from './vault/format';
-import { applyTheme, clampSidebar, fontFamilyOf, loadPrefs, type Prefs, savePrefs } from './vault/prefs';
+import { applyTheme, clampHistBar, clampSidebar, fontFamilyOf, HISTBAR_COLLAPSE, loadPrefs, type Prefs, savePrefs } from './vault/prefs';
 import { isHidden } from './vault/prettyNames';
 import { allDirPaths, buildTree, firstSelectable, flatten } from './vault/tree';
 import { avatarStyle, glyphOf, hueForId, loadVaultMeta, resolveMeta, saveVaultMeta, type VaultMetaMap } from './vault/vaultMeta';
@@ -82,6 +82,11 @@ export default function App() {
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  // Multi-selection: every file path that's currently highlighted (always
+  // includes `selectedPath`, the active/editor file). `anchorPath` is the last
+  // plainly-clicked file — the fixed end of a shift-range.
+  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
+  const [anchorPath, setAnchorPath] = useState<string | null>(null);
 
   const [paint, setPaint] = useState<Paint | null>(null);
   const [docText, setDocText] = useState('');
@@ -103,6 +108,8 @@ export default function App() {
   const [crumbEditing, setCrumbEditing] = useState(false);
 
   const [sidebarW, setSidebarW] = useState(prefs.sidebarW);
+  const [histBarH, setHistBarH] = useState(prefs.histBarH);
+  const [resizingBar, setResizingBar] = useState(false);
 
   const [entry, setEntry] = useState<'new' | 'connect' | null>(null);
   const [newVaultName, setNewVaultName] = useState('');
@@ -119,6 +126,7 @@ export default function App() {
   // refs for values used inside imperative handlers / async flows
   const activeIdRef = useRef<string | null>(null);
   const selectedRef = useRef<string | null>(null);
+  const selectedPathsRef = useRef<Set<string>>(new Set());
   const bufferRef = useRef('');
   const playheadRef = useRef<number | null>(null);
   const viewRef = useRef<View | null>(null);
@@ -131,6 +139,7 @@ export default function App() {
   const paintSeq = useRef(0);
   activeIdRef.current = activeId;
   selectedRef.current = selectedPath;
+  selectedPathsRef.current = selectedPaths;
   playheadRef.current = playhead;
   viewRef.current = view;
   nowRef.current = now;
@@ -345,6 +354,8 @@ export default function App() {
       }
       setExpanded(exp);
       setSelectedPath(sel);
+      setSelectedPaths(sel ? new Set([sel]) : new Set());
+      setAnchorPath(sel);
       scheduleHistory(id);
     },
     [flushSave, refreshFiles, scheduleHistory],
@@ -400,6 +411,8 @@ export default function App() {
       contentRef.current[`${id}::${path}`] = content;
       if (parent) setExpanded((e) => ({ ...e, [parent]: true }));
       setSelectedPath(path);
+      setSelectedPaths(new Set([path]));
+      setAnchorPath(path);
       dirtyRef.current = false;
       bufferRef.current = content;
       try {
@@ -483,6 +496,9 @@ export default function App() {
       });
       if (selectedRef.current === oldPath) setSelectedPath(newPath);
       else if (selectedRef.current && selectedRef.current.startsWith(oldPath + '/')) setSelectedPath(remap(selectedRef.current));
+      const remapSel = (p: string) => (p === oldPath || p.startsWith(oldPath + '/') ? remap(p) : p);
+      setSelectedPaths((prev) => new Set(Array.from(prev, remapSel)));
+      setAnchorPath((p) => (p ? remapSel(p) : p));
 
       void (async () => {
         try {
@@ -497,20 +513,37 @@ export default function App() {
     [scheduleHistory],
   );
 
-  const deleteNode = useCallback(
-    (path: string, isDir: boolean) => {
+  // Delete one or more paths (folders delete their whole subtree). Drives both the
+  // single-file delete and the batch delete of a multi-selection.
+  const deletePaths = useCallback(
+    (paths: string[]) => {
       const id = activeIdRef.current;
-      if (!id) return;
+      if (!id || paths.length === 0) return;
       setCtxMenu(null);
-      const sel = selectedRef.current;
-      const victims = isDir ? filesRef.current.filter((f) => f.path === path || f.path.startsWith(path + '/')).map((f) => f.path) : [path];
-      const next = filesRef.current.filter((f) => !(f.path === path || f.path.startsWith(path + '/')));
+      const victimSet = new Set<string>();
+      for (const p of paths) {
+        victimSet.add(p);
+        for (const f of filesRef.current) if (f.path === p || f.path.startsWith(p + '/')) victimSet.add(f.path);
+      }
+      const next = filesRef.current.filter((f) => !victimSet.has(f.path));
       filesRef.current = next;
       setFiles(next);
-      for (const p of victims) delete contentRef.current[`${id}::${p}`];
-      if (sel && (sel === path || sel.startsWith(path + '/'))) setSelectedPath(firstSelectable(buildTree(next)));
+      for (const p of victimSet) delete contentRef.current[`${id}::${p}`];
+      const sel = selectedRef.current;
+      if (sel && victimSet.has(sel)) {
+        const fallback = firstSelectable(buildTree(next));
+        setSelectedPath(fallback);
+        setSelectedPaths(fallback ? new Set([fallback]) : new Set());
+        setAnchorPath(fallback);
+      } else {
+        setSelectedPaths((prev) => {
+          const np = new Set(prev);
+          for (const p of victimSet) np.delete(p);
+          return np;
+        });
+      }
       void (async () => {
-        for (const p of victims) {
+        for (const p of victimSet) {
           try {
             await api.deleteFile(id, p);
           } catch (err) {
@@ -520,8 +553,43 @@ export default function App() {
         scheduleHistory(id);
       })();
     },
-    [],
+    [scheduleHistory],
   );
+
+  // Context-menu / programmatic delete of a single node. If the node is a FILE
+  // that's part of a multi-selection, delete the whole selection (batch delete);
+  // otherwise just this node (today's behavior).
+  const deleteNode = useCallback(
+    (path: string, isDir: boolean) => {
+      const sel = selectedPathsRef.current;
+      if (!isDir && sel.size > 1 && sel.has(path)) deletePaths(Array.from(sel));
+      else deletePaths([path]);
+    },
+    [deletePaths],
+  );
+
+  // Keyboard: Delete/Backspace removes the whole current selection; Escape
+  // collapses a multi-selection back to just the active file. Guarded so it never
+  // fires while typing in an input/textarea or the contenteditable editor.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (e.key === 'Escape') {
+        const active = selectedRef.current;
+        setSelectedPaths(active ? new Set([active]) : new Set());
+        return;
+      }
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        const sel = selectedPathsRef.current;
+        if (sel.size === 0) return;
+        e.preventDefault();
+        deletePaths(Array.from(sel));
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [deletePaths]);
 
   const openCtx = useCallback((e: React.MouseEvent, node: { path: string; isDir: boolean; name: string }) => {
     e.preventDefault();
@@ -599,6 +667,51 @@ export default function App() {
       document.addEventListener('pointerup', up);
     },
     [sidebarW, updatePrefs],
+  );
+
+  // ---------- history/log bar resize ----------
+  // The bar lives at the bottom and grows UPWARD, so dragging up (clientY
+  // decreasing) makes it taller. One shared height drives whichever panel is
+  // open. Drag below the collapse threshold → snap fully shut; dragging back up
+  // within the same gesture re-opens the tab we started from.
+  const onHistBarResize = useCallback(
+    (e: React.PointerEvent) => {
+      e.preventDefault();
+      const startY = e.clientY;
+      const h0 = histBarH;
+      const wasHist = histOpen;
+      const wasLog = logOpen;
+      let collapsed = false;
+      let latest = h0;
+      setResizingBar(true);
+      const move = (ev: PointerEvent) => {
+        const proposed = h0 - (ev.clientY - startY);
+        if (proposed < HISTBAR_COLLAPSE) {
+          collapsed = true;
+          setHistOpen(false);
+          setLogOpen(false);
+        } else {
+          if (collapsed) {
+            collapsed = false;
+            setHistOpen(wasHist);
+            setLogOpen(wasLog);
+          }
+          latest = clampHistBar(proposed);
+          setHistBarH(latest);
+        }
+      };
+      const up = () => {
+        document.removeEventListener('pointermove', move);
+        document.removeEventListener('pointerup', up);
+        document.body.style.cursor = '';
+        setResizingBar(false);
+        if (!collapsed) updatePrefs({ histBarH: latest });
+      };
+      document.body.style.cursor = 'row-resize';
+      document.addEventListener('pointermove', move);
+      document.addEventListener('pointerup', up);
+    },
+    [histBarH, histOpen, logOpen, updatePrefs],
   );
 
   // ---------- theme / font ----------
@@ -745,6 +858,8 @@ export default function App() {
       setActiveId(null);
       setScreen('connect');
       setSelectedPath(null);
+      setSelectedPaths(new Set());
+      setAnchorPath(null);
     }
   }, [removeVaultState, refreshVaults]);
 
@@ -766,6 +881,47 @@ export default function App() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tree, expanded, filterTs, files, prefs.showHidden]);
+
+  // Click on a FILE row, honoring the keyboard modifiers (like a normal file
+  // manager / IDE). Plain → select just this file + open it. Cmd/Ctrl → toggle it
+  // in/out of the multi-selection. Shift → range-select from the anchor through
+  // this row across the flattened visible FILE order. The clicked file always
+  // becomes the active/editor file (except a cmd-click that DESELECTS it).
+  // Declared after `rows` because the shift-range slices the visible file order.
+  const onFileClick = useCallback(
+    (path: string, e: { shiftKey: boolean; metaKey: boolean; ctrlKey: boolean }) => {
+      if (e.shiftKey && anchorPath) {
+        const fileRows = rows.filter((r) => r.node.type === 'file').map((r) => r.node.path);
+        const a = fileRows.indexOf(anchorPath);
+        const b = fileRows.indexOf(path);
+        if (a >= 0 && b >= 0) {
+          const [lo, hi] = a <= b ? [a, b] : [b, a];
+          setSelectedPaths(new Set(fileRows.slice(lo, hi + 1)));
+          void selectFile(path);
+          return; // keep the existing anchor for further shift-clicks
+        }
+      }
+      if (e.metaKey || e.ctrlKey) {
+        const has = selectedPaths.has(path);
+        const next = new Set(selectedPaths);
+        if (has) next.delete(path);
+        else next.add(path);
+        setSelectedPaths(next);
+        setAnchorPath(path);
+        if (!has) void selectFile(path);
+        else if (path === selectedPath) {
+          // Deselected the active file → move the editor to another selected file.
+          const remaining = Array.from(next);
+          if (remaining.length) void selectFile(remaining[remaining.length - 1]);
+        }
+        return;
+      }
+      setSelectedPaths(new Set([path]));
+      setAnchorPath(path);
+      void selectFile(path);
+    },
+    [rows, anchorPath, selectedPaths, selectedPath, selectFile],
+  );
 
   const ctxTargetPath = ctxMenu && !ctxMenu.root ? ctxMenu.path ?? null : null;
 
@@ -898,8 +1054,8 @@ export default function App() {
                       <Icon.ShareIcon style={{ flex: 'none' }} />
                       <span style={{ fontSize: 13.5 }}>Share this vault…</span>
                     </div>
-                    <div className="asp-hover-danger" onClick={() => { setVaultMenuOpen(false); if (activeMeta) setRemoveVaultState({ id: activeMeta.id, name: activeMeta.displayName, path: activeMeta.path, trash: false }); }} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 9px', borderRadius: 8, cursor: 'pointer', color: '#c0392b' }}>
-                      <Icon.TrashIcon stroke="#c0392b" style={{ flex: 'none' }} />
+                    <div className="asp-hover-soft" onClick={() => { setVaultMenuOpen(false); if (activeMeta) setRemoveVaultState({ id: activeMeta.id, name: activeMeta.displayName, path: activeMeta.path, trash: false }); }} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 9px', borderRadius: 8, cursor: 'pointer', color: 'var(--text2)' }}>
+                      <Icon.TrashIcon stroke="var(--text2)" style={{ flex: 'none' }} />
                       <span style={{ fontSize: 13.5 }}>Remove this vault…</span>
                     </div>
                     <div style={{ height: 1, background: 'var(--line)', margin: '4px 6px' }} />
@@ -962,6 +1118,7 @@ export default function App() {
             <FileTree
               rows={rows}
               selectedPath={selectedPath}
+              selectedPaths={selectedPaths}
               expanded={expanded}
               renaming={renaming}
               renameValue={renameValue}
@@ -970,10 +1127,10 @@ export default function App() {
               prettyNames={prefs.prettyNames}
               ctxTargetPath={ctxTargetPath}
               onEmptyContext={openTreeCtx}
-              onRowClick={({ node }) => {
+              onRowClick={({ node }, e) => {
                 if (renaming === node.path) return;
                 if (node.type === 'dir') toggleDir(node.path);
-                else void selectFile(node.path);
+                else onFileClick(node.path, e);
               }}
               onRowContext={openCtx}
               onRenameChange={setRenameValue}
@@ -1063,6 +1220,12 @@ export default function App() {
           </main>
         </div>
 
+        {(histOpen || logOpen) && (
+          <div onPointerDown={onHistBarResize} className="hb-resize" style={{ height: 7, flex: 'none', cursor: 'row-resize', margin: '-3px 0', zIndex: 6, position: 'relative', display: 'flex', alignItems: 'center' }}>
+            <div className="hb-line" style={{ height: 1, alignSelf: 'center', width: '100%', background: 'var(--line)' }} />
+          </div>
+        )}
+
         <HistoryBar
           events={events}
           histRaw={histRaw}
@@ -1081,6 +1244,8 @@ export default function App() {
           identity={identity}
           histOpen={histOpen}
           logOpen={logOpen}
+          barHeight={histOpen || logOpen ? histBarH : 38}
+          animate={!resizingBar}
           onTabHistory={onTabHistory}
           onTabLog={onTabLog}
           onNow={onNow}
@@ -1104,13 +1269,12 @@ export default function App() {
                 </>
               ) : (
                 <>
-                  <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)', padding: '5px 11px 3px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ctxMenu.name}</div>
                   <div className="asp-hover-soft" onClick={() => { setRenaming(ctxMenu.path!); setRenameValue(ctxMenu.name!); setCtxMenu(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                     <Icon.PencilIcon style={{ flex: 'none' }} />
                     <span>Rename</span>
                   </div>
-                  <div className="asp-hover-danger" onClick={() => deleteNode(ctxMenu.path!, !!ctxMenu.isDir)} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: '#c0392b' }}>
-                    <Icon.TrashIcon stroke="#c0392b" style={{ flex: 'none' }} />
+                  <div className="asp-hover-soft" onClick={() => deleteNode(ctxMenu.path!, !!ctxMenu.isDir)} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                    <Icon.TrashIcon stroke="var(--text2)" style={{ flex: 'none' }} />
                     <span>Delete</span>
                   </div>
                 </>

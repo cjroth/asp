@@ -67,6 +67,8 @@ export interface Api {
   restoreFileAt(id: string, path: string, ts: number): Promise<void>;
   rescan(id: string): Promise<void>;
   removeVault(id: string, trash: boolean): Promise<void>;
+  // Reveal a folder/file in the OS file manager (Finder/Explorer). Desktop-only.
+  revealPath(path: string): Promise<void>;
 }
 
 // ---- desktop backend: Tauri commands (a thin pass-through) ----
@@ -93,6 +95,7 @@ const tauriApi: Api = {
   restoreFileAt: (id, path, ts) => invoke<void>('restore_file_at', { id, path, ts }),
   rescan: (id) => invoke<void>('rescan', { id }),
   removeVault: (id, trash) => invoke<void>('remove_vault', { id, trash }),
+  revealPath: (path) => invoke<void>('reveal_path', { path }),
 };
 
 // The web backend (wasm + OPFS) is heavy, so it's loaded lazily only when we're

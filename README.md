@@ -93,6 +93,89 @@ conformance vectors and the SDK⇄real-`asp` parity e2e.
   Bearer`, `?auth_key=`, or `bearer.<key>` subprotocol; 401 on mismatch) or
   **TOFU** bounded to the empty-set window (`--no-tofu` disables it).
 
+## Download & install
+
+Grab the latest build from the
+[**Releases**](https://github.com/cjroth/asp/releases/latest) page. Every release
+ships the desktop app, the `asp` CLI, the TypeScript SDK, the wasm packages, and
+the Obsidian plugin.
+
+> **Heads-up: the builds are not code-signed.** They're plain unsigned binaries,
+> so macOS Gatekeeper and Windows SmartScreen will warn that the developer is
+> "unidentified" / the app is "unrecognized." That's the OS being cautious about
+> *any* unsigned download — not an actual malware detection. The one-time steps
+> below tell each OS to trust it. (Signing them properly is possible later — it
+> needs paid Apple/Windows developer certs.)
+
+### Desktop app
+
+**macOS** — download `Context.Desktop_<version>_universal.dmg` (runs on both
+Apple Silicon and Intel), open it, and drag the app to Applications. On first
+launch Gatekeeper blocks it because it's unsigned. Get past it once:
+
+- **Right-click** (Control-click) the app in Applications → **Open** → **Open**
+  in the dialog, **or**
+- launch it once (it gets blocked), then go to **System Settings → Privacy &
+  Security**, scroll down, and click **Open Anyway**, **or**
+- from a terminal, clear the quarantine flag:
+  ```sh
+  xattr -dr com.apple.quarantine "/Applications/Context Desktop.app"
+  ```
+
+After that first approval it opens normally forever.
+
+**Windows** — download `Context.Desktop_<version>_x64_en-US.msi` (or the
+`_x64-setup.exe` NSIS installer) and run it. SmartScreen may show "Windows
+protected your PC" — click **More info → Run anyway** (unsigned-installer
+warning, one time).
+
+**Linux** — download the package for your distro and install it:
+
+```sh
+# Debian / Ubuntu
+sudo dpkg -i Context.Desktop_<version>_amd64.deb || sudo apt-get -f install
+
+# Fedora / RHEL / openSUSE
+sudo rpm -i Context.Desktop-<version>-1.x86_64.rpm
+```
+
+(No AppImage is published — the `.deb`/`.rpm` cover the mainstream desktops.)
+
+### `asp` CLI
+
+Download the archive for your platform, unpack it, and put `asp` on your `PATH`:
+
+| Platform | Asset |
+| --- | --- |
+| Linux x86-64 | `asp-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS (Apple Silicon) | `asp-<version>-aarch64-apple-darwin.tar.gz` |
+| macOS (Intel) | `asp-<version>-x86_64-apple-darwin.tar.gz` |
+| Windows x86-64 | `asp-<version>-x86_64-pc-windows-msvc.zip` |
+
+```sh
+tar xzf asp-<version>-x86_64-unknown-linux-gnu.tar.gz
+sudo install asp-<version>-x86_64-unknown-linux-gnu/asp /usr/local/bin/asp
+asp --version
+```
+
+On macOS the downloaded binary is quarantined too; clear it before first run:
+
+```sh
+xattr -d com.apple.quarantine ./asp   # then: chmod +x ./asp && ./asp --version
+```
+
+### SDK, wasm, and the Obsidian plugin
+
+- **TypeScript SDK** — `asp-sdk-<version>.tgz`; install with
+  `npm install ./asp-sdk-<version>.tgz` (or `bun add ./asp-sdk-<version>.tgz`).
+- **wasm packages** — `asp-wasm-<version>.tar.gz` contains both the `nodejs`
+  (`pkg/`) and `web` (`pkg-web/`) targets.
+- **Obsidian plugin** — `main.js` + `manifest.json`; drop them into
+  `<your vault>/.obsidian/plugins/agent-sync/`, or install via
+  [BRAT](https://github.com/TfTHacker/obsidian42-brat) pointing at this repo.
+
+Once you have the CLI, jump to [Quick start](#quick-start-two-devices-dialed-by-key-over-iroh).
+
 ## Build
 
 Requirements: Rust (stable, 1.91+, for iroh 1.0), a C compiler (for bundled

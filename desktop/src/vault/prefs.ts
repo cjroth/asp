@@ -16,6 +16,7 @@ export interface Prefs {
   writingColumn: boolean;
   theme: Theme;
   sidebarW: number;
+  histBarH: number;
   showHidden: boolean;
   prettyNames: boolean;
 }
@@ -28,6 +29,7 @@ export const DEFAULT_PREFS: Prefs = {
   writingColumn: true,
   theme: 'light',
   sidebarW: 266,
+  histBarH: 150,
   showHidden: false,
   prettyNames: false,
 };
@@ -77,4 +79,13 @@ export const SIDEBAR_MIN = 200;
 export const SIDEBAR_MAX = 460;
 export function clampSidebar(w: number): number {
   return Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, w));
+}
+
+// The bottom history/log bar grows upward from the bottom. One shared height
+// drives whichever panel is open; dragging below COLLAPSE snaps it fully shut.
+export const HISTBAR_MIN = 96;
+export const HISTBAR_MAX = 640;
+export const HISTBAR_COLLAPSE = 72;
+export function clampHistBar(h: number): number {
+  return Math.max(HISTBAR_MIN, Math.min(HISTBAR_MAX, h));
 }

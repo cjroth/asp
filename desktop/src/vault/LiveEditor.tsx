@@ -4,7 +4,9 @@
 // of its content and the caret stays put. Markdown files render with the live
 // markdown highlighter; code files render with the per-line syntax highlighter.
 import React, { useEffect, useRef } from 'react';
+import { applyCachedDiagrams, renderDiagrams } from './diagram';
 import { caretOffset, hasFrontmatter, isCodeFile, readLive, renderDoc, setCaret, setTextOffsetIn, textOffsetIn } from './markdown';
+import { loadMermaid } from './mermaid';
 import type { FrontmatterStyle } from './prefs';
 
 export interface LiveEditorProps {
@@ -26,6 +28,7 @@ export default function LiveEditor(props: LiveEditorProps) {
   const composing = useRef(false);
   const paintedKey = useRef<string>('');
   const rehlTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const diagTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lineCount = useRef(0); // top-level line divs as of the last full render
   // Keep handler-visible values fresh without re-binding (avoids stale closures).
   const roRef = useRef(readOnly);
@@ -41,6 +44,22 @@ export default function LiveEditor(props: LiveEditorProps) {
 
   const render = (src: string) => renderDoc(src, pathRef.current, accentRef.current, fmRef.current);
 
+  // Fill in rendered diagram SVGs after a (re)paint. Cached diagrams are replayed
+  // synchronously (no flicker for unchanged blocks); any new ones are rendered via
+  // the async, dynamically-imported mermaid boundary on a short debounce so a
+  // burst of edits coalesces into one render. Diagram previews are
+  // contenteditable=false and skipped by the line walkers, so this never disturbs
+  // the caret. It degrades to the visible code fallback if mermaid is unavailable.
+  const paintDiagrams = (el: HTMLElement) => {
+    const pending = applyCachedDiagrams(el);
+    if (pending === 0) return;
+    if (diagTimer.current) clearTimeout(diagTimer.current);
+    diagTimer.current = setTimeout(() => {
+      const cur = ref.current;
+      if (cur) void renderDiagrams(cur, loadMermaid);
+    }, 200);
+  };
+
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
@@ -54,12 +73,16 @@ export default function LiveEditor(props: LiveEditorProps) {
     } else {
       el.innerHTML = renderDoc(source, path, accent, frontmatterStyle);
       lineCount.current = source.split('\n').length;
+      paintDiagrams(el);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paintKey, source, readOnly, notExist, accent, path, frontmatterStyle]);
 
   // Clean up the pending re-highlight on unmount.
-  useEffect(() => () => { if (rehlTimer.current) clearTimeout(rehlTimer.current); }, []);
+  useEffect(() => () => {
+    if (rehlTimer.current) clearTimeout(rehlTimer.current);
+    if (diagTimer.current) clearTimeout(diagTimer.current);
+  }, []);
 
   // Re-applying syntax highlighting rebuilds DOM. Rebuilding the WHOLE document is
   // O(document size) — a ~600ms hitch on a 4000-line file. So while typing we let
@@ -74,6 +97,7 @@ export default function LiveEditor(props: LiveEditorProps) {
     const src = readLive(el);
     el.innerHTML = render(src);
     lineCount.current = src.split('\n').length;
+    paintDiagrams(el);
     if (off != null) setCaret(el, off);
   };
 
@@ -119,6 +143,32 @@ export default function LiveEditor(props: LiveEditorProps) {
     if (composing.current) return;
     if (rehlTimer.current) clearTimeout(rehlTimer.current);
     rehlTimer.current = setTimeout(rehighlight, 320);
+  };
+
+  // Clicking the checkbox of a `- [ ]` task line toggles its source between
+  // `[ ]` and `[x]`. We preventDefault so no caret/selection lands in the line,
+  // re-render just that line div, and commit the new source via onChange. The
+  // `.cm-task-box` hit target carries no source text, so readLive is unaffected.
+  const onMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    const el = ref.current;
+    if (!el || roRef.current) return;
+    const box = (e.target as HTMLElement).closest?.('.cm-task-box');
+    if (!box) return;
+    const lineDiv = box.closest('.cm-task') as HTMLElement | null;
+    if (!lineDiv || lineDiv.parentNode !== el) return;
+    const idx = Array.prototype.indexOf.call(el.childNodes, lineDiv);
+    /* v8 ignore next -- lineDiv is a direct child, so idx is always found */
+    if (idx < 0) return;
+    const lines = readLive(el).split('\n');
+    const m = (lines[idx] ?? '').match(/^(\s*[-*]\s+\[)([ xX])(\].*)$/);
+    /* v8 ignore next -- the box only renders on a valid task line, so m matches */
+    if (!m) return;
+    e.preventDefault();
+    lines[idx] = m[1] + (m[2] === ' ' ? 'x' : ' ') + m[3];
+    const tmp = document.createElement('div');
+    tmp.innerHTML = render(lines[idx]);
+    el.replaceChild(tmp.firstChild as HTMLElement, lineDiv);
+    changeRef.current(lines.join('\n'));
   };
 
   const onPaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
@@ -178,6 +228,7 @@ export default function LiveEditor(props: LiveEditorProps) {
       ref={ref}
       data-testid="live-editor"
       spellCheck={false}
+      onMouseDown={onMouseDown}
       onInput={onInput}
       onPaste={onPaste}
       onCompositionStart={onCompositionStart}

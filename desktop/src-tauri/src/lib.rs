@@ -66,6 +66,7 @@ pub fn run() {
             commands::restore_file_at,
             commands::rescan,
             commands::remove_vault,
+            commands::reveal_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Context Desktop");

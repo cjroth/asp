@@ -1,6 +1,6 @@
 {
   "name": "@asp/sdk",
-  "version": "0.1.0",
+  "version": "0.1.26",
   "description": "TypeScript SDK for the Agent Sync Protocol — a thin shim over the one Rust engine via wasm (asp-core/asp-wasm). One engine everywhere.",
   "license": "MIT OR Apache-2.0",
   "type": "module",
@@ -12,7 +12,10 @@
       "default": "./src/engine-node.ts"
     }
   },
-  "files": ["src", "README.md"],
+  "files": [
+    "src",
+    "README.md"
+  ],
   "scripts": {
     "build:wasm": "node scripts/build-wasm.mjs",
     "test": "bun test test"

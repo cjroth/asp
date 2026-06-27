@@ -48,6 +48,17 @@ describe('renderLiveHtml', () => {
     expect(div.querySelectorAll('.cm-task-done').length).toBe(1);
   });
 
+  it('renders a clickable checkbox hit-zone that carries no source text', () => {
+    const div = document.createElement('div');
+    const src = '- [x] done\n- [ ] todo';
+    div.innerHTML = renderLiveHtml(src);
+    const boxes = div.querySelectorAll('.cm-task-box');
+    expect(boxes.length).toBe(2);
+    boxes.forEach((b) => expect(b.textContent).toBe(''));
+    // The box adds no characters: readLive (textContent per line) round-trips exact.
+    expect(readLive(div)).toBe(src);
+  });
+
   it('renders bullets and links and inline code', () => {
     const div = document.createElement('div');
     div.innerHTML = renderLiveHtml('- a [t](http://x) `c`');
@@ -181,6 +192,61 @@ describe('tables, fences, quotes, rules, ordered lists', () => {
     const d = html(renderLiveHtml(src));
     expect(d.textContent).toContain('code');
     expect(readLive(d)).toBe(src);
+  });
+});
+
+describe('mermaid / diagram fences', () => {
+  const SRC = '```mermaid\ngraph TD\nA --> B\n```';
+
+  it('emits a contenteditable=false .md-diagram preview after the closing fence', () => {
+    const d = html(renderLiveHtml(SRC));
+    const node = d.querySelector('.md-diagram') as HTMLElement;
+    expect(node).not.toBeNull();
+    expect(node.getAttribute('contenteditable')).toBe('false');
+    // The extracted source is exactly the fence body (between the ``` lines).
+    expect(node.getAttribute('data-diagram-src')).toBe('graph TD\nA --> B');
+    // The raw fence lines are still rendered as editable divs above the preview.
+    expect(d.textContent).toContain('graph TD');
+  });
+
+  it('recognises the ```diagram alias', () => {
+    const d = html(renderLiveHtml('```diagram\nsequenceDiagram\n```'));
+    expect(d.querySelector('.md-diagram')!.getAttribute('data-diagram-src')).toBe('sequenceDiagram');
+  });
+
+  it('round-trips the source: the preview contributes zero lines/characters', () => {
+    const d = html(renderLiveHtml(SRC));
+    expect(readLive(d)).toBe(SRC);
+  });
+
+  it('round-trips with prose surrounding the diagram', () => {
+    const src = '# Title\n\n' + SRC + '\n\nafter';
+    const d = html(renderLiveHtml(src));
+    expect(d.querySelector('.md-diagram')).not.toBeNull();
+    expect(readLive(d)).toBe(src);
+  });
+
+  it('does NOT add a preview for a plain (non-diagram) code fence', () => {
+    const d = html(renderLiveHtml('```js\ncode\n```'));
+    expect(d.querySelector('.md-diagram')).toBeNull();
+  });
+
+  it('does NOT add a preview for an unterminated diagram fence', () => {
+    const d = html(renderLiveHtml('```mermaid\ngraph TD'));
+    expect(d.querySelector('.md-diagram')).toBeNull();
+  });
+
+  it('caret offsets skip the diagram preview (offsets land in the real source)', () => {
+    const d = html(renderLiveHtml(SRC));
+    document.body.appendChild(d);
+    // Total source length is preserved despite the extra preview node.
+    setCaret(d, SRC.length);
+    expect(caretOffset(d)).toBe(SRC.length);
+    // An offset inside the fence body still maps correctly across the preview.
+    const mid = '```mermaid\ngraph TD'.length;
+    setCaret(d, mid);
+    expect(caretOffset(d)).toBe(mid);
+    document.body.removeChild(d);
   });
 });
 

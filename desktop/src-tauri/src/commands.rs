@@ -136,3 +136,34 @@ pub fn rescan(state: State<AppState>, id: String) -> R<()> {
 pub fn remove_vault(state: State<AppState>, id: String, trash: bool) -> R<()> {
     e(state.engine.remove_vault(&id, trash))
 }
+
+/// Reveal a folder/file in the OS file manager (Finder on macOS, Explorer on
+/// Windows, the default handler for the parent directory on Linux). Not an
+/// engine concern — a pure shell-out, so it lives here rather than in asp-core.
+#[tauri::command(async)]
+pub fn reveal_path(path: String) -> R<()> {
+    use std::process::Command;
+    let p = PathBuf::from(&path);
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg("-R").arg(&p);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = Command::new("explorer");
+        c.arg(format!("/select,{}", p.display()));
+        c
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut cmd = {
+        // xdg-open has no "select" — open the containing directory instead.
+        let dir = p.parent().map(PathBuf::from).unwrap_or(p.clone());
+        let mut c = Command::new("xdg-open");
+        c.arg(dir);
+        c
+    };
+    cmd.spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
