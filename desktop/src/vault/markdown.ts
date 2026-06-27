@@ -53,14 +53,22 @@ export function renderLiveHtml(src: string, accent = '#3d63dd', fmStyle: Frontma
   // editable code-fence divs, so the source round-trips byte-for-byte.
   let inDiagram = false;
   let diagramSrc: string[] = [];
-  // A run of consecutive table-row lines is grouped under one `.tbl-wrap`
-  // element so the table (and only the table) can scroll horizontally without
-  // squashing cells. `readLive`/caret helpers flatten this wrapper so each row
-  // still maps 1:1 to a source line.
+  // When a fence opens with a recognized language (```tsx, ```python, …) we hold
+  // its per-line syntax highlighter here and apply it to each body line; null for
+  // plain/unknown fences (which stay un-highlighted).
+  let fenceHi: ((raw: string) => string) | null = null;
+  // A run of consecutive table-row lines is grouped under one `.tbl-scroll`
+  // region wrapping an inner `.tbl-grid` (a CSS `display:table` box) so columns
+  // ALIGN across rows while only the table scrolls horizontally — without
+  // squashing cells or widening the prose. A trailing `.tbl-pad` spacer (a
+  // sibling of the grid, NOT a row) gives a content-width table some extra
+  // scroll room on the right. `readLive`/caret helpers descend through BOTH
+  // wrappers (and skip the spacer) so each `.tbl-row` still maps 1:1 to a
+  // source line.
   let inTable = false;
   const closeTable = () => {
     if (inTable) {
-      html += '</div>';
+      html += '</div><div class="tbl-pad" contenteditable="false" aria-hidden="true"></div></div>';
       inTable = false;
     }
   };
@@ -114,20 +122,31 @@ export function renderLiveHtml(src: string, accent = '#3d63dd', fmStyle: Frontma
       inFence = !inFence;
       html += div('', 'background:var(--bg-input);padding:4px 14px;border-radius:' + (inFence ? '9px 9px 0 0' : '0 0 9px 9px'), mk(esc(ln)));
       if (opening) {
-        if (isDiagramLang(fenceInfo(ln))) {
+        const info = fenceInfo(ln);
+        if (isDiagramLang(info)) {
           inDiagram = true;
           diagramSrc = [];
+        } else {
+          const key = fenceLang(info);
+          fenceHi = key === 'txt' ? null : lineHighlighterFor(key);
         }
-      } else if (inDiagram) {
-        // Closing a diagram fence: append the (skipped) rendered preview element.
-        html += diagramPreviewHtml(diagramSrc.join('\n'));
-        inDiagram = false;
+      } else {
+        if (inDiagram) {
+          // Closing a diagram fence: append the (skipped) rendered preview.
+          html += diagramPreviewHtml(diagramSrc.join('\n'));
+          inDiagram = false;
+        }
+        fenceHi = null;
       }
       continue;
     }
     if (inFence) {
       if (inDiagram) diagramSrc.push(ln);
-      html += div('', 'font-family:JetBrains Mono,monospace;font-size:13.5px;color:var(--text2);background:var(--bg-input);padding:1px 14px', esc(ln) || '<br>');
+      // Highlight recognized-language bodies; plain fences and diagram source
+      // stay literal. The highlighter preserves textContent, so readLive still
+      // round-trips the source byte-for-byte.
+      const inner = !inDiagram && fenceHi ? fenceHi(ln) : esc(ln);
+      html += div('', 'font-family:JetBrains Mono,monospace;font-size:13.5px;color:var(--text2);background:var(--bg-input);padding:1px 14px', inner || '<br>');
       continue;
     }
     if (/^\s*\|.*\|\s*$/.test(ln)) {
@@ -144,7 +163,7 @@ export function renderLiveHtml(src: string, accent = '#3d63dd', fmStyle: Frontma
       }
       const cls = isSep ? 'tbl-row tbl-sep' : isHeader ? 'tbl-row tbl-head' : 'tbl-row';
       if (!inTable) {
-        html += '<div class="tbl-wrap">';
+        html += '<div class="tbl-scroll"><div class="tbl-grid">';
         inTable = true;
       }
       html += '<div class="' + cls + '">' + cells + '</div>';
@@ -403,10 +422,35 @@ function cssLine(raw: string): string {
   return out;
 }
 
+// Map a fenced-code info string (```tsx, ```python, ```rust …) to a highlighter
+// language key. Returns 'txt' for none/unknown, so callers can skip highlighting.
+export function fenceLang(info: string): string {
+  const w = (String(info || '').trim().toLowerCase().match(/^[a-z0-9+#.]+/) || [''])[0];
+  if (['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'javascript', 'typescript'].includes(w)) return 'js';
+  if (['py', 'python'].includes(w)) return 'py';
+  if (['rs', 'rust'].includes(w)) return 'rs';
+  if (['sh', 'bash', 'zsh', 'shell', 'console'].includes(w)) return 'sh';
+  if (['yml', 'yaml'].includes(w)) return 'yaml';
+  if (w === 'toml') return 'toml';
+  if (w === 'sql') return 'sql';
+  if (['json', 'jsonc', 'json5'].includes(w)) return 'json';
+  if (['html', 'htm', 'xml', 'svg', 'vue'].includes(w)) return 'html';
+  if (['css', 'scss', 'sass', 'less'].includes(w)) return 'css';
+  return 'txt';
+}
+
+// One per-line highlighter for a resolved language key — shared by the code-file
+// view and markdown fenced blocks. Every line it emits preserves textContent
+// verbatim (only wraps substrings in spans), so the editor reads the source back
+// out of the DOM unchanged.
+function lineHighlighterFor(langKey: string): (raw: string) => string {
+  const cfg = LANGS[langKey] || LANGS.txt;
+  const reSrc = langKey === 'html' || langKey === 'css' ? '' : buildRe(cfg);
+  return langKey === 'html' ? htmlLine : langKey === 'css' ? cssLine : (raw: string) => genericLine(raw, cfg, reSrc);
+}
+
 export function renderCodeHtml(src: string, lang: string): string {
-  const cfg = LANGS[lang] || LANGS.txt;
-  const reSrc = lang === 'html' || lang === 'css' ? '' : buildRe(cfg);
-  const line = lang === 'html' ? htmlLine : lang === 'css' ? cssLine : (raw: string) => genericLine(raw, cfg, reSrc);
+  const line = lineHighlighterFor(lang);
   return String(src)
     .replace(/\r/g, '')
     .split('\n')
@@ -423,11 +467,14 @@ export function renderDoc(src: string, path: string, accent: string, fmStyle: Fr
   return isCodeFile(path) ? renderCodeHtml(src, langOf(path)) : renderLiveHtml(src, accent, fmStyle);
 }
 
-// The editor's line nodes, flattening any `.tbl-wrap` grouping back into its
-// constituent `.tbl-row` children. Tables render as a single top-level wrapper
-// (so only the table scrolls horizontally), but each row is still exactly one
-// source line — so callers walk this flattened list to keep the strict 1:1
-// line↔node mapping the source reconstruction and caret math depend on.
+// The editor's line nodes, flattening any `.tbl-scroll` table grouping back into
+// its constituent `.tbl-row` children. Tables render as a single top-level
+// `.tbl-scroll > .tbl-grid > .tbl-row` nesting (so only the table scrolls
+// horizontally and its columns align), but each row is still exactly one source
+// line — so callers walk this flattened list to keep the strict 1:1 line↔node
+// mapping the source reconstruction and caret math depend on. We descend through
+// BOTH wrappers to the grid and expose ONLY its `.tbl-row` children; the trailing
+// `.tbl-pad` scroll spacer is a sibling of the grid and maps to no source line.
 function lineNodes(el: HTMLElement): ChildNode[] {
   const out: ChildNode[] = [];
   el.childNodes.forEach((n) => {
@@ -435,8 +482,9 @@ function lineNodes(el: HTMLElement): ChildNode[] {
     // NO source line — skip it entirely so readLive/caretOffset/setCaret treat it
     // as if it weren't there (zero lines, zero characters).
     if (n.nodeType === 1 && (n as HTMLElement).classList?.contains('md-diagram')) return;
-    if (n.nodeType === 1 && (n as HTMLElement).classList?.contains('tbl-wrap')) {
-      n.childNodes.forEach((r) => out.push(r));
+    if (n.nodeType === 1 && (n as HTMLElement).classList?.contains('tbl-scroll')) {
+      const grid = (n as HTMLElement).querySelector('.tbl-grid');
+      if (grid) grid.childNodes.forEach((r) => out.push(r));
     } else {
       out.push(n);
     }

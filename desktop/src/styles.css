@@ -77,19 +77,24 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
 }
 .cm-task-done .cm-body { color: var(--faint); text-decoration: line-through; }
 
-/* Markdown tables. A wide table scrolls horizontally inside its own `.tbl-wrap`
-   region so cells show full content instead of squashing, while the surrounding
-   prose keeps its normal width. */
-.tbl-wrap { overflow-x: auto; max-width: 100%; margin-top: 16px; }
-.tbl-row { display: flex; width: max-content; min-width: 100%; border-left: 1px solid var(--line); }
-.tbl-row .tcell {
-  flex: 1 0 auto; min-width: 120px; padding: 6px 13px; border-right: 1px solid var(--line);
-  border-bottom: 1px solid var(--line); font-size: 14px; line-height: 1.5;
-  white-space: nowrap;
+/* Markdown tables. A wide table scrolls horizontally as a unit inside its own
+   `.tbl-scroll` region (so cells show full content instead of squashing) while
+   the surrounding prose keeps its normal width. The inner `.tbl-grid` is a CSS
+   `display:table` box so every column ALIGNS across all rows. The scroll region
+   is a flex row [grid | spacer]: the `.tbl-pad` spacer is always laid out to the
+   grid's right, so even a content-width table has extra room to scroll right
+   while staying left-aligned with the prose. */
+.tbl-scroll { overflow-x: auto; max-width: 100%; margin-top: 16px; display: flex; align-items: flex-start; }
+.tbl-grid { display: table; min-width: 100%; border-collapse: collapse; flex: 0 0 auto; }
+.tbl-row { display: table-row; }
+.tcell {
+  display: table-cell; padding: 6px 13px; border: 1px solid var(--line);
+  font-size: 14px; line-height: 1.5; white-space: nowrap; vertical-align: top;
 }
-.tbl-head { border-top: 1px solid var(--line); }
 .tbl-head .tcell { font-weight: 600; background: var(--bg-input); }
-.tbl-sep { height: 0; line-height: 0; overflow: hidden; border: none; }
+.tbl-sep { line-height: 0; }
+.tbl-sep .tcell { padding: 0; border: 0; height: 0; line-height: 0; font-size: 0; }
+.tbl-pad { flex: 0 0 64px; align-self: stretch; }
 
 /* Rendered diagram preview. A ```mermaid / ```diagram fence keeps its editable
    source above; this contenteditable=false block (skipped by the line walkers)
