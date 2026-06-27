@@ -3,6 +3,7 @@
 // track (pan, scrub, zoom, jump-to-event); Log shows real sync events derived
 // from history() + live status. All color is theme-driven via CSS variables.
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { api } from '../lib/api';
 import type { HistEvent, VaultStatus } from '../lib/api';
 import {
   axisTicksFor,
@@ -61,6 +62,28 @@ export default function HistoryBar(props: HistoryBarProps) {
 
   const [logCopied, setLogCopied] = useState(false);
   const [logCtx, setLogCtx] = useState<{ x: number; y: number; line: string } | null>(null);
+
+  // Location path: single click copies the full path (with brief feedback),
+  // double click reveals it in the OS file manager. A short timer on the single
+  // click lets a following dblclick cancel it so a reveal never also copies.
+  const [pathCopied, setPathCopied] = useState(false);
+  const clickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onPathClick = () => {
+    if (clickTimer.current) clearTimeout(clickTimer.current);
+    clickTimer.current = setTimeout(() => {
+      clickTimer.current = null;
+      copy(location);
+      setPathCopied(true);
+      setTimeout(() => setPathCopied(false), 1200);
+    }, 250);
+  };
+  const onPathDouble = () => {
+    if (clickTimer.current) {
+      clearTimeout(clickTimer.current);
+      clickTimer.current = null;
+    }
+    void api.revealPath(location);
+  };
 
   // ---- geometry ----
   const span = view.end - view.start;
@@ -185,7 +208,12 @@ export default function HistoryBar(props: HistoryBarProps) {
         <span style={{ display: 'inline-flex', flex: 'none', color: 'var(--faint2)' }}>
           {locationIsPath ? <Icon.FolderIcon size={12} stroke="var(--faint2)" /> : <Icon.GlobeIcon size={12} stroke="var(--faint2)" />}
         </span>
-        <span style={{ fontFamily: locationIsPath ? "'JetBrains Mono', monospace" : 'inherit', fontSize: 12, color: 'var(--text2)', maxWidth: 190, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{location}</span>
+        <span
+          onClick={locationIsPath ? onPathClick : undefined}
+          onDoubleClick={locationIsPath ? onPathDouble : undefined}
+          title={locationIsPath ? 'Click to copy path · double-click to reveal in file manager' : undefined}
+          style={{ fontFamily: locationIsPath ? "'JetBrains Mono', monospace" : 'inherit', fontSize: 12, color: pathCopied ? accent : 'var(--text2)', maxWidth: 190, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: locationIsPath ? 'pointer' : 'default' }}
+        >{locationIsPath && pathCopied ? 'Copied path' : location}</span>
         <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10.5, color: 'var(--faint2)', flex: 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{fingerprint}</span>
         {timeTravel && (
           <span style={{ fontSize: 11, fontFamily: "'JetBrains Mono', monospace", padding: '2px 9px', borderRadius: 20, flex: 'none', background: accentSoft, color: accent, fontWeight: 500 }}>{fmtFull(playT)}</span>

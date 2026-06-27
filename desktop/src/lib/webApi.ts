@@ -236,5 +236,8 @@ export function createWebApi(): Api {
     authorize: async () => {},
     createSnapshot: async () => '',
     restore: async () => {},
+
+    // No native file manager in the browser — revealing a folder is a no-op.
+    revealPath: async () => {},
   };
 }

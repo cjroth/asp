@@ -1,8 +1,11 @@
-import { cleanup, fireEvent, render } from '@testing-library/react';
+import { act, cleanup, fireEvent, render } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HistEvent, VaultStatus } from '../lib/api';
 import { buildEvents } from './history';
 import HistoryBar, { type HistoryBarProps } from './HistoryBar';
+
+const revealPath = vi.fn(async () => {});
+vi.mock('../lib/api', () => ({ api: { revealPath: (...a: unknown[]) => revealPath(...(a as [])) } }));
 
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 
@@ -108,6 +111,54 @@ describe('HistoryBar', () => {
   it('renders the time-travel pill and visible-row ratio when scrubbing', () => {
     const { getByText } = render(<HistoryBar {...props({ timeTravel: true, playhead: NOW - 600000 })} />);
     expect(getByText(/\/ 4 rows/)).toBeTruthy();
+  });
+
+  it('single-clicks the location path to copy it (with feedback), without revealing', () => {
+    vi.useFakeTimers();
+    revealPath.mockClear();
+    const writeText = vi.fn();
+    Object.assign(navigator, { clipboard: { writeText } });
+    const { getByText, queryByText } = render(<HistoryBar {...props({ location: '/home/me/vault' })} />);
+
+    fireEvent.click(getByText('/home/me/vault'));
+    act(() => vi.advanceTimersByTime(250)); // single-click timer fires (no dblclick cancelled it)
+    expect(writeText).toHaveBeenCalledWith('/home/me/vault');
+    expect(revealPath).not.toHaveBeenCalled();
+    expect(getByText('Copied path')).toBeTruthy();
+
+    act(() => vi.advanceTimersByTime(1200)); // feedback reverts
+    expect(queryByText('Copied path')).toBeNull();
+    expect(getByText('/home/me/vault')).toBeTruthy();
+  });
+
+  it('double-clicks the location path to reveal it in the file manager (no copy)', () => {
+    vi.useFakeTimers();
+    revealPath.mockClear();
+    const writeText = vi.fn();
+    Object.assign(navigator, { clipboard: { writeText } });
+    const { getByText } = render(<HistoryBar {...props({ location: '/home/me/vault' })} />);
+
+    const span = getByText('/home/me/vault');
+    fireEvent.click(span);
+    fireEvent.doubleClick(span); // cancels the pending single-click copy
+    act(() => vi.advanceTimersByTime(500));
+    expect(revealPath).toHaveBeenCalledWith('/home/me/vault');
+    expect(writeText).not.toHaveBeenCalled();
+  });
+
+  it('does not attach copy/reveal behavior in web mode (locationIsPath=false)', () => {
+    vi.useFakeTimers();
+    revealPath.mockClear();
+    const writeText = vi.fn();
+    Object.assign(navigator, { clipboard: { writeText } });
+    const { getByText } = render(<HistoryBar {...props({ locationIsPath: false, location: 'web vault' })} />);
+
+    const span = getByText('web vault');
+    fireEvent.click(span);
+    fireEvent.doubleClick(span);
+    act(() => vi.advanceTimersByTime(500));
+    expect(writeText).not.toHaveBeenCalled();
+    expect(revealPath).not.toHaveBeenCalled();
   });
 
   it('swallows clipboard errors when copying the log', () => {

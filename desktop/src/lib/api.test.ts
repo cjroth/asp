@@ -76,6 +76,9 @@ describe('api — thin Tauri command surface', () => {
 
     await api.removeVault('id', true);
     expect(invoke).toHaveBeenCalledWith('remove_vault', { id: 'id', trash: true });
+
+    await api.revealPath('/p');
+    expect(invoke).toHaveBeenCalledWith('reveal_path', { path: '/p' });
   });
 
   it('createVault is rejected on desktop (web-only)', async () => {
