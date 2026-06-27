@@ -63,18 +63,27 @@ export default function LiveEditor(props: LiveEditorProps) {
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    if (paintedKey.current === paintKey) return;
-    paintedKey.current = paintKey;
-    el.contentEditable = readOnly ? 'false' : 'true';
-    el.style.opacity = readOnly ? '0.92' : '1';
-    if (rehlTimer.current) clearTimeout(rehlTimer.current);
-    if (notExist) {
-      el.innerHTML = '<div style="color:var(--faint2); font-style:italic">This file did not exist at this point in time.</div>';
-    } else {
-      el.innerHTML = renderDoc(source, path, accent, frontmatterStyle);
-      lineCount.current = source.split('\n').length;
-      paintDiagrams(el);
+    if (paintedKey.current !== paintKey) {
+      paintedKey.current = paintKey;
+      el.contentEditable = readOnly ? 'false' : 'true';
+      el.style.opacity = readOnly ? '0.92' : '1';
+      if (rehlTimer.current) clearTimeout(rehlTimer.current);
+      if (notExist) {
+        el.innerHTML = '<div style="color:var(--faint2); font-style:italic">This file did not exist at this point in time.</div>';
+      } else {
+        el.innerHTML = renderDoc(source, path, accent, frontmatterStyle);
+        lineCount.current = source.split('\n').length;
+      }
     }
+    // Always (re)schedule the diagram render — even when the repaint above is
+    // skipped for an unchanged paintKey. React 18 StrictMode runs effects
+    // setup→cleanup→setup in dev: the cleanup effect below clears the pending
+    // diagram timer BETWEEN the two setups, and the guarded repaint won't re-arm
+    // it on the second setup. Scheduling here unconditionally re-arms it, so the
+    // SVG renders instead of staying stuck on its <pre> code fallback. It only
+    // touches contenteditable=false `.md-diagram` nodes and is a no-op once every
+    // diagram is rendered, so the caret and repaint behavior are unaffected.
+    if (!notExist) paintDiagrams(el);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paintKey, source, readOnly, notExist, accent, path, frontmatterStyle]);
 

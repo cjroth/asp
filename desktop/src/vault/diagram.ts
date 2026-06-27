@@ -114,8 +114,11 @@ export async function renderDiagrams(root: ParentNode, load: MermaidLoader): Pro
       svgCache.set(src, svg);
       node.innerHTML = svg;
       node.setAttribute('data-diagram-rendered', src);
-    } catch {
-      // Invalid diagram: leave the `<pre>` source fallback untouched.
+    } catch (err) {
+      // Invalid diagram: leave the `<pre>` source fallback untouched, but surface
+      // the failure so genuine diagram-syntax errors stay debuggable instead of
+      // silently showing raw source.
+      console.warn('[md-diagram] mermaid render failed:', err);
     }
   }
 }

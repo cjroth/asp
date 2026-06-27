@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render } from '@testing-library/react';
+import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { _clearDiagramCache } from './diagram';
 import LiveEditor, { type LiveEditorProps } from './LiveEditor';
@@ -217,6 +218,29 @@ describe('LiveEditor', () => {
     expect(el.querySelector('.md-diagram svg')).not.toBeNull();
     expect(mockRender).toHaveBeenCalledWith(expect.any(String), 'graph TD\nA --> B');
     expect(readLive(el)).toBe(src); // still exact after the SVG is injected
+  });
+
+  // Regression: the real app mounts the editor inside <React.StrictMode>, whose
+  // dev-mode double-invoke runs effects setup→cleanup→setup. The diagram-render
+  // timer was armed by the (paintKey-guarded) paint effect on the FIRST setup,
+  // then cleared by the `[]` unmount-cleanup effect during the simulated unmount,
+  // and never re-armed on the SECOND setup (guard short-circuits it) — so the
+  // diagram stayed stuck on its <pre> code fallback in the browser. Rendering the
+  // editor under StrictMode here reproduces that ordering; the SVG must still
+  // appear after the debounce.
+  it('renders the diagram even under React.StrictMode (timer survives the double-invoke)', async () => {
+    const src = '```mermaid\nflowchart LR\nA --> B\n```';
+    const { getByTestId } = render(
+      <React.StrictMode>
+        <LiveEditor {...props({ source: src })} />
+      </React.StrictMode>,
+    );
+    const el = getByTestId('live-editor');
+    expect(el.querySelector('.md-diagram')).not.toBeNull();
+    expect(el.querySelector('.md-diagram svg')).toBeNull(); // fallback first
+    await vi.advanceTimersByTimeAsync(200);
+    expect(el.querySelector('.md-diagram svg')).not.toBeNull();
+    expect(readLive(el)).toBe(src); // source still round-trips exactly
   });
 
   it('replays the cached SVG synchronously on a re-render (no flicker, no re-parse)', async () => {
