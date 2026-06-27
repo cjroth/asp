@@ -6,6 +6,7 @@
   "scripts": {
     "dev:web": "vite",
     "build:web": "vite build",
+    "build:wasm": "node ../../sdks/typescript/scripts/build-wasm.mjs",
     "typecheck": "tsc --noEmit",
     "dev": "tauri dev",
     "build": "tauri build"
