@@ -46,6 +46,30 @@ export default function FileTree(props: FileTreeProps) {
     return () => window.removeEventListener('resize', measure);
   }, []);
 
+  // Keep the selected file visible: when the selection (or the row set) changes,
+  // scroll it into view if it's outside the viewport. Without this, creating a
+  // file in a huge vault selects a row that's scrolled off-screen — it looks like
+  // "nothing happened".
+  useEffect(() => {
+    if (!selectedPath) return;
+    const el = containerRef.current;
+    if (!el) return;
+    const idx = rows.findIndex((r) => r.node.type === 'file' && r.node.path === selectedPath);
+    if (idx < 0) return;
+    const rowTop = idx * ROW_H;
+    const rowBottom = rowTop + ROW_H;
+    const viewTop = el.scrollTop;
+    const viewBottom = viewTop + (el.clientHeight || height);
+    if (rowTop < viewTop) {
+      el.scrollTop = rowTop;
+      setScrollTop(rowTop);
+    } else if (rowBottom > viewBottom) {
+      const nt = rowBottom - (el.clientHeight || height);
+      el.scrollTop = nt;
+      setScrollTop(nt);
+    }
+  }, [selectedPath, rows, height]);
+
   const total = rows.length;
   const start = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
   const end = Math.min(total, Math.ceil((scrollTop + height) / ROW_H) + OVERSCAN);

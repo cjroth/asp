@@ -389,13 +389,30 @@ export default function App() {
   const newFile = useCallback(async () => {
     const id = activeIdRef.current;
     if (!id) return;
-    await flushSave();
+    // Reserve the name + show the file SYNCHRONOUSLY (before any await), so a
+    // rapid second click sees it and picks a different name instead of colliding
+    // on the same "untitled.md" (the "adds every other time" bug). Capture the
+    // outgoing file's edits to flush, since we're changing the selection now.
     const name = freeUntitledName(filesRef.current.map((f) => f.path));
-    await api.writeFile(id, name, `# ${name.replace(/\.md$/, '')}\n\n`);
+    const prevPath = selectedRef.current;
+    const prevDirty = dirtyRef.current;
+    const prevBuf = bufferRef.current;
+    const content = `# ${name.replace(/\.md$/, '')}\n\n`;
+    const next = [...filesRef.current, { path: name, file_id: name, is_dir: false, merge_class: 'text' }];
+    filesRef.current = next;
+    setFiles(next);
     setSelectedPath(name);
-    await refreshFiles(id);
+    dirtyRef.current = false;
+    bufferRef.current = content;
+    // Persist: flush the previous file's edits, then create the new one.
+    try {
+      if (prevDirty && prevPath) await api.writeFile(id, prevPath, prevBuf);
+      await api.writeFile(id, name, content);
+    } catch (err) {
+      console.error('new file failed', err);
+    }
     scheduleHistory(id);
-  }, [flushSave, refreshFiles, scheduleHistory]);
+  }, [scheduleHistory]);
 
   const commitRename = useCallback(
     async (oldPath: string, rawName: string) => {
@@ -415,7 +432,12 @@ export default function App() {
       for (const a of affected) {
         await api.renameFile(id, a.path, newPath + a.path.slice(oldPath.length));
       }
-      await refreshFiles(id);
+      // Optimistic: remap the affected paths in place instead of refetching all.
+      const next = filesRef.current.map((f) =>
+        f.path === oldPath || f.path.startsWith(oldPath + '/') ? { ...f, path: newPath + f.path.slice(oldPath.length) } : f,
+      );
+      filesRef.current = next;
+      setFiles(next);
       scheduleHistory(id);
       setExpanded((e) => {
         const next: Record<string, boolean> = {};
@@ -449,13 +471,16 @@ export default function App() {
       } else {
         await api.deleteFile(id, path);
       }
-      const fs = await refreshFiles(id);
+      // Optimistic: drop the deleted subtree from the in-memory list.
+      const next = filesRef.current.filter((f) => !(f.path === path || f.path.startsWith(path + '/')));
+      filesRef.current = next;
+      setFiles(next);
       scheduleHistory(id);
       if (sel && (sel === path || sel.startsWith(path + '/'))) {
-        setSelectedPath(firstSelectable(buildTree(fs)));
+        setSelectedPath(firstSelectable(buildTree(next)));
       }
     },
-    [refreshFiles, scheduleHistory],
+    [scheduleHistory],
   );
 
   const openCtx = useCallback((e: React.MouseEvent, node: { path: string; isDir: boolean; name: string }) => {
@@ -697,14 +722,18 @@ export default function App() {
 
   const visibleRows = filterTs == null ? events.length : events.filter((e) => e.ts <= filterTs).length;
 
-  const ticks = events
-    .filter((e) => e.ts >= view2.start - span * 0.03 && e.ts <= view2.end + span * 0.03)
-    .map((e) => ({
-      title: `${e.kind} · ${e.path} · ${fmtFull(e.ts)}`,
-      pct: toPct(e.ts, view2),
-      color: colorOf(e.kind),
-      past: e.ts <= playT,
-    }));
+  // Cap the number of rendered tick DOM nodes: a vault import creates one event
+  // per file (thousands), all clustered at the same instant — rendering them all
+  // is a needless render bomb (they overlap into the same pixel anyway).
+  const inView = events.filter((e) => e.ts >= view2.start - span * 0.03 && e.ts <= view2.end + span * 0.03);
+  const MAX_TICKS = 240;
+  const sampled = inView.length > MAX_TICKS ? inView.filter((_, i) => i % Math.ceil(inView.length / MAX_TICKS) === 0) : inView;
+  const ticks = sampled.map((e) => ({
+    title: `${e.kind} · ${e.path} · ${fmtFull(e.ts)}`,
+    pct: toPct(e.ts, view2),
+    color: colorOf(e.kind),
+    past: e.ts <= playT,
+  }));
 
   const playPct = Math.max(0, Math.min(100, toPct(playT, view2)));
   const nowPct = Math.max(0, Math.min(100, toPct(now, view2)));
