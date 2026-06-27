@@ -95,6 +95,26 @@ describe('FileTree', () => {
     expect(onRenameCommit).toHaveBeenCalled();
   });
 
+  it('highlights every file in selectedPaths and passes the mouse event to onRowClick', () => {
+    const onRowClick = vi.fn();
+    const paths = ['a.md', 'b.md', 'c.md'];
+    const rows = rowsFor(paths, {});
+    const { container } = render(
+      <FileTree {...props(rows, 'a.md', {}, { selectedPaths: new Set(['a.md', 'c.md']), accentSoft: '#abcdef', onRowClick })} />,
+    );
+    const highlighted = (Array.from(container.querySelectorAll('.asp-hover-row')) as HTMLElement[]).filter(
+      (r) => r.style.background === 'rgb(171, 205, 239)', // #abcdef
+    );
+    // a.md (active) + c.md (selected) highlighted; b.md is not.
+    expect(highlighted.map((r) => r.textContent)).toEqual(['a.md', 'c.md']);
+
+    // A modifier-click forwards the original MouseEvent (so App can read meta/shift).
+    fireEvent.click(container.querySelector('.asp-hover-row') as HTMLElement, { metaKey: true });
+    expect(onRowClick).toHaveBeenCalled();
+    expect(onRowClick.mock.calls[0][1]).toBeTruthy(); // the event object
+    expect(onRowClick.mock.calls[0][1].metaKey).toBe(true);
+  });
+
   it('uses ResizeObserver when available (observe + disconnect on unmount)', () => {
     const observe = vi.fn();
     const disconnect = vi.fn();

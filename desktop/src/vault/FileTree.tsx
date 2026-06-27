@@ -15,6 +15,10 @@ const OVERSCAN = 8;
 export interface FileTreeProps {
   rows: FlatRow[];
   selectedPath: string | null;
+  // Every file path in the current multi-selection (includes selectedPath). The
+  // single-select case is just a one-element set. Optional so callers that only
+  // care about the active file (and tests) can omit it.
+  selectedPaths?: Set<string>;
   expanded: Record<string, boolean>;
   renaming: string | null;
   renameValue: string;
@@ -23,15 +27,18 @@ export interface FileTreeProps {
   prettyNames: boolean;
   ctxTargetPath: string | null;
   onEmptyContext?: (e: React.MouseEvent) => void;
-  onRowClick: (row: FlatRow) => void;
+  onRowClick: (row: FlatRow, e: React.MouseEvent) => void;
   onRowContext: (e: React.MouseEvent, node: { path: string; isDir: boolean; name: string }) => void;
   onRenameChange: (v: string) => void;
   onRenameKey: (e: React.KeyboardEvent, path: string) => void;
   onRenameCommit: (path: string) => void;
 }
 
+const EMPTY_SET: ReadonlySet<string> = new Set();
+
 export default function FileTree(props: FileTreeProps) {
   const { rows, selectedPath, expanded, renaming, renameValue, accent, accentSoft, prettyNames, ctxTargetPath } = props;
+  const selectedPaths = props.selectedPaths ?? EMPTY_SET;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [height, setHeight] = useState(400);
@@ -96,6 +103,9 @@ export default function FileTree(props: FileTreeProps) {
           const top = (start + i) * ROW_H;
           const isDir = node.type === 'dir';
           const isActive = !isDir && node.path === selectedPath;
+          // Highlighted if it's the active file OR any member of the multi-selection.
+          // Active stays "primary" (drives text color / weight / icon accent below).
+          const isSelected = isActive || (!isDir && selectedPaths.has(node.path));
           const isRenaming = renaming === node.path;
           const hidden = isHidden(node.name);
           const pretty = prettyNames ? prettyName(node.name, isDir) : { label: node.name, italic: false };
@@ -104,7 +114,7 @@ export default function FileTree(props: FileTreeProps) {
             <div
               key={node.path}
               className="asp-hover-row"
-              onClick={() => props.onRowClick({ node, depth })}
+              onClick={(e) => props.onRowClick({ node, depth }, e)}
               onContextMenu={(e) => props.onRowContext(e, { path: node.path, isDir, name: node.name })}
               style={{
                 position: 'absolute',
@@ -125,7 +135,7 @@ export default function FileTree(props: FileTreeProps) {
                 fontStyle: hidden || pretty.italic ? 'italic' : 'normal',
                 boxSizing: 'border-box',
                 color,
-                background: isActive ? accentSoft : 'transparent',
+                background: isSelected ? accentSoft : 'transparent',
                 boxShadow: node.path === ctxTargetPath ? `inset 0 0 0 1.5px ${accent}` : 'none',
               }}
             >

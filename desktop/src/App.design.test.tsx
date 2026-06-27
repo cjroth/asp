@@ -273,6 +273,83 @@ describe('App — editor', () => {
   });
 });
 
+describe('App — multi-selection', () => {
+  beforeEach(async () => { render(<App />); await openVault(); });
+
+  // Tree rows are .asp-hover-row; the breadcrumb is not, so match exact text.
+  const treeRow = (name: string) =>
+    (Array.from(document.querySelectorAll('.asp-hover-row')) as HTMLElement[]).find((r) => r.textContent === name)!;
+  const isHL = (el: HTMLElement) => el.style.background !== '' && el.style.background !== 'transparent';
+  const hlCount = () => (Array.from(document.querySelectorAll('.asp-hover-row')) as HTMLElement[]).filter(isHL).length;
+
+  it('plain click selects exactly one file (clears any multi-selection)', async () => {
+    await screen.findByTestId('live-editor'); // README auto-selected
+    fireEvent.click(treeRow('TODO.md'), { metaKey: true }); // README + TODO
+    fireEvent.click(treeRow('README.md')); // plain → only README
+    expect(isHL(treeRow('README.md'))).toBe(true);
+    expect(isHL(treeRow('TODO.md'))).toBe(false);
+  });
+
+  it('cmd/ctrl-click toggles a file in and out without losing the others', async () => {
+    await screen.findByTestId('live-editor');
+    expect(isHL(treeRow('README.md'))).toBe(true);
+    expect(isHL(treeRow('TODO.md'))).toBe(false);
+    // add TODO
+    fireEvent.click(treeRow('TODO.md'), { metaKey: true });
+    expect(isHL(treeRow('TODO.md'))).toBe(true);
+    expect(isHL(treeRow('README.md'))).toBe(true); // others kept
+    // ctrl-click removes it again
+    fireEvent.click(treeRow('TODO.md'), { ctrlKey: true });
+    expect(isHL(treeRow('TODO.md'))).toBe(false);
+    expect(isHL(treeRow('README.md'))).toBe(true);
+  });
+
+  it('shift-click selects a range from the anchor across the visible rows', async () => {
+    await screen.findByTestId('live-editor');
+    fireEvent.click(treeRow('notes')); // expand → reveals notes/a.md
+    await screen.findByText('a.md');
+    // anchor is README (default). Shift-click a.md → README, TODO, a.md all selected.
+    fireEvent.click(treeRow('a.md'), { shiftKey: true });
+    expect(isHL(treeRow('README.md'))).toBe(true);
+    expect(isHL(treeRow('TODO.md'))).toBe(true);
+    expect(isHL(treeRow('a.md'))).toBe(true);
+  });
+
+  it('cmd-clicking the active file moves the editor to a remaining selected file', async () => {
+    await screen.findByTestId('live-editor');
+    fireEvent.click(treeRow('TODO.md'), { metaKey: true }); // add TODO → it becomes active
+    await waitFor(() => expect(screen.getAllByText('TODO.md').length).toBeGreaterThanOrEqual(2)); // breadcrumb = active
+    fireEvent.click(treeRow('TODO.md'), { ctrlKey: true }); // deselect the active file
+    // Editor falls back to the still-selected README (breadcrumb shows it again).
+    await waitFor(() => expect(screen.getAllByText('README.md').length).toBeGreaterThanOrEqual(2));
+  });
+
+  it('batch-deletes every selected file via a selected row context menu', async () => {
+    await screen.findByTestId('live-editor');
+    fireEvent.click(treeRow('TODO.md'), { metaKey: true }); // README + TODO selected
+    fireEvent.contextMenu(treeRow('TODO.md')); // right-click a member of the selection
+    fireEvent.click(await screen.findByText('Delete'));
+    await waitFor(() => expect(deleteFile).toHaveBeenCalledWith('v1', 'README.md'));
+    await waitFor(() => expect(deleteFile).toHaveBeenCalledWith('v1', 'TODO.md'));
+  });
+
+  it('batch-deletes the selection with the Delete key', async () => {
+    await screen.findByTestId('live-editor');
+    fireEvent.click(treeRow('TODO.md'), { metaKey: true });
+    fireEvent.keyDown(document.body, { key: 'Delete' });
+    await waitFor(() => expect(deleteFile).toHaveBeenCalledWith('v1', 'README.md'));
+    await waitFor(() => expect(deleteFile).toHaveBeenCalledWith('v1', 'TODO.md'));
+  });
+
+  it('Escape collapses a multi-selection back to the single active file', async () => {
+    await screen.findByTestId('live-editor');
+    fireEvent.click(treeRow('TODO.md'), { metaKey: true }); // README + TODO highlighted
+    expect(hlCount()).toBe(2);
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(hlCount()).toBe(1); // collapsed to just the active file
+  });
+});
+
 describe('App — empty + edge states', () => {
   it('shows the empty editor state and saving indicator', async () => {
     render(<App />);
