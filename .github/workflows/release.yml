@@ -121,10 +121,49 @@ jobs:
           generate_release_notes: true
 
   # ---------------------------------------------------------------------------
+  # Build the engine to wasm ONCE, on Linux, and share it with every consumer.
+  #
+  # The wasm packages are platform-independent (.wasm + JS glue), but BUILDING
+  # them is not: asp-core's deps (ring, via iroh/quinn/rustls) compile C to the
+  # wasm32 target with clang, and only Linux's LLVM clang has that target —
+  # Apple's clang and the Windows toolchain do not. So we build here and pass
+  # the result downstream as an artifact instead of rebuilding per platform.
+  # ---------------------------------------------------------------------------
+  wasm:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+      - uses: actions-rust-lang/setup-rust-toolchain@fb51252c7ba57d633bc668f941da052e410add48 # v1.13.0
+        with:
+          target: wasm32-unknown-unknown
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@d0f4f69b07c0804d1003ca9a5a5f853423872ed9 # v2.62.13
+        with:
+          tool: wasm-pack
+      - name: Build the engine to wasm (nodejs + web)
+        run: cd sdks/typescript && bun run build:wasm
+      - name: Upload the wasm packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wasm-pkgs
+          # LCA of these two paths is crates/asp-wasm, so the artifact holds
+          # pkg/** and pkg-web/**; consumers restore it to that same dir.
+          path: |
+            crates/asp-wasm/pkg
+            crates/asp-wasm/pkg-web
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
   # Desktop app — Tauri installers for macOS, Windows, Linux.
   # ---------------------------------------------------------------------------
   desktop:
-    needs: prepare
+    needs: [prepare, wasm]
     permissions:
       contents: write
     strategy:
@@ -133,7 +172,7 @@ jobs:
         include:
           - name: linux
             os: ubuntu-22.04
-            rust_targets: wasm32-unknown-unknown
+            rust_targets: ""
             tauri_args: ""
             bundle_glob: |
               desktop/src-tauri/target/release/bundle/deb/*.deb
@@ -141,7 +180,7 @@ jobs:
               desktop/src-tauri/target/release/bundle/appimage/*.AppImage
           - name: macos
             os: macos-14
-            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin,wasm32-unknown-unknown
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
             tauri_args: "--target universal-apple-darwin"
             # Only the .dmg is produced by a default `bundle: all` build; the
             # .app.tar.gz updater artifact needs `createUpdaterArtifacts`, which
@@ -150,7 +189,7 @@ jobs:
               desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
           - name: windows
             os: windows-latest
-            rust_targets: wasm32-unknown-unknown
+            rust_targets: ""
             tauri_args: ""
             bundle_glob: |
               desktop/src-tauri/target/release/bundle/msi/*.msi
@@ -183,17 +222,15 @@ jobs:
         with:
           workspaces: desktop/src-tauri
 
-      - name: Install wasm-pack
-        uses: taiki-e/install-action@d0f4f69b07c0804d1003ca9a5a5f853423872ed9 # v2.62.13
+      # The desktop WebView bundle imports the engine compiled to wasm
+      # (desktop/package.json depends on crates/asp-wasm/pkg-web), so the wasm
+      # packages must be in place before `bun install` resolves them. They are
+      # built once by the `wasm` job — restore them here.
+      - name: Restore the wasm packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          tool: wasm-pack
-
-      # The desktop WebView bundle imports the asp-core engine compiled to wasm
-      # (desktop/package.json depends on the generated crates/asp-wasm/pkg-web),
-      # so the wasm packages must exist before `bun install` resolves them.
-      - name: Build the engine to wasm (nodejs + web)
-        shell: bash
-        run: cd sdks/typescript && bun run build:wasm
+          name: wasm-pkgs
+          path: crates/asp-wasm
 
       - name: Install desktop frontend deps
         shell: bash
@@ -286,7 +323,7 @@ jobs:
   # TypeScript SDK tarball + wasm packages (nodejs + web).
   # ---------------------------------------------------------------------------
   sdk-wasm:
-    needs: prepare
+    needs: [prepare, wasm]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -298,24 +335,16 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
-      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
-
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
-      - uses: actions-rust-lang/setup-rust-toolchain@fb51252c7ba57d633bc668f941da052e410add48 # v1.13.0
+      - name: Restore the wasm packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          target: wasm32-unknown-unknown
-
-      - name: Install wasm-pack
-        uses: taiki-e/install-action@d0f4f69b07c0804d1003ca9a5a5f853423872ed9 # v2.62.13
-        with:
-          tool: wasm-pack
-
-      - name: Build the engine to wasm (nodejs + web)
-        run: cd sdks/typescript && bun run build:wasm
+          name: wasm-pkgs
+          path: crates/asp-wasm
 
       - name: Stage artifacts
         run: |
@@ -345,7 +374,7 @@ jobs:
   # Obsidian plugin — self-contained main.js + manifest.json.
   # ---------------------------------------------------------------------------
   obsidian:
-    needs: prepare
+    needs: [prepare, wasm]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -356,20 +385,13 @@ jobs:
 
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
 
-      - uses: actions-rust-lang/setup-rust-toolchain@fb51252c7ba57d633bc668f941da052e410add48 # v1.13.0
+      # The plugin's esbuild inlines the nodejs-target wasm (crates/asp-wasm/pkg)
+      # as base64 — restore it from the `wasm` job rather than rebuilding.
+      - name: Restore the wasm packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          target: wasm32-unknown-unknown
-
-      - name: Install wasm-pack
-        uses: taiki-e/install-action@d0f4f69b07c0804d1003ca9a5a5f853423872ed9 # v2.62.13
-        with:
-          tool: wasm-pack
-
-      - name: Install binaryen (wasm-opt)
-        run: sudo apt-get update && sudo apt-get install -y binaryen
-
-      - name: Build the engine to wasm (nodejs + web)
-        run: cd sdks/typescript && bun run build:wasm
+          name: wasm-pkgs
+          path: crates/asp-wasm
 
       - name: Build the plugin (self-contained main.js)
         run: cd plugins/obsidian && bun install --frozen-lockfile && bun run build
@@ -394,7 +416,7 @@ jobs:
   # Flip the draft to a published release once every build uploaded cleanly.
   # ---------------------------------------------------------------------------
   publish:
-    needs: [prepare, desktop, cli, sdk-wasm, obsidian]
+    needs: [prepare, wasm, desktop, cli, sdk-wasm, obsidian]
     runs-on: ubuntu-latest
     permissions:
       contents: write
