@@ -13,10 +13,13 @@
 
 use anyhow::{anyhow, Context, Result};
 use asp_core::iroh_net;
+use asp_core::log::LogRow;
 use asp_core::net::{AuthOpts, EngineRef};
-use asp_core::{Engine, Identity, VaultConfig};
+use asp_core::{compute_files, BlobStore, Engine, Identity, VaultConfig};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
@@ -41,6 +44,36 @@ pub struct VaultStatus {
     pub head: String,
     pub listening_ticket: Option<String>,
     pub peers: Vec<String>,
+}
+
+/// One node in the file tree (a file or a directory). The frontend renders this
+/// as an expandable sidebar; children are present only for directories.
+#[derive(Clone, Serialize)]
+pub struct TreeNode {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub children: Option<Vec<TreeNode>>,
+}
+
+/// One log row surfaced to the history timeline (point-in-time-travel UI).
+#[derive(Clone, Serialize)]
+pub struct HistoryEvent {
+    pub id: String,
+    pub ts: i64,
+    pub lamport: u64,
+    pub kind: String, // create | edit | rename | delete | reclass
+    pub path: Option<String>,
+}
+
+/// Result of a point-in-time read: the file's content at `ts` (or `gone` when it
+/// didn't exist yet / was deleted by then).
+#[derive(Clone, Serialize)]
+pub struct FileAtTime {
+    pub exists: bool,
+    pub content: Option<String>,
+    pub key: String,
 }
 
 type Conns = Arc<AsyncMutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<asp_core::Msg>>>>;
@@ -264,5 +297,227 @@ impl DesktopEngine {
             listening_ticket: f.listening_ticket.clone(),
             peers,
         })
+    }
+
+    // ---------------- vault file operations (the editor surface) ----------------
+    //
+    // Every method here is a thin call into `asp-core`'s `Engine` (record_write /
+    // record_remove / record_rename / materialize / state_as_of / all_rows). No
+    // protocol/merge/fold logic lives in this crate — `Engine` owns it.
+
+    /// The materialized file tree of a vault, as nested directory/file nodes.
+    fn build_tree(live: &[asp_core::FileRow]) -> Vec<TreeNode> {
+        // Live files are flat `path` strings; build a nested tree by splitting on
+        // '/' so the sidebar can render folders expandable. A directory node is
+        // synthesized for every interior path segment.
+        #[derive(Default)]
+        struct Builder {
+            name: String,
+            path: String,
+            children: BTreeMap<String, Builder>,
+            is_file: bool,
+        }
+        let mut root = Builder { name: String::new(), path: String::new(), children: BTreeMap::new(), is_file: false };
+        for f in live {
+            if f.deleted {
+                continue;
+            }
+            let segs: Vec<&str> = f.path.split('/').filter(|s| !s.is_empty()).collect();
+            let mut cur = &mut root;
+            let mut acc = String::new();
+            for (i, seg) in segs.iter().enumerate() {
+                if !acc.is_empty() {
+                    acc.push('/');
+                }
+                acc.push_str(seg);
+                let is_leaf = i == segs.len() - 1;
+                let entry = cur.children.entry(seg.to_string()).or_insert_with(|| Builder {
+                    name: seg.to_string(),
+                    path: acc.clone(),
+                    children: BTreeMap::new(),
+                    is_file: false,
+                });
+                if is_leaf {
+                    entry.is_file = true;
+                }
+                cur = entry;
+            }
+        }
+        fn finalize(b: Builder) -> Vec<TreeNode> {
+            b.children
+                .into_iter()
+                .map(|(_, c)| {
+                    let is_dir = !c.is_file;
+                    let name = c.name.clone();
+                    let path = c.path.clone();
+                    let children = if is_dir { Some(finalize(c)) } else { None };
+                    TreeNode { name, path, is_dir, children }
+                })
+                .collect()
+        }
+        finalize(root)
+    }
+
+    /// List the file tree of a vault (files + synthesized directory nodes).
+    pub fn files_tree(&self, id: &str) -> Result<Vec<TreeNode>> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let eng = f.engine.lock().unwrap();
+        let live = eng.store.live_files()?;
+        Ok(Self::build_tree(&live))
+    }
+
+    /// Read a file's content (UTF-8 text). `None` if the file does not exist.
+    /// Authoritative source is the deterministic fold (not the on-disk file,
+    /// which may be mid-materialize).
+    pub fn read_file(&self, id: &str, path: &str) -> Result<Option<String>> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let eng = f.engine.lock().unwrap();
+        let rows = eng.store.all_rows()?;
+        let files = compute_files(&eng.store, &rows)?;
+        match files.into_iter().find(|x| x.path == path && !x.deleted) {
+            Some(f) => match f.result_hash {
+                Some(h) => {
+                    let bytes = eng.store.get_blob(&h)?.unwrap_or_default();
+                    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+                }
+                None => Ok(Some(String::new())),
+            },
+            None => Ok(None),
+        }
+    }
+
+    /// Author a create/edit for `path` with `content` (UTF-8 text), then
+    /// materialize so the file appears on disk and converges to peers.
+    pub fn write_file(&self, id: &str, path: &str, content: &str) -> Result<()> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let eng = f.engine.lock().unwrap();
+        eng.record_write(path, content.as_bytes())?;
+        eng.materialize()?;
+        Ok(())
+    }
+
+    /// Author a delete for `path`, then materialize so the file disappears on
+    /// disk and converges to peers.
+    pub fn delete_file(&self, id: &str, path: &str) -> Result<()> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let eng = f.engine.lock().unwrap();
+        eng.record_remove(path)?;
+        eng.materialize()?;
+        Ok(())
+    }
+
+    /// Author a rename `from` -> `to` (stable `file_id`), then materialize.
+    pub fn rename_file(&self, id: &str, from: &str, to: &str) -> Result<()> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let eng = f.engine.lock().unwrap();
+        eng.record_rename(from, to)?;
+        eng.materialize()?;
+        Ok(())
+    }
+
+    /// Create a new untitled file with starter content (avoids a name clash by
+    /// suffixing `-N`). Returns the chosen path.
+    pub fn new_file(&self, id: &str, name: &str, content: &str) -> Result<String> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let eng = f.engine.lock().unwrap();
+        let live: std::collections::HashSet<String> =
+            eng.store.live_files()?.into_iter().map(|x| x.path).collect();
+        let mut chosen = name.to_string();
+        let mut i = 1;
+        while live.contains(&chosen) {
+            chosen = format!("untitled-{}.md", i);
+            i += 1;
+        }
+        eng.record_write(&chosen, content.as_bytes())?;
+        eng.materialize()?;
+        Ok(chosen)
+    }
+
+    /// Surface the log as a flat list of history events (the timeline data).
+    pub fn history(&self, id: &str) -> Result<Vec<HistoryEvent>> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let eng = f.engine.lock().unwrap();
+        let mut rows: Vec<LogRow> = eng.store.all_rows()?;
+        rows.sort_by(|a, b| a.ts.cmp(&b.ts).then(a.lamport.cmp(&b.lamport)));
+        Ok(rows
+            .into_iter()
+            .map(|r| HistoryEvent {
+                id: r.id,
+                ts: r.ts,
+                lamport: r.lamport,
+                kind: r.kind.as_str().to_string(),
+                path: r.path,
+            })
+            .collect())
+    }
+
+    /// The byte-exact state of a vault at wall-clock time `ts` (best-effort PITR
+    /// fold). Returns the content of `path` if it existed then, else `gone`.
+    pub fn file_at_time(&self, id: &str, path: &str, ts: i64) -> Result<FileAtTime> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let eng = f.engine.lock().unwrap();
+        let files = eng.state_as_of(ts)?;
+        match files.get(path) {
+            Some(bytes) => Ok(FileAtTime { exists: true, content: Some(String::from_utf8_lossy(bytes).into_owned()), key: format!("{}:{}", path, ts) }),
+            None => Ok(FileAtTime { exists: false, content: None, key: "gone".to_string() }),
+        }
+    }
+
+    /// Restore a single file to its content at wall-clock `ts`, by authoring a
+    /// new write row (a deterministic "restore here" edit). No-op if the file
+    /// didn't exist then; clears the playhead state on the caller side.
+    pub fn restore_file_at(&self, id: &str, path: &str, ts: i64) -> Result<bool> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let eng = f.engine.lock().unwrap();
+        let files = eng.state_as_of(ts)?;
+        match files.get(path) {
+            Some(bytes) => {
+                eng.record_write(path, bytes)?;
+                eng.materialize()?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Forget a managed folder. When `trash` is true (and the folder is a real
+    /// on-disk vault), move the directory to the OS trash; otherwise leave the
+    /// files on disk untouched (the vault is only removed from the app). Returns
+    /// the on-disk path that was (or would have been) removed.
+    pub fn remove_vault(&self, id: &str, trash: bool) -> Result<String> {
+        let mut folders = self.folders.lock().unwrap();
+        let f = folders.remove(id).ok_or_else(|| anyhow!("no such folder"))?;
+        // Stop the listener if one is bound.
+        if let Some(h) = f.listener {
+            h.abort();
+        }
+        let path = f.path.clone();
+        if trash {
+            // Best-effort move to a sibling `.trash/` dir inside the parent (the
+            // std lib has no cross-platform "recycle bin"; the Tauri shell can
+            // upgrade this to a real OS-trash call, but the engine stays free
+            // of system bindings and testable on plain Linux).
+            if let Some(parent) = path.parent() {
+                let trash_dir = parent.join(".asp-trash");
+                let _ = fs::create_dir_all(&trash_dir);
+                let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "vault".into());
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let dest = trash_dir.join(format!("{}-{}", name, stamp));
+                let _ = fs::rename(&path, &dest);
+            }
+        }
+        Ok(path.to_string_lossy().to_string())
     }
 }

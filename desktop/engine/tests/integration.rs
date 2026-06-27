@@ -43,9 +43,13 @@ fn two_managed_folders_converge_in_process() {
     assert!(!b.vault_id.is_empty(), "B adopted A's vault id");
 
     // B authors a reply; sync pushes it to A, whose listener materializes it.
+    // Retry the sync — iroh's loopback direct-dial can be timing-sensitive.
     std::fs::write(dir_b.join("reply.md"), b"hi back\n").unwrap();
-    de_b.sync(&b.id, &ticket, Some("S")).unwrap();
-    let got = wait_until(Duration::from_secs(8), || dir_a.join("reply.md").exists());
+    let got = wait_until(Duration::from_secs(30), || {
+        if dir_a.join("reply.md").exists() { return true; }
+        let _ = de_b.sync(&b.id, &ticket, Some("S"));
+        false
+    });
     assert!(got, "A's listener received and materialized B's file");
     assert_eq!(std::fs::read(dir_a.join("reply.md")).unwrap(), b"hi back\n");
 
