@@ -1542,18 +1542,18 @@ export default function App() {
           </>
         )}
 
-        {/* tab context menu — Rename / Close / Delete */}
+        {/* tab context menu — Close / Rename / Delete */}
         {tabCtx && (
           <>
             <div onClick={() => setTabCtx(null)} onContextMenu={(e) => { e.preventDefault(); setTabCtx(null); }} style={{ position: 'fixed', inset: 0, zIndex: 60 }} />
             <div style={{ position: 'fixed', left: tabCtx.x, top: tabCtx.y, zIndex: 61, width: 156, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, boxShadow: '0 12px 32px rgba(28,25,23,0.16)', padding: 5 }}>
-              <div className="asp-hover-soft" onClick={() => { setTabRenaming(tabCtx.path); setTabRenameValue(basename(tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                <Icon.PencilIcon style={{ flex: 'none' }} />
-                <span>Rename</span>
-              </div>
               <div className="asp-hover-soft" onClick={() => { onTabClose(tabCtx.path); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
                 <span>Close</span>
+              </div>
+              <div className="asp-hover-soft" onClick={() => { setTabRenaming(tabCtx.path); setTabRenameValue(basename(tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                <Icon.PencilIcon style={{ flex: 'none' }} />
+                <span>Rename</span>
               </div>
               <div className="asp-hover-soft" onClick={() => { deleteNode(tabCtx.path, false); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <Icon.TrashIcon stroke="var(--text2)" style={{ flex: 'none' }} />

@@ -318,6 +318,16 @@ describe('App — tabs + URL hash (desktop)', () => {
     expect(tab('notes/a.md').getAttribute('aria-selected')).toBe('true');
   });
 
+  it('lists the tab right-click menu items in order: Close, Rename, Delete', async () => {
+    await openTwoTabs();
+    fireEvent.contextMenu(tab('README.md'));
+    const close = await screen.findByText('Close');
+    // The menu container holds the three items in DOM order.
+    const menu = close.closest('div[style*="position: fixed"]') as HTMLElement;
+    const rendered = Array.from(menu.querySelectorAll('.asp-hover-soft')).map((el) => (el.textContent || '').replace('×', ''));
+    expect(rendered).toEqual(['Close', 'Rename', 'Delete']);
+  });
+
   it('Delete in the tab right-click menu deletes the file and closes its tab', async () => {
     await openTwoTabs();
     fireEvent.contextMenu(tab('notes/a.md'));
