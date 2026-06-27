@@ -66,7 +66,9 @@ async function main() {
     }, 8000);
     ok('select-file', { ms: Date.now() - t });
 
-    // Typing latency: focus the editor and type a burst; measure total.
+    // Typing latency in the auto-selected README (large when ?big= set): focus,
+    // type a burst, measure. Then measure the re-highlight settle after a pause —
+    // this must stay small (line-level re-highlight) even on a big file.
     const editor = await driver.findElement(By.css('[data-testid="live-editor"]'));
     await editor.click();
     t = Date.now();
@@ -74,6 +76,14 @@ async function main() {
     const typeMs = Date.now() - t;
     ok('type-43-chars', { ms: typeMs, msPerKey: Math.round(typeMs / 43) });
     if (typeMs / 43 > 120) bad('typing-laggy', { msPerKey: Math.round(typeMs / 43) });
+
+    await sleep(450); // let any pending re-highlight finish
+    t = Date.now();
+    await editor.sendKeys('Z');
+    await sleep(360); // re-highlight debounce (~320ms) fires within this
+    const settleMs = Date.now() - t - 360;
+    ok('rehighlight-settle', { ms: settleMs });
+    if (settleMs > 250) bad('rehighlight-slow', { ms: settleMs });
 
     // Create a file → it appears (in breadcrumb + scrolled-to tree row).
     t = Date.now();

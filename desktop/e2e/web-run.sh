@@ -4,8 +4,9 @@
 set -u
 N=${1:-1000}
 ROOT=/home/chris/asp/desktop
+BIG=${2:-1500}
 export PORT=${PORT:-5599}
-export URL="http://127.0.0.1:${PORT}/?n=${N}"
+export URL="http://127.0.0.1:${PORT}/?n=${N}&big=${BIG}"
 export WEBKIT_DISABLE_COMPOSITING_MODE=1 LIBGL_ALWAYS_SOFTWARE=1 GDK_BACKEND=x11 NO_AT_BRIDGE=1
 
 [ -f "$ROOT/dist/index.html" ] || { echo "build the frontend first (bun run build:web)"; exit 2; }

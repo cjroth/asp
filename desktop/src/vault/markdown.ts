@@ -165,6 +165,50 @@ function placeInNode(child: HTMLElement, pos: number): void {
   sel.addRange(range);
 }
 
+// Caret char offset within a single element, counting ALL text (including the
+// hidden cm-mark markers) — for re-highlighting just one line.
+export function textOffsetIn(root: HTMLElement): number | null {
+  const sel = getSelection();
+  if (!sel || !sel.rangeCount) return null;
+  const r = sel.getRangeAt(0);
+  if (!root.contains(r.endContainer) && r.endContainer !== root) return null;
+  let offset = 0;
+  const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let n: Node | null;
+  while ((n = w.nextNode())) {
+    if (n === r.endContainer) return offset + r.endOffset;
+    offset += (n.nodeValue || '').length;
+  }
+  return offset;
+}
+
+export function setTextOffsetIn(root: HTMLElement, target: number): void {
+  const sel = getSelection();
+  if (!sel) return;
+  const range = document.createRange();
+  let remaining = target;
+  const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let n: Node | null;
+  let last: Node | null = null;
+  while ((n = w.nextNode())) {
+    last = n;
+    const len = (n.nodeValue || '').length;
+    if (remaining <= len) {
+      range.setStart(n, remaining);
+      range.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return;
+    }
+    remaining -= len;
+  }
+  if (last) range.setStart(last, (last.nodeValue || '').length);
+  else range.setStart(root, 0);
+  range.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
 export function wordCountOf(content: string): string {
   const words = content.trim() ? content.trim().split(/\s+/).length : 0;
   return words + (words === 1 ? ' word' : ' words');

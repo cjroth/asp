@@ -3,9 +3,17 @@
 // scale. Holds an in-memory vault of `?n=` files. Kept fast (microtask) so this
 // measures FRONTEND rendering cost, not backend latency.
 (function () {
-  var N = parseInt(new URLSearchParams(location.search).get('n') || '1000', 10);
+  var qs = new URLSearchParams(location.search);
+  var N = parseInt(qs.get('n') || '1000', 10);
+  var BIG = parseInt(qs.get('big') || '0', 10); // lines in README, to test large-file editing
+  function bigBody(prefix) {
+    if (!BIG) return '# ' + prefix + ' vault\n\nSeeded for perf testing.\n';
+    var out = '# ' + prefix + ' (large file, ' + BIG + ' lines)\n\n';
+    for (var j = 0; j < BIG; j++) out += '- line ' + j + ' with some **bold** and `code` and [a link](http://x/' + j + ')\n';
+    return out;
+  }
   function mk(prefix) {
-    var c = { 'README.md': '# ' + prefix + ' vault\n\nSeeded for perf testing.\n' };
+    var c = { 'README.md': bigBody(prefix) };
     for (var i = 0; i < N; i++) c['note-' + String(i).padStart(5, '0') + '.md'] = '# ' + prefix + ' note ' + i + '\n\n- one\n- two\n\nBody **text** ' + i + '.\n';
     return c;
   }

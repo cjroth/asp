@@ -3,7 +3,7 @@
 // `paintKey` changes (a new selection or a time-travel instant), so typing
 // never triggers a React re-render of its content and the caret stays put.
 import React, { useEffect, useRef } from 'react';
-import { caretOffset, readLive, renderLiveHtml, setCaret } from './markdown';
+import { caretOffset, readLive, renderLiveHtml, setCaret, setTextOffsetIn, textOffsetIn } from './markdown';
 
 export interface LiveEditorProps {
   source: string;
@@ -22,6 +22,7 @@ export default function LiveEditor(props: LiveEditorProps) {
   const composing = useRef(false);
   const paintedKey = useRef<string>('');
   const rehlTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lineCount = useRef(0); // top-level line divs as of the last full render
   // Keep handler-visible values fresh without re-binding (avoids stale closures).
   const roRef = useRef(readOnly);
   const accentRef = useRef(accent);
@@ -42,6 +43,7 @@ export default function LiveEditor(props: LiveEditorProps) {
       el.innerHTML = '<div style="color:#b0aaa2; font-style:italic">This file did not exist at this point in time.</div>';
     } else {
       el.innerHTML = renderLiveHtml(source, accent);
+      lineCount.current = source.split('\n').length;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paintKey, source, readOnly, notExist, accent]);
@@ -49,18 +51,51 @@ export default function LiveEditor(props: LiveEditorProps) {
   // Clean up the pending re-highlight on unmount.
   useEffect(() => () => { if (rehlTimer.current) clearTimeout(rehlTimer.current); }, []);
 
-  // Re-applying syntax highlighting rebuilds the whole document's DOM, which is
-  // O(document size) — far too slow to do on every keystroke. So while typing we
-  // let the browser insert characters natively (instant) and only re-highlight
-  // after a short pause. `readLive` still reconstructs the exact source from the
-  // DOM, so saves are correct in the meantime.
-  const rehighlight = () => {
-    const el = ref.current;
-    if (!el || roRef.current || composing.current) return;
+  // Re-applying syntax highlighting rebuilds DOM. Rebuilding the WHOLE document is
+  // O(document size) — a ~600ms hitch on a 4000-line file. So while typing we let
+  // the browser insert characters natively (instant), and on a short pause we
+  // re-highlight only the EDITED line. A full re-render happens only when the line
+  // count changed (Enter/Backspace/paste) or the doc has a code fence (where a
+  // line's rendering depends on lines above it). `readLive` reconstructs the exact
+  // source either way, so saves are always correct.
+  const fullRehighlight = (el: HTMLElement) => {
     const off = caretOffset(el);
     const src = readLive(el);
     el.innerHTML = renderLiveHtml(src, accentRef.current);
+    lineCount.current = src.split('\n').length;
     if (off != null) setCaret(el, off);
+  };
+
+  const currentLineDiv = (el: HTMLElement): HTMLElement | null => {
+    const sel = getSelection();
+    if (!sel || !sel.rangeCount) return null;
+    let node: Node | null = sel.getRangeAt(0).endContainer;
+    while (node && node.parentNode !== el) node = node.parentNode;
+    return node && node.parentNode === el ? (node as HTMLElement) : null;
+  };
+
+  const rehighlight = () => {
+    const el = ref.current;
+    if (!el || roRef.current || composing.current) return;
+    const src = readLive(el);
+    const lines = src.split('\n');
+    const lineDiv = currentLineDiv(el);
+    const structural = lines.length !== lineCount.current || el.childNodes.length !== lines.length;
+    if (!lineDiv || structural || src.indexOf('```') !== -1) {
+      fullRehighlight(el);
+      return;
+    }
+    const idx = Array.prototype.indexOf.call(el.childNodes, lineDiv);
+    const off = textOffsetIn(lineDiv);
+    const tmp = document.createElement('div');
+    tmp.innerHTML = renderLiveHtml(lines[idx] ?? '', accentRef.current);
+    const newDiv = tmp.firstChild as HTMLElement | null;
+    if (!newDiv) {
+      fullRehighlight(el);
+      return;
+    }
+    el.replaceChild(newDiv, lineDiv);
+    if (off != null) setTextOffsetIn(newDiv, off);
   };
 
   const onInput = () => {
@@ -86,11 +121,8 @@ export default function LiveEditor(props: LiveEditorProps) {
     composing.current = false;
     const el = ref.current;
     if (!el || roRef.current) return;
-    const off = caretOffset(el);
-    const src = readLive(el);
-    el.innerHTML = renderLiveHtml(src, accentRef.current);
-    if (off != null) setCaret(el, off);
-    changeRef.current(src);
+    fullRehighlight(el);
+    changeRef.current(readLive(el));
   };
 
   const style: React.CSSProperties & Record<string, string> = {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { caretOffset, inlineMd, readLive, renderLiveHtml, setCaret, wordCountOf } from './markdown';
+import { caretOffset, inlineMd, readLive, renderLiveHtml, setCaret, setTextOffsetIn, textOffsetIn, wordCountOf } from './markdown';
 
 describe('renderLiveHtml', () => {
   it('emits one div per source line and a <br> for blank lines', () => {
@@ -73,6 +73,23 @@ describe('caret offset/setCaret round-trip', () => {
     setCaret(div, 12);
     const off = caretOffset(div);
     expect(off).toBe(12);
+    document.body.removeChild(div);
+  });
+});
+
+describe('textOffsetIn / setTextOffsetIn (single-line caret, for line-level re-highlight)', () => {
+  it('round-trips a caret offset within one rendered line (incl. hidden markers)', () => {
+    const div = document.createElement('div');
+    document.body.appendChild(div);
+    // One heading line; its rendered DOM has hidden cm-mark for "## ".
+    div.innerHTML = renderLiveHtml('## Hello world');
+    const line = div.firstElementChild as HTMLElement;
+    // Offset 5 = after "## He" counting the hidden "## " markers too.
+    setTextOffsetIn(line, 5);
+    expect(textOffsetIn(line)).toBe(5);
+    // End of line.
+    setTextOffsetIn(line, 14);
+    expect(textOffsetIn(line)).toBe(14);
     document.body.removeChild(div);
   });
 });
