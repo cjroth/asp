@@ -10,6 +10,7 @@ import init, { WasmEngine } from 'asp-wasm';
 // resolves to a `file://` URL the browser refuses to fetch.
 import wasmUrl from 'asp-wasm/asp_wasm_bg.wasm?url';
 import type { Api, FileAt, FileEntry, HistEvent, VaultInfo, VaultStatus } from './api';
+import { WELCOME_MD } from '../vault/welcome';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -150,7 +151,7 @@ export function createWebApi(): Api {
       const id = 'w_' + randHex(8);
       const vault_id = randHex(16);
       const eng = new WasmEngine(await deviceSeed(), vault_id);
-      eng.record_write('README.md', enc.encode('# New vault\n\nThis vault lives in your browser (OPFS). Every edit saves locally and syncs to your other devices over iroh.\n'));
+      eng.record_write('README.md', enc.encode(WELCOME_MD));
       engines.set(id, eng);
       await persist(id, eng);
       const reg = await registry();
