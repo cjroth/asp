@@ -239,7 +239,11 @@ describe('App — editor', () => {
 
   it('deletes a file via its context menu', async () => {
     fireEvent.contextMenu(screen.getByText('TODO.md'));
-    fireEvent.click(await screen.findByText('Delete'));
+    // menu shows Rename + Delete, but no filename header (TODO.md stays a single tree row)
+    expect(await screen.findByText('Rename')).toBeTruthy();
+    expect(screen.getByText('Delete')).toBeTruthy();
+    expect(screen.getAllByText('TODO.md')).toHaveLength(1);
+    fireEvent.click(screen.getByText('Delete'));
     await waitFor(() => expect(deleteFile).toHaveBeenCalledWith('v1', 'TODO.md'));
   });
 

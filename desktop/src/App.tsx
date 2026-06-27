@@ -1007,8 +1007,8 @@ export default function App() {
                       <Icon.ShareIcon style={{ flex: 'none' }} />
                       <span style={{ fontSize: 13.5 }}>Share this vault…</span>
                     </div>
-                    <div className="asp-hover-danger" onClick={() => { setVaultMenuOpen(false); if (activeMeta) setRemoveVaultState({ id: activeMeta.id, name: activeMeta.displayName, path: activeMeta.path, trash: false }); }} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 9px', borderRadius: 8, cursor: 'pointer', color: '#c0392b' }}>
-                      <Icon.TrashIcon stroke="#c0392b" style={{ flex: 'none' }} />
+                    <div className="asp-hover-soft" onClick={() => { setVaultMenuOpen(false); if (activeMeta) setRemoveVaultState({ id: activeMeta.id, name: activeMeta.displayName, path: activeMeta.path, trash: false }); }} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 9px', borderRadius: 8, cursor: 'pointer', color: 'var(--text2)' }}>
+                      <Icon.TrashIcon stroke="var(--text2)" style={{ flex: 'none' }} />
                       <span style={{ fontSize: 13.5 }}>Remove this vault…</span>
                     </div>
                     <div style={{ height: 1, background: 'var(--line)', margin: '4px 6px' }} />
@@ -1214,13 +1214,12 @@ export default function App() {
                 </>
               ) : (
                 <>
-                  <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)', padding: '5px 11px 3px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ctxMenu.name}</div>
                   <div className="asp-hover-soft" onClick={() => { setRenaming(ctxMenu.path!); setRenameValue(ctxMenu.name!); setCtxMenu(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                     <Icon.PencilIcon style={{ flex: 'none' }} />
                     <span>Rename</span>
                   </div>
-                  <div className="asp-hover-danger" onClick={() => deleteNode(ctxMenu.path!, !!ctxMenu.isDir)} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: '#c0392b' }}>
-                    <Icon.TrashIcon stroke="#c0392b" style={{ flex: 'none' }} />
+                  <div className="asp-hover-soft" onClick={() => deleteNode(ctxMenu.path!, !!ctxMenu.isDir)} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                    <Icon.TrashIcon stroke="var(--text2)" style={{ flex: 'none' }} />
                     <span>Delete</span>
                   </div>
                 </>
