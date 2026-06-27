@@ -20,7 +20,7 @@ That single run will:
 3. open a **draft** GitHub Release,
 4. build and attach, in parallel from the tagged commit:
    - **Desktop** (Tauri): macOS `.dmg` (universal), Windows `.msi` + `.exe`,
-     Linux `.deb` + `.rpm` + `.AppImage`,
+     Linux `.deb` + `.rpm`,
    - **CLI**: `asp` for `x86_64-linux`, `aarch64`/`x86_64` macOS, `x86_64`
      Windows (`.tar.gz` / `.zip`),
    - **SDK + wasm**: `asp-sdk-X.Y.Z.tgz` and `asp-wasm-X.Y.Z.tar.gz`

@@ -173,11 +173,13 @@ jobs:
           - name: linux
             os: ubuntu-22.04
             rust_targets: ""
-            tauri_args: ""
+            # Build .deb + .rpm only. AppImage's linuxdeploy bundler SIGABRTs on
+            # hosted runners (no usable FUSE), and deb/rpm already cover the
+            # Debian/Ubuntu/Fedora/RHEL/openSUSE desktop.
+            tauri_args: "--bundles deb,rpm"
             bundle_glob: |
               desktop/src-tauri/target/release/bundle/deb/*.deb
               desktop/src-tauri/target/release/bundle/rpm/*.rpm
-              desktop/src-tauri/target/release/bundle/appimage/*.AppImage
           - name: macos
             os: macos-14
             rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -208,8 +210,7 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libappindicator3-dev \
             librsvg2-dev \
-            patchelf \
-            libfuse2
+            patchelf
 
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
 
