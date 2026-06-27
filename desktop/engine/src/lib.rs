@@ -132,6 +132,30 @@ impl DesktopEngine {
         self.identity.to_ssh_string()
     }
 
+    /// Drive a future to completion on the engine's runtime from *any* calling
+    /// context — crucially, including from inside another tokio runtime.
+    ///
+    /// We must NOT use `self.rt.block_on()` directly. Tauri dispatches our
+    /// `#[command(async)]` handlers via `async_runtime::spawn`, so command code
+    /// runs *inside Tauri's own tokio runtime*. Calling a second runtime's
+    /// `block_on` from there panics ("Cannot start a runtime from within a
+    /// runtime"); that panic aborts the command task before it can reply, so the
+    /// webview's `invoke` promise hangs forever (e.g. Share stuck on
+    /// "Generating…", an edit's write never resolving). Spawning the future onto
+    /// our runtime and parking the caller on a channel is safe from any context:
+    /// our runtime's own worker threads drive the future to completion.
+    fn block<F>(&self, fut: F) -> F::Output
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.rt.spawn(async move {
+            let _ = tx.send(fut.await);
+        });
+        rx.recv().expect("engine runtime task panicked or runtime shut down")
+    }
+
     fn auth_opts(&self, auth_keys: Vec<String>) -> AuthOpts {
         AuthOpts { auth_keys, no_tofu: false, default_ttl_days: 90 }
     }
@@ -208,7 +232,7 @@ impl DesktopEngine {
     fn bind_ep(&self) -> Result<iroh_net::Endpoint> {
         let seed = self.identity.seed();
         let relays = Self::use_relays();
-        self.rt.block_on(iroh_net::bind_endpoint(&seed, relays))
+        self.block(async move { iroh_net::bind_endpoint(&seed, relays).await })
     }
 
     /// If `peer`+`ep` are set, start a persistent reconnecting connector to that
@@ -249,7 +273,7 @@ impl DesktopEngine {
     /// app's own `record_*` edits, which materialize before the watcher sees them).
     fn broadcast(&self, conns: &Conns, wr: WireRow) {
         let conns = conns.clone();
-        self.rt.block_on(async move {
+        self.block(async move {
             let map = conns.lock().await;
             for tx in map.values() {
                 let _ = tx.send(Msg::Push { row: Box::new(wr.clone()) });
@@ -331,7 +355,7 @@ impl DesktopEngine {
         let ep = self.bind_ep().context("clone endpoint")?;
         let ce = engine.clone();
         let (bep, baddr) = (ep.clone(), addr.clone());
-        self.rt.block_on(async move { iroh_net::clone_bootstrap(ce, &bep, baddr, &auth).await.map(|_| ()) })?;
+        self.block(async move { iroh_net::clone_bootstrap(ce, &bep, baddr, &auth).await.map(|_| ()) })?;
         let id = random_id();
         let conns: Conns = Arc::new(AsyncMutex::new(HashMap::new()));
         // Stay connected to the source so edits sync live both ways (not one-shot).
@@ -378,7 +402,8 @@ impl DesktopEngine {
                     ep
                 }
             };
-            let ticket = self.rt.block_on(iroh_net::ticket(&ep, relays)).context("ticket")?;
+            let ep_t = ep.clone();
+            let ticket = self.block(async move { iroh_net::ticket(&ep_t, relays).await }).context("ticket")?;
             let handle = self.rt.spawn(async move {
                 let _ = iroh_net::serve(engine, ep, auth, conns).await;
             });
@@ -405,7 +430,7 @@ impl DesktopEngine {
         let auth = self.auth_opts(auth_key.map(|s| vec![s.to_string()]).unwrap_or_default());
         let addr = iroh_net::parse_peer(ticket)?;
         let seed = self.identity.seed();
-        self.rt.block_on(async move {
+        self.block(async move {
             match shared_ep {
                 // Reuse the folder's standing endpoint (one device key, one socket).
                 Some(ep) => iroh_net::sync_oneshot(engine, &ep, addr, &auth).await,
