@@ -496,6 +496,15 @@ function lineNodes(el: HTMLElement): ChildNode[] {
   return out;
 }
 
+// The source-line index of a line node, in the SAME flattened space readLive
+// uses (tables expanded to their `.tbl-row` children, `.md-diagram` previews
+// skipped). Callers must use THIS — not `el.childNodes` indexing — to map a line
+// div to its source line, or tables/diagrams shift the index and they read the
+// wrong line. Returns -1 if the node isn't one of the editor's line nodes.
+export function lineIndexOf(el: HTMLElement, node: Node): number {
+  return lineNodes(el).indexOf(node as ChildNode);
+}
+
 // Reconstruct source markdown from the editor DOM: one source line per line
 // node (its textContent, which includes the hidden cm-mark syntax); <br> → "".
 export function readLive(el: HTMLElement): string {

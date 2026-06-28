@@ -5,7 +5,7 @@
 // markdown highlighter; code files render with the per-line syntax highlighter.
 import React, { useEffect, useRef } from 'react';
 import { applyCachedDiagrams, renderDiagrams } from './diagram';
-import { caretOffset, hasFrontmatter, isCodeFile, readLive, renderDoc, setCaret, setTextOffsetIn, textOffsetIn } from './markdown';
+import { caretOffset, hasFrontmatter, isCodeFile, lineIndexOf, readLive, renderDoc, setCaret, setTextOffsetIn, textOffsetIn } from './markdown';
 import { loadMermaid } from './mermaid';
 import type { FrontmatterStyle } from './prefs';
 
@@ -165,8 +165,11 @@ export default function LiveEditor(props: LiveEditorProps) {
     if (!box) return;
     const lineDiv = box.closest('.cm-task') as HTMLElement | null;
     if (!lineDiv || lineDiv.parentNode !== el) return;
-    const idx = Array.prototype.indexOf.call(el.childNodes, lineDiv);
-    /* v8 ignore next -- lineDiv is a direct child, so idx is always found */
+    // Map to the SOURCE-line index in readLive's flattened space (tables expanded,
+    // diagrams skipped) — NOT the raw el.childNodes index, which a preceding table
+    // or diagram preview shifts out of sync, making us read/toggle the wrong line.
+    const idx = lineIndexOf(el, lineDiv);
+    /* v8 ignore next -- lineDiv is a line node, so idx is always found */
     if (idx < 0) return;
     const lines = readLive(el).split('\n');
     const m = (lines[idx] ?? '').match(/^(\s*[-*]\s+\[)([ xX])(\].*)$/);

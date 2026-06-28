@@ -195,6 +195,37 @@ describe('LiveEditor', () => {
     expect(readLive(el)).toBe('- [ ] todo');
   });
 
+  it('toggles the right task line when a TABLE precedes it (childNodes idx ≠ line idx)', () => {
+    // A `.tbl-scroll` is ONE childNode but spans multiple source lines, so the
+    // task line div's index among el.childNodes is LOWER than its source-line
+    // index. The handler must map through the same flattened line list readLive
+    // uses, or it toggles/looks up the wrong line and silently does nothing.
+    const onChange = vi.fn();
+    const source = '| a | b |\n| - | - |\n- [ ] todo';
+    const { getByTestId } = render(<LiveEditor {...props({ source, onChange })} />);
+    const el = getByTestId('live-editor');
+    const box = el.querySelector('.cm-task-box') as HTMLElement;
+    fireEvent.mouseDown(box);
+    expect(onChange).toHaveBeenCalledWith('| a | b |\n| - | - |\n- [x] todo');
+    expect(readLive(el)).toBe('| a | b |\n| - | - |\n- [x] todo');
+    expect(el.querySelector('.cm-task-done')).not.toBeNull();
+  });
+
+  it('toggles the right task line when a DIAGRAM precedes it (skipped node shifts idx)', () => {
+    // A `.md-diagram` preview is a childNode that maps to ZERO source lines, so
+    // the task line div's index among el.childNodes is HIGHER than its source-line
+    // index. The handler must skip it the same way readLive does.
+    const onChange = vi.fn();
+    const source = '```mermaid\ngraph TD\nA --> B\n```\n- [ ] todo';
+    const { getByTestId } = render(<LiveEditor {...props({ source, onChange })} />);
+    const el = getByTestId('live-editor');
+    expect(el.querySelector('.md-diagram')).not.toBeNull();
+    const box = el.querySelector('.cm-task-box') as HTMLElement;
+    fireEvent.mouseDown(box);
+    expect(onChange).toHaveBeenCalledWith('```mermaid\ngraph TD\nA --> B\n```\n- [x] todo');
+    expect(readLive(el)).toBe('```mermaid\ngraph TD\nA --> B\n```\n- [x] todo');
+  });
+
   it('ignores mousedown outside any task line', () => {
     const onChange = vi.fn();
     const { getByTestId } = render(<LiveEditor {...props({ source: 'plain text', onChange })} />);
