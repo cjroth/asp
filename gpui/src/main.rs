@@ -6,10 +6,13 @@ use gpui::{
 };
 use gpui_platform::application;
 
+mod assets;
+mod icons;
 mod screens;
 mod theme;
 mod vault;
 
+use assets::Assets;
 use screens::connect::ConnectScreen;
 use theme::Theme;
 
@@ -46,7 +49,8 @@ fn main() {
         return;
     }
 
-    application().run(|cx: &mut App| {
+    application().with_assets(Assets).run(|cx: &mut App| {
+        cx.text_system().add_fonts(Assets::font_bytes()).ok();
         let bounds = Bounds::centered(None, size(px(1100.0), px(740.0)), cx);
         cx.open_window(
             WindowOptions {
@@ -65,9 +69,10 @@ fn run_shot(out_path: &str, screen: &str) {
     let text_system = Arc::new(gpui_wgpu::CosmicTextSystem::new("sans-serif"));
     let mut cx = HeadlessAppContext::with_platform(
         text_system,
-        Arc::new(()),
+        Arc::new(Assets),
         gpui_platform::current_headless_renderer,
     );
+    cx.text_system().add_fonts(Assets::font_bytes()).ok();
 
     let win_size: Size<Pixels> = size(px(1100.0), px(740.0));
     let handle: AnyWindowHandle = match screen {

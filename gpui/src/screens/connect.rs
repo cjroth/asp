@@ -5,7 +5,8 @@ use gpui::{
     div, prelude::*, px, FontWeight, SharedString, Window,
 };
 
-use crate::theme::{self, Theme, FONT_MONO};
+use crate::icons::icon;
+use crate::theme::{self, Appearance, Theme, FONT_MONO};
 
 /// One vault row in the list card (fixture-or-engine-driven).
 #[derive(Clone)]
@@ -127,7 +128,7 @@ impl Render for ConnectScreen {
             .child(div().flex_1())
             .child(platform)
             .child(
-                // Theme toggle button (28×28 bordered).
+                // Theme toggle button (28×28 bordered): moon in light, sun in dark.
                 div()
                     .size(px(28.0))
                     .rounded(px(8.0))
@@ -137,9 +138,15 @@ impl Render for ConnectScreen {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(13.0))
-                    .text_color(t.text3)
-                    .child("☾"),
+                    .child(icon(
+                        if t.appearance == Appearance::Dark {
+                            "theme-sun"
+                        } else {
+                            "theme-moon"
+                        },
+                        px(16.0),
+                        t.text3,
+                    )),
             );
 
         let headline = div()
@@ -162,7 +169,7 @@ impl Render for ConnectScreen {
             .gap(px(8.0))
             .text_size(px(14.0))
             .font_weight(FontWeight(500.0))
-            .child("＋")
+            .child(icon("plus", px(16.0), t.bg))
             .child("New Vault");
 
         let connect_btn = div()
@@ -179,7 +186,7 @@ impl Render for ConnectScreen {
             .gap(px(8.0))
             .text_size(px(14.0))
             .font_weight(FontWeight(500.0))
-            .child("⇄")
+            .child(icon("connect", px(15.0), t.text2))
             .child("Connect Vault");
 
         let actions = div().flex().gap(px(10.0)).child(new_btn).child(connect_btn);
@@ -216,6 +223,7 @@ impl Render for ConnectScreen {
             .flex()
             .items_center()
             .gap(px(6.0))
+            .child(icon("user", px(12.0), t.faint2))
             .child(format!("This device · {}", self.fingerprint));
 
         // Centered card column on the bg-sub backdrop.
@@ -276,8 +284,16 @@ impl ConnectScreen {
             .child(
                 div()
                     .mt(px(3.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
                     .text_size(px(11.0))
                     .text_color(t.faint)
+                    .child(icon(
+                        if v.is_web { "globe" } else { "folder" },
+                        px(12.0),
+                        t.faint,
+                    ))
                     .child(v.location.clone()),
             );
 
@@ -298,5 +314,8 @@ impl ConnectScreen {
             .child(avatar)
             .child(content)
             .child(trailing)
+            .when(!v.loading, |d| {
+                d.child(icon("chevron-right", px(15.0), gpui::rgb(0xcfc9c1)))
+            })
     }
 }
