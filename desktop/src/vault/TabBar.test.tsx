@@ -113,56 +113,66 @@ describe('TabBar', () => {
     expect(onRequestRename).not.toHaveBeenCalled();
   });
 
-  it('reorders by dragging one tab onto another (from index → to index)', () => {
+  // --- @dnd-kit/sortable reordering -------------------------------------------
+  // Pointer dragging needs real layout (jsdom getBoundingClientRect is 0-sized),
+  // so reordering is driven deterministically through the KeyboardSensor: focus a
+  // tab, Space to pick up, Arrow to move, Space to drop. We feed the sortable
+  // measurement a synthetic horizontal layout via getBoundingClientRect so the
+  // arrow-key coordinate getter can find the neighbouring slot. (The pure index
+  // mapping is exhaustively covered in tabDnd.test.ts; a real pointer drag is
+  // covered by e2e/tab-reorder-drag.mjs.)
+  function layOutHorizontally() {
+    // Give every rendered tab a 100px-wide slot at left = index*100. dnd-kit reads
+    // these rects when a keyboard drag starts to locate the next item rightward.
+    for (const t of screen.getAllByTestId('tab')) {
+      const i = Number(t.getAttribute('data-path')!.match(/\d+/)?.[0] ?? 0);
+      (t as HTMLElement).getBoundingClientRect = () =>
+        ({ left: i * 100, right: i * 100 + 90, top: 0, bottom: 30, width: 90, height: 30, x: i * 100, y: 0, toJSON() {} }) as DOMRect;
+    }
+  }
+
+  // @dnd-kit's KeyboardSensor registers its document keydown listener inside a
+  // setTimeout and measures droppable rects on a rAF, so the test must yield a
+  // macrotask after pick-up (and between each key) for the move/drop to register.
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  async function keyboardDrag(tab: HTMLElement, arrows: string[]) {
+    tab.focus();
+    fireEvent.keyDown(tab, { key: ' ', code: 'Space' }); // pick up
+    await tick();
+    for (const key of arrows) {
+      fireEvent.keyDown(tab, { key, code: key });
+      await tick();
+    }
+    fireEvent.keyDown(tab, { key: ' ', code: 'Space' }); // drop
+    await tick();
+  }
+
+  it('reorders forward via the keyboard sensor (Space, ArrowRight, Space)', async () => {
     const onReorder = vi.fn();
-    const dt = { effectAllowed: '', setData: vi.fn(), getData: vi.fn(() => '') };
-    render(<TabBar {...base} onReorder={onReorder} tabs={['a.md', 'b.md', 'c.md']} active="a.md" />);
-    const tabs = screen.getAllByTestId('tab');
-    fireEvent.dragStart(tabs[0], { dataTransfer: dt });
-    fireEvent.drop(tabs[2], { dataTransfer: dt });
-    expect(onReorder).toHaveBeenCalledWith(0, 2);
-  });
-
-  it('live-previews the new order while dragging (before drop), then commits it', () => {
-    const onReorder = vi.fn();
-    const dt = { effectAllowed: '', setData: vi.fn(), getData: vi.fn(() => '') };
-    render(<TabBar {...base} onReorder={onReorder} tabs={['a.md', 'b.md', 'c.md']} active="a.md" />);
-    const paths = () => screen.getAllByTestId('tab').map((t) => t.getAttribute('data-path'));
-    // Baseline DOM order.
-    expect(paths()).toEqual(['a.md', 'b.md', 'c.md']);
-
-    const tabA = screen.getByText('a.md').closest('[data-testid="tab"]')!;
-    const tabC = screen.getByText('c.md').closest('[data-testid="tab"]')!;
-    fireEvent.dragStart(tabA, { dataTransfer: dt });
-    // The dragged tab is visually de-emphasised.
-    expect((tabA as HTMLElement).style.opacity).toBe('0.55');
-
-    // Hover over c.md → the dragged a.md slides to the end, LIVE (no drop yet).
-    fireEvent.dragOver(tabC, { dataTransfer: dt });
-    expect(paths()).toEqual(['b.md', 'c.md', 'a.md']);
-    expect(onReorder).not.toHaveBeenCalled();
-
-    // Drop on c.md commits exactly that order (move a.md from 0 → 2).
-    fireEvent.drop(screen.getByText('c.md').closest('[data-testid="tab"]')!, { dataTransfer: dt });
+    render(<TabBar {...base} onReorder={onReorder} tabs={['t0.md', 't1.md', 't2.md']} active="t0.md" />);
+    layOutHorizontally();
+    await keyboardDrag(screen.getAllByTestId('tab')[0], ['ArrowRight']);
     expect(onReorder).toHaveBeenCalledTimes(1);
-    expect(onReorder).toHaveBeenCalledWith(0, 2);
-  });
+    expect(onReorder).toHaveBeenCalledWith(0, 1);
+  }, 15000);
 
-  it('resets the live preview order on dragEnd (no commit)', () => {
+  it('reorders backward via the keyboard sensor (Space, ArrowLeft, Space)', async () => {
     const onReorder = vi.fn();
-    const dt = { effectAllowed: '', setData: vi.fn(), getData: vi.fn(() => '') };
-    render(<TabBar {...base} onReorder={onReorder} tabs={['a.md', 'b.md', 'c.md']} active="a.md" />);
-    const paths = () => screen.getAllByTestId('tab').map((t) => t.getAttribute('data-path'));
-    const tabA = screen.getByText('a.md').closest('[data-testid="tab"]')!;
-    const tabC = screen.getByText('c.md').closest('[data-testid="tab"]')!;
-    fireEvent.dragStart(tabA, { dataTransfer: dt });
-    fireEvent.dragOver(tabC, { dataTransfer: dt });
-    expect(paths()).toEqual(['b.md', 'c.md', 'a.md']);
-    // Abandoning the drag snaps the order back to the prop order.
-    fireEvent.dragEnd(tabA);
-    expect(paths()).toEqual(['a.md', 'b.md', 'c.md']);
+    render(<TabBar {...base} onReorder={onReorder} tabs={['t0.md', 't1.md', 't2.md']} active="t2.md" />);
+    layOutHorizontally();
+    await keyboardDrag(screen.getAllByTestId('tab')[2], ['ArrowLeft']);
+    expect(onReorder).toHaveBeenCalledTimes(1);
+    expect(onReorder).toHaveBeenCalledWith(2, 1);
+  }, 15000);
+
+  it('does not fire onReorder when the keyboard drag ends where it started', async () => {
+    const onReorder = vi.fn();
+    render(<TabBar {...base} onReorder={onReorder} tabs={['t0.md', 't1.md', 't2.md']} active="t0.md" />);
+    layOutHorizontally();
+    // Pick up and immediately drop without moving → no-op (handleDragEnd → null).
+    await keyboardDrag(screen.getAllByTestId('tab')[0], []);
     expect(onReorder).not.toHaveBeenCalled();
-  });
+  }, 15000);
 
   it('opens a file dragged from the tree (x-asp-path) without reordering', () => {
     const onReorder = vi.fn();
@@ -175,6 +185,26 @@ describe('TabBar', () => {
     expect(onReorder).not.toHaveBeenCalled();
   });
 
+  it('renders an empty rename input when no renameValue is supplied', () => {
+    render(<TabBar {...base} tabs={['a.md']} active="a.md" renamingPath="a.md" />);
+    expect((screen.getByTestId('tab-rename-input') as HTMLInputElement).value).toBe('');
+  });
+
+  it('swallows a dataTransfer that throws on getData (restricted clipboard)', () => {
+    const onDropOpenPath = vi.fn();
+    const dt = {
+      effectAllowed: '',
+      setData: vi.fn(),
+      getData: () => {
+        throw new Error('blocked');
+      },
+    };
+    render(<TabBar {...base} onDropOpenPath={onDropOpenPath} tabs={['a.md']} active="a.md" />);
+    // The drop must not throw, and with no readable path nothing opens.
+    fireEvent.drop(screen.getByTestId('tab-bar'), { dataTransfer: dt });
+    expect(onDropOpenPath).not.toHaveBeenCalled();
+  });
+
   it('renders an inline rename input for the renaming tab', () => {
     const onRenameChange = vi.fn();
     render(<TabBar {...base} tabs={['a.md', 'b.md']} active="a.md" renamingPath="a.md" renameValue="a.md" onRenameChange={onRenameChange} />);
@@ -182,17 +212,6 @@ describe('TabBar', () => {
     expect(input.value).toBe('a.md');
     fireEvent.change(input, { target: { value: 'a2.md' } });
     expect(onRenameChange).toHaveBeenCalledWith('a2.md');
-  });
-
-  it('dropping a dragged tab on blank strip space reorders it to the end', () => {
-    const onReorder = vi.fn();
-    const dt = { effectAllowed: '', setData: vi.fn(), getData: () => '' };
-    render(<TabBar {...base} onReorder={onReorder} tabs={['a.md', 'b.md', 'c.md']} active="a.md" />);
-    fireEvent.dragStart(screen.getAllByTestId('tab')[0], { dataTransfer: dt });
-    // The strip (not a tab) receives the drop → reorder to the last slot.
-    fireEvent.dragOver(screen.getByTestId('tab-bar'), { dataTransfer: dt });
-    fireEvent.drop(screen.getByTestId('tab-bar'), { dataTransfer: dt });
-    expect(onReorder).toHaveBeenCalledWith(0, 2);
   });
 
   it('opens a tree-dragged file dropped on blank strip space', () => {
@@ -204,15 +223,14 @@ describe('TabBar', () => {
     expect(onDropOpenPath).toHaveBeenCalledWith('q.md');
   });
 
-  it('clears the drag state on dragEnd (a later blank drop does nothing)', () => {
+  it('ignores a drop that carries no recognised path (no open, no reorder)', () => {
     const onReorder = vi.fn();
+    const onDropOpenPath = vi.fn();
     const dt = { effectAllowed: '', setData: vi.fn(), getData: () => '' };
-    render(<TabBar {...base} onReorder={onReorder} tabs={['a.md', 'b.md']} active="a.md" />);
-    const t0 = screen.getAllByTestId('tab')[0];
-    fireEvent.dragStart(t0, { dataTransfer: dt });
-    fireEvent.dragOver(t0, { dataTransfer: dt });
-    fireEvent.dragEnd(t0);
+    render(<TabBar {...base} onReorder={onReorder} onDropOpenPath={onDropOpenPath} tabs={['a.md', 'b.md']} active="a.md" />);
+    fireEvent.dragOver(screen.getByTestId('tab-bar'), { dataTransfer: dt });
     fireEvent.drop(screen.getByTestId('tab-bar'), { dataTransfer: dt });
     expect(onReorder).not.toHaveBeenCalled();
+    expect(onDropOpenPath).not.toHaveBeenCalled();
   });
 });

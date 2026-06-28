@@ -464,13 +464,26 @@ describe('App — tabs + URL hash (desktop)', () => {
 
   it('reorders tabs by dragging and persists the new order to localStorage', async () => {
     await openTwoTabs();
-    const dt = { effectAllowed: '', setData: vi.fn(), getData: () => '' };
-    const tabs = screen.getAllByTestId('tab');
-    fireEvent.dragStart(tabs[1], { dataTransfer: dt }); // grab notes/a.md (idx 1)
-    fireEvent.drop(tabs[0], { dataTransfer: dt }); // drop onto README (idx 0)
+    // Reordering now goes through @dnd-kit/sortable (pointer/keyboard) rather than
+    // native HTML5 drag. jsdom has no layout, so we drive it through the
+    // KeyboardSensor: give the tabs a synthetic horizontal layout, then pick up
+    // notes/a.md (idx 1), ArrowLeft, drop → it lands before README.md (idx 0).
+    const tick = () => new Promise((r) => setTimeout(r, 0));
+    screen.getAllByTestId('tab').forEach((t, i) => {
+      (t as HTMLElement).getBoundingClientRect = () =>
+        ({ left: i * 100, right: i * 100 + 90, top: 0, bottom: 30, width: 90, height: 30, x: i * 100, y: 0, toJSON() {} }) as DOMRect;
+    });
+    const grabbed = screen.getAllByTestId('tab')[1]; // notes/a.md
+    grabbed.focus();
+    fireEvent.keyDown(grabbed, { key: ' ', code: 'Space' }); // pick up
+    await tick();
+    fireEvent.keyDown(grabbed, { key: 'ArrowLeft', code: 'ArrowLeft' });
+    await tick();
+    fireEvent.keyDown(grabbed, { key: ' ', code: 'Space' }); // drop
+    await tick();
     await waitFor(() => expect(tabPaths()).toEqual(['notes/a.md', 'README.md']));
     await waitFor(() => expect(JSON.parse(localStorage.getItem('asp.tabs.vidA')!)).toEqual(['notes/a.md', 'README.md']));
-  });
+  }, 15000);
 
   it('dropping a tree file on the tab strip OPENS it as a tab (does not move it)', async () => {
     await openAlpha();

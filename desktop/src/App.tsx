@@ -236,6 +236,31 @@ export default function App() {
     return fs;
   }, []);
 
+  // Re-read the currently-open file so a peer's live edit to it shows up. Only
+  // when the editor isn't dirty (never clobber unsaved local edits) and we're on
+  // the live head (not time-travelling). Repaints only if the bytes changed.
+  const refreshActiveContent = useCallback(async () => {
+    const id = activeIdRef.current;
+    const path = selectedRef.current;
+    if (!id || !path || dirtyRef.current) return;
+    const ph = playheadRef.current;
+    if (ph != null && ph < nowRef.current) return; // viewing history; leave it be
+    try {
+      const fresh = await api.readFile(id, path);
+      // Bail if the user moved on while we were awaiting, or started editing.
+      if (activeIdRef.current !== id || selectedRef.current !== path || dirtyRef.current) return;
+      const key = `${id}::${path}`;
+      if (contentRef.current[key] === fresh) return; // unchanged — no repaint
+      contentRef.current[key] = fresh;
+      bufferRef.current = fresh;
+      const seq = ++paintSeq.current;
+      setDocText(fresh);
+      setPaint({ source: fresh, readOnly: false, notExist: false, key: `${path}#live#${seq}` });
+    } catch {
+      /* transient backend error — try again next poll */
+    }
+  }, []);
+
   useEffect(() => {
     void api.getIdentity().then(setIdentity).catch(() => {});
     void (async () => {
@@ -292,12 +317,19 @@ export default function App() {
       if (screen === 'editor' && activeIdRef.current) {
         const id = activeIdRef.current;
         void api.getStatus(id).then((st) => setStatuses((p) => ({ ...p, [id]: st }))).catch(() => {});
+        // Pull in changes a peer pushed while we sit in the editor: the file tree,
+        // the derived history, and the bytes of the file we're looking at. Without
+        // this the backend converges but the UI shows a stale snapshot until the
+        // vault is reopened.
+        void refreshFiles(id).catch(() => {});
+        scheduleHistory(id);
+        void refreshActiveContent();
       } else {
         void refreshVaults().then(refreshStatuses);
       }
     }, 10000);
     return () => clearInterval(t);
-  }, [screen, refreshVaults, refreshStatuses]);
+  }, [screen, refreshVaults, refreshStatuses, refreshFiles, scheduleHistory, refreshActiveContent]);
 
   const metaOf = useCallback(
     (v: VaultInfo) => resolveMeta(metaMap, v.vault_id, basename(v.path)),

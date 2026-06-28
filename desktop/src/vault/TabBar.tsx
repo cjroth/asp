@@ -10,14 +10,41 @@
 //                                   (opens it as a tab; it is NOT moved)
 // Inline rename (driven by App via renamingPath/renameValue) reuses App's
 // commitRename — the same flow the old breadcrumb used.
-import React, { useRef, useState } from 'react';
+//
+// Two DISTINCT drag systems coexist here, on purpose:
+//   1. REORDER — @dnd-kit/sortable (POINTER events). Smooth animated reordering
+//      of tabs within the strip; commits via onReorder on drag end. Works in the
+//      Tauri WebKit/WebView2 webview.
+//   2. EXTERNAL OPEN — NATIVE HTML5 drag (`onDragOver`/`onDrop` + TAB_DND_PATH).
+//      A file dragged out of the tree is dropped on the strip to open it. @dnd-kit
+//      uses pointer events, native DnD uses drag events, so the two never collide
+//      — the tabs are NOT `draggable`, so dragging a tab never starts native DnD,
+//      and dragging a file never triggers @dnd-kit (no pointerdown on a tab).
+import React from 'react';
+import {
+  DndContext,
+  KeyboardSensor,
+  PointerSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core';
+import { restrictToHorizontalAxis } from '@dnd-kit/modifiers';
+import {
+  SortableContext,
+  horizontalListSortingStrategy,
+  sortableKeyboardCoordinates,
+  useSortable,
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 import { basename } from './format';
 import { prettyName } from './prettyNames';
+import { reorderFromDragEnd } from './tabDnd';
 
-// dataTransfer MIME tags. The tree tags dragged files so this (separate)
-// component can tell "open as a tab" drops apart from internal tab reorders.
+// dataTransfer MIME tag the tree stamps on a dragged file so this (separate)
+// component can recognise an "open as a tab" native drop.
 export const TAB_DND_PATH = 'application/x-asp-path';
-const TAB_DND_REORDER = 'application/x-asp-tab';
 
 export interface TabBarProps {
   tabs: string[];
@@ -45,46 +72,170 @@ function labelFor(path: string, pretty: boolean): string {
   return pretty ? prettyName(base, false).label : base;
 }
 
-// Pure helper: return a copy of `arr` with the item at `from` moved to `to`.
-// Used to derive the live drag-preview order from the canonical tabs prop.
-function moveItem<T>(arr: T[], from: number, to: number): T[] {
-  if (from === to) return arr;
-  const copy = arr.slice();
-  const [it] = copy.splice(from, 1);
-  copy.splice(to, 0, it);
-  return copy;
+// Props handed to each sortable tab. Kept flat (not the whole TabBarProps) so the
+// child only depends on what it actually renders/reports.
+interface SortableTabProps {
+  path: string;
+  isActive: boolean;
+  isRenaming: boolean;
+  prettyNames: boolean;
+  accent: string;
+  onSelect: (path: string) => void;
+  onClose: (path: string) => void;
+  onContext?: (path: string, e: React.MouseEvent) => void;
+  onRequestRename?: (path: string) => void;
+  renameValue?: string;
+  onRenameChange?: (v: string) => void;
+  onRenameKeyDown?: (e: React.KeyboardEvent, path: string) => void;
+  onRenameCommit?: (path: string) => void;
 }
 
-// Live drag state: original index of the dragged tab + the index it would land
-// on right now. Both are indices into the canonical `tabs` prop.
-interface DragState {
-  from: number;
-  to: number;
+function SortableTab(p: SortableTabProps) {
+  const { path, isActive, isRenaming, prettyNames, accent, onSelect, onClose } = p;
+  // useSortable wires this node into the DndContext: setNodeRef registers it as a
+  // sortable item, `attributes`/`listeners` carry the pointer + keyboard activator
+  // (we disable them while renaming so the text input owns all input), and
+  // transform/transition drive the neighbour-slide + dragged-tab-follows-pointer
+  // animation. `id` is the path (stable) — what onReorder's index math resolves.
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: path,
+    disabled: isRenaming,
+  });
+  return (
+    <div
+      ref={setNodeRef}
+      {...attributes}
+      {...listeners}
+      // Our semantics win over @dnd-kit's defaults: this is a selectable tab, not
+      // a generic button. (Listed AFTER the spreads so JSX's later props override.)
+      role="tab"
+      aria-selected={isActive}
+      data-testid="tab"
+      data-path={path}
+      title={path}
+      onMouseDown={(e) => {
+        if (e.button === 1) {
+          // Middle-click closes (button 1).
+          e.preventDefault();
+          onClose(path);
+        }
+      }}
+      onClick={() => {
+        if (!isRenaming) onSelect(path);
+      }}
+      onDoubleClick={() => {
+        // Ignore while this tab is already editing; single-click still activates
+        // (the dblclick is preceded by the usual click→select).
+        if (!isRenaming) p.onRequestRename?.(path);
+      }}
+      onContextMenu={(e) => p.onContext?.(path, e)}
+      style={{
+        position: 'relative',
+        display: 'flex',
+        alignItems: 'center',
+        gap: 7,
+        flex: 'none',
+        maxWidth: 220,
+        padding: '0 8px 0 12px',
+        cursor: 'pointer',
+        borderRight: '1px solid var(--line)',
+        // The active tab adopts the editor background + a top accent so it reads
+        // as visually connected to the document below the header.
+        background: isActive ? 'var(--bg)' : 'transparent',
+        color: isActive ? 'var(--text)' : 'var(--text3)',
+        fontSize: 12.5,
+        fontWeight: isActive ? 600 : 500,
+        boxShadow: isActive ? `inset 0 2px 0 ${accent}` : 'none',
+        whiteSpace: 'nowrap',
+        // @dnd-kit transform/transition: neighbours slide as the dragged tab moves
+        // and the lifted tab follows the pointer; it also dims while dragging.
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.55 : 1,
+        zIndex: isDragging ? 1 : undefined,
+        touchAction: 'none',
+      }}
+    >
+      {isRenaming ? (
+        <input
+          data-testid="tab-rename-input"
+          autoFocus
+          value={p.renameValue ?? ''}
+          spellCheck={false}
+          onClick={(e) => e.stopPropagation()}
+          onChange={(e) => p.onRenameChange?.(e.target.value)}
+          onKeyDown={(e) => p.onRenameKeyDown?.(e, path)}
+          onBlur={() => p.onRenameCommit?.(path)}
+          style={{
+            width: 130,
+            fontFamily: 'inherit',
+            fontSize: 12.5,
+            color: 'var(--text)',
+            background: 'var(--bg)',
+            border: `1px solid ${accent}`,
+            borderRadius: 4,
+            padding: '1px 5px',
+            outline: 'none',
+          }}
+        />
+      ) : (
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{labelFor(path, prettyNames)}</span>
+      )}
+      <button
+        data-testid="tab-close"
+        data-path={path}
+        aria-label={`Close ${labelFor(path, prettyNames)}`}
+        title="Close"
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose(path);
+        }}
+        onMouseDown={(e) => e.stopPropagation()}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: 17,
+          height: 17,
+          flex: 'none',
+          border: 'none',
+          background: 'transparent',
+          color: 'inherit',
+          borderRadius: 4,
+          cursor: 'pointer',
+          padding: 0,
+          fontSize: 14,
+          lineHeight: 1,
+          opacity: 0.7,
+        }}
+      >
+        ×
+      </button>
+    </div>
+  );
 }
 
 export default function TabBar(props: TabBarProps) {
   const { tabs, active, prettyNames, accent, onSelect, onClose } = props;
-  // Index of the tab currently being dragged for an internal reorder (null when
-  // the drag came from the file tree instead). Kept in a ref so drop handlers
-  // can read it synchronously (jsdom dataTransfer is unreliable).
-  const dragIndex = useRef<number | null>(null);
-  // Live preview of where the dragged tab would land. Drives a reordered render
-  // so the user SEES the tab slide into place during the drag; reset on
-  // drop/dragEnd. The tabs prop stays the source of truth — App owns the order.
-  const [drag, setDrag] = useState<DragState | null>(null);
 
-  // The order to actually render: the previewed order while dragging, else the
-  // canonical tabs. Each tab keeps key={path}, so React moves the existing DOM
-  // nodes (rather than rebuilding) and the CSS transitions animate the shift.
-  const previewTabs = drag ? moveItem(tabs, drag.from, drag.to) : tabs;
-  const draggedPath = drag ? tabs[drag.from] : null;
+  // PointerSensor with a 4px activation distance so a plain click still selects a
+  // tab (and dbl-click renames, right-click menus) without ever starting a drag —
+  // only a deliberate 4px drag picks the tab up. KeyboardSensor gives accessible
+  // (and deterministic, test-friendly) reordering via Space + Arrow keys.
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
 
-  const resetDrag = () => {
-    dragIndex.current = null;
-    setDrag(null);
+  // Translate @dnd-kit's (activeId, overId) into App's (from, to) index contract
+  // and fire onReorder exactly once — never for a no-op (dropped on itself / no
+  // target). The tabs prop stays the source of truth; App owns the committed order.
+  const handleDragEnd = (e: DragEndEvent) => {
+    const move = reorderFromDragEnd(tabs, e.active.id, e.over?.id);
+    if (move) props.onReorder?.(move.from, move.to);
   };
 
-  // Read the file path off a drop that originated in the file tree.
+  // Read the file path off a NATIVE drop that originated in the file tree.
   const openDroppedPath = (e: React.DragEvent): boolean => {
     let p = '';
     try {
@@ -101,186 +252,56 @@ export default function TabBar(props: TabBarProps) {
 
   if (tabs.length === 0) return null;
   return (
-    <div
-      data-testid="tab-bar"
-      role="tablist"
-      className="asp-scroll"
-      style={{
-        flex: 1,
-        minWidth: 0,
-        alignSelf: 'stretch',
-        display: 'flex',
-        alignItems: 'stretch',
-        overflowX: 'auto',
-        overflowY: 'hidden',
-      }}
-      // Allow drops anywhere on the strip (reorder-to-end or open-from-tree).
-      onDragOver={(e) => {
-        if (dragIndex.current != null || (props.onDropOpenPath && e.dataTransfer)) e.preventDefault();
-      }}
-      onDrop={(e) => {
-        // Tab drops stopPropagation, so this only fires over blank strip space.
-        if (dragIndex.current != null) {
-          e.preventDefault();
-          props.onReorder?.(dragIndex.current, tabs.length - 1);
-          resetDrag();
-        } else if (openDroppedPath(e)) {
-          e.preventDefault();
-        }
-      }}
+    <DndContext
+      sensors={sensors}
+      collisionDetection={closestCenter}
+      modifiers={[restrictToHorizontalAxis]}
+      onDragEnd={handleDragEnd}
     >
-      {previewTabs.map((path) => {
-        // Index into the canonical tabs prop (stable regardless of the live
-        // preview position) — what App's onReorder contract speaks in.
-        const i = tabs.indexOf(path);
-        const isActive = path === active;
-        const isDragging = path === draggedPath;
-        const isRenaming = props.renamingPath != null && props.renamingPath === path;
-        return (
-          <div
-            key={path}
-            role="tab"
-            aria-selected={isActive}
-            data-testid="tab"
-            data-path={path}
-            title={path}
-            draggable={!isRenaming}
-            onMouseDown={(e) => {
-              if (e.button === 1) {
-                // Middle-click closes (button 1).
-                e.preventDefault();
-                onClose(path);
-              }
-            }}
-            onClick={() => {
-              if (!isRenaming) onSelect(path);
-            }}
-            onDoubleClick={() => {
-              // Ignore while this tab is already editing; single-click still
-              // activates (the dblclick is preceded by the usual click→select).
-              if (!isRenaming) props.onRequestRename?.(path);
-            }}
-            onContextMenu={(e) => props.onContext?.(path, e)}
-            onDragStart={(e) => {
-              if (isRenaming) return;
-              dragIndex.current = i;
-              setDrag({ from: i, to: i });
-              if (e.dataTransfer) {
-                e.dataTransfer.effectAllowed = 'move';
-                try {
-                  e.dataTransfer.setData(TAB_DND_REORDER, String(i));
-                } catch {
-                  /* jsdom */
-                }
-              }
-            }}
-            onDragEnd={() => {
-              resetDrag();
-            }}
-            onDragOver={(e) => {
-              if (dragIndex.current != null) {
-                // Reordering: live-preview the dragged tab landing in this slot.
-                e.preventDefault();
-                if (drag == null || drag.to !== i) setDrag({ from: dragIndex.current, to: i });
-              } else if (props.onDropOpenPath && e.dataTransfer) {
-                // A file dragged from the tree — allow the open-as-tab drop.
-                e.preventDefault();
-              }
-            }}
-            onDrop={(e) => {
-              e.stopPropagation();
-              if (dragIndex.current != null) {
-                e.preventDefault();
-                props.onReorder?.(dragIndex.current, i);
-                resetDrag();
-              } else if (openDroppedPath(e)) {
-                e.preventDefault();
-              }
-            }}
-            style={{
-              position: 'relative',
-              display: 'flex',
-              alignItems: 'center',
-              gap: 7,
-              flex: 'none',
-              maxWidth: 220,
-              padding: '0 8px 0 12px',
-              cursor: 'pointer',
-              borderRight: '1px solid var(--line)',
-              // The active tab adopts the editor background + a top accent so it
-              // reads as visually connected to the document below the header.
-              background: isActive ? 'var(--bg)' : 'transparent',
-              color: isActive ? 'var(--text)' : 'var(--text3)',
-              fontSize: 12.5,
-              fontWeight: isActive ? 600 : 500,
-              boxShadow: isActive ? `inset 0 2px 0 ${accent}` : 'none',
-              whiteSpace: 'nowrap',
-              // Live-reorder feel: the dragged tab dims + shrinks slightly while
-              // neighbours slide into their new slots (the reordered render moves
-              // the keyed nodes; this transition animates the shift).
-              transition: 'transform 0.16s ease, opacity 0.16s ease',
-              opacity: isDragging ? 0.55 : 1,
-              transform: isDragging ? 'scale(0.96)' : 'none',
-            }}
-          >
-            {isRenaming ? (
-              <input
-                data-testid="tab-rename-input"
-                autoFocus
-                value={props.renameValue ?? ''}
-                spellCheck={false}
-                onClick={(e) => e.stopPropagation()}
-                onChange={(e) => props.onRenameChange?.(e.target.value)}
-                onKeyDown={(e) => props.onRenameKeyDown?.(e, path)}
-                onBlur={() => props.onRenameCommit?.(path)}
-                style={{
-                  width: 130,
-                  fontFamily: 'inherit',
-                  fontSize: 12.5,
-                  color: 'var(--text)',
-                  background: 'var(--bg)',
-                  border: `1px solid ${accent}`,
-                  borderRadius: 4,
-                  padding: '1px 5px',
-                  outline: 'none',
-                }}
-              />
-            ) : (
-              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{labelFor(path, prettyNames)}</span>
-            )}
-            <button
-              data-testid="tab-close"
-              data-path={path}
-              aria-label={`Close ${labelFor(path, prettyNames)}`}
-              title="Close"
-              onClick={(e) => {
-                e.stopPropagation();
-                onClose(path);
-              }}
-              onMouseDown={(e) => e.stopPropagation()}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                width: 17,
-                height: 17,
-                flex: 'none',
-                border: 'none',
-                background: 'transparent',
-                color: 'inherit',
-                borderRadius: 4,
-                cursor: 'pointer',
-                padding: 0,
-                fontSize: 14,
-                lineHeight: 1,
-                opacity: 0.7,
-              }}
-            >
-              ×
-            </button>
-          </div>
-        );
-      })}
-    </div>
+      <SortableContext items={tabs} strategy={horizontalListSortingStrategy}>
+        <div
+          data-testid="tab-bar"
+          role="tablist"
+          className="asp-scroll"
+          style={{
+            flex: 1,
+            minWidth: 0,
+            alignSelf: 'stretch',
+            display: 'flex',
+            alignItems: 'stretch',
+            overflowX: 'auto',
+            overflowY: 'hidden',
+          }}
+          // NATIVE HTML5 drop target for "open a file dragged from the tree". This
+          // is independent of @dnd-kit (drag events vs pointer events); a per-tab
+          // drop bubbles here too, so the whole strip opens tree-dragged files.
+          onDragOver={(e) => {
+            if (props.onDropOpenPath && e.dataTransfer) e.preventDefault();
+          }}
+          onDrop={(e) => {
+            if (openDroppedPath(e)) e.preventDefault();
+          }}
+        >
+          {tabs.map((path) => (
+            <SortableTab
+              key={path}
+              path={path}
+              isActive={path === active}
+              isRenaming={props.renamingPath != null && props.renamingPath === path}
+              prettyNames={prettyNames}
+              accent={accent}
+              onSelect={onSelect}
+              onClose={onClose}
+              onContext={props.onContext}
+              onRequestRename={props.onRequestRename}
+              renameValue={props.renameValue}
+              onRenameChange={props.onRenameChange}
+              onRenameKeyDown={props.onRenameKeyDown}
+              onRenameCommit={props.onRenameCommit}
+            />
+          ))}
+        </div>
+      </SortableContext>
+    </DndContext>
   );
 }
