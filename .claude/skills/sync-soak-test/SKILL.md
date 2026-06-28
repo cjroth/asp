@@ -79,6 +79,48 @@ To exercise the real renderer (the same WebKit engine Tauri ships) at scale:
 staling the driver's node ref) independent of app changes — judge a run by the
 earlier steps (load/open/virtualized-rows/history-tick-cap), not that one.
 
+## Actively expand the surface — don't just re-run
+
+The fuzzer is generative (random seeds/op sequences explore a large state space),
+but its *surface* is bounded by the scenario list and topology. Running it green
+proves no regression in **covered** behavior — it says nothing about **uncovered**
+behavior. When the task is "find bugs / push to the limits" (not just "check my
+change didn't regress"), spend most of the effort growing the surface:
+
+1. **Diff coverage against the real API.** List every public method on
+   `DesktopEngine` (`grep 'pub fn' desktop/engine/src/lib.rs`) and every CLI
+   subcommand (`crates/asp/src/main.rs`). Anything the fuzzer never calls is a
+   blind spot. Known gaps as of this writing, each worth a new scenario or a
+   focused test:
+   - **snapshot / restore** and **time-travel** (`read_file_at`, `restore_file_at`)
+     *while sync is concurrently mutating the vault*.
+   - **auth**: `authorize`, revoke, TTL expiry, TOFU vs `--auth-key`, a peer
+     presenting the wrong key (must be rejected, not silently dropped).
+   - **offline → reconnect → catch-up**: drop a peer mid-edit, keep editing both
+     sides, reconnect, assert version-vector catch-up converges (the CLI side has
+     `tests/e2e/clone_catchup.rs` to mirror; the desktop engine path is thinner).
+   - **`rescan` / external edits**: mutate a file on disk *behind* the engine and
+     confirm `rescan` captures it and it syncs.
+   - **relay topology**: `--relay` co-hosted and a standalone `asp relay`, so the
+     ticket routes through a relay instead of direct loopback.
+   - **scope**: `.aspignore` rules, files outside scope, `.asp/` never syncing.
+   - **the web wasm+OPFS path**: persistence across reload, one-shot `sync`
+     semantics, and the fact that web never auto-syncs after clone (below).
+   - **scale**: 5000+ files, deep trees, many peers — watch convergence latency.
+
+2. **Add the case, then prove it fails first.** New scenario in `apply_scenario`,
+   or a new focused `#[test]` in `desktop/engine/tests/` / `vitest` file. For a
+   suspected bug, write the assertion of *correct* behavior and confirm it fails
+   before fixing — a green test that never failed proves nothing.
+
+3. **Vary the adversary, not just the seed.** Change interleaving (apply op then
+   sync vs sync mid-op), timing (debounce 0 vs 500ms), and direction (CLI-origin
+   vs engine-origin vs both-at-once). Many sync bugs only appear at one ordering.
+
+4. **Loop until a real streak.** Keep adding/attacking until the fuzzer clears
+   ~10+ clean rounds in a row across the *expanded* surface — then report what new
+   coverage was added, not just "tests pass."
+
 ## Where the bugs actually are
 
 Across thousands of fuzz rounds the `asp-core` sync path showed **zero
