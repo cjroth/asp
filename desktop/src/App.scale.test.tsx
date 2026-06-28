@@ -116,6 +116,7 @@ describe('App at scale (~1000 files)', () => {
     const name = renderedNotes()[0];
     fireEvent.contextMenu(rowFor(name));
     fireEvent.click(await screen.findByText('Delete'));
+    fireEvent.click(await screen.findByTestId('confirm-delete'));
     // Synchronously gone from the tree (the 40ms backend hasn't returned yet).
     expect(present(name)).toBe(false);
     await waitFor(() => expect(deleteFile).toHaveBeenCalledWith('v1', name));
@@ -130,6 +131,7 @@ describe('App at scale (~1000 files)', () => {
     for (const nm of targets) {
       fireEvent.contextMenu(rowFor(nm));
       fireEvent.click(await screen.findByText('Delete'));
+      fireEvent.click(await screen.findByTestId('confirm-delete'));
     }
     for (const nm of targets) expect(present(nm)).toBe(false);
     await waitFor(() => targets.forEach((nm) => expect(CONTENT[nm]).toBeUndefined()));

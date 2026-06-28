@@ -372,6 +372,7 @@ describe('App — editor', () => {
     expect(screen.getByText('Delete')).toBeTruthy();
     expect(screen.getAllByText('TODO.md')).toHaveLength(1);
     fireEvent.click(screen.getByText('Delete'));
+    fireEvent.click(await screen.findByTestId('confirm-delete'));
     await waitFor(() => expect(deleteFile).toHaveBeenCalledWith('v1', 'TODO.md'));
   });
 
@@ -461,6 +462,9 @@ describe('App — multi-selection', () => {
     fireEvent.click(treeRow('TODO.md'), { metaKey: true }); // README + TODO selected
     fireEvent.contextMenu(treeRow('TODO.md')); // right-click a member of the selection
     fireEvent.click(await screen.findByText('Delete'));
+    // The confirm modal names the count for a multi-selection.
+    expect((await screen.findByTestId('delete-confirm')).textContent).toContain('2 items');
+    fireEvent.click(screen.getByTestId('confirm-delete'));
     await waitFor(() => expect(deleteFile).toHaveBeenCalledWith('v1', 'README.md'));
     await waitFor(() => expect(deleteFile).toHaveBeenCalledWith('v1', 'TODO.md'));
   });
@@ -469,6 +473,7 @@ describe('App — multi-selection', () => {
     await screen.findByTestId('live-editor');
     fireEvent.click(treeRow('TODO.md'), { metaKey: true });
     fireEvent.keyDown(document.body, { key: 'Delete' });
+    fireEvent.click(await screen.findByTestId('confirm-delete'));
     await waitFor(() => expect(deleteFile).toHaveBeenCalledWith('v1', 'README.md'));
     await waitFor(() => expect(deleteFile).toHaveBeenCalledWith('v1', 'TODO.md'));
   });

@@ -297,6 +297,7 @@ describe('App — tabs + URL hash (desktop)', () => {
     await waitFor(() => expect(tabPaths()).toEqual(['README.md', 'notes/a.md']));
     fireEvent.contextMenu(treeRow('a.md'));
     fireEvent.click(await screen.findByText('Delete'));
+    fireEvent.click(await screen.findByTestId('confirm-delete'));
     await waitFor(() => expect(deleteFile).toHaveBeenCalledWith('v1', 'notes/a.md'));
     await waitFor(() => expect(tabPaths()).toEqual(['README.md']));
     await waitFor(() => expect(parseHash(window.location.hash)?.path).toBe('README.md'));
@@ -332,8 +333,67 @@ describe('App — tabs + URL hash (desktop)', () => {
     await openTwoTabs();
     fireEvent.contextMenu(tab('notes/a.md'));
     fireEvent.click(await screen.findByText('Delete'));
+    fireEvent.click(await screen.findByTestId('confirm-delete'));
     await waitFor(() => expect(deleteFile).toHaveBeenCalledWith('v1', 'notes/a.md'));
     await waitFor(() => expect(tabPaths()).toEqual(['README.md']));
+  });
+
+  it('the tab Delete asks for confirmation first and deletes nothing until confirmed', async () => {
+    await openTwoTabs();
+    fireEvent.contextMenu(tab('notes/a.md'));
+    fireEvent.click(await screen.findByText('Delete'));
+    // The confirm modal is up, naming the file; nothing deleted yet.
+    expect(await screen.findByTestId('delete-confirm')).toBeTruthy();
+    expect(screen.getByTestId('delete-confirm').textContent).toContain('a.md');
+    expect(deleteFile).not.toHaveBeenCalled();
+    expect(tabPaths()).toEqual(['README.md', 'notes/a.md']);
+  });
+
+  it('canceling the confirm modal (Cancel button) deletes nothing', async () => {
+    await openTwoTabs();
+    fireEvent.contextMenu(tab('notes/a.md'));
+    fireEvent.click(await screen.findByText('Delete'));
+    fireEvent.click(await screen.findByText('Cancel'));
+    await waitFor(() => expect(screen.queryByTestId('delete-confirm')).toBeNull());
+    expect(deleteFile).not.toHaveBeenCalled();
+    expect(tabPaths()).toEqual(['README.md', 'notes/a.md']);
+  });
+
+  it('Escape on the confirm modal closes it without deleting', async () => {
+    await openTwoTabs();
+    fireEvent.contextMenu(tab('notes/a.md'));
+    fireEvent.click(await screen.findByText('Delete'));
+    fireEvent.keyDown(await screen.findByTestId('delete-confirm'), { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByTestId('delete-confirm')).toBeNull());
+    expect(deleteFile).not.toHaveBeenCalled();
+    expect(tabPaths()).toEqual(['README.md', 'notes/a.md']);
+  });
+
+  it('clicking the confirm-modal overlay closes it without deleting', async () => {
+    await openTwoTabs();
+    fireEvent.contextMenu(tab('notes/a.md'));
+    fireEvent.click(await screen.findByText('Delete'));
+    fireEvent.click(await screen.findByTestId('delete-confirm-overlay'));
+    await waitFor(() => expect(screen.queryByTestId('delete-confirm')).toBeNull());
+    expect(deleteFile).not.toHaveBeenCalled();
+  });
+
+  it('Enter on the confirm modal confirms the delete', async () => {
+    await openTwoTabs();
+    fireEvent.contextMenu(tab('notes/a.md'));
+    fireEvent.click(await screen.findByText('Delete'));
+    fireEvent.keyDown(await screen.findByTestId('delete-confirm'), { key: 'Enter' });
+    await waitFor(() => expect(deleteFile).toHaveBeenCalledWith('v1', 'notes/a.md'));
+  });
+
+  it('the keyboard Delete key routes through the confirm modal', async () => {
+    await openTwoTabs(); // active = notes/a.md, single selection
+    fireEvent.keyDown(document.body, { key: 'Delete' });
+    // Nothing deleted until the modal is confirmed.
+    expect(await screen.findByTestId('delete-confirm')).toBeTruthy();
+    expect(deleteFile).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId('confirm-delete'));
+    await waitFor(() => expect(deleteFile).toHaveBeenCalledWith('v1', 'notes/a.md'));
   });
 
   it('reorders tabs by dragging and persists the new order to localStorage', async () => {

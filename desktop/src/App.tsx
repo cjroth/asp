@@ -145,6 +145,9 @@ export default function App() {
   const [vaultCtx, setVaultCtx] = useState<{ x: number; y: number; id: string; vaultId: string; name: string } | null>(null);
   const [customize, setCustomize] = useState<CustomizeInit | null>(null);
   const [removeVaultState, setRemoveVaultState] = useState<{ id: string; name: string; path: string; trash: boolean } | null>(null);
+  // Pending delete awaiting confirmation. `paths` is the exact set to remove
+  // (already expanded for multi-selection); `label`/`count` drive the message.
+  const [deleteConfirm, setDeleteConfirm] = useState<{ paths: string[]; label: string; count: number } | null>(null);
 
   // refs for values used inside imperative handlers / async flows
   const activeIdRef = useRef<string | null>(null);
@@ -695,9 +698,10 @@ export default function App() {
     [movePaths],
   );
 
-  // Delete one or more paths (folders delete their whole subtree). Drives both the
-  // single-file delete and the batch delete of a multi-selection.
-  const deletePaths = useCallback(
+  // Actually delete one or more paths (folders delete their whole subtree). Drives
+  // both the single-file delete and the batch delete of a multi-selection. Runs
+  // only AFTER the user confirms — entry points go through `requestDelete`.
+  const performDelete = useCallback(
     (paths: string[]) => {
       const id = activeIdRef.current;
       if (!id || paths.length === 0) return;
@@ -752,16 +756,33 @@ export default function App() {
     [scheduleHistory],
   );
 
+  // Open the confirm-before-delete modal for `paths`. Nothing is removed until the
+  // user confirms (`confirmDelete` → `performDelete`). All delete entry points —
+  // the file-tree menu, the tab menu, and the keyboard — funnel through here.
+  const requestDelete = useCallback((paths: string[]) => {
+    if (paths.length === 0) return;
+    setCtxMenu(null);
+    setTabCtx(null);
+    setDeleteConfirm({ paths, label: basename(paths[0]), count: paths.length });
+  }, []);
+
+  const confirmDelete = useCallback(() => {
+    setDeleteConfirm((dc) => {
+      if (dc) performDelete(dc.paths);
+      return null;
+    });
+  }, [performDelete]);
+
   // Context-menu / programmatic delete of a single node. If the node is a FILE
   // that's part of a multi-selection, delete the whole selection (batch delete);
-  // otherwise just this node (today's behavior).
+  // otherwise just this node. Expands to the selection FIRST, then confirms.
   const deleteNode = useCallback(
     (path: string, isDir: boolean) => {
       const sel = selectedPathsRef.current;
-      if (!isDir && sel.size > 1 && sel.has(path)) deletePaths(Array.from(sel));
-      else deletePaths([path]);
+      if (!isDir && sel.size > 1 && sel.has(path)) requestDelete(Array.from(sel));
+      else requestDelete([path]);
     },
-    [deletePaths],
+    [requestDelete],
   );
 
   // Keyboard: Delete/Backspace removes the whole current selection; Escape
@@ -780,12 +801,12 @@ export default function App() {
         const sel = selectedPathsRef.current;
         if (sel.size === 0) return;
         e.preventDefault();
-        deletePaths(Array.from(sel));
+        requestDelete(Array.from(sel));
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [deletePaths]);
+  }, [requestDelete]);
 
   const openCtx = useCallback((e: React.MouseEvent, node: { path: string; isDir: boolean; name: string }) => {
     e.preventDefault();
@@ -1739,6 +1760,31 @@ export default function App() {
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 2 }}>
               <button autoFocus onClick={() => setRemoveVaultState(null)} style={{ fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: 'var(--text2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 9, padding: '8px 16px', cursor: 'pointer' }}>Cancel</button>
               <button onClick={() => void confirmRemove()} style={{ fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: 'var(--bg)', background: '#c0392b', border: 'none', borderRadius: 9, padding: '8px 16px', cursor: 'pointer' }}>{removeVaultState.trash ? 'Remove & Trash folder' : 'Remove from asp'}</button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* delete-confirm modal — files/folders are recoverable from History, so the
+          message is honest (not "can't be undone") and the button is non-red. */}
+      {deleteConfirm && (
+        <>
+          <div data-testid="delete-confirm-overlay" onClick={() => setDeleteConfirm(null)} style={{ position: 'fixed', inset: 0, zIndex: 72, background: 'var(--overlay)', backdropFilter: 'blur(2px)' }} />
+          <div
+            data-testid="delete-confirm"
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') { e.preventDefault(); setDeleteConfirm(null); }
+              else if (e.key === 'Enter') { e.preventDefault(); confirmDelete(); }
+            }}
+            style={{ position: 'fixed', zIndex: 73, top: '50%', left: '50%', transform: 'translate(-50%,-50%)', width: 'min(412px,92vw)', background: 'var(--bg)', borderRadius: 16, boxShadow: '0 24px 60px rgba(28,25,23,0.28)', padding: 20, display: 'flex', flexDirection: 'column', gap: 14 }}
+          >
+            <div>
+              <div style={{ fontSize: 16, fontWeight: 600, letterSpacing: '-0.01em' }}>{deleteConfirm.count === 1 ? `Delete “${deleteConfirm.label}”?` : `Delete ${deleteConfirm.count} items?`}</div>
+              <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 4, lineHeight: 1.5 }}>{deleteConfirm.count === 1 ? 'It’s removed from the vault — you can bring it back from the History timeline.' : 'They’re removed from the vault — you can bring them back from the History timeline.'}</div>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 2 }}>
+              <button onClick={() => setDeleteConfirm(null)} style={{ fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: 'var(--text2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 9, padding: '8px 16px', cursor: 'pointer' }}>Cancel</button>
+              <button data-testid="confirm-delete" autoFocus onClick={() => confirmDelete()} style={{ fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: 'var(--bg)', background: 'var(--text)', border: 'none', borderRadius: 9, padding: '8px 16px', cursor: 'pointer' }}>Delete</button>
             </div>
           </div>
         </>
