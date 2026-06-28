@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quickstart — Agent Sync Protocol docs</title>
+  <meta name="description" content="Get your context syncing across every device, editor, and agent in under two minutes.">
+  <link rel="preload" href="/src/fonts/space-grotesk-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/src/styles.css">
+  <script type="module" src="/src/main.js"></script>
+</head>
+<body>
+<div class="pa">
+
+  <!-- NAV -->
+  <header class="pa-nav nav-bar">
+    <div class="pa-sec fx ac jb" style="height:74px">
+      <a class="fx ac gap10" href="/" style="text-decoration:none;color:inherit">
+        <span class="pa-glyph"></span>
+        <span class="fw7" style="font-size:21px">Agent Sync Protocol</span>
+      </a>
+      <nav class="nav-links fx ac gap24 fw5" style="font-size:16px">
+        <a href="index.html#features">Product</a>
+        <a href="index.html#git">Protocol</a>
+        <a href="demo.html">Demo</a>
+        <a class="pa-acc fw7" href="docs.html">Docs</a>
+        <a href="index.html#cta">Pricing</a>
+      </nav>
+      <div class="fx ac gap12">
+        <span class="nav-star pa-pill pa-mono fw7" style="font-size:13px">★ 4.2k</span>
+        <button class="pa-btn" style="padding:11px 22px;font-size:15px;box-shadow:0 4px 0 #4a2fd2">Get early access</button>
+        <button class="menu-toggle" aria-label="Toggle menu">
+          <span class="mln"></span><span class="mln"></span><span class="mln"></span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- DOCS LAYOUT -->
+  <div class="fx" style="align-items:stretch">
+    <aside class="dx-side">
+      <div class="dx-sec" style="margin-top:0">Getting started</div>
+      <a class="dx-link">Introduction</a>
+      <a class="dx-link on">Quickstart</a>
+      <a class="dx-link">Core concepts</a>
+      <div class="dx-sec">Guides</div>
+      <a class="dx-link">Syncing context</a>
+      <a class="dx-link">Versioning &amp; recovery</a>
+      <a class="dx-link">Knowledge graph</a>
+      <a class="dx-link">Coding agents</a>
+      <div class="dx-sec">Reference</div>
+      <a class="dx-link">CLI</a>
+      <a class="dx-link">HTTP API</a>
+      <a class="dx-link">Configuration</a>
+      <a class="dx-link">Self-hosting</a>
+    </aside>
+
+    <main class="dx-main">
+      <div class="dx-crumb">Getting started / Quickstart</div>
+      <h1 class="dx-h1">Quickstart</h1>
+      <div class="dx-lead">Get your context syncing across every device, editor, and agent in under two minutes.</div>
+
+      <h2 id="install" class="dx-h2">Install</h2>
+      <div class="dx-p">Install the <span class="dx-ic">asp</span> CLI with a single command. It runs anywhere — macOS, Linux, or WSL.</div>
+      <div class="dx-code"><span class="dx-pr">$</span> curl -fsSL get.asp.dev | sh<br><span class="dx-cm"># installs asp 1.0.0 to /usr/local/bin</span></div>
+
+      <h2 id="init" class="dx-h2">Initialize a context</h2>
+      <div class="dx-p">Run <span class="dx-ic">asp init</span> inside any folder of notes or markdown to start tracking it.</div>
+      <div class="dx-code"><span class="dx-pr">$</span> cd ~/notes<br><span class="dx-pr">$</span> asp init<br><span class="dx-ok">✓ created .asp/ · tracking 0 files</span></div>
+      <div class="dx-note"><span style="font-size:20px;color:#6b4ef0">◆</span><div><div class="fw7" style="margin-bottom:3px">Already using Git?</div><div class="dx-p" style="margin:0;font-size:15px"><span class="dx-ic">asp init</span> detects your repository and syncs alongside it — no migration, no lock-in.</div></div></div>
+
+      <h2 id="sync" class="dx-h2">Sync everywhere</h2>
+      <div class="dx-p">Add a remote and start the watcher. Every change is versioned and mirrored to your other devices and agents in real time.</div>
+      <div class="dx-code"><span class="dx-pr">$</span> asp remote add origin asp://you@cloud<br><span class="dx-pr">$</span> asp sync --watch<br><span class="dx-ok">↻ watching ~/notes · 3 devices · 0 conflicts</span></div>
+
+      <h2 id="next" class="dx-h2">Next steps</h2>
+      <div class="fx gap12" style="margin-top:4px">
+        <a class="pa-card" style="flex:1;padding:18px;text-decoration:none;color:#221d2c"><div class="fw7" style="font-size:17px;margin-bottom:4px">Core concepts →</div><div style="font-size:14px;color:#4b4458">How sync, versions, and the graph fit together.</div></a>
+        <a class="pa-card" style="flex:1;padding:18px;text-decoration:none;color:#221d2c"><div class="fw7" style="font-size:17px;margin-bottom:4px">Connect an agent →</div><div style="font-size:14px;color:#4b4458">Give a coding agent live read-write context.</div></a>
+      </div>
+    </main>
+
+    <aside class="dx-toc">
+      <div class="dx-tlab">On this page</div>
+      <a class="dx-tl on" href="#install">Install</a>
+      <a class="dx-tl" href="#init">Initialize a context</a>
+      <a class="dx-tl" href="#sync">Sync everywhere</a>
+      <a class="dx-tl" href="#next">Next steps</a>
+    </aside>
+  </div>
+
+</div>
+</body>
+</html>

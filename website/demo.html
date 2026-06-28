@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sync demo — Agent Sync Protocol</title>
+  <meta name="description" content="An interactive peer-to-peer sync demo: edit a vault on any node and watch it converge across every device and agent in real time.">
+  <link rel="preload" href="/src/fonts/space-grotesk-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/src/styles.css">
+  <link rel="stylesheet" href="/src/demo.css">
+  <script type="module" src="/src/demo.js"></script>
+</head>
+<body>
+<div class="pa">
+
+  <!-- NAV -->
+  <header class="pa-nav nav-bar">
+    <div class="pa-sec fx ac jb" style="height:74px">
+      <a class="fx ac gap10" href="/" style="text-decoration:none;color:inherit">
+        <span class="pa-glyph"></span>
+        <span class="fw7" style="font-size:21px">Agent Sync Protocol</span>
+      </a>
+      <nav class="nav-links fx ac gap24 fw5" style="font-size:16px">
+        <a href="index.html#features">Product</a>
+        <a href="index.html#git">Protocol</a>
+        <a class="pa-acc fw7" href="demo.html">Demo</a>
+        <a href="docs.html">Docs</a>
+        <a href="index.html#cta">Pricing</a>
+      </nav>
+      <div class="fx ac gap12">
+        <span class="nav-star pa-pill pa-mono fw7" style="font-size:13px">★ 4.2k</span>
+        <button class="pa-btn" style="padding:11px 22px;font-size:15px;box-shadow:0 4px 0 #4a2fd2">Get early access</button>
+        <button class="menu-toggle" aria-label="Toggle menu">
+          <span class="mln"></span><span class="mln"></span><span class="mln"></span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- INTERACTIVE DEMO (mounted by src/demo.js) -->
+  <div id="sync-demo"></div>
+
+</div>
+</body>
+</html>

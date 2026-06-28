@@ -1,0 +1,57 @@
+/* ============================================================
+   ASP Sync Demo — interactive p2p sync simulator
+   ============================================================ */
+.sd-page{background:#efe6d4;font-family:'Space Grotesk',sans-serif;color:#221d2c;padding:32px 26px;display:flex;justify-content:center;align-items:flex-start}
+.sd-app{width:100%;max-width:1320px;background:#f7f1e6;border:2.5px solid #221d2c;border-radius:24px;overflow:hidden;box-shadow:9px 9px 0 #221d2c}
+.sd-top{display:flex;align-items:center;gap:14px;padding:14px 22px;border-bottom:2.5px solid #221d2c;background:#fff}
+.sd-mark{display:inline-flex;align-items:center;gap:8px;font-weight:700;font-size:19px;letter-spacing:.02em}
+.sd-tick{width:18px;height:18px;border-radius:6px;background:#6b4ef0;transform:rotate(45deg);display:inline-block}
+.sd-subt{font-family:'Space Mono',monospace;font-size:12px;color:#8a7f98}
+.sd-stat{font-family:'Space Mono',monospace;font-size:12px;color:#8a7f98}
+.sd-stat b{color:#221d2c;font-size:14px;margin-left:4px}
+.sd-btn{background:#6b4ef0;color:#fff;border:none;border-radius:999px;padding:9px 18px;font-weight:700;font-size:14px;font-family:'Space Grotesk',sans-serif;cursor:pointer;box-shadow:0 4px 0 #4a2fd2}
+.sd-btn2{background:#fff;color:#221d2c;border:2px solid #221d2c;border-radius:999px;padding:7px 15px;font-weight:700;font-size:13px;font-family:'Space Grotesk',sans-serif;cursor:pointer}
+.sd-map{padding:28px 24px 18px;border-bottom:2.5px solid #221d2c;background:#faf5ec}
+.sd-mesh{display:flex;align-items:flex-start;justify-content:center}
+.mcol{display:flex;flex-direction:column;align-items:center;gap:9px;width:108px}
+.mnode{width:62px;height:62px;border-radius:18px;border:2.5px solid #221d2c;background:#fff;box-shadow:3px 3px 0 #221d2c;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:22px;position:relative;cursor:pointer}
+.mnode.on{box-shadow:3px 3px 0 #6b4ef0;border-color:#6b4ef0}
+.mdot{position:absolute;top:-6px;right:-6px;width:15px;height:15px;border-radius:50%;border:2.5px solid #faf5ec}
+.mlabel{text-align:center;font-size:13px;font-weight:700;line-height:1.2}
+.mrole{font-family:'Space Mono',monospace;font-size:10px;color:#9a8fb0;text-transform:uppercase;letter-spacing:.06em;font-weight:400}
+.edge{width:64px;height:4px;margin-top:29px;border-radius:2px;background:repeating-linear-gradient(90deg,#6b4ef0 0 7px,transparent 7px 15px);background-size:30px 4px;animation:sdflow .9s linear infinite}
+.edge.off{background:#d8cbb2;animation:none}
+@keyframes sdflow{to{background-position:-30px 0}}
+.sd-legend{display:flex;gap:20px;justify-content:center;margin-top:20px;font-family:'Space Mono',monospace;font-size:11px;color:#8a7f98;flex-wrap:wrap}
+.ld{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:0}
+.sd-main{display:flex;min-height:540px}
+.sd-focus{flex:1;display:flex;flex-direction:column;min-width:0}
+.np-head{display:flex;align-items:center;gap:12px;padding:15px 20px;border-bottom:2.5px solid #221d2c}
+.np-badge{font-family:'Space Mono',monospace;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#7a7088;border:2px solid #e2d6bf;border-radius:999px;padding:3px 11px}
+.spill{display:inline-flex;align-items:center;gap:7px;font-weight:700;font-size:13px;padding:5px 13px;border-radius:999px;border:2px solid #221d2c;background:#fff}
+.sdot{display:inline-block;width:9px;height:9px;border-radius:50%}
+.np-act{background:#fff;color:#221d2c;border:2px solid #221d2c;border-radius:999px;padding:6px 14px;font-weight:700;font-size:13px;font-family:'Space Grotesk',sans-serif;cursor:pointer}
+.np-body{flex:1;display:flex;min-height:0}
+.np-tree{width:212px;border-right:2.5px solid #221d2c;padding:14px 10px;display:flex;flex-direction:column;gap:2px;background:#faf5ec}
+.np-treelab{font-family:'Space Mono',monospace;font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:#9a8fb0;font-weight:700;padding:4px 8px 9px}
+.ftrow{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:9px;font-size:14px;font-weight:600;color:#4b4458;cursor:pointer}
+.ftrow.on{background:#6b4ef0;color:#fff}
+.fdot{width:7px;height:7px;border-radius:2px;background:#b9add0;flex:none}
+.ftrow.on .fdot{background:#fff}
+.ftadd{font-family:'Space Mono',monospace;font-size:12px;color:#9a8fb0;padding:9px 10px;cursor:pointer;margin-top:4px}
+.np-ed{flex:1;display:flex;flex-direction:column;min-width:0;background:#fff}
+.ed-tab{display:flex;align-items:center;gap:8px;padding:11px 18px;border-bottom:2px solid #efe1c9;font-family:'Space Mono',monospace;font-size:13px;font-weight:700}
+.fdot2{width:8px;height:8px;border-radius:2px;background:#6b4ef0;display:inline-block}
+.ed-mut{color:#a89db8;font-weight:400}
+.ed-area{flex:1;border:none;resize:none;padding:18px 20px;font-family:'Space Mono',monospace;font-size:14px;line-height:1.75;color:#3a3448;background:#fff;outline:none;width:100%;min-height:240px}
+.np-log{border-top:2.5px solid #221d2c;background:#faf5ec;padding:13px 18px;height:168px;overflow:auto}
+.lg{display:flex;align-items:center;gap:10px;font-family:'Space Mono',monospace;font-size:12px;padding:3px 0;color:#5b5470}
+.lg-dot{width:8px;height:8px;border-radius:50%;flex:none}
+
+@media (max-width:760px){
+  .sd-page{padding:18px 12px}
+  .sd-top{flex-wrap:wrap}
+  .sd-mesh{overflow-x:auto;justify-content:flex-start}
+  .np-body{flex-direction:column}
+  .np-tree{width:auto;border-right:none;border-bottom:2.5px solid #221d2c}
+}

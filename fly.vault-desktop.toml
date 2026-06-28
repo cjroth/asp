@@ -1,0 +1,44 @@
+# All-in-one ASP vault box for the DESKTOP app to clone/sync over iroh.
+# `asp watch --listen --relay`: serves its own vault AND co-hosts an iroh relay,
+# pinning itself as its own home relay so the printed ticket routes peers
+# straight here. Connect directly — no separate relay box.
+#
+#   fly deploy --config fly.vault-desktop.toml --dockerfile Dockerfile.vault
+#
+# Auth: set the enrollment secret as a fly secret, then clients clone with it:
+#   fly secrets set ASP_AUTH_KEY=... -a asp-vault-desktop
+#   asp clone <ticket> ./vault --auth-key ...
+
+app = "asp-vault-desktop"
+primary_region = "iad"   # Ashburn, VA — closest fly region to Raleigh, NC
+
+[build]
+  dockerfile = "Dockerfile.vault"
+
+[env]
+  ASP_DIR = "/mnt/workspace/vault"
+  ASP_HOME = "/mnt/workspace/.asp-home"
+  ASP_COHOST_RELAY = "1"
+  # Pin THIS app's public URL as the home relay so the printed ticket routes
+  # peers to the co-hosted relay (fly terminates TLS at 443 → forwards to 8080).
+  ASP_RELAY_URL = "https://asp-vault-desktop.fly.dev"
+
+# The co-hosted relay's HTTP/WS edge. Long-lived relay connections ride this, so
+# never auto-stop the machine.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+# Stateful: vault history + node identity live on one volume. Single replica
+# only — a duplicated identity breaks peers' pinned trust.
+[[mounts]]
+  source = "asp_vault_data"
+  destination = "/mnt/workspace"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512
