@@ -646,33 +646,26 @@ describe('App — empty + edge states', () => {
 // The `.asp-scroll` regions (file tree, editor, history bar, vault list, customize
 // modal) hold genuinely overflowing content, so e2e measurement confirmed the
 // scrollbars are real (not a layout-overflow bug) — see e2e/scroll-metrics.mjs.
-// The fix makes them UNOBTRUSIVE on web (Chromium forces an always-on classic bar
-// when `::-webkit-scrollbar` is styled, whereas the macOS desktop WebView overlays
-// /auto-hides them): the thumb is transparent until the region is hovered, while
-// the scrollbar BOX stays so the gutter is stable and layout never shifts. These
-// pin that contract so the soften-scrollbar fix can't silently regress.
-describe('.asp-scroll soften: auto-hiding (hover-reveal) scrollbar thumb', () => {
+// Chromium/web forces an always-on classic scrollbar (with a reserved gutter) the
+// moment `::-webkit-scrollbar` is given a width, whereas the macOS desktop WebView
+// overlays/auto-hides them. So we HIDE the scrollbar entirely (cross-browser) —
+// `display:none` for WebKit and `scrollbar-width:none` for Firefox — keeping the
+// regions fully scrollable via wheel/trackpad/drag. These pin that contract.
+describe('.asp-scroll: scrollbar hidden entirely (web matches desktop overlay)', () => {
   const cssText = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
 
-  it('keeps the scrollbar box (width/height) so the gutter is stable, not removed', () => {
-    expect(cssText).toMatch(/\.asp-scroll::-webkit-scrollbar\s*\{[^}]*width:\s*10px/);
-    // Scrollability is NOT removed: the bar/track is preserved (no display:none).
+  it('hides the WebKit scrollbar with display:none (no reserved gutter)', () => {
     const barRule = (cssText.match(/\.asp-scroll::-webkit-scrollbar\s*\{([^}]*)\}/) || ['', ''])[1];
-    expect(barRule).not.toMatch(/display\s*:\s*none/);
+    expect(barRule).toMatch(/display\s*:\s*none/);
+    // It must NOT give the bar a width (that would force the always-on classic bar).
+    expect(barRule).not.toMatch(/width:\s*10px/);
   });
 
-  it('makes the thumb transparent by default so it auto-hides like the desktop overlay', () => {
-    const thumbRule = (cssText.match(/\.asp-scroll::-webkit-scrollbar-thumb\s*\{([^}]*)\}/) || ['', ''])[1];
-    expect(thumbRule).not.toBe('');
-    expect(thumbRule).toMatch(/background:\s*transparent/);
+  it('hides the Firefox scrollbar with scrollbar-width:none', () => {
+    expect(cssText).toMatch(/\.asp-scroll\s*\{[^}]*scrollbar-width:\s*none/);
   });
 
-  it('reveals the thumb only on container hover (light + dark), keeping it functional', () => {
-    // Light: hovering the region paints the thumb.
-    expect(cssText).toMatch(/\.asp-scroll:hover::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*#00000016/);
-    // Dark: theme override also gates on container hover.
-    expect(cssText).toMatch(/\[data-theme="dark"\]\s*\.asp-scroll:hover::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*#ffffff1f/);
-    // The default (non-hover) thumb is NOT given a visible color anywhere.
-    expect(cssText).not.toMatch(/\.asp-scroll::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*#00000016/);
+  it('no longer paints a hover-revealed thumb (the bar is gone, not recolored)', () => {
+    expect(cssText).not.toMatch(/\.asp-scroll:hover::-webkit-scrollbar-thumb/);
   });
 });
