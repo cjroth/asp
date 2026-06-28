@@ -171,6 +171,40 @@ describe('App end-to-end wiring', () => {
   });
 });
 
+// The vault-switcher dropdown must keep the action items (esp. "New vault…" /
+// "Open another folder…") reachable no matter how many vaults exist: the vault
+// LIST scrolls, the actions stay pinned outside that scroll region.
+describe('App — vault-switcher list scrolls with actions pinned', () => {
+  const manyVaults = Array.from({ length: 40 }, (_, i) => ({
+    id: `v${i}`,
+    path: `/home/me/vault-${i}`,
+    vault_id: `vid${i}`,
+    enabled: false,
+    listening_ticket: null,
+  }));
+  beforeEach(() => listVaults.mockResolvedValue(manyVaults));
+  afterEach(() => listVaults.mockResolvedValue([]));
+
+  it('makes the vault list scrollable while pinning the New vault / Open folder action', async () => {
+    render(<App />);
+    // Open the first vault so the sidebar (with the switcher) is shown.
+    fireEvent.click(await screen.findByText('vault-0'));
+    fireEvent.click(await screen.findByTestId('vault-switcher'));
+    await screen.findByText('Switch vault');
+
+    // (1) The vault-list container is its own bounded, scrollable region.
+    const list = screen.getByTestId('vault-list');
+    expect(list.style.overflowY).toBe('auto');
+    expect(list.style.maxHeight).toBeTruthy();
+    expect(list.style.maxHeight).not.toBe('none');
+
+    // (2) The pinned action is present and NOT inside the scrolling list.
+    const action = screen.getByText('Open another folder…');
+    expect(action).toBeTruthy();
+    expect(list.contains(action)).toBe(false);
+  });
+});
+
 // Tabs + active-file-in-URL (DESKTOP platform — __TAURI_INTERNALS__ is set by
 // test-setup). The web counterpart lives in App.web.test.tsx.
 describe('App — tabs + URL hash (desktop)', () => {

@@ -1370,21 +1370,23 @@ export default function App() {
               {vaultMenuOpen && (
                 <>
                   <div onClick={() => setVaultMenuOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 40 }} />
-                  <div style={{ position: 'absolute', top: 'calc(100% - 4px)', left: 8, right: 8, zIndex: 41, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 12, boxShadow: '0 12px 32px rgba(28,25,23,0.13)', padding: 6, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <div style={{ position: 'absolute', top: 'calc(100% - 4px)', left: 8, right: 8, zIndex: 41, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 12, boxShadow: '0 12px 32px rgba(28,25,23,0.13)', padding: 6, display: 'flex', flexDirection: 'column', gap: 2, maxHeight: 'calc(100vh - 80px)' }}>
                     <div style={{ fontSize: 10.5, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--faint2)', padding: '7px 9px 4px' }}>Switch vault</div>
-                    {vaultMetas.map((v) => (
-                      <div key={v.id} className="asp-hover-soft" onClick={() => void openVault(v.id)} style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '8px 9px', borderRadius: 8, cursor: 'pointer' }}>
-                        <div style={avatarStyle({ hue: v.hue, emoji: v.emoji }, 26, 8)}>{glyphOf({ emoji: v.emoji, name: v.displayName })}</div>
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ fontSize: 13.5, fontWeight: 500, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v.displayName}</div>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 1, minWidth: 0 }}>
-                            <Icon.FolderIcon size={12} stroke="var(--faint2)" />
-                            <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10.5, color: 'var(--faint2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v.path}</span>
+                    <div className="asp-scroll" data-testid="vault-list" style={{ overflowY: 'auto', minHeight: 0, maxHeight: 'calc(100vh - 320px)', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                      {vaultMetas.map((v) => (
+                        <div key={v.id} className="asp-hover-soft" onClick={() => void openVault(v.id)} style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '8px 9px', borderRadius: 8, cursor: 'pointer' }}>
+                          <div style={avatarStyle({ hue: v.hue, emoji: v.emoji }, 26, 8)}>{glyphOf({ emoji: v.emoji, name: v.displayName })}</div>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 13.5, fontWeight: 500, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v.displayName}</div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 1, minWidth: 0 }}>
+                              <Icon.FolderIcon size={12} stroke="var(--faint2)" />
+                              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10.5, color: 'var(--faint2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v.path}</span>
+                            </div>
                           </div>
+                          {v.id === activeId && <Icon.CheckIcon stroke={accent} style={{ flex: 'none' }} />}
                         </div>
-                        {v.id === activeId && <Icon.CheckIcon stroke={accent} style={{ flex: 'none' }} />}
-                      </div>
-                    ))}
+                      ))}
+                    </div>
                     <div style={{ height: 1, background: 'var(--line)', margin: '4px 6px' }} />
                     <div className="asp-hover-soft" onClick={() => activeMeta && openCustomize(activeMeta)} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 9px', borderRadius: 8, cursor: 'pointer', color: 'var(--text2)' }}>
                       <Icon.WandIcon style={{ flex: 'none' }} />
