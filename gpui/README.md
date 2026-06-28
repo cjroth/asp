@@ -67,14 +67,43 @@ select files → time-travel → share → toggle theme), forcing a synchronous
 agent then *reads the PNGs* to verify the UI visually — real rendered output,
 not a DOM/text assertion.
 
+The harness lives in the `shoot`/`smoke` binaries, gated behind the `capture`
+feature so a normal app build never touches the patch (see below).
+
+## Run the app (macOS / Metal, or Linux with a display)
+
+The app uses **stock GPUI** from Zed git — no patch needed to run it.
+
+Prerequisites on macOS: Rust via rustup + Xcode Command Line Tools
+(`xcode-select --install`).
+
 ```sh
-cargo build --bin shoot
-bash shot-driver.sh /tmp/aspshots   # runs headless under Xvfb+lavapipe
-# → /tmp/aspshots/{01-connect,02-editor,03-welcome,04-timetravel,05-share,06-editor-dark,07-connect-dark}.png
+git fetch && git checkout gpui      # this branch
+cd gpui
+cargo run --bin aspgui              # builds lib + app only; Metal on macOS
 ```
 
-## Run (on a machine with a display, e.g. macOS/Metal)
+Use `--bin aspgui` (not bare `cargo build`/`run`): the `shoot`/`smoke` binaries
+require the `capture` feature and the patched GPUI, so they're skipped by a
+normal build.
+
+## Headless screenshot harness (the feedback loop)
+
+To run the PNG-capture harness you need GPUI with the offscreen
+`render_to_image` patch:
 
 ```sh
-cargo run --bin aspgui
+git clone https://github.com/zed-industries/zed /path/to/zed
+cd /path/to/zed && git checkout 5837e7e && git apply /path/to/asp/gpui/zed-gpui-headless.patch
+```
+
+Point the two GPUI deps in `Cargo.toml` at `/path/to/zed/crates/{gpui,gpui_platform}`
+(add `features = ["x11","wayland"]` to `gpui_platform` on Linux), then:
+
+```sh
+cargo build --bin shoot --features capture
+bash shot-driver.sh /tmp/aspshots   # Linux: headless under Xvfb + lavapipe
+# macOS has a built-in Metal headless renderer, so capture works there too.
+# → /tmp/aspshots/{01-connect,02-editor,03-welcome,04-timetravel,05-share,
+#   06-editor-dark,07-connect-dark,08-editing,09-edited-rendered}.png
 ```
