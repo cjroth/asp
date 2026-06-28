@@ -6,6 +6,7 @@ use gpui::{
 };
 use gpui_platform::application;
 
+mod app;
 mod assets;
 mod engine;
 mod icons;
@@ -13,9 +14,8 @@ mod screens;
 mod theme;
 mod vault;
 
+use app::AspApp;
 use assets::Assets;
-use screens::connect::ConnectScreen;
-use screens::editor::EditorScreen;
 use theme::Theme;
 
 struct HelloWorld;
@@ -59,7 +59,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| ConnectScreen::fixture(Theme::light())),
+            |_, cx| cx.new(|_| AspApp::new()),
         )
         .unwrap();
         cx.activate(true);
@@ -83,27 +83,19 @@ fn run_shot(out_path: &str, screen: &str) {
             .expect("open window")
             .into(),
         "connect-dark" => cx
-            .open_window(win_size, |_, cx| {
-                cx.new(|_| ConnectScreen::fixture(Theme::dark()))
-            })
+            .open_window(win_size, |_, cx| cx.new(|_| AspApp::fixture_connect(Theme::dark())))
             .expect("open window")
             .into(),
         "editor" => cx
-            .open_window(win_size, |_, cx| {
-                cx.new(|_| EditorScreen::fixture(Theme::light()))
-            })
+            .open_window(win_size, |_, cx| cx.new(|_| AspApp::fixture_editor(Theme::light())))
             .expect("open window")
             .into(),
         "editor-dark" => cx
-            .open_window(win_size, |_, cx| {
-                cx.new(|_| EditorScreen::fixture(Theme::dark()))
-            })
+            .open_window(win_size, |_, cx| cx.new(|_| AspApp::fixture_editor(Theme::dark())))
             .expect("open window")
             .into(),
         _ => cx
-            .open_window(win_size, |_, cx| {
-                cx.new(|_| ConnectScreen::fixture(Theme::light()))
-            })
+            .open_window(win_size, |_, cx| cx.new(|_| AspApp::fixture_connect(Theme::light())))
             .expect("open window")
             .into(),
     };
