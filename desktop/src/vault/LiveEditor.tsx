@@ -9,6 +9,14 @@ import { caretOffset, hasFrontmatter, isCodeFile, lineIndexOf, readLive, renderD
 import { loadMermaid } from './mermaid';
 import type { FrontmatterStyle } from './prefs';
 
+// Open a link/image-badge URL outside the editor. There is no in-app "open URL"
+// backend (api.ts only reveals paths in the OS file manager), so we hand the URL
+// to the platform: on desktop Tauri intercepts `window.open(_blank)` and hands it
+// to the OS browser; on web it opens a new tab. `noopener` severs the opener ref.
+function openExternal(url: string): void {
+  window.open(url, '_blank', 'noopener');
+}
+
 export interface LiveEditorProps {
   source: string;
   paintKey: string; // bump to force a repaint from outside (select / scrub)
@@ -160,7 +168,20 @@ export default function LiveEditor(props: LiveEditorProps) {
   // `.cm-task-box` hit target carries no source text, so readLive is unaffected.
   const onMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
     const el = ref.current;
-    if (!el || roRef.current) return;
+    if (!el) return;
+    // Clicking an inline link or image badge that carries a URL opens it
+    // externally. We preventDefault so no caret/selection lands in the
+    // contentEditable line (which would corrupt the document). This runs even when
+    // read-only — opening a URL never mutates the source — and is keyed off
+    // `[data-href]`, a different target than the `.cm-task-box` checkbox below.
+    const link = (e.target as HTMLElement).closest?.('.cm-link[data-href], .cm-img[data-href]') as HTMLElement | null;
+    const href = link?.getAttribute('data-href');
+    if (href) {
+      e.preventDefault();
+      openExternal(href);
+      return;
+    }
+    if (roRef.current) return;
     const box = (e.target as HTMLElement).closest?.('.cm-task-box');
     if (!box) return;
     const lineDiv = box.closest('.cm-task') as HTMLElement | null;

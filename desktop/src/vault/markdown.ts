@@ -9,11 +9,36 @@ import type { FrontmatterStyle } from './prefs';
 
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const mk = (t: string) => '<span class="cm-mark">' + t + '</span>';
+// `esc` already neutralized & < >; for attribute context we additionally escape "
+// (we always emit double-quoted attributes) so a URL/alt can't break out of one.
+const attr = (s: string) => s.replace(/"/g, '&quot;');
+// A visual-only <img> badge. It carries NO source text, so the line walkers /
+// readLive never see it — the literal `![alt](url)` lives entirely in a hidden
+// cm-mark, keeping the round-trip byte-exact. `href` (optional) makes it clickable.
+const imgTag = (url: string, alt: string, href?: string) =>
+  '<img class="cm-img" src="' + attr(url) + '" alt="' + attr(alt) + '"' + (href ? ' data-href="' + attr(href) + '"' : '') + ' contenteditable="false">';
+
+// Images, image-wrapped links, and plain links in ONE ordered pass so a match's
+// generated HTML is never re-scanned by a later alternative (which would corrupt
+// the hidden marks). Order is significant: `[![alt](img)](url)` (image-in-link)
+// must be tried before a bare image, which must be tried before a plain link
+// (otherwise `[t](u)` / `![a](u)` would partially match the wrong rule).
+const INLINE_LINK_RE =
+  /\[!\[([^\]]*)\]\(([^)]+)\)\]\(([^)]+)\)|!\[([^\]]*)\]\(([^)]+)\)|\[([^\]]+)\]\(([^)]+)\)/g;
 
 export function inlineMd(raw: string): string {
   let s = esc(raw);
   s = s.replace(/`([^`]+)`/g, (_m, a) => mk('`') + '<code class="cm-code">' + a + '</code>' + mk('`'));
-  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, t, u) => mk('[') + '<span class="cm-link">' + t + '</span>' + mk('](' + u + ')'));
+  s = s.replace(INLINE_LINK_RE, (_m, liAlt, liImg, liUrl, imgAlt, imgUrl, lnkTxt, lnkUrl) => {
+    // [![alt](img)](url): render the badge image, clickable to `url`. Whole literal
+    // stays hidden so readLive reconstructs it exactly.
+    if (liUrl !== undefined) return mk('[![' + liAlt + '](' + liImg + ')](' + liUrl + ')') + imgTag(liImg, liAlt, liUrl);
+    // ![alt](url): a (non-link) inline image badge.
+    if (imgUrl !== undefined) return mk('![' + imgAlt + '](' + imgUrl + ')') + imgTag(imgUrl, imgAlt);
+    // [text](url): keep the visible text, hide the syntax, carry the URL on the
+    // span (data-href) so a click handler can open it without an editable <a>.
+    return mk('[') + '<span class="cm-link" data-href="' + attr(lnkUrl) + '">' + lnkTxt + '</span>' + mk('](' + lnkUrl + ')');
+  });
   s = s.replace(/\*\*([^*]+)\*\*/g, (_m, a) => mk('**') + '<strong>' + a + '</strong>' + mk('**'));
   s = s.replace(/(^|[^*\w])\*([^*\n]+)\*/g, (_m, p, a) => p + mk('*') + '<em>' + a + '</em>' + mk('*'));
   return s;

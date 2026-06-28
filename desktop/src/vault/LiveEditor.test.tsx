@@ -226,6 +226,44 @@ describe('LiveEditor', () => {
     expect(readLive(el)).toBe('```mermaid\ngraph TD\nA --> B\n```\n- [x] todo');
   });
 
+  it('opens a link URL on click without altering the document', () => {
+    const open = vi.spyOn(window, 'open').mockReturnValue(null);
+    const onChange = vi.fn();
+    const source = 'see [docs](https://x/readme)';
+    const { getByTestId } = render(<LiveEditor {...props({ source, onChange })} />);
+    const el = getByTestId('live-editor');
+    const link = el.querySelector('.cm-link[data-href]') as HTMLElement;
+    const ev = fireEvent.mouseDown(link);
+    expect(ev).toBe(false); // preventDefault() → no caret lands in the line
+    expect(open).toHaveBeenCalledWith('https://x/readme', '_blank', 'noopener');
+    expect(onChange).not.toHaveBeenCalled();
+    expect(readLive(el)).toBe(source); // document unchanged
+    open.mockRestore();
+  });
+
+  it('opens an image-wrapped link badge on click and works even when read-only', () => {
+    const open = vi.spyOn(window, 'open').mockReturnValue(null);
+    const source = '[![CI](https://x/badge.svg)](https://x/actions)';
+    const { getByTestId } = render(<LiveEditor {...props({ source, readOnly: true })} />);
+    const el = getByTestId('live-editor');
+    const img = el.querySelector('.cm-img[data-href]') as HTMLElement;
+    fireEvent.mouseDown(img);
+    expect(open).toHaveBeenCalledWith('https://x/actions', '_blank', 'noopener');
+    expect(readLive(el)).toBe(source);
+    open.mockRestore();
+  });
+
+  it('does not open or toggle when clicking a plain (non-link) image badge', () => {
+    const open = vi.spyOn(window, 'open').mockReturnValue(null);
+    const { getByTestId } = render(<LiveEditor {...props({ source: '![CI](https://x/ci.svg)' })} />);
+    const el = getByTestId('live-editor');
+    const img = el.querySelector('.cm-img') as HTMLElement;
+    expect(img.hasAttribute('data-href')).toBe(false);
+    fireEvent.mouseDown(img);
+    expect(open).not.toHaveBeenCalled();
+    open.mockRestore();
+  });
+
   it('ignores mousedown outside any task line', () => {
     const onChange = vi.fn();
     const { getByTestId } = render(<LiveEditor {...props({ source: 'plain text', onChange })} />);

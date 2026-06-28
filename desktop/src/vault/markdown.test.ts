@@ -83,6 +83,58 @@ describe('inlineMd', () => {
     expect(div.querySelector('strong')!.textContent).toBe('bold');
     expect(div.querySelector('em')!.textContent).toBe('em');
   });
+
+  it('renders an inline image badge and round-trips the literal via readLive', () => {
+    const div = document.createElement('div');
+    div.innerHTML = inlineMd('![CI](https://x/ci.svg)');
+    const img = div.querySelector('img.cm-img') as HTMLImageElement;
+    expect(img).not.toBeNull();
+    expect(img.getAttribute('src')).toBe('https://x/ci.svg');
+    expect(img.getAttribute('alt')).toBe('CI');
+    // A plain image is not a link → no data-href.
+    expect(img.hasAttribute('data-href')).toBe(false);
+    // The visible img carries no text; the literal lives in hidden marks, so the
+    // line's textContent (what readLive reads) reconstructs the source exactly.
+    expect(div.textContent).toBe('![CI](https://x/ci.svg)');
+  });
+
+  it('renders an image-wrapped link: clickable badge carrying the link URL, round-trips', () => {
+    const src = '[![CI](https://x/badge.svg)](https://x/actions)';
+    const div = document.createElement('div');
+    div.innerHTML = inlineMd(src);
+    const img = div.querySelector('img.cm-img') as HTMLImageElement;
+    expect(img.getAttribute('src')).toBe('https://x/badge.svg');
+    expect(img.getAttribute('data-href')).toBe('https://x/actions');
+    // inlineMd emits inline content (not line divs); textContent IS the literal
+    // source the editor reads back per line — so this is the round-trip check.
+    expect(div.textContent).toBe(src);
+  });
+
+  it('makes a plain link clickable (data-href) and keeps the text + round-trip', () => {
+    const src = '[docs](https://x/readme)';
+    const div = document.createElement('div');
+    div.innerHTML = inlineMd(src);
+    const link = div.querySelector('.cm-link') as HTMLElement;
+    expect(link.textContent).toBe('docs');
+    expect(link.getAttribute('data-href')).toBe('https://x/readme');
+    expect(div.textContent).toBe(src);
+  });
+
+  it('escapes quotes/ampersands in URLs for attribute safety and round-trips', () => {
+    const src = '![a](https://x/q?a=1&b=2)';
+    const div = document.createElement('div');
+    div.innerHTML = inlineMd(src);
+    const img = div.querySelector('img.cm-img') as HTMLImageElement;
+    expect(img.getAttribute('src')).toBe('https://x/q?a=1&b=2');
+    expect(div.textContent).toBe(src);
+  });
+
+  it('renders an image inside a heading (heading body passes through inlineMd)', () => {
+    const div = document.createElement('div');
+    div.innerHTML = renderLiveHtml('# Thunderbolt ![CI](https://x/ci.svg)');
+    expect(div.querySelector('img.cm-img')).not.toBeNull();
+    expect(readLive(div)).toBe('# Thunderbolt ![CI](https://x/ci.svg)');
+  });
 });
 
 describe('readLive round-trips source through the rendered DOM', () => {

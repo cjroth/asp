@@ -52,6 +52,12 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
   background: var(--bg-input); padding: 1px 5px; border-radius: 5px;
 }
 .cm-link { color: var(--accent, #3d63dd); border-bottom: 1px solid var(--accent, #3d63dd); }
+/* Inline image badge (shields.io etc.): kept small and baseline-aligned so it sits
+   inline within headings/prose. It carries no source text (the literal `![…](…)`
+   lives in a hidden cm-mark), so readLive round-trips unchanged. */
+.cm-img { max-height: 1.4em; vertical-align: middle; }
+/* A link or image badge that carries a URL is clickable to open it. */
+.cm-link[data-href], .cm-img[data-href] { cursor: pointer; }
 .cm-ul { position: relative; padding-left: 1.5em; }
 .cm-ul::before {
   content: '•'; position: absolute; left: 0.4em; top: -0.02em;
