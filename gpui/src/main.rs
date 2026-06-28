@@ -7,6 +7,7 @@ use gpui::{
 use gpui_platform::application;
 
 mod assets;
+mod engine;
 mod icons;
 mod screens;
 mod theme;
