@@ -46,7 +46,17 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
 .asp-icon-btn:hover { background: var(--line) !important; color: var(--text) !important; }
 
 /* Live (contentEditable) markdown WYSIWYG classes. */
-.cm-mark { display: none; }
+/* Literal markdown syntax (`#`, `**`, backticks, link brackets, table pipes…) is
+   kept in the DOM so `readLive` reconstructs the source byte-for-byte, yet it must
+   render invisible. We keep the span IN-FLOW and zero-width (`font-size:0`) rather
+   than removing it with `display:none`: an inline box pulled out of the line box
+   can disturb the caret height and the selection rectangles of the ADJACENT text
+   in Chromium-based engines (Tauri's WebView2) — the syntax marks bracket every
+   styled run, so a removed box sits right where the caret/selection boundary
+   lands. `font-size:0` collapses the marker to zero width with no glyphs;
+   `color:transparent` is a belt-and-suspenders guard. The marker's text stays in
+   `textContent`, so the byte-exact round-trip is unchanged. */
+.cm-mark { font-size: 0; color: transparent; }
 .cm-code {
   font-family: 'JetBrains Mono', monospace; font-size: 0.86em;
   background: var(--bg-input); padding: 1px 5px; border-radius: 5px;
