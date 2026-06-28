@@ -14,6 +14,7 @@ mod vault;
 
 use assets::Assets;
 use screens::connect::ConnectScreen;
+use screens::editor::EditorScreen;
 use theme::Theme;
 
 struct HelloWorld;
@@ -83,6 +84,18 @@ fn run_shot(out_path: &str, screen: &str) {
         "connect-dark" => cx
             .open_window(win_size, |_, cx| {
                 cx.new(|_| ConnectScreen::fixture(Theme::dark()))
+            })
+            .expect("open window")
+            .into(),
+        "editor" => cx
+            .open_window(win_size, |_, cx| {
+                cx.new(|_| EditorScreen::fixture(Theme::light()))
+            })
+            .expect("open window")
+            .into(),
+        "editor-dark" => cx
+            .open_window(win_size, |_, cx| {
+                cx.new(|_| EditorScreen::fixture(Theme::dark()))
             })
             .expect("open window")
             .into(),
