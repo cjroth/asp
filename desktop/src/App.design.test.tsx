@@ -205,6 +205,8 @@ describe('App — editor', () => {
     // Pinned (does not scroll with the document).
     expect(status.style.flexGrow).toBe('0');
     expect(status.style.flexShrink).toBe('0');
+    // Items are right-aligned within the centered content column.
+    expect((status.firstElementChild as HTMLElement).style.justifyContent).toBe('flex-end');
   });
 
   it('flips the content status to Saving… while a write is in flight', async () => {

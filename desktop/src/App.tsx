@@ -1492,7 +1492,7 @@ export default function App() {
                     editor scroll region). It does not scroll with the document
                     and aligns horizontally to the editor's column. */}
                 <div data-testid="content-status" style={{ flex: 'none', display: 'flex', justifyContent: 'center', borderBottom: '1px solid var(--line)' }}>
-                  <div style={{ width: centered ? '760px' : '100%', maxWidth: '100%', padding: centered ? '7px 40px' : '7px 36px', display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <div style={{ width: centered ? '760px' : '100%', maxWidth: '100%', padding: centered ? '7px 40px' : '7px 36px', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8 }}>
                     <span style={{ width: 6, height: 6, borderRadius: '50%', flex: 'none', background: saving ? '#d9a93d' : '#3fa45a', transition: 'background .2s' }} />
                     <span style={{ fontSize: 11.5, color: 'var(--faint)', whiteSpace: 'nowrap' }}>{saving ? 'Saving…' : 'Saved'}</span>
                     <span style={{ width: 1, height: 11, background: 'var(--line)', flex: 'none', margin: '0 2px' }} />
