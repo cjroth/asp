@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   caretOffset,
@@ -399,5 +401,55 @@ describe('code files', () => {
     expect(countLabel('l1\nl2\nl3\n', 'a.ts')).toBe('3 lines');
     expect(countLabel('only', 'a.ts')).toBe('1 line');
     expect(countLabel('', 'a.ts')).toBe('0 lines');
+  });
+});
+
+// The hidden-syntax `.cm-mark` spans must stay invisible AND keep their literal
+// source text in the DOM so `readLive` round-trips byte-exact. They were switched
+// from `display:none` to an IN-FLOW zero-width technique (`font-size:0`) so the
+// markers no longer leave the line box — which is what disturbs the caret height
+// and selection rectangles of the adjacent styled text in Chromium-based engines
+// (see e2e/prose-metrics.mjs for the real-browser measurements). These tests pin
+// both halves of the contract: the invisibility CSS technique, and the byte-exact
+// round-trip across every prose construct that uses marks.
+describe('cm-mark invisibility technique + round-trip (caret/selection fix)', () => {
+  // vitest runs from the project root; the jsdom env makes import.meta.url an
+  // http URL, so resolve the stylesheet from cwd instead of a file: URL.
+  const cssText = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
+  // The standalone `.cm-mark { … }` rule (not the more specific frontmatter ones).
+  const markRule = (cssText.match(/^\.cm-mark\s*\{([^}]*)\}/m) || ['', ''])[1];
+
+  it('keeps marks IN-FLOW and zero-width (not display:none) so the line box is intact', () => {
+    expect(markRule).not.toBe('');
+    // The whole point of the fix: marks are no longer pulled out of the line box.
+    expect(markRule).not.toMatch(/display\s*:\s*none/);
+    // Invisible + zero-footprint: no glyphs, no width.
+    expect(markRule).toMatch(/font-size\s*:\s*0/);
+  });
+
+  it('marks still carry the LITERAL source syntax as their text (round-trip data)', () => {
+    const div = document.createElement('div');
+    div.innerHTML = renderLiveHtml('# Heading\n**bold** and `code` and [t](u)');
+    const marks = [...div.querySelectorAll('.cm-mark')].map((m) => m.textContent);
+    expect(marks).toContain('# '); // heading hashes + space
+    expect(marks).toContain('**'); // bold fences
+    expect(marks).toContain('`'); // inline-code fences
+    // The link literal is split across hidden marks around the visible text.
+    expect(marks.join('')).toContain('](u)');
+  });
+
+  it('round-trips byte-exact for representative prose (headings, bold, italic, code, links, lists, quotes)', () => {
+    const srcs = [
+      '# Title with **bold** and `code`',
+      'Para with *italic*, `inline`, and a [link](https://example.com/a?b=1&c=2).',
+      '- bullet with **strong** text\n- [x] a done task `here`',
+      '> quoted **line** with a [ref](http://x) and `tt`',
+      'plain trailing line',
+    ];
+    for (const src of srcs) {
+      const div = document.createElement('div');
+      div.innerHTML = renderLiveHtml(src);
+      expect(readLive(div)).toBe(src);
+    }
   });
 });
