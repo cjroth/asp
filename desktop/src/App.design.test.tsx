@@ -86,7 +86,10 @@ describe('App — connect screen', () => {
     render(<App />);
     const row = await screen.findByText('notes');
     fireEvent.contextMenu(row);
-    fireEvent.click(await screen.findByText('Customize…'));
+    const customize = await screen.findByText('Customize…');
+    // Vault-row context menu is text-only (no leading icon).
+    expect((customize.closest('.asp-hover-soft') as HTMLElement).querySelector('svg')).toBeNull();
+    fireEvent.click(customize);
     fireEvent.change(screen.getByDisplayValue('notes'), { target: { value: 'My Notes' } });
     fireEvent.change(screen.getByPlaceholderText('Search emojis'), { target: { value: 'rocket' } });
     const grid = (Array.from(document.querySelectorAll('.asp-hover-list')) as HTMLElement[]).find((e) => e.textContent === '🚀');

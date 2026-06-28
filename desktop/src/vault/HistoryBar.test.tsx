@@ -163,6 +163,9 @@ describe('HistoryBar', () => {
 
     // Right-click the folder icon → context menu appears with both actions.
     fireEvent.contextMenu(getByTitle('Open in file manager'), { clientX: 20, clientY: 20 });
+    // The context menu rows are text-only (no leading icons).
+    const reveal = getByText('Open in file manager').closest('.asp-hover-soft') as HTMLElement;
+    expect(reveal.querySelector('svg')).toBeNull();
     fireEvent.click(getByText('Open in file manager'));
     expect(revealPath).toHaveBeenCalledWith('/home/me/vault');
     expect(queryByText('Open in file manager')).toBeNull(); // menu closes after a choice

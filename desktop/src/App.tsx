@@ -1608,23 +1608,19 @@ export default function App() {
             <div style={{ position: 'fixed', left: ctxMenu.x, top: ctxMenu.y, zIndex: 61, width: 172, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, boxShadow: '0 12px 32px rgba(28,25,23,0.16)', padding: 5 }}>
               {ctxMenu.root ? (
                 <>
-                  <div className="asp-hover-soft" onClick={() => void createFile(ctxTargetDir(ctxMenu))} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                    <Icon.NewFileIcon size={14} style={{ flex: 'none' }} />
+                  <div className="asp-hover-soft" onClick={() => void createFile(ctxTargetDir(ctxMenu))} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                     <span>New file</span>
                   </div>
-                  <div className="asp-hover-soft" onClick={() => void createFolder(ctxTargetDir(ctxMenu))} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                    <Icon.NewFolderIcon size={14} style={{ flex: 'none' }} />
+                  <div className="asp-hover-soft" onClick={() => void createFolder(ctxTargetDir(ctxMenu))} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                     <span>New folder</span>
                   </div>
                 </>
               ) : (
                 <>
-                  <div className="asp-hover-soft" onClick={() => { setRenaming(ctxMenu.path!); setRenameValue(ctxMenu.name!); setCtxMenu(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                    <Icon.PencilIcon style={{ flex: 'none' }} />
+                  <div className="asp-hover-soft" onClick={() => { setRenaming(ctxMenu.path!); setRenameValue(ctxMenu.name!); setCtxMenu(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                     <span>Rename</span>
                   </div>
-                  <div className="asp-hover-soft" onClick={() => deleteNode(ctxMenu.path!, !!ctxMenu.isDir)} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                    <Icon.TrashIcon stroke="var(--text2)" style={{ flex: 'none' }} />
+                  <div className="asp-hover-soft" onClick={() => deleteNode(ctxMenu.path!, !!ctxMenu.isDir)} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                     <span>Delete</span>
                   </div>
                 </>
@@ -1638,33 +1634,26 @@ export default function App() {
           <>
             <div onClick={() => setTabCtx(null)} onContextMenu={(e) => { e.preventDefault(); setTabCtx(null); }} style={{ position: 'fixed', inset: 0, zIndex: 60 }} />
             <div style={{ position: 'fixed', left: tabCtx.x, top: tabCtx.y, zIndex: 61, width: 188, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, boxShadow: '0 12px 32px rgba(28,25,23,0.16)', padding: 5 }}>
-              <div className="asp-hover-soft" onClick={() => { onTabClose(tabCtx.path); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
+              <div className="asp-hover-soft" onClick={() => { onTabClose(tabCtx.path); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <span>Close</span>
               </div>
-              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeOthers(openTabs, tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
+              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeOthers(openTabs, tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <span>Close Others</span>
               </div>
-              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeToLeft(openTabs, tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
+              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeToLeft(openTabs, tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <span>Close to the Left</span>
               </div>
-              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeToRight(openTabs, tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
+              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeToRight(openTabs, tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <span>Close to the Right</span>
               </div>
-              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeAll()); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
+              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeAll()); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <span>Close All</span>
               </div>
               <div style={{ height: 1, background: 'var(--line)', margin: '4px 6px' }} />
-              <div className="asp-hover-soft" onClick={() => { setTabRenaming(tabCtx.path); setTabRenameValue(basename(tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                <Icon.PencilIcon style={{ flex: 'none' }} />
+              <div className="asp-hover-soft" onClick={() => { setTabRenaming(tabCtx.path); setTabRenameValue(basename(tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <span>Rename</span>
               </div>
-              <div className="asp-hover-soft" onClick={() => { deleteNode(tabCtx.path, false); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                <Icon.TrashIcon stroke="var(--text2)" style={{ flex: 'none' }} />
+              <div className="asp-hover-soft" onClick={() => { deleteNode(tabCtx.path, false); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <span>Delete</span>
               </div>
             </div>
@@ -1683,12 +1672,10 @@ export default function App() {
         <>
           <div onClick={() => setVaultCtx(null)} onContextMenu={(e) => { e.preventDefault(); setVaultCtx(null); }} style={{ position: 'fixed', inset: 0, zIndex: 62 }} />
           <div style={{ position: 'fixed', left: vaultCtx.x, top: vaultCtx.y, zIndex: 63, width: 176, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, boxShadow: '0 10px 28px rgba(28,25,23,0.15)', padding: 4 }}>
-            <div className="asp-hover-soft" onClick={() => { const v = vaults.find((x) => x.id === vaultCtx.id); setVaultCtx(null); if (v) openCustomize(v); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text2)' }}>
-              <Icon.WandIcon size={14} style={{ flex: 'none' }} />
+            <div className="asp-hover-soft" onClick={() => { const v = vaults.find((x) => x.id === vaultCtx.id); setVaultCtx(null); if (v) openCustomize(v); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text2)' }}>
               <span>Customize…</span>
             </div>
-            <div className="asp-hover-danger" onClick={() => { const v = vaultMetas.find((x) => x.id === vaultCtx.id); setVaultCtx(null); if (v) setRemoveVaultState({ id: v.id, name: v.displayName, path: v.path, trash: false }); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: '#c0392b' }}>
-              <Icon.TrashIcon stroke="#c0392b" size={14} style={{ flex: 'none' }} />
+            <div className="asp-hover-danger" onClick={() => { const v = vaultMetas.find((x) => x.id === vaultCtx.id); setVaultCtx(null); if (v) setRemoveVaultState({ id: v.id, name: v.displayName, path: v.path, trash: false }); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: '#c0392b' }}>
               <span>Remove vault…</span>
             </div>
           </div>

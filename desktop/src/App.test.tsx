@@ -370,8 +370,11 @@ describe('App — tabs + URL hash (desktop)', () => {
     const close = await screen.findByText('Close');
     // The menu container holds the items in DOM order.
     const menu = close.closest('div[style*="position: fixed"]') as HTMLElement;
-    const rendered = Array.from(menu.querySelectorAll('.asp-hover-soft')).map((el) => (el.textContent || '').replace('×', ''));
+    const rendered = Array.from(menu.querySelectorAll('.asp-hover-soft')).map((el) => el.textContent || '');
     expect(rendered).toEqual(['Close', 'Close Others', 'Close to the Left', 'Close to the Right', 'Close All', 'Rename', 'Delete']);
+    // Right-click context menu is text-only: no leading icons or × glyphs.
+    expect(menu.querySelector('svg')).toBeNull();
+    expect(menu.textContent).not.toContain('×');
   });
 
   it('Close Others closes every tab but the right-clicked one (switching active when needed)', async () => {
