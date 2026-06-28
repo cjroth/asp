@@ -35,13 +35,25 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
 .tab-strip { scrollbar-width: none; }
 .tab-strip::-webkit-scrollbar { display: none; }
 
+/* Themed scrollbars for the real scroll regions (file tree, editor, history bar,
+   vault list, customize modal). The content here genuinely overflows, so these
+   bars stay fully functional — but the THUMB is transparent until you hover the
+   region, so it auto-hides to match the unobtrusive overlay scrollbars the macOS
+   desktop WebView draws. Styling `::-webkit-scrollbar` at all otherwise forces
+   Chromium/web into an always-on CLASSIC bar (the "scrollbars appeared on web"
+   report). Crucially we keep the scrollbar BOX (width/height) at all times, so the
+   gutter is reserved whenever content overflows and hover only RECOLORS the
+   already-present thumb — it never adds/removes the bar, so layout never shifts. */
 .asp-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
 .asp-scroll::-webkit-scrollbar-thumb {
-  background: #00000016; border-radius: 8px;
+  background: transparent; border-radius: 8px;
   border: 3px solid transparent; background-clip: padding-box;
+  transition: background 0.18s ease;
 }
-[data-theme="dark"] .asp-scroll::-webkit-scrollbar-thumb { background: #ffffff1f; background-clip: padding-box; }
-.asp-scroll::-webkit-scrollbar-thumb:hover { background: #00000026; background-clip: padding-box; }
+.asp-scroll:hover::-webkit-scrollbar-thumb { background: #00000016; background-clip: padding-box; }
+.asp-scroll:hover::-webkit-scrollbar-thumb:hover { background: #00000026; background-clip: padding-box; }
+[data-theme="dark"] .asp-scroll:hover::-webkit-scrollbar-thumb { background: #ffffff1f; background-clip: padding-box; }
+[data-theme="dark"] .asp-scroll:hover::-webkit-scrollbar-thumb:hover { background: #ffffff2e; background-clip: padding-box; }
 
 /* Hover affordances — the design applies these via `style-hover`; in React they
    are CSS classes so the same elements light up on hover, theme-aware. */

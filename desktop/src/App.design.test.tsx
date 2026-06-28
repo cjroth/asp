@@ -2,6 +2,8 @@
 // new file/folder, hidden + pretty names, breadcrumb rename, customize, share,
 // remove, history/log tabs + time-travel, and the entry modals — all wired to a
 // mocked backend.
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -638,5 +640,39 @@ describe('App — empty + edge states', () => {
     fireEvent.change(screen.getByPlaceholderText(/Paste the code/), { target: { value: 'asp1x' } });
     fireEvent.change(screen.getByPlaceholderText(/Leave blank/), { target: { value: 'KEY' } });
     fireEvent.click(document.querySelector('[style*="z-index: 58"]') as HTMLElement);
+  });
+});
+
+// The `.asp-scroll` regions (file tree, editor, history bar, vault list, customize
+// modal) hold genuinely overflowing content, so e2e measurement confirmed the
+// scrollbars are real (not a layout-overflow bug) — see e2e/scroll-metrics.mjs.
+// The fix makes them UNOBTRUSIVE on web (Chromium forces an always-on classic bar
+// when `::-webkit-scrollbar` is styled, whereas the macOS desktop WebView overlays
+// /auto-hides them): the thumb is transparent until the region is hovered, while
+// the scrollbar BOX stays so the gutter is stable and layout never shifts. These
+// pin that contract so the soften-scrollbar fix can't silently regress.
+describe('.asp-scroll soften: auto-hiding (hover-reveal) scrollbar thumb', () => {
+  const cssText = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
+
+  it('keeps the scrollbar box (width/height) so the gutter is stable, not removed', () => {
+    expect(cssText).toMatch(/\.asp-scroll::-webkit-scrollbar\s*\{[^}]*width:\s*10px/);
+    // Scrollability is NOT removed: the bar/track is preserved (no display:none).
+    const barRule = (cssText.match(/\.asp-scroll::-webkit-scrollbar\s*\{([^}]*)\}/) || ['', ''])[1];
+    expect(barRule).not.toMatch(/display\s*:\s*none/);
+  });
+
+  it('makes the thumb transparent by default so it auto-hides like the desktop overlay', () => {
+    const thumbRule = (cssText.match(/\.asp-scroll::-webkit-scrollbar-thumb\s*\{([^}]*)\}/) || ['', ''])[1];
+    expect(thumbRule).not.toBe('');
+    expect(thumbRule).toMatch(/background:\s*transparent/);
+  });
+
+  it('reveals the thumb only on container hover (light + dark), keeping it functional', () => {
+    // Light: hovering the region paints the thumb.
+    expect(cssText).toMatch(/\.asp-scroll:hover::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*#00000016/);
+    // Dark: theme override also gates on container hover.
+    expect(cssText).toMatch(/\[data-theme="dark"\]\s*\.asp-scroll:hover::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*#ffffff1f/);
+    // The default (non-hover) thumb is NOT given a visible color anywhere.
+    expect(cssText).not.toMatch(/\.asp-scroll::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*#00000016/);
   });
 });
