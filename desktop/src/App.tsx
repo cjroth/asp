@@ -317,19 +317,28 @@ export default function App() {
       if (screen === 'editor' && activeIdRef.current) {
         const id = activeIdRef.current;
         void api.getStatus(id).then((st) => setStatuses((p) => ({ ...p, [id]: st }))).catch(() => {});
+        // A browser node can't open a listening socket, so it never *receives* a
+        // peer's push — it has to pull by re-dialing the upstream it cloned from.
+        // Desktop syncs continuously in its background engine and needs no
+        // poll-driven sync, so this is web-only. `syncNow` with no ticket falls
+        // back to the stored upstream (a no-op for locally-created web vaults).
+        const synced = desktop ? Promise.resolve() : api.syncNow(id).catch(() => {});
         // Pull in changes a peer pushed while we sit in the editor: the file tree,
         // the derived history, and the bytes of the file we're looking at. Without
         // this the backend converges but the UI shows a stale snapshot until the
-        // vault is reopened.
-        void refreshFiles(id).catch(() => {});
-        scheduleHistory(id);
-        void refreshActiveContent();
+        // vault is reopened. On web we refresh *after* the sync lands so the new
+        // state shows up in the same tick.
+        void synced.then(() => {
+          void refreshFiles(id).catch(() => {});
+          scheduleHistory(id);
+          void refreshActiveContent();
+        });
       } else {
         void refreshVaults().then(refreshStatuses);
       }
     }, 10000);
     return () => clearInterval(t);
-  }, [screen, refreshVaults, refreshStatuses, refreshFiles, scheduleHistory, refreshActiveContent]);
+  }, [screen, desktop, refreshVaults, refreshStatuses, refreshFiles, scheduleHistory, refreshActiveContent]);
 
   const metaOf = useCallback(
     (v: VaultInfo) => resolveMeta(metaMap, v.vault_id, basename(v.path)),

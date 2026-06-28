@@ -19,6 +19,11 @@ const randHex = (n: number) => Array.from(crypto.getRandomValues(new Uint8Array(
 interface RegEntry {
   id: string;
   vault_id: string;
+  // The upstream this vault was cloned from. Browsers can't open a listening
+  // socket, so a web node can only stay in sync by re-dialing this ticket — the
+  // poll calls `syncNow` and we fall back to these when no ticket is passed.
+  ticket?: string;
+  authKey?: string | null;
 }
 
 // ---- byte store: OPFS when available, in-memory fallback otherwise ----
@@ -137,6 +142,13 @@ export function createWebApi(): Api {
 
   const info = (e: RegEntry): VaultInfo => ({ id: e.id, path: '', vault_id: e.vault_id, enabled: true, listening_ticket: null });
 
+  // Look up the upstream a vault was cloned from, so the poll-driven `syncNow`
+  // (called without an explicit ticket) can re-dial it.
+  const upstreamOf = async (id: string): Promise<{ ticket: string; authKey?: string | null } | null> => {
+    const entry = (await registry()).find((r) => r.id === id);
+    return entry?.ticket ? { ticket: entry.ticket, authKey: entry.authKey ?? null } : null;
+  };
+
   return {
     listVaults: async () => (await registry()).map(info),
 
@@ -169,14 +181,27 @@ export function createWebApi(): Api {
       engines.set(id, eng);
       await persist(id, eng);
       const reg = await registry();
-      reg.unshift({ id, vault_id });
+      // Remember the upstream so the poll can keep re-syncing against it — a
+      // browser node has no other way to pull a peer's later pushes.
+      reg.unshift({ id, vault_id, ticket, authKey: authKey ?? null });
       await writeJson('registry.json', reg);
       return info({ id, vault_id });
     },
 
     syncNow: async (id, ticket, authKey) => {
+      // Called from the editor poll with no ticket: fall back to the upstream we
+      // cloned from. A vault created locally (no upstream) simply has nothing to
+      // sync against, so this is a no-op.
+      let t = ticket;
+      let k = authKey;
+      if (!t) {
+        const up = await upstreamOf(id);
+        if (!up) return;
+        t = up.ticket;
+        k = up.authKey ?? undefined;
+      }
       const eng = await engineFor(id);
-      await eng.sync(ticket, authKey ?? null, null);
+      await eng.sync(t, k ?? null, null);
       await persist(id, eng);
     },
 

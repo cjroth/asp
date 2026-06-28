@@ -50,7 +50,9 @@ export interface Api {
   createVault(name: string): Promise<VaultInfo>;
   cloneRemote(dest: string, ticket: string, authKey?: string): Promise<VaultInfo>;
   setAllowConnections(id: string, on: boolean, authKey?: string): Promise<string | null>;
-  syncNow(id: string, ticket: string, authKey?: string): Promise<void>;
+  // Sync once against `ticket`. On web, omit `ticket` to re-dial the upstream the
+  // vault was cloned from (the poll uses this to pull a peer's later pushes).
+  syncNow(id: string, ticket?: string, authKey?: string): Promise<void>;
   getStatus(id: string): Promise<VaultStatus>;
   getIdentity(): Promise<string>;
   authorize(id: string, pubkey: string): Promise<void>;
@@ -78,7 +80,7 @@ const tauriApi: Api = {
   createVault: () => Promise.reject(new Error('createVault is web-only')),
   cloneRemote: (dest, ticket, authKey) => invoke<VaultInfo>('clone_remote', { dest, ticket, authKey }),
   setAllowConnections: (id, on, authKey) => invoke<string | null>('set_allow_connections', { id, on, authKey }),
-  syncNow: (id, ticket, authKey) => invoke<void>('sync_now', { id, ticket, authKey }),
+  syncNow: (id, ticket, authKey) => invoke<void>('sync_now', { id, ticket: ticket ?? null, authKey }),
   getStatus: (id) => invoke<VaultStatus>('get_status', { id }),
   getIdentity: () => invoke<string>('get_identity'),
   authorize: (id, pubkey) => invoke<void>('authorize', { id, pubkey }),
