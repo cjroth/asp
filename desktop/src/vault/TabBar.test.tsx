@@ -32,6 +32,21 @@ describe('TabBar', () => {
     expect(tabs[1].textContent).not.toContain('notes/');
   });
 
+  it('uses the no-scrollbar tab-strip class (not asp-scroll) so tabs fill the full row height', () => {
+    render(<TabBar {...base} tabs={['a.md', 'b.md']} active="a.md" />);
+    const strip = screen.getByTestId('tab-bar');
+    // The strip must NOT use asp-scroll (which draws a 10px-tall scrollbar that
+    // eats the bottom of the 48px header row); it uses the hidden-scrollbar class.
+    expect(strip.classList.contains('tab-strip')).toBe(true);
+    expect(strip.classList.contains('asp-scroll')).toBe(false);
+    // It still stretches each tab to the full header-row height.
+    expect(strip.style.alignItems).toBe('stretch');
+    expect(strip.style.alignSelf).toBe('stretch');
+    // …while staying horizontally scrollable (just without a visible bar).
+    expect(strip.style.overflowX).toBe('auto');
+    expect(strip.style.overflowY).toBe('hidden');
+  });
+
   it('marks the active tab via aria-selected', () => {
     render(<TabBar {...base} tabs={['a.md', 'b.md']} active="b.md" />);
     const tabs = screen.getAllByTestId('tab');

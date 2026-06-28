@@ -262,7 +262,7 @@ export default function TabBar(props: TabBarProps) {
         <div
           data-testid="tab-bar"
           role="tablist"
-          className="asp-scroll"
+          className="tab-strip"
           style={{
             flex: 1,
             minWidth: 0,

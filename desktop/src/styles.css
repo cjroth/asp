@@ -15,7 +15,7 @@
 }
 
 * { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; height: 100%; }
+html, body { margin: 0; padding: 0; height: 100%; overscroll-behavior: none; }
 #root { height: 100%; }
 body {
   font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
@@ -28,6 +28,12 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
 
 @keyframes aspPulse { 0%, 100% { opacity: 1 } 50% { opacity: .32 } }
 @keyframes aspSpin { to { transform: rotate(360deg) } }
+
+/* Tab strip — stays horizontally scrollable (trackpad/drag reaches far tabs) but
+   hides the scrollbar entirely (cross-browser), so the strip's scrollbar gutter
+   doesn't eat vertical space and the tabs fill the full header-row height. */
+.tab-strip { scrollbar-width: none; }
+.tab-strip::-webkit-scrollbar { display: none; }
 
 .asp-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
 .asp-scroll::-webkit-scrollbar-thumb {
