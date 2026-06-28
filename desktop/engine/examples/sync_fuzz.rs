@@ -404,6 +404,7 @@ enum Scenario {
     RenameOntoExisting,
     CaseOnlyRename,
     RenameThenEdit,
+    ExternalRescan,
 }
 
 fn pick_scenario(rng: &mut Rng, round: usize) -> Scenario {
@@ -415,6 +416,7 @@ fn pick_scenario(rng: &mut Rng, round: usize) -> Scenario {
             EditExisting, NewFile, Rename, Delete, DeleteRecreate, RapidBurst,
             LargeFile, ManyFiles, ConcurrentSameFile, EmptyFile, DeepNesting,
             TruncateToEmpty, SwapNames, RenameOntoExisting, CaseOnlyRename, RenameThenEdit,
+            ExternalRescan,
         ]
     };
     rng.pick(&menu).clone()
@@ -613,6 +615,28 @@ fn apply_scenario(
             live.retain(|p| p != &from);
             live.push(to.clone());
             format!("rename+edit/{side:?} ->{to}")
+        }
+        ExternalRescan => {
+            // An edit made BEHIND an engine's API — written straight to its vault
+            // dir by some external tool (editor, git pull, script) — then captured
+            // via `rescan`. The desktop engine doesn't watch the filesystem, so
+            // rescan is the only capture path, and it must broadcast the captured
+            // rows live to peers (mirrors the CLI's auto-capture). Picks an engine
+            // side (the CLI hub auto-captures via `watch`, so rescan is moot there).
+            let i = rng.below(np);
+            let name = format!("ext/{:04}-{}", rng.next_u64() % 10000, rng.pick(NAMES));
+            let full = peers[i].dir.join(&name);
+            if let Some(parent) = full.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&full, rand_content(rng, "external edit").as_bytes());
+            let t = Instant::now();
+            let _ = peers[i].de.rescan(&peers[i].id);
+            lat.push(t.elapsed().as_millis());
+            if !live.contains(&name) {
+                live.push(name.clone());
+            }
+            format!("external-rescan/Engine({i}) {name}")
         }
     }
 }

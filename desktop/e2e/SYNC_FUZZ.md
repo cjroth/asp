@@ -92,10 +92,77 @@ Suggested fix: persist the upstream ticket+authKey in the web registry and have 
 editor poll call `syncNow` for vaults that have one (the desktop engine gets this
 for free via its persistent connector; only the web thin client needs it).
 
+**#3 (fixed) — `rescan` and snapshot `restore` did not push their changes to
+live peers.** Both `DesktopEngine` forwarders authored rows into the log but
+*discarded* them: `rescan` called `eng.capture_rescan()?;` (dropping the returned
+`Vec<WireRow>`) and `restore` called `eng.restore(target)?;` likewise — while the
+structurally-identical `create_dir` broadcasts its `capture_rescan` rows. Effect: a
+user who edits files behind the engine (external editor, `git pull`, a script) and
+hits refresh, or restores a snapshot, sees it locally but **connected peers stay
+stale** until some unrelated event triggers a sync. The bug sat in the surface the
+cross-surface fuzzer never exercised (it only wrote via `write_file`). Fixed in
+`lib.rs`: both now broadcast their authored rows like `write_file`/`create_dir`.
+Proven by `desktop/engine/tests/sync_surface_probes.rs` (rescan + restore probes
+fail before, pass after; `restore_file_at` is the passing control that isolates the
+bug to the missing broadcast). The fuzzer now has an `ExternalRescan` scenario
+(write straight to an engine's vault dir, then `rescan`) so the regression is
+guarded by the soak battery.
+
+**#4 (fixed) — the ignore scope froze at `Engine::open`; mid-session `.aspignore`
+changes were silently ignored.** `Engine::reload_scope()` existed but had **zero
+callers anywhere in the source** — scope was loaded once in `Engine::open` and
+never refreshed. A long-running engine (`asp watch` or the desktop engine) that
+gained or changed an `.aspignore` — edited locally, or **pushed by a peer** (it's a
+normal in-scope synced file) — kept authoring and syncing files the new rules say
+to ignore. Peers could thus disagree on what's in scope → divergent synced sets.
+(`asp scope` looked correct only because it opens a throwaway engine per call.)
+Fixed in `asp-core/engine.rs`: scope moved behind a `RefCell` (Engine is already
+`!Sync`, like the `batch` `Cell`) and reloaded at the two disk chokepoints —
+`capture_rescan` start (external/rescan edits) and `materialize` end when
+`.aspignore` was written/removed (local-API + peer-push). Made non-destructive: a
+file that *becomes* ignored but still exists on disk is dropped from management,
+not tombstoned (no surprise delete-on-all-peers). Proven by
+`asp-core/tests/disk_capture.rs::aspignore_added_after_open_takes_effect_without_reopen`
+(fails before, passes after) and the cross-surface
+`sync_surface_probes2.rs::aspignore_added_mid_session_takes_effect_both_sides`
+(local API both directions, external+rescan, and peer-push reload).
+
+**#5 (fixed) — the desktop engine ignored `ASP_RELAY_URL`.** The CLI honors
+`--relay-url`/`ASP_RELAY_URL` to pin a self-hosted `asp relay`, but the desktop
+engine only ever called `iroh_net::bind_endpoint(seed, relays)` and
+`ticket(ep, relays)` — the no-relay-URL variants (`bind_endpoint` hardcodes
+`relay_url: None`). So a NAT'd desktop user who configured their own relay got
+silently dropped onto the public n0 relays (or nothing, under `ASP_NO_RELAY=1`),
+and the tickets it minted never advertised the relay — undiallable for a peer that
+needs it. Fixed in `lib.rs`: a `relay_url()` helper reads `ASP_RELAY_URL` and feeds
+`bind_endpoint_relay` + `ticket_with_relay` at every binding site (clone, connector,
+listener, one-shot sync). Proven by
+`sync_surface_probes2.rs::ticket_advertises_configured_relay_url` (the minted ticket
+carries only a direct IP before the fix; the configured relay after).
+
+### Coverage added this round (surface expansion, no bug)
+
+- **auth wrong-key rejection** — a desktop clone with the wrong auth key is rejected
+  and leaks no vault content; the right key converges (`wrong_auth_key_is_rejected_and_leaks_no_data`).
+- **reconnect catch-up** — disconnect a peer (`remove_vault`), accumulate a batch of
+  edits while it's gone, reconnect by re-cloning → version-vector catch-up pulls the
+  whole batch with no loss (`reconnect_after_disconnect_catches_up_accumulated_edits`).
+  Note: true *simultaneous bidirectional* offline editing isn't simulable in-process —
+  the desktop API has no "pause sync but keep the folder writable" primitive
+  (`set_allow_connections(false)` only stops *new* accepts; `set_enabled` is a UI flag).
+- **scale** — 5000-file clone converges; capture ~3.5s, clone+converge ~4.2s over
+  loopback, no cliff past the fuzzer's ~1000 (`clone_at_scale_5000_files_converges`).
+- **relay topology** is already exercised transitively by the fuzzer's `--peers 2/3`
+  (engine → CLI hub → engine) and by the CLI e2e (`relay_topology.rs`/`relay_cohost.rs`).
+
 ## Backend verdict
 
 Thousands of randomized rounds across 1/2/3-engine topologies and many seeds, with
 vaults up to ~1000 files: **zero divergences.** Concurrent same-file writes from
 all sides converge; renames (including swaps and case-only) propagate; unicode and
 spaced paths round-trip. The `asp-core` sync path that both desktop and web share
-is solid; the bugs live in the UI/refresh layer above it (findings #1, #2).
+is solid; the bugs live in the engine forwarders, the scope/ignore plumbing, and
+the UI/refresh + relay-config layer above it (findings #1–#5) — specifically in
+entry points the fuzzer hadn't exercised, which is why expanding the *surface*
+(not just re-running) is what surfaces them. Every confirmed bug so far sat in a
+desktop-engine forwarder or wiring gap, never in the `asp-core` convergence core.

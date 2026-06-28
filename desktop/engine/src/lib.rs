@@ -166,6 +166,17 @@ impl DesktopEngine {
         !matches!(std::env::var("ASP_NO_RELAY").as_deref(), Ok("1") | Ok("true"))
     }
 
+    /// Pin a specific self-hosted relay (`asp relay`) via `ASP_RELAY_URL`, mirroring
+    /// the CLI's `--relay-url`. When set it takes precedence over the public n0
+    /// relays (and over `ASP_NO_RELAY`), so a NAT'd desktop user can route through
+    /// their own relay; without it the endpoint uses n0 / direct per `use_relays`.
+    fn relay_url() -> Option<String> {
+        match std::env::var("ASP_RELAY_URL") {
+            Ok(u) if !u.trim().is_empty() => Some(u.trim().to_string()),
+            _ => None,
+        }
+    }
+
     fn handle(&self, eng: Engine) -> EngineRef {
         Arc::new(Mutex::new(eng))
     }
@@ -232,7 +243,10 @@ impl DesktopEngine {
     fn bind_ep(&self) -> Result<iroh_net::Endpoint> {
         let seed = self.identity.seed();
         let relays = Self::use_relays();
-        self.block(async move { iroh_net::bind_endpoint(&seed, relays).await })
+        let relay_url = Self::relay_url();
+        self.block(async move {
+            iroh_net::bind_endpoint_relay(&seed, relays, relay_url.as_deref()).await
+        })
     }
 
     /// If `peer`+`ep` are set, start a persistent reconnecting connector to that
@@ -403,7 +417,10 @@ impl DesktopEngine {
                 }
             };
             let ep_t = ep.clone();
-            let ticket = self.block(async move { iroh_net::ticket(&ep_t, relays).await }).context("ticket")?;
+            let relay_url = Self::relay_url();
+            let ticket = self
+                .block(async move { iroh_net::ticket_with_relay(&ep_t, relays, relay_url.as_deref()).await })
+                .context("ticket")?;
             let handle = self.rt.spawn(async move {
                 let _ = iroh_net::serve(engine, ep, auth, conns).await;
             });
@@ -436,7 +453,9 @@ impl DesktopEngine {
                 Some(ep) => iroh_net::sync_oneshot(engine, &ep, addr, &auth).await,
                 // No standing endpoint (a plain local folder): a throwaway is fine.
                 None => {
-                    let ep = iroh_net::bind_endpoint(&seed, Self::use_relays()).await?;
+                    let relay_url = Self::relay_url();
+                    let ep =
+                        iroh_net::bind_endpoint_relay(&seed, Self::use_relays(), relay_url.as_deref()).await?;
                     let r = iroh_net::sync_oneshot(engine, &ep, addr, &auth).await;
                     ep.close().await;
                     r
@@ -479,10 +498,19 @@ impl DesktopEngine {
     }
 
     pub fn restore(&self, id: &str, target: &str) -> Result<()> {
-        let folders = self.folders.lock().unwrap();
-        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-        let eng = f.engine.lock().unwrap();
-        eng.restore(target)?;
+        // `restore` authors the rows that revert the vault to the target state;
+        // push them live to peers (as write_file/create_dir do) so a connected
+        // peer converges instead of silently keeping the pre-restore content.
+        let (conns, rows) = {
+            let folders = self.folders.lock().unwrap();
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            let eng = f.engine.lock().unwrap();
+            let rows = eng.restore(target)?;
+            (f.conns.clone(), rows)
+        };
+        for wr in rows {
+            self.broadcast(&conns, wr);
+        }
         Ok(())
     }
 
@@ -666,10 +694,20 @@ impl DesktopEngine {
     /// Re-capture on-disk changes into the log (manual refresh after external
     /// edits). Mirrors the CLI's rescan.
     pub fn rescan(&self, id: &str) -> Result<()> {
-        let folders = self.folders.lock().unwrap();
-        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-        let eng = f.engine.lock().unwrap();
-        eng.capture_rescan()?;
+        // capture_rescan authors rows for on-disk changes made behind the engine
+        // (external editors, git pulls, scripts). Broadcast them live to peers —
+        // exactly as create_dir does with its capture_rescan rows — so an external
+        // edit + refresh propagates instead of leaving connected peers stale.
+        let (conns, rows) = {
+            let folders = self.folders.lock().unwrap();
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            let eng = f.engine.lock().unwrap();
+            let rows = eng.capture_rescan()?;
+            (f.conns.clone(), rows)
+        };
+        for wr in rows {
+            self.broadcast(&conns, wr);
+        }
         Ok(())
     }
 
