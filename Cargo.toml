@@ -15,6 +15,9 @@ default-members = [
 # plain `cargo --workspace`; keep it out of the workspace build/test graph.
 exclude = [
     "desktop/src-tauri",
+    # The native GPUI shell links a patched local Zed checkout + system X libs;
+    # build it on its own (`cd gpui && cargo build`), not via `cargo --workspace`.
+    "gpui",
 ]
 
 [workspace.package]

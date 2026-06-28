@@ -1,0 +1,37 @@
+[package]
+name = "aspgui"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "aspgui"
+path = "src/lib.rs"
+
+[dependencies]
+# GPUI from a local patched Zed checkout — adds offscreen `render_to_image`/
+# `Window::capture_image()` for headless screenshots. Apply `zed-gpui-headless.patch`
+# to a Zed checkout at rev 5837e7e and point these at it. See README.
+gpui = { path = "/home/chris/zed-src/crates/gpui" }
+gpui_platform = { path = "/home/chris/zed-src/crates/gpui_platform", features = ["x11", "wayland"] }
+image = "0.25.1"
+anyhow = "1"
+hex = "0.4"
+# asp backend — relative within this repo (HARD INVARIANT: all behavior via the engine).
+asp-core = { path = "../crates/asp-core" }
+asp-desktop-engine = { path = "../desktop/engine" }
+
+[profile.dev]
+debug = 0
+strip = "debuginfo"
+
+[[bin]]
+name = "aspgui"
+path = "src/bin/aspgui.rs"
+
+[[bin]]
+name = "shoot"
+path = "src/bin/shoot.rs"
+
+[[bin]]
+name = "smoke"
+path = "src/bin/smoke.rs"
