@@ -453,3 +453,22 @@ describe('cm-mark invisibility technique + round-trip (caret/selection fix)', ()
     }
   });
 });
+
+// The macOS WebView (and browsers) rubber-band the whole document at the scroll
+// edges. We kill that PAGE-level bounce by setting `overscroll-behavior: none` on
+// `html, body` — without disabling scrolling, and without touching the inner
+// content/`.asp-scroll` regions (overscroll inside real scrollable content is
+// intentionally kept). This pins the rule so the page-bounce fix can't regress.
+describe('page-level rubber-band overscroll disabled (html, body)', () => {
+  const cssText = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
+  const htmlBodyRule = (cssText.match(/^html,\s*body\s*\{([^}]*)\}/m) || ['', ''])[1];
+
+  it('sets overscroll-behavior:none on the html, body rule', () => {
+    expect(htmlBodyRule).not.toBe('');
+    expect(htmlBodyRule).toMatch(/overscroll-behavior\s*:\s*none/);
+  });
+
+  it('does NOT clip the page with overflow:hidden on body (screens keep their own scroll)', () => {
+    expect(htmlBodyRule).not.toMatch(/overflow\s*:\s*hidden/);
+  });
+});
