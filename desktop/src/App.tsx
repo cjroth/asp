@@ -1489,15 +1489,14 @@ export default function App() {
 
                 {/* Save-status + word count: a subtle, fixed bar pinned to the
                     top of the content area (below the tab strip, above the
-                    editor scroll region). It does not scroll with the document
-                    and aligns horizontally to the editor's column. */}
-                <div data-testid="content-status" style={{ flex: 'none', display: 'flex', justifyContent: 'center', borderBottom: '1px solid var(--line)' }}>
-                  <div style={{ width: centered ? '760px' : '100%', maxWidth: '100%', padding: centered ? '7px 40px' : '7px 36px', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8 }}>
-                    <span style={{ width: 6, height: 6, borderRadius: '50%', flex: 'none', background: saving ? '#d9a93d' : '#3fa45a', transition: 'background .2s' }} />
-                    <span style={{ fontSize: 11.5, color: 'var(--faint)', whiteSpace: 'nowrap' }}>{saving ? 'Saving…' : 'Saved'}</span>
-                    <span style={{ width: 1, height: 11, background: 'var(--line)', flex: 'none', margin: '0 2px' }} />
-                    <span style={{ fontSize: 11.5, color: 'var(--faint2)', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>{count}</span>
-                  </div>
+                    editor scroll region). It does not scroll with the document.
+                    Full-width of the pane, with the cluster hugging the right
+                    edge so it sits near the editor pane's right chrome. */}
+                <div data-testid="content-status" style={{ flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, padding: '7px 18px', borderBottom: '1px solid var(--line)' }}>
+                  <span style={{ width: 6, height: 6, borderRadius: '50%', flex: 'none', background: saving ? '#d9a93d' : '#3fa45a', transition: 'background .2s' }} />
+                  <span style={{ fontSize: 11.5, color: 'var(--faint)', whiteSpace: 'nowrap' }}>{saving ? 'Saving…' : 'Saved'}</span>
+                  <span style={{ width: 1, height: 11, background: 'var(--line)', flex: 'none', margin: '0 2px' }} />
+                  <span style={{ fontSize: 11.5, color: 'var(--faint2)', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>{count}</span>
                 </div>
 
                 {timeTravel && (
