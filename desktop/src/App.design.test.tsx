@@ -177,10 +177,11 @@ describe('App — connect screen', () => {
 describe('App — editor', () => {
   beforeEach(async () => { render(<App />); await openVault(); });
 
-  it('toggles the reading font and theme from the status bar', async () => {
-    await screen.findByTestId('live-editor');
-    fireEvent.click(screen.getByTitle(/Reading font/));
-    expect(JSON.parse(localStorage.getItem('asp.prefs.v1')!).fontOverride).toBe('Serif');
+  it('toggles theme from the status bar (the Sans/Serif font toggle is gone)', async () => {
+    const editor = await screen.findByTestId('live-editor');
+    // The reading-font toggle was removed — markdown is always serif.
+    expect(screen.queryByTitle(/Reading font/)).toBeNull();
+    expect(editor.style.fontFamily).toContain('Newsreader');
     const themeBtns = screen.getAllByTitle('Toggle theme');
     fireEvent.click(themeBtns[themeBtns.length - 1]);
     expect(document.documentElement.getAttribute('data-theme')).toBe('dark');

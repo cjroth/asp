@@ -66,7 +66,7 @@ export default function App() {
   const [prefs, setPrefsState] = useState<Prefs>(loadPrefs);
   const accent = prefs.accent;
   const accentSoft = accent + '22';
-  const fontFamily = fontFamilyOf(prefs);
+  const fontFamily = fontFamilyOf();
   const centered = prefs.writingColumn !== false;
   const updatePrefs = useCallback((patch: Partial<Prefs>) => {
     setPrefsState((p) => {
@@ -931,17 +931,12 @@ export default function App() {
     [histBarH, histOpen, logOpen, updatePrefs],
   );
 
-  // ---------- theme / font ----------
+  // ---------- theme ----------
   const onToggleTheme = useCallback(() => {
     const next = prefs.theme === 'dark' ? 'light' : 'dark';
     applyTheme(next);
     updatePrefs({ theme: next });
   }, [prefs.theme, updatePrefs]);
-  const onToggleFont = useCallback(() => {
-    const cur = prefs.fontOverride || prefs.font;
-    updatePrefs({ fontOverride: cur === 'Serif' ? 'Sans' : 'Serif' });
-  }, [prefs.font, prefs.fontOverride, updatePrefs]);
-  const fontIsSerif = (prefs.fontOverride || prefs.font) === 'Serif';
 
   // ---------- connect / new / share / remove / customize ----------
   const onOpenFolder = useCallback(async () => {
@@ -1494,9 +1489,6 @@ export default function App() {
                   <span style={{ fontSize: 12, color: 'var(--faint2)', fontVariantNumeric: 'tabular-nums', flex: 'none' }}>{count}</span>
                   <div style={{ width: 1, height: 16, background: 'var(--line)', flex: 'none', marginLeft: 2 }} />
                   <div style={{ display: 'flex', alignItems: 'center', gap: 1, flex: 'none' }}>
-                    <button className="asp-icon-btn" onClick={onToggleFont} title={fontIsSerif ? 'Reading font: Serif' : 'Reading font: Sans'} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 28, height: 26, flex: 'none', border: 'none', background: 'transparent', borderRadius: 6, cursor: 'pointer', padding: 0, color: 'var(--text3)', opacity: fontIsSerif ? 1 : 0.45 }}>
-                      <span style={{ fontFamily: "'Newsreader',Georgia,serif", fontSize: 16, fontWeight: 500, lineHeight: 1, display: 'block' }}>A</span>
-                    </button>
                     {themeBtn({ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 28, height: 26, flex: 'none', border: 'none', background: 'transparent', color: 'var(--text3)', borderRadius: 7, cursor: 'pointer', padding: 0 })}
                   </div>
                 </div>

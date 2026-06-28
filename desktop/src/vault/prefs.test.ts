@@ -29,7 +29,16 @@ describe('prefs', () => {
     const p = loadPrefs();
     expect(p.accent).toBe('#ff0000');
     expect(p.theme).toBe('dark');
-    expect(p.font).toBe('Sans'); // default preserved
+    expect(p.prettyNames).toBe(false); // default preserved
+  });
+
+  it('tolerates legacy persisted prefs that still carry font / fontOverride keys', () => {
+    // Old builds wrote `font` + `fontOverride`; they are no longer part of Prefs.
+    // The spread keeps them harmless and the active prefs are unaffected.
+    localStorage.setItem('asp.prefs.v1', JSON.stringify({ font: 'Mono', fontOverride: 'Sans', accent: '#abcdef' }));
+    const p = loadPrefs();
+    expect(p.accent).toBe('#abcdef');
+    expect(fontFamilyOf()).toBe(FONT_FAMILIES.Serif); // still serif regardless
   });
 
   it('tolerates corrupt JSON', () => {
@@ -50,9 +59,8 @@ describe('prefs', () => {
     expect(document.documentElement.getAttribute('data-theme')).toBe('light');
   });
 
-  it('fontFamilyOf prefers the override', () => {
-    expect(fontFamilyOf({ ...DEFAULT_PREFS, font: 'Sans', fontOverride: null })).toBe(FONT_FAMILIES.Sans);
-    expect(fontFamilyOf({ ...DEFAULT_PREFS, font: 'Sans', fontOverride: 'Serif' })).toBe(FONT_FAMILIES.Serif);
+  it('fontFamilyOf always returns the serif reading font', () => {
+    expect(fontFamilyOf()).toBe(FONT_FAMILIES.Serif);
   });
 
   it('clampSidebar bounds the width', () => {

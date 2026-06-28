@@ -1,7 +1,8 @@
-// User preferences + theme. The design exposes accent / font / writing-column /
-// frontmatter-style as canvas props and theme / font-override / sidebar-width /
-// hidden-files / pretty-names as in-app state; here they are one persisted Prefs
-// object (localStorage `asp.prefs.v1`). No backend involvement — these are local
+// User preferences + theme. The design exposes accent / writing-column /
+// frontmatter-style as canvas props and theme / sidebar-width / hidden-files /
+// pretty-names as in-app state; here they are one persisted Prefs object
+// (localStorage `asp.prefs.v1`). Markdown prose always renders in the serif
+// reading font (see `fontFamilyOf`). No backend involvement — these are local
 // view settings only.
 
 export type FontKey = 'Sans' | 'Serif' | 'Mono';
@@ -10,8 +11,6 @@ export type Theme = 'light' | 'dark';
 
 export interface Prefs {
   accent: string;
-  font: FontKey; // base reading font
-  fontOverride: FontKey | null; // status-bar toggle (Serif ⇄ Sans)
   frontmatterStyle: FrontmatterStyle;
   writingColumn: boolean;
   theme: Theme;
@@ -23,8 +22,6 @@ export interface Prefs {
 
 export const DEFAULT_PREFS: Prefs = {
   accent: '#3d63dd',
-  font: 'Sans',
-  fontOverride: null,
   frontmatterStyle: 'Below',
   writingColumn: true,
   theme: 'light',
@@ -70,9 +67,10 @@ export function applyTheme(theme: Theme): void {
   }
 }
 
-// The effective reading font: the status-bar override wins over the base font.
-export function fontFamilyOf(prefs: Prefs): string {
-  return FONT_FAMILIES[prefs.fontOverride || prefs.font];
+// Markdown prose is ALWAYS rendered in the serif reading font (there is no
+// Sans/Serif toggle). Kept as a function so call sites stay stable.
+export function fontFamilyOf(): string {
+  return FONT_FAMILIES.Serif;
 }
 
 export const SIDEBAR_MIN = 200;
