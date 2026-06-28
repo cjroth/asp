@@ -20,7 +20,7 @@ import { applyTheme, clampHistBar, clampSidebar, fontFamilyOf, HISTBAR_COLLAPSE,
 import { isHidden } from './vault/prettyNames';
 import { allDirPaths, buildTree, firstSelectable, flatten } from './vault/tree';
 import TabBar from './vault/TabBar';
-import { buildHash, closeTab, loadOpenTabs, parseHash, remapTabs, removeTabs, reorderTabs, saveOpenTabs, withTab } from './vault/tabs';
+import { buildHash, closeAll, closeOthers, closeTab, closeToLeft, closeToRight, loadOpenTabs, parseHash, remapTabs, removeTabs, reorderTabs, saveOpenTabs, withTab } from './vault/tabs';
 import { WELCOME_MD } from './vault/welcome';
 import { avatarStyle, glyphOf, hueForId, loadVaultMeta, resolveMeta, saveVaultMeta, type VaultMetaMap } from './vault/vaultMeta';
 
@@ -1186,13 +1186,43 @@ export default function App() {
     [flushSave],
   );
 
-  // Right-click a tab → Rename / Close / Delete menu (App renders it).
+  // Apply a multi-close transform (Close Others / Left / Right / All) to the open
+  // tabs. These CLOSE tabs only — no file is deleted. If the active file is among
+  // the closed tabs, switch to a surviving tab (prefer the kept tab nearest the
+  // old active, scanning right then left); when nothing survives, fall back to the
+  // vault's default file and adopt it as the sole open tab. Mirrors the survivor
+  // selection in `performDelete`.
+  const applyTabClose = useCallback(
+    (tabsAfter: string[]) => {
+      const oldTabs = openTabsRef.current;
+      const sel = selectedRef.current;
+      if (sel && !tabsAfter.includes(sel)) {
+        let na: string | null = null;
+        const idx = oldTabs.indexOf(sel);
+        if (idx >= 0) {
+          for (let i = idx + 1; i < oldTabs.length && na == null; i++) if (tabsAfter.includes(oldTabs[i])) na = oldTabs[i];
+          for (let i = idx - 1; i >= 0 && na == null; i--) if (tabsAfter.includes(oldTabs[i])) na = oldTabs[i];
+        }
+        if (na == null) na = tabsAfter.length ? tabsAfter[0] : firstSelectable(buildTree(filesRef.current));
+        void flushSave();
+        setOpenTabs(na ? withTab(tabsAfter, na) : tabsAfter);
+        setSelectedPath(na);
+        setSelectedPaths(na ? new Set([na]) : new Set());
+        setAnchorPath(na);
+      } else {
+        setOpenTabs(tabsAfter);
+      }
+    },
+    [flushSave],
+  );
+
+  // Right-click a tab → Close / Close-variants / Rename / Delete menu (App renders it).
   const onTabContext = useCallback((path: string, e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
     setVaultMenuOpen(false);
     setCtxMenu(null);
-    setTabCtx({ x: Math.min(e.clientX, window.innerWidth - 164), y: Math.min(e.clientY, window.innerHeight - 130), path });
+    setTabCtx({ x: Math.min(e.clientX, window.innerWidth - 196), y: Math.min(e.clientY, window.innerHeight - 308), path });
   }, []);
 
   // Drag-reorder within the strip → persist the new order (the per-vault
@@ -1571,15 +1601,32 @@ export default function App() {
           </>
         )}
 
-        {/* tab context menu — Close / Rename / Delete */}
+        {/* tab context menu — Close / Close Others / Close to the Left / Close to the Right / Close All / Rename / Delete */}
         {tabCtx && (
           <>
             <div onClick={() => setTabCtx(null)} onContextMenu={(e) => { e.preventDefault(); setTabCtx(null); }} style={{ position: 'fixed', inset: 0, zIndex: 60 }} />
-            <div style={{ position: 'fixed', left: tabCtx.x, top: tabCtx.y, zIndex: 61, width: 156, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, boxShadow: '0 12px 32px rgba(28,25,23,0.16)', padding: 5 }}>
+            <div style={{ position: 'fixed', left: tabCtx.x, top: tabCtx.y, zIndex: 61, width: 188, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, boxShadow: '0 12px 32px rgba(28,25,23,0.16)', padding: 5 }}>
               <div className="asp-hover-soft" onClick={() => { onTabClose(tabCtx.path); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
                 <span>Close</span>
               </div>
+              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeOthers(openTabs, tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
+                <span>Close Others</span>
+              </div>
+              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeToLeft(openTabs, tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
+                <span>Close to the Left</span>
+              </div>
+              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeToRight(openTabs, tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
+                <span>Close to the Right</span>
+              </div>
+              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeAll()); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
+                <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
+                <span>Close All</span>
+              </div>
+              <div style={{ height: 1, background: 'var(--line)', margin: '4px 6px' }} />
               <div className="asp-hover-soft" onClick={() => { setTabRenaming(tabCtx.path); setTabRenameValue(basename(tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <Icon.PencilIcon style={{ flex: 'none' }} />
                 <span>Rename</span>

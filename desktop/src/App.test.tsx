@@ -330,14 +330,69 @@ describe('App — tabs + URL hash (desktop)', () => {
     expect(tab('notes/a.md').getAttribute('aria-selected')).toBe('true');
   });
 
-  it('lists the tab right-click menu items in order: Close, Rename, Delete', async () => {
+  it('lists the tab right-click menu items in order: Close, Close Others, Close to the Left, Close to the Right, Close All, Rename, Delete', async () => {
     await openTwoTabs();
     fireEvent.contextMenu(tab('README.md'));
     const close = await screen.findByText('Close');
-    // The menu container holds the three items in DOM order.
+    // The menu container holds the items in DOM order.
     const menu = close.closest('div[style*="position: fixed"]') as HTMLElement;
     const rendered = Array.from(menu.querySelectorAll('.asp-hover-soft')).map((el) => (el.textContent || '').replace('×', ''));
-    expect(rendered).toEqual(['Close', 'Rename', 'Delete']);
+    expect(rendered).toEqual(['Close', 'Close Others', 'Close to the Left', 'Close to the Right', 'Close All', 'Rename', 'Delete']);
+  });
+
+  it('Close Others closes every tab but the right-clicked one (switching active when needed)', async () => {
+    await openTwoTabs(); // active = notes/a.md
+    fireEvent.contextMenu(tab('README.md'));
+    fireEvent.click(await screen.findByText('Close Others'));
+    await waitFor(() => expect(tabPaths()).toEqual(['README.md']));
+    expect(tab('README.md').getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('Close to the Left closes the tabs before the right-clicked one', async () => {
+    await openTwoTabs(); // tabs [README, notes/a.md], active notes/a.md
+    fireEvent.contextMenu(tab('notes/a.md'));
+    fireEvent.click(await screen.findByText('Close to the Left'));
+    await waitFor(() => expect(tabPaths()).toEqual(['notes/a.md']));
+    // The right-clicked tab was already active, so it stays active.
+    expect(tab('notes/a.md').getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('Close to the Right closes the tabs after the right-clicked one (switching active when needed)', async () => {
+    await openTwoTabs(); // tabs [README, notes/a.md], active notes/a.md
+    fireEvent.contextMenu(tab('README.md'));
+    fireEvent.click(await screen.findByText('Close to the Right'));
+    await waitFor(() => expect(tabPaths()).toEqual(['README.md']));
+    expect(tab('README.md').getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('Close All closes every tab and lands on the vault default file', async () => {
+    await openTwoTabs();
+    fireEvent.contextMenu(tab('notes/a.md'));
+    fireEvent.click(await screen.findByText('Close All'));
+    await waitFor(() => expect(tabPaths()).toEqual(['README.md']));
+    expect(tab('README.md').getAttribute('aria-selected')).toBe('true');
+    await waitFor(() => expect(parseHash(window.location.hash)?.path).toBe('README.md'));
+  });
+
+  it('Close to the Right with three tabs keeps the left side and reselects a neighbor', async () => {
+    await openTwoTabs(); // [README, notes/a.md], active notes/a.md
+    // Create a third tab (active = the new untitled.md), to the RIGHT of notes/a.md.
+    fireEvent.click(screen.getByTitle('New note'));
+    fireEvent.click(await screen.findByText('New file'));
+    await waitFor(() => expect(tabPaths()).toEqual(['README.md', 'notes/a.md', 'untitled.md']));
+    fireEvent.contextMenu(tab('notes/a.md'));
+    fireEvent.click(await screen.findByText('Close to the Right'));
+    await waitFor(() => expect(tabPaths()).toEqual(['README.md', 'notes/a.md']));
+    // The active file (untitled.md) was closed → nearest surviving neighbor wins.
+    expect(tab('notes/a.md').getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('does NOT delete files when closing (Close Others is non-destructive)', async () => {
+    await openTwoTabs();
+    fireEvent.contextMenu(tab('README.md'));
+    fireEvent.click(await screen.findByText('Close Others'));
+    await waitFor(() => expect(tabPaths()).toEqual(['README.md']));
+    expect(deleteFile).not.toHaveBeenCalled();
   });
 
   it('Delete in the tab right-click menu deletes the file and closes its tab', async () => {

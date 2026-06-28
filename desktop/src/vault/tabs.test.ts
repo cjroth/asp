@@ -1,6 +1,6 @@
 // Exhaustive unit tests for the pure tab/hash helpers. Pinned at 100% coverage.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { buildHash, closeTab, loadOpenTabs, parseHash, remapTabs, removeTabs, reorderTabs, saveOpenTabs, withTab } from './tabs';
+import { buildHash, closeAll, closeOthers, closeTab, closeToLeft, closeToRight, loadOpenTabs, parseHash, remapTabs, removeTabs, reorderTabs, saveOpenTabs, withTab } from './tabs';
 
 describe('buildHash / parseHash', () => {
   it('round-trips a plain vault + file', () => {
@@ -186,5 +186,78 @@ describe('reorderTabs', () => {
     expect(reorderTabs(t, 5, 0)).toBe(t);
     expect(reorderTabs(t, 0, -1)).toBe(t);
     expect(reorderTabs(t, 0, 9)).toBe(t);
+  });
+});
+
+describe('closeOthers', () => {
+  it('keeps only the given path (middle)', () => {
+    expect(closeOthers(['a', 'b', 'c'], 'b')).toEqual(['b']);
+  });
+  it('keeps only the given path (first)', () => {
+    expect(closeOthers(['a', 'b', 'c'], 'a')).toEqual(['a']);
+  });
+  it('keeps only the given path (last)', () => {
+    expect(closeOthers(['a', 'b', 'c'], 'c')).toEqual(['c']);
+  });
+  it('is a no-op on a single matching tab', () => {
+    expect(closeOthers(['a'], 'a')).toEqual(['a']);
+  });
+  it('keeps nothing when the path is not present', () => {
+    expect(closeOthers(['a', 'b'], 'zzz')).toEqual([]);
+  });
+  it('keeps nothing on an empty list', () => {
+    expect(closeOthers([], 'a')).toEqual([]);
+  });
+});
+
+describe('closeToLeft', () => {
+  it('drops everything before the path (middle)', () => {
+    expect(closeToLeft(['a', 'b', 'c'], 'b')).toEqual(['b', 'c']);
+  });
+  it('is a no-op when the path is first', () => {
+    expect(closeToLeft(['a', 'b', 'c'], 'a')).toEqual(['a', 'b', 'c']);
+  });
+  it('keeps only the path when it is last', () => {
+    expect(closeToLeft(['a', 'b', 'c'], 'c')).toEqual(['c']);
+  });
+  it('is a no-op on a single tab', () => {
+    expect(closeToLeft(['a'], 'a')).toEqual(['a']);
+  });
+  it('returns the original (same ref) when the path is not present', () => {
+    const t = ['a', 'b'];
+    expect(closeToLeft(t, 'zzz')).toBe(t);
+  });
+  it('returns the original (same ref) on an empty list', () => {
+    const t: string[] = [];
+    expect(closeToLeft(t, 'a')).toBe(t);
+  });
+});
+
+describe('closeToRight', () => {
+  it('drops everything after the path (middle)', () => {
+    expect(closeToRight(['a', 'b', 'c'], 'b')).toEqual(['a', 'b']);
+  });
+  it('keeps only the path when it is first', () => {
+    expect(closeToRight(['a', 'b', 'c'], 'a')).toEqual(['a']);
+  });
+  it('is a no-op when the path is last', () => {
+    expect(closeToRight(['a', 'b', 'c'], 'c')).toEqual(['a', 'b', 'c']);
+  });
+  it('is a no-op on a single tab', () => {
+    expect(closeToRight(['a'], 'a')).toEqual(['a']);
+  });
+  it('returns the original (same ref) when the path is not present', () => {
+    const t = ['a', 'b'];
+    expect(closeToRight(t, 'zzz')).toBe(t);
+  });
+  it('returns the original (same ref) on an empty list', () => {
+    const t: string[] = [];
+    expect(closeToRight(t, 'a')).toBe(t);
+  });
+});
+
+describe('closeAll', () => {
+  it('returns an empty list', () => {
+    expect(closeAll()).toEqual([]);
   });
 });

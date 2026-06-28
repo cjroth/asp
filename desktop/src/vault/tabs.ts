@@ -118,3 +118,32 @@ export function reorderTabs(tabs: string[], from: number, to: number): string[] 
   next.splice(to, 0, moved);
   return next;
 }
+
+// ---------- multi-close transforms (pure) ----------
+// Each returns the new tab-path array; active-file reassignment is the caller's
+// job. These CLOSE tabs only — no file is ever deleted.
+
+// Close every tab EXCEPT `path` (the right-clicked tab). A `path` that isn't open
+// keeps nothing (→ []).
+export function closeOthers(tabs: string[], path: string): string[] {
+  return tabs.filter((t) => t === path);
+}
+
+// Close every tab to the LEFT of `path`, keeping `path` and everything after it.
+// A `path` that isn't present leaves the list unchanged (same ref).
+export function closeToLeft(tabs: string[], path: string): string[] {
+  const idx = tabs.indexOf(path);
+  return idx === -1 ? tabs : tabs.slice(idx);
+}
+
+// Close every tab to the RIGHT of `path`, keeping `path` and everything before it.
+// A `path` that isn't present leaves the list unchanged (same ref).
+export function closeToRight(tabs: string[], path: string): string[] {
+  const idx = tabs.indexOf(path);
+  return idx === -1 ? tabs : tabs.slice(0, idx + 1);
+}
+
+// Close ALL tabs.
+export function closeAll(): string[] {
+  return [];
+}
