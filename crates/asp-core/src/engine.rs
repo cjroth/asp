@@ -27,7 +27,12 @@ pub struct Engine {
     pub git_dir: PathBuf,
     pub store: SqliteStore,
     pub identity: Identity,
-    pub scope: crate::scope::Scope,
+    /// Ignore rules (`.aspignore` + the always-ignored dirs). Reloaded from disk
+    /// by `materialize()` whenever `.aspignore` changes — locally or via a peer
+    /// push — so the scope never freezes at the value loaded when the engine
+    /// opened. Behind a `RefCell` for the same reason `batch` is a `Cell`:
+    /// `Engine` is `!Sync` and only ever touched behind a `Mutex`.
+    pub scope: std::cell::RefCell<crate::scope::Scope>,
     /// Per-vault authoring `site_id` (distinct from `identity`, the device key).
     pub site: String,
     /// When set, the per-`record_*` `materialize()` is suppressed — capture
@@ -83,8 +88,16 @@ impl Engine {
         let store = SqliteStore::open(&asp_dir.join("asp.db"))?;
         let scope = Self::load_scope(root);
         let site = load_or_create_site_id(&asp_dir)?;
-        let eng =
-            Engine { root: root.to_path_buf(), asp_dir, git_dir, store, identity, scope, site, batch: std::cell::Cell::new(false) };
+        let eng = Engine {
+            root: root.to_path_buf(),
+            asp_dir,
+            git_dir,
+            store,
+            identity,
+            scope: std::cell::RefCell::new(scope),
+            site,
+            batch: std::cell::Cell::new(false),
+        };
         Ok(eng)
     }
 
@@ -105,8 +118,8 @@ impl Engine {
         }
     }
 
-    pub fn reload_scope(&mut self) {
-        self.scope = Self::load_scope(&self.root);
+    pub fn reload_scope(&self) {
+        *self.scope.borrow_mut() = Self::load_scope(&self.root);
     }
 
     /// The authoring identity (per-vault, distinct from the device connection key).
@@ -144,7 +157,7 @@ impl Engine {
     /// Record a create/edit for `rel` with new `bytes`. Returns the authored row
     /// (with blobs to ship) or None if the content is unchanged (self-write echo).
     pub fn record_write(&self, rel: &str, bytes: &[u8]) -> AspResult<Option<WireRow>> {
-        if self.scope.ignored(rel) {
+        if self.scope.borrow().ignored(rel) {
             return Ok(None);
         }
         let result_hash = self.store.put_blob(bytes)?;
@@ -356,6 +369,9 @@ impl Engine {
         }
 
         // Write/overwrite desired files atomically (only when content differs).
+        // Track whether `.aspignore` is (re)written this pass so we can refresh
+        // the live scope below without a stat on every materialize.
+        let mut aspignore_changed = false;
         for (path, bytes) in &desired {
             let abs = self.root.join(path);
             let differs = match fs::read(&abs) {
@@ -363,6 +379,9 @@ impl Engine {
                 Err(_) => true,
             };
             if differs {
+                if path == ".aspignore" {
+                    aspignore_changed = true;
+                }
                 if let Some(parent) = abs.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -384,11 +403,21 @@ impl Engine {
         let desired_dir_set: std::collections::HashSet<&String> = desired_dirs.iter().collect();
         for path in old_live {
             if !desired.contains_key(&path) && !desired_dir_set.contains(&path) {
+                if path == ".aspignore" {
+                    aspignore_changed = true; // an ignore file was removed
+                }
                 let abs = self.root.join(&path);
                 let _ = fs::remove_file(&abs); // no-op if it was a directory
                 self.prune_empty_dirs(Some(abs.as_path()));
                 self.prune_empty_dirs(abs.parent());
             }
+        }
+
+        // `.aspignore` changed on disk this pass (local edit or a peer push):
+        // refresh the live ignore rules so newly-ignored paths stop syncing and
+        // un-ignored ones resume, instead of the scope staying frozen at open.
+        if aspignore_changed {
+            self.reload_scope();
         }
 
         // Derived git export at the settle boundary.
@@ -432,6 +461,13 @@ impl Engine {
         // inside `record_*` keeps reading that same pre-capture state. Reset the
         // flag even on error so a failed scan can't wedge the engine into batch
         // mode forever.
+        // Disk is the input to a capture, and `.aspignore` lives on disk — so
+        // refresh the scope from disk first. This is what makes an `.aspignore`
+        // edited externally (another editor, a `git pull`, a script) take effect
+        // on the next rescan instead of staying frozen at the open-time value.
+        // (`materialize()` separately reloads it for the API/peer-push paths, where
+        // the change arrives as a written row rather than a pre-existing disk file.)
+        self.reload_scope();
         self.batch.set(true);
         let result = self.capture_rescan_inner(&self.scan_disk()?);
         self.batch.set(false);
@@ -451,7 +487,18 @@ impl Engine {
         let mut changed: Vec<String> = Vec::new();
         for (path, f) in &live {
             match on_disk.get(path) {
-                None => disappeared.push(path.clone()),
+                None => {
+                    // `scan_disk` omits ignored paths, so a file that just became
+                    // ignored (e.g. a new `.aspignore` rule) looks "disappeared".
+                    // Don't tombstone one that still physically exists — that would
+                    // delete it on every peer the moment it's ignored. Drop it from
+                    // management instead; only a genuinely-removed file is deleted.
+                    let still_on_disk =
+                        self.scope.borrow().ignored(path) && self.root.join(path).exists();
+                    if !still_on_disk {
+                        disappeared.push(path.clone());
+                    }
+                }
                 Some(bytes) => {
                     if f.result_hash.as_deref() != Some(crate::oid::content_hash(bytes).as_str()) {
                         changed.push(path.clone());
@@ -569,7 +616,7 @@ impl Engine {
                 Ok(r) => r.to_string_lossy().replace('\\', "/"),
                 Err(_) => continue,
             };
-            if self.scope.ignored(&rel) {
+            if self.scope.borrow().ignored(&rel) {
                 continue;
             }
             if fs::read_dir(&path).map(|mut it| it.next().is_none()).unwrap_or(false) {
@@ -647,7 +694,7 @@ impl Engine {
                 Ok(r) => r.to_string_lossy().replace('\\', "/"),
                 Err(_) => continue,
             };
-            if self.scope.ignored(&rel) {
+            if self.scope.borrow().ignored(&rel) {
                 continue;
             }
             if path.is_dir() {

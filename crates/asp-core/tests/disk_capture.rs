@@ -183,3 +183,37 @@ fn reopening_an_unchanged_vault_reconciles_to_a_no_op() {
     assert!(e2.reconcile_startup().unwrap().is_empty(), "reopening an unchanged vault must author nothing");
     assert!(e2.materialize().unwrap().contains_key("keep.md"), "and the file is still there");
 }
+
+#[test]
+fn aspignore_added_after_open_takes_effect_without_reopen() {
+    // The scope must NOT freeze at the value loaded when the engine opened.
+    // A long-running engine (`asp watch` / the desktop engine) that gains an
+    // `.aspignore` mid-session — authored locally or materialized from a peer
+    // push — must start honoring it. Regression guard for the dead `reload_scope`
+    // (it had zero callers; scope only ever loaded once at `Engine::open`).
+    let (dir, e) = open_vault();
+
+    // Before any ignore rules: a *.log file is in scope and captures normally.
+    fs::write(dir.path().join("early.log"), b"captured while in scope\n").unwrap();
+    assert_eq!(e.capture_rescan().unwrap().len(), 1, "early.log captured (no ignore yet)");
+
+    // Author an `.aspignore` mid-session, then materialize (the chokepoint that
+    // refreshes the live scope when `.aspignore` changes on disk).
+    fs::write(dir.path().join(".aspignore"), b"*.log\n").unwrap();
+    e.capture_rescan().unwrap(); // captures .aspignore; materialize reloads scope
+    e.materialize().unwrap();
+
+    // A NEW *.log must now be ignored on every authoring path.
+    assert!(
+        e.record_write("late.log", b"should be ignored\n").unwrap().is_none(),
+        "record_write honors the mid-session .aspignore (no row authored)"
+    );
+    fs::write(dir.path().join("disk.log"), b"external, should be ignored\n").unwrap();
+    fs::write(dir.path().join("kept.md"), b"in scope\n").unwrap();
+    let rows = e.capture_rescan().unwrap();
+    let files = e.materialize().unwrap();
+    assert!(files.contains_key("kept.md"), "in-scope file still captured");
+    assert!(!files.contains_key("disk.log"), "external *.log filtered by the live scope");
+    assert!(!files.contains_key("late.log"), "API-authored *.log never materialized");
+    assert_eq!(rows.len(), 1, "only kept.md authored from the rescan, not the *.log files");
+}
