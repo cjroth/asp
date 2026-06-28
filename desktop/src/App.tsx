@@ -1460,8 +1460,9 @@ export default function App() {
           <main style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
             {hasSelection ? (
               <>
-                {/* Merged header row: the tab strip (left, scrollable) shares one
-                    row with the save/count/font/theme cluster (right). */}
+                {/* Tab strip row: the tab strip (left, scrollable) shares one
+                    row with the dark-mode/theme button (right). The save-status
+                    and word count moved down into the content area below. */}
                 <div style={{ height: 48, flex: 'none', display: 'flex', alignItems: 'center', gap: 10, padding: '0 16px 0 0', borderBottom: '1px solid var(--line)' }}>
                   <TabBar
                     tabs={openTabs}
@@ -1481,15 +1482,21 @@ export default function App() {
                     onRenameKeyDown={(e, path) => { if (e.key === 'Enter') { e.preventDefault(); void commitRename(path, tabRenameValue); } else if (e.key === 'Escape') setTabRenaming(null); }}
                     onRenameCommit={(path) => void commitRename(path, tabRenameValue)}
                   />
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 'none' }}>
-                    <span style={{ width: 7, height: 7, borderRadius: '50%', flex: 'none', background: saving ? '#d9a93d' : '#3fa45a', transition: 'background .2s' }} />
-                    <span style={{ fontSize: 12, color: 'var(--faint)', whiteSpace: 'nowrap' }}>{saving ? 'Saving…' : 'Saved'}</span>
-                  </div>
-                  <div style={{ width: 1, height: 16, background: 'var(--line)', flex: 'none' }} />
-                  <span style={{ fontSize: 12, color: 'var(--faint2)', fontVariantNumeric: 'tabular-nums', flex: 'none' }}>{count}</span>
-                  <div style={{ width: 1, height: 16, background: 'var(--line)', flex: 'none', marginLeft: 2 }} />
                   <div style={{ display: 'flex', alignItems: 'center', gap: 1, flex: 'none' }}>
                     {themeBtn({ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 28, height: 26, flex: 'none', border: 'none', background: 'transparent', color: 'var(--text3)', borderRadius: 7, cursor: 'pointer', padding: 0 })}
+                  </div>
+                </div>
+
+                {/* Save-status + word count: a subtle, fixed bar pinned to the
+                    top of the content area (below the tab strip, above the
+                    editor scroll region). It does not scroll with the document
+                    and aligns horizontally to the editor's column. */}
+                <div data-testid="content-status" style={{ flex: 'none', display: 'flex', justifyContent: 'center', borderBottom: '1px solid var(--line)' }}>
+                  <div style={{ width: centered ? '760px' : '100%', maxWidth: '100%', padding: centered ? '7px 40px' : '7px 36px', display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ width: 6, height: 6, borderRadius: '50%', flex: 'none', background: saving ? '#d9a93d' : '#3fa45a', transition: 'background .2s' }} />
+                    <span style={{ fontSize: 11.5, color: 'var(--faint)', whiteSpace: 'nowrap' }}>{saving ? 'Saving…' : 'Saved'}</span>
+                    <span style={{ width: 1, height: 11, background: 'var(--line)', flex: 'none', margin: '0 2px' }} />
+                    <span style={{ fontSize: 11.5, color: 'var(--faint2)', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>{count}</span>
                   </div>
                 </div>
 
