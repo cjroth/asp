@@ -28,6 +28,9 @@ export interface TabBarProps {
   onSelect: (path: string) => void;
   onClose: (path: string) => void;
   onContext?: (path: string, e: React.MouseEvent) => void;
+  // Double-click a tab → start an inline rename (same flow as the context-menu
+  // Rename). App seeds renamingPath/renameValue in response.
+  onRequestRename?: (path: string) => void;
   onReorder?: (from: number, to: number) => void;
   onDropOpenPath?: (path: string) => void;
   renamingPath?: string | null;
@@ -114,6 +117,11 @@ export default function TabBar(props: TabBarProps) {
             }}
             onClick={() => {
               if (!isRenaming) onSelect(path);
+            }}
+            onDoubleClick={() => {
+              // Ignore while this tab is already editing; single-click still
+              // activates (the dblclick is preceded by the usual click→select).
+              if (!isRenaming) props.onRequestRename?.(path);
             }}
             onContextMenu={(e) => props.onContext?.(path, e)}
             onDragStart={(e) => {

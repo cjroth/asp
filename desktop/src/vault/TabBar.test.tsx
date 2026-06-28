@@ -99,6 +99,20 @@ describe('TabBar', () => {
     expect(onContext.mock.calls[0][0]).toBe('b.md');
   });
 
+  it('double-clicking a tab requests a rename (with its path)', () => {
+    const onRequestRename = vi.fn();
+    render(<TabBar {...base} onRequestRename={onRequestRename} tabs={['a.md', 'b.md']} active="a.md" />);
+    fireEvent.doubleClick(screen.getAllByTestId('tab')[1]);
+    expect(onRequestRename).toHaveBeenCalledWith('b.md');
+  });
+
+  it('does not request a rename when double-clicking the tab already being renamed', () => {
+    const onRequestRename = vi.fn();
+    render(<TabBar {...base} onRequestRename={onRequestRename} tabs={['a.md']} active="a.md" renamingPath="a.md" renameValue="a.md" />);
+    fireEvent.doubleClick(screen.getByTestId('tab'));
+    expect(onRequestRename).not.toHaveBeenCalled();
+  });
+
   it('reorders by dragging one tab onto another (from index → to index)', () => {
     const onReorder = vi.fn();
     const dt = { effectAllowed: '', setData: vi.fn(), getData: vi.fn(() => '') };

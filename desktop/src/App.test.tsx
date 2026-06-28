@@ -279,6 +279,17 @@ describe('App — tabs + URL hash (desktop)', () => {
     await waitFor(() => expect(parseHash(window.location.hash)).toEqual({ vaultId: 'vidA', path: 'GUIDE.md' }));
   });
 
+  it('double-clicking a tab puts it into inline rename', async () => {
+    await openAlpha();
+    await screen.findByTestId('live-editor');
+    fireEvent.doubleClick(tab('README.md'));
+    const input = await screen.findByTestId('tab-rename-input');
+    expect((input as HTMLInputElement).value).toBe('README.md');
+    fireEvent.change(input, { target: { value: 'GUIDE.md' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(renameFile).toHaveBeenCalledWith('v1', 'README.md', 'GUIDE.md'));
+  });
+
   it('moving the active file (drag-drop) remaps its tab and the hash', async () => {
     await openAlpha();
     await screen.findByTestId('live-editor');

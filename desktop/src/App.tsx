@@ -1447,6 +1447,7 @@ export default function App() {
                     onSelect={onTabSelect}
                     onClose={onTabClose}
                     onContext={onTabContext}
+                    onRequestRename={(path) => { setTabRenaming(path); setTabRenameValue(basename(path)); }}
                     onReorder={onTabReorder}
                     onDropOpenPath={onTabDropOpen}
                     renamingPath={tabRenaming}
