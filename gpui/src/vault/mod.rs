@@ -2,4 +2,6 @@
 //! parity tests mirroring the original vitest suites. These hold the app's
 //! deterministic core (naming, tree, tabs, history geometry, markdown, prefs).
 pub mod format;
+pub mod history;
+pub mod tabs;
 pub mod tree;
