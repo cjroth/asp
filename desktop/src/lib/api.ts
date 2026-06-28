@@ -51,8 +51,13 @@ export interface Api {
   cloneRemote(dest: string, ticket: string, authKey?: string): Promise<VaultInfo>;
   setAllowConnections(id: string, on: boolean, authKey?: string): Promise<string | null>;
   // Sync once against `ticket`. On web, omit `ticket` to re-dial the upstream the
-  // vault was cloned from (the poll uses this to pull a peer's later pushes).
+  // vault was cloned from. (Web also holds a live connection — see startLiveSync.)
   syncNow(id: string, ticket?: string, authKey?: string): Promise<void>;
+  // Web: open and hold a live connection to the upstream, calling `onChange`
+  // whenever a remote push lands (realtime, no polling). Desktop syncs live in
+  // its background engine, so this is a no-op there. Idempotent per id.
+  startLiveSync(id: string, onChange: () => void): Promise<void>;
+  stopLiveSync(id: string): Promise<void>;
   getStatus(id: string): Promise<VaultStatus>;
   getIdentity(): Promise<string>;
   authorize(id: string, pubkey: string): Promise<void>;
@@ -81,6 +86,10 @@ const tauriApi: Api = {
   cloneRemote: (dest, ticket, authKey) => invoke<VaultInfo>('clone_remote', { dest, ticket, authKey }),
   setAllowConnections: (id, on, authKey) => invoke<string | null>('set_allow_connections', { id, on, authKey }),
   syncNow: (id, ticket, authKey) => invoke<void>('sync_now', { id, ticket: ticket ?? null, authKey }),
+  // Desktop keeps a standing connection in its background engine; nothing for the
+  // frontend to hold open, so these are no-ops (the UI refreshes on its poll).
+  startLiveSync: async () => {},
+  stopLiveSync: async () => {},
   getStatus: (id) => invoke<VaultStatus>('get_status', { id }),
   getIdentity: () => invoke<string>('get_identity'),
   authorize: (id, pubkey) => invoke<void>('authorize', { id, pubkey }),

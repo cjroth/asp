@@ -1,23 +1,25 @@
-// Web live-sync: a browser (wasm/OPFS) node can't open a listening socket, so it
-// never *receives* a peer's push — the only way it learns of later changes is by
-// re-dialing the upstream it cloned from. That pull has to be driven by the
-// editor poll (`api.syncNow`); without it the desktop edits a file and the web
-// tab shows a stale snapshot forever. This test pushes a peer change into an
-// "upstream" map that only `syncNow` drains into the visible CONTENT, then proves
-// the web UI catches up on its own — i.e. the poll really does sync.
+// Web live-sync: a browser (wasm/OPFS) node can't accept inbound connections, so
+// it dials the upstream it cloned from and holds that link OPEN — rows stream
+// both ways in realtime, no polling. The app starts that connection when a web
+// vault is open (`api.startLiveSync`) and the engine calls back on every remote
+// push; the app's callback refreshes the tree + open file. This test drives a
+// remote push by invoking that callback (exactly what the live connection does
+// when a peer's row lands) and asserts the UI catches up — immediately, not on a
+// 10s tick.
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// CONTENT is what the (web) backend currently holds; UPSTREAM is what a peer has
-// pushed but the web node hasn't pulled yet. syncNow drains UPSTREAM → CONTENT,
-// exactly like dialing the ticket and running bidirectional catch-up.
 let CONTENT: Record<string, string> = {};
-let UPSTREAM: Record<string, string> = {};
 function reset() {
   CONTENT = { 'README.md': '# Vault\n\nhello\n', 'note.md': '# Note\n\noriginal body\n' };
-  UPSTREAM = {};
 }
 const tick = (ms = 2) => new Promise((r) => setTimeout(r, ms));
+
+// The app registers an onChange callback via startLiveSync; we keep it so the
+// test can fire it to simulate a remote push landing in the engine.
+let onRemotePush: (() => void) | null = null;
+const startLiveSync = vi.fn(async (_id: string, onChange: () => void) => { onRemotePush = onChange; });
+const stopLiveSync = vi.fn(async () => { onRemotePush = null; });
 
 const listFiles = vi.fn(async () => {
   await tick();
@@ -25,13 +27,6 @@ const listFiles = vi.fn(async () => {
 });
 const readFile = vi.fn(async (_id: string, p: string) => { await tick(); return CONTENT[p] ?? ''; });
 const writeFile = vi.fn(async (_id: string, p: string, c: string) => { await tick(); CONTENT[p] = c; });
-// The pull: re-dial upstream and converge. No ticket arg — the web backend falls
-// back to the stored upstream, which is the whole point of the fix.
-const syncNow = vi.fn(async (_id: string, ticket?: string) => {
-  await tick();
-  Object.assign(CONTENT, UPSTREAM);
-  UPSTREAM = {};
-});
 const getStatus = vi.fn(async (id: string) => ({
   id, vault_id: 'wv', rows: Object.keys(CONTENT).length, files: Object.keys(CONTENT).length,
   head: '', listening_ticket: null, peers: [], last_ts: null,
@@ -46,7 +41,9 @@ vi.mock('./lib/api', () => ({
     cloneRemote: vi.fn(),
     createVault: vi.fn(),
     setAllowConnections: vi.fn(async () => null),
-    syncNow: (id: string, ticket?: string, authKey?: string) => syncNow(id, ticket),
+    syncNow: vi.fn(async () => {}),
+    startLiveSync: (id: string, onChange: () => void) => startLiveSync(id, onChange),
+    stopLiveSync: (id: string) => stopLiveSync(id),
     getStatus: (id: string) => getStatus(id),
     getIdentity: vi.fn(async () => 'ssh-ed25519 AAAA me@browser'),
     listFiles: (id: string) => listFiles(id),
@@ -68,7 +65,8 @@ const w = window as unknown as Record<string, unknown>;
 beforeEach(() => {
   vi.clearAllMocks();
   reset();
-  // Web platform: no Tauri shell. This is what makes the poll choose the pull path.
+  onRemotePush = null;
+  // Web platform: no Tauri shell. This is what makes the app use the live link.
   delete w.__TAURI_INTERNALS__;
   delete w.__TAURI__;
 });
@@ -85,27 +83,39 @@ async function openVault() {
 const treeHas = (name: string) =>
   Array.from(document.querySelectorAll('.asp-hover-row')).some((r) => (r.textContent || '').includes(name));
 
-describe('web live-sync: the editor poll pulls peer pushes via syncNow', () => {
-  it('drives api.syncNow for the active web vault (no ticket → upstream fallback)', async () => {
+describe('web live-sync: a held-open connection pushes peer changes into the UI', () => {
+  it('opens a live connection for the active web vault', async () => {
     await openVault();
-    await waitFor(() => expect(syncNow).toHaveBeenCalledWith('w1', undefined), { timeout: 12000 });
+    await waitFor(() => expect(startLiveSync).toHaveBeenCalledWith('w1', expect.any(Function)));
   }, 15000);
 
-  it('a file a peer pushed appears in the tree only because the poll syncs', async () => {
+  it('a file a peer pushed appears in the tree as soon as the push lands', async () => {
     await openVault();
     expect(treeHas('from-peer.md')).toBe(false);
-    // A peer (the desktop hub) pushes a new file upstream; the web node hasn't
-    // pulled it yet, so it isn't in CONTENT until syncNow drains it.
-    UPSTREAM['from-peer.md'] = '# Pushed by a peer\n\nhi from the desktop\n';
-    await waitFor(() => expect(treeHas('from-peer.md')).toBe(true), { timeout: 12000 });
+    // A peer pushes a new file over the live connection: the engine integrates it
+    // and calls the app's onChange — simulated here by mutating CONTENT then firing.
+    CONTENT['from-peer.md'] = '# Pushed by a peer\n\nhi from the desktop\n';
+    onRemotePush?.();
+    await waitFor(() => expect(treeHas('from-peer.md')).toBe(true), { timeout: 5000 });
   }, 15000);
 
-  it('a peer edit to the OPEN file updates the editor after a poll-driven sync', async () => {
+  it('a peer edit to the OPEN file updates the editor when the push lands', async () => {
     await openVault();
     fireEvent.click(await screen.findByText('note.md'));
     const editor = await screen.findByTestId('live-editor');
     await waitFor(() => expect(editor.textContent || '').toContain('original body'));
-    UPSTREAM['note.md'] = '# Note\n\nEDITED ON THE DESKTOP over the wire\n';
-    await waitFor(() => expect(editor.textContent || '').toContain('EDITED ON THE DESKTOP'), { timeout: 12000 });
+    CONTENT['note.md'] = '# Note\n\nEDITED ON THE DESKTOP over the wire\n';
+    onRemotePush?.();
+    await waitFor(() => expect(editor.textContent || '').toContain('EDITED ON THE DESKTOP'), { timeout: 5000 });
+  }, 15000);
+
+  it('tears the live connection down when the vault view goes away', async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByText('Using browser storage'));
+    await screen.findByText('Files');
+    await waitFor(() => expect(startLiveSync).toHaveBeenCalledWith('w1', expect.any(Function)));
+    // Unmounting runs the effect cleanup, which must stop the live connection.
+    cleanup();
+    await waitFor(() => expect(stopLiveSync).toHaveBeenCalledWith('w1'));
   }, 15000);
 });

@@ -118,6 +118,10 @@ export function createWebApi(): Api {
 
   const registry = () => readJson<RegEntry[]>('registry.json', []);
   const engines = new Map<string, WasmEngine>();
+  // Live connections, one per vault id. A browser can't accept inbound
+  // connections, but once it dials the upstream it holds the link open and rows
+  // stream both ways in realtime — no polling.
+  const live = new Map<string, { stop: boolean }>();
 
   async function engineFor(id: string): Promise<WasmEngine> {
     const cached = engines.get(id);
@@ -186,6 +190,45 @@ export function createWebApi(): Api {
       reg.unshift({ id, vault_id, ticket, authKey: authKey ?? null });
       await writeJson('registry.json', reg);
       return info({ id, vault_id });
+    },
+
+    // Hold a live connection to the upstream open, reconnecting if it drops. The
+    // engine integrates remote pushes in realtime and fires `onChange` so the UI
+    // refreshes; locally-authored rows push out over the same connection. A vault
+    // with no upstream (created locally) has nothing to connect to.
+    startLiveSync: async (id, onChange) => {
+      if (live.has(id)) return;
+      const up = await upstreamOf(id);
+      if (!up) return;
+      const eng = await engineFor(id);
+      const handle = { stop: false };
+      live.set(id, handle);
+      void (async () => {
+        while (!handle.stop) {
+          try {
+            // Resolves when the connection closes; on_change fires per remote push.
+            await eng.connect_live(up.ticket, up.authKey ?? undefined, null, () => {
+              void persist(id, eng);
+              try {
+                onChange();
+              } catch {
+                /* listener threw — ignore */
+              }
+            });
+          } catch {
+            /* connect/dial failed — back off and retry below */
+          }
+          if (handle.stop) break;
+          await new Promise((r) => setTimeout(r, 1500)); // reconnect backoff
+        }
+        live.delete(id);
+      })();
+    },
+
+    stopLiveSync: async (id) => {
+      const h = live.get(id);
+      if (h) h.stop = true;
+      live.delete(id);
     },
 
     syncNow: async (id, ticket, authKey) => {

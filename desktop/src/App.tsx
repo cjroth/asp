@@ -317,28 +317,46 @@ export default function App() {
       if (screen === 'editor' && activeIdRef.current) {
         const id = activeIdRef.current;
         void api.getStatus(id).then((st) => setStatuses((p) => ({ ...p, [id]: st }))).catch(() => {});
-        // A browser node can't open a listening socket, so it never *receives* a
-        // peer's push — it has to pull by re-dialing the upstream it cloned from.
-        // Desktop syncs continuously in its background engine and needs no
-        // poll-driven sync, so this is web-only. `syncNow` with no ticket falls
-        // back to the stored upstream (a no-op for locally-created web vaults).
-        const synced = desktop ? Promise.resolve() : api.syncNow(id).catch(() => {});
-        // Pull in changes a peer pushed while we sit in the editor: the file tree,
-        // the derived history, and the bytes of the file we're looking at. Without
-        // this the backend converges but the UI shows a stale snapshot until the
-        // vault is reopened. On web we refresh *after* the sync lands so the new
-        // state shows up in the same tick.
-        void synced.then(() => {
+        // Desktop's engine holds a standing connection and converges in the
+        // background; the UI catches up by re-reading on this tick. Web doesn't
+        // poll for sync at all — it holds a live connection that pushes changes
+        // straight into the UI (see the live-sync effect below) — so we only do
+        // the periodic re-read on desktop.
+        if (desktop) {
           void refreshFiles(id).catch(() => {});
           scheduleHistory(id);
           void refreshActiveContent();
-        });
+        }
       } else {
         void refreshVaults().then(refreshStatuses);
       }
     }, 10000);
     return () => clearInterval(t);
   }, [screen, desktop, refreshVaults, refreshStatuses, refreshFiles, scheduleHistory, refreshActiveContent]);
+
+  // Web live sync: a browser can't be *pushed* to, but it can dial the upstream
+  // and hold the link open. While a web vault is open in the editor we keep that
+  // live connection up; each remote push lands in the engine and refreshes the
+  // tree + open file in realtime. Desktop is excluded (its engine is already
+  // live; the poll above re-reads it).
+  const liveRefresh = useCallback(
+    (id: string) => {
+      void refreshFiles(id).catch(() => {});
+      scheduleHistory(id);
+      void refreshActiveContent();
+    },
+    [refreshFiles, scheduleHistory, refreshActiveContent],
+  );
+  const liveRefreshRef = useRef(liveRefresh);
+  liveRefreshRef.current = liveRefresh;
+  useEffect(() => {
+    if (desktop || screen !== 'editor' || !activeId) return;
+    const id = activeId;
+    void api.startLiveSync(id, () => liveRefreshRef.current(id));
+    return () => {
+      void api.stopLiveSync(id);
+    };
+  }, [desktop, screen, activeId]);
 
   const metaOf = useCallback(
     (v: VaultInfo) => resolveMeta(metaMap, v.vault_id, basename(v.path)),

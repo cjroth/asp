@@ -88,6 +88,128 @@ pub async fn sync_oneshot(
     result
 }
 
+/// **Live** connect: dial `ticket`, run the same handshake + catch-up as
+/// `sync_oneshot`, but then *stay connected* and stream rows both ways in
+/// realtime — the browser can't accept inbound connections, but once it dials
+/// out the link is bidirectional. Inbound peer pushes are integrated and reported
+/// via `on_change(rows)`; locally-authored rows arriving on `local_rx` are pushed
+/// to the peer over the same connection. Returns when the connection closes (the
+/// caller reconnects). The future owns everything → `'static`.
+#[cfg(target_arch = "wasm32")]
+pub async fn connect_live(
+    eng: Rc<MemEngine>,
+    ticket: String,
+    auth_keys: Vec<String>,
+    relay_url: Option<String>,
+    local_rx: futures_channel::mpsc::UnboundedReceiver<crate::wire::WireRow>,
+    mut on_change: impl FnMut(usize),
+) -> Result<(), String> {
+    use futures_util::StreamExt;
+
+    let addr: EndpointAddr = EndpointTicket::from_str(ticket.trim())
+        .map(EndpointAddr::from)
+        .map_err(|e| format!("bad ticket: {e}"))?;
+    let seed = eng.device_seed();
+    let ep = bind(&seed, relay_url).await?;
+    let conn = ep.connect(addr, ALPN).await.map_err(|e| format!("connect: {e}"))?;
+    let verified_peer = crate::NodeId(*conn.remote_id().as_bytes());
+    let (mut send, recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
+
+    let admit = AdmitCtx {
+        no_tofu: false,
+        auth_key_ok: false,
+        auth_key_configured: false,
+        default_ttl_days: 90,
+        now_unix: 0,
+    };
+    let mut session = Session::new(Role::Connector, &*eng, admit, verified_peer, auth_keys);
+    for step in session.start() {
+        if let Step::Send(m) = step {
+            write_frame(&mut send, &m.to_bytes().map_err(|e| e.to_string())?).await?;
+        }
+    }
+
+    // A half-read frame must never be dropped by stream selection, so a dedicated
+    // reader future owns `recv` and forwards whole frames over a channel; the main
+    // loop only selects over cancel-safe stream items.
+    let (frame_tx, frame_rx) = futures_channel::mpsc::unbounded::<Vec<u8>>();
+    wasm_bindgen_futures::spawn_local(async move {
+        let mut recv = recv;
+        loop {
+            match read_frame(&mut recv).await {
+                Ok(Some(f)) => {
+                    if frame_tx.unbounded_send(f).is_err() {
+                        break;
+                    }
+                }
+                _ => break, // EOF or read error → drop frame_tx → frame_rx ends
+            }
+        }
+    });
+
+    enum Ev {
+        Frame(Vec<u8>),
+        Local(crate::wire::WireRow),
+        Closed,
+    }
+    let frames = frame_rx.map(Ev::Frame);
+    let locals = local_rx.map(Ev::Local);
+    let closed = futures_util::stream::once(async move {
+        conn.closed().await;
+        Ev::Closed
+    });
+    // Box::pin so the combined stream is Unpin (the `once(async …)` arm isn't).
+    let mut events = Box::pin(futures_util::stream::select(
+        futures_util::stream::select(frames, locals),
+        closed,
+    ));
+
+    let mut result: Result<(), String> = Ok(());
+    'live: while let Some(ev) = events.next().await {
+        match ev {
+            Ev::Closed => break,
+            Ev::Local(row) => {
+                // A row the host just authored — push it to the peer immediately.
+                let frame = Msg::Push { row: Box::new(row) }.to_bytes().map_err(|e| e.to_string())?;
+                if write_frame(&mut send, &frame).await.is_err() {
+                    break; // peer went away; caller reconnects
+                }
+            }
+            Ev::Frame(frame) => {
+                let msg = match Msg::from_bytes(&frame) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let steps = session.on_msg(&*eng, msg).map_err(|e| e.to_string())?;
+                let mut integrated = 0usize;
+                for step in steps {
+                    match step {
+                        Step::Send(m) => {
+                            write_frame(&mut send, &m.to_bytes().map_err(|e| e.to_string())?).await?
+                        }
+                        Step::Integrated(rows) => integrated += rows.len(),
+                        Step::Closed(reason) => {
+                            result = Err(reason);
+                            break 'live;
+                        }
+                        // Initial catch-up done — refresh the UI, then keep the
+                        // connection open for live pushes.
+                        Step::PeerSynced => on_change(0),
+                        Step::Authenticated(_) | Step::CatchUp { .. } => {}
+                    }
+                }
+                if integrated > 0 {
+                    on_change(integrated);
+                }
+            }
+        }
+    }
+
+    let _ = send.finish();
+    ep.close().await;
+    result
+}
+
 async fn drive(
     ep: &Endpoint,
     eng: &Rc<MemEngine>,
