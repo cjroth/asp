@@ -123,6 +123,47 @@ describe('TabBar', () => {
     expect(onReorder).toHaveBeenCalledWith(0, 2);
   });
 
+  it('live-previews the new order while dragging (before drop), then commits it', () => {
+    const onReorder = vi.fn();
+    const dt = { effectAllowed: '', setData: vi.fn(), getData: vi.fn(() => '') };
+    render(<TabBar {...base} onReorder={onReorder} tabs={['a.md', 'b.md', 'c.md']} active="a.md" />);
+    const paths = () => screen.getAllByTestId('tab').map((t) => t.getAttribute('data-path'));
+    // Baseline DOM order.
+    expect(paths()).toEqual(['a.md', 'b.md', 'c.md']);
+
+    const tabA = screen.getByText('a.md').closest('[data-testid="tab"]')!;
+    const tabC = screen.getByText('c.md').closest('[data-testid="tab"]')!;
+    fireEvent.dragStart(tabA, { dataTransfer: dt });
+    // The dragged tab is visually de-emphasised.
+    expect((tabA as HTMLElement).style.opacity).toBe('0.55');
+
+    // Hover over c.md → the dragged a.md slides to the end, LIVE (no drop yet).
+    fireEvent.dragOver(tabC, { dataTransfer: dt });
+    expect(paths()).toEqual(['b.md', 'c.md', 'a.md']);
+    expect(onReorder).not.toHaveBeenCalled();
+
+    // Drop on c.md commits exactly that order (move a.md from 0 → 2).
+    fireEvent.drop(screen.getByText('c.md').closest('[data-testid="tab"]')!, { dataTransfer: dt });
+    expect(onReorder).toHaveBeenCalledTimes(1);
+    expect(onReorder).toHaveBeenCalledWith(0, 2);
+  });
+
+  it('resets the live preview order on dragEnd (no commit)', () => {
+    const onReorder = vi.fn();
+    const dt = { effectAllowed: '', setData: vi.fn(), getData: vi.fn(() => '') };
+    render(<TabBar {...base} onReorder={onReorder} tabs={['a.md', 'b.md', 'c.md']} active="a.md" />);
+    const paths = () => screen.getAllByTestId('tab').map((t) => t.getAttribute('data-path'));
+    const tabA = screen.getByText('a.md').closest('[data-testid="tab"]')!;
+    const tabC = screen.getByText('c.md').closest('[data-testid="tab"]')!;
+    fireEvent.dragStart(tabA, { dataTransfer: dt });
+    fireEvent.dragOver(tabC, { dataTransfer: dt });
+    expect(paths()).toEqual(['b.md', 'c.md', 'a.md']);
+    // Abandoning the drag snaps the order back to the prop order.
+    fireEvent.dragEnd(tabA);
+    expect(paths()).toEqual(['a.md', 'b.md', 'c.md']);
+    expect(onReorder).not.toHaveBeenCalled();
+  });
+
   it('opens a file dragged from the tree (x-asp-path) without reordering', () => {
     const onReorder = vi.fn();
     const onDropOpenPath = vi.fn();

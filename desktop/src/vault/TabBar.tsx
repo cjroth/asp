@@ -10,7 +10,7 @@
 //                                   (opens it as a tab; it is NOT moved)
 // Inline rename (driven by App via renamingPath/renameValue) reuses App's
 // commitRename — the same flow the old breadcrumb used.
-import React, { useRef } from 'react';
+import React, { useRef, useState } from 'react';
 import { basename } from './format';
 import { prettyName } from './prettyNames';
 
@@ -45,11 +45,44 @@ function labelFor(path: string, pretty: boolean): string {
   return pretty ? prettyName(base, false).label : base;
 }
 
+// Pure helper: return a copy of `arr` with the item at `from` moved to `to`.
+// Used to derive the live drag-preview order from the canonical tabs prop.
+function moveItem<T>(arr: T[], from: number, to: number): T[] {
+  if (from === to) return arr;
+  const copy = arr.slice();
+  const [it] = copy.splice(from, 1);
+  copy.splice(to, 0, it);
+  return copy;
+}
+
+// Live drag state: original index of the dragged tab + the index it would land
+// on right now. Both are indices into the canonical `tabs` prop.
+interface DragState {
+  from: number;
+  to: number;
+}
+
 export default function TabBar(props: TabBarProps) {
   const { tabs, active, prettyNames, accent, onSelect, onClose } = props;
   // Index of the tab currently being dragged for an internal reorder (null when
-  // the drag came from the file tree instead).
+  // the drag came from the file tree instead). Kept in a ref so drop handlers
+  // can read it synchronously (jsdom dataTransfer is unreliable).
   const dragIndex = useRef<number | null>(null);
+  // Live preview of where the dragged tab would land. Drives a reordered render
+  // so the user SEES the tab slide into place during the drag; reset on
+  // drop/dragEnd. The tabs prop stays the source of truth — App owns the order.
+  const [drag, setDrag] = useState<DragState | null>(null);
+
+  // The order to actually render: the previewed order while dragging, else the
+  // canonical tabs. Each tab keeps key={path}, so React moves the existing DOM
+  // nodes (rather than rebuilding) and the CSS transitions animate the shift.
+  const previewTabs = drag ? moveItem(tabs, drag.from, drag.to) : tabs;
+  const draggedPath = drag ? tabs[drag.from] : null;
+
+  const resetDrag = () => {
+    dragIndex.current = null;
+    setDrag(null);
+  };
 
   // Read the file path off a drop that originated in the file tree.
   const openDroppedPath = (e: React.DragEvent): boolean => {
@@ -90,14 +123,18 @@ export default function TabBar(props: TabBarProps) {
         if (dragIndex.current != null) {
           e.preventDefault();
           props.onReorder?.(dragIndex.current, tabs.length - 1);
-          dragIndex.current = null;
+          resetDrag();
         } else if (openDroppedPath(e)) {
           e.preventDefault();
         }
       }}
     >
-      {tabs.map((path, i) => {
+      {previewTabs.map((path) => {
+        // Index into the canonical tabs prop (stable regardless of the live
+        // preview position) — what App's onReorder contract speaks in.
+        const i = tabs.indexOf(path);
         const isActive = path === active;
+        const isDragging = path === draggedPath;
         const isRenaming = props.renamingPath != null && props.renamingPath === path;
         return (
           <div
@@ -127,6 +164,7 @@ export default function TabBar(props: TabBarProps) {
             onDragStart={(e) => {
               if (isRenaming) return;
               dragIndex.current = i;
+              setDrag({ from: i, to: i });
               if (e.dataTransfer) {
                 e.dataTransfer.effectAllowed = 'move';
                 try {
@@ -137,10 +175,15 @@ export default function TabBar(props: TabBarProps) {
               }
             }}
             onDragEnd={() => {
-              dragIndex.current = null;
+              resetDrag();
             }}
             onDragOver={(e) => {
-              if (dragIndex.current != null || (props.onDropOpenPath && e.dataTransfer)) {
+              if (dragIndex.current != null) {
+                // Reordering: live-preview the dragged tab landing in this slot.
+                e.preventDefault();
+                if (drag == null || drag.to !== i) setDrag({ from: dragIndex.current, to: i });
+              } else if (props.onDropOpenPath && e.dataTransfer) {
+                // A file dragged from the tree — allow the open-as-tab drop.
                 e.preventDefault();
               }
             }}
@@ -149,7 +192,7 @@ export default function TabBar(props: TabBarProps) {
               if (dragIndex.current != null) {
                 e.preventDefault();
                 props.onReorder?.(dragIndex.current, i);
-                dragIndex.current = null;
+                resetDrag();
               } else if (openDroppedPath(e)) {
                 e.preventDefault();
               }
@@ -172,6 +215,12 @@ export default function TabBar(props: TabBarProps) {
               fontWeight: isActive ? 600 : 500,
               boxShadow: isActive ? `inset 0 2px 0 ${accent}` : 'none',
               whiteSpace: 'nowrap',
+              // Live-reorder feel: the dragged tab dims + shrinks slightly while
+              // neighbours slide into their new slots (the reordered render moves
+              // the keyed nodes; this transition animates the shift).
+              transition: 'transform 0.16s ease, opacity 0.16s ease',
+              opacity: isDragging ? 0.55 : 1,
+              transform: isDragging ? 'scale(0.96)' : 'none',
             }}
           >
             {isRenaming ? (
