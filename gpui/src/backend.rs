@@ -16,10 +16,17 @@ pub struct Backend {
 impl Backend {
     pub fn new() -> Result<Self> {
         let engine = DesktopEngine::new(load_identity())?;
-        let _ = engine.reopen_saved();
         Ok(Backend {
             engine: Arc::new(engine),
         })
+    }
+
+    /// Re-open every previously-saved vault (rescanning each from disk). This can
+    /// be slow for large vaults, so callers run it off the UI thread — see
+    /// `AspApp::new`. Errors are non-fatal (a missing/again-unreadable vault is
+    /// simply skipped by the engine).
+    pub fn reopen_saved(&self) {
+        let _ = self.engine.reopen_saved();
     }
 
     pub fn identity_ssh(&self) -> String {

@@ -21,15 +21,21 @@ asp-desktop-engine = { path = "../desktop/engine" }
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "5837e7e", features = ["x11", "wayland"] }
 
+# `runtime_shaders` compiles Metal shaders at runtime, so the build does not need
+# the offline `metal` tool (which ships only with full Xcode, not the Command Line
+# Tools). Keeps the app buildable on a stock CLT-only macOS install.
+# `font-kit` is REQUIRED for any text to render: without it `gpui_macos` falls
+# back to `NoopTextSystem` (it logs a warning and draws no glyphs).
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "5837e7e" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "5837e7e", features = ["runtime_shaders", "font-kit"] }
 
-# Headless-screenshot harness (bin/shoot, bin/smoke). Needs the patched GPUI
-# (`zed-gpui-headless.patch` → Zed @ 5837e7e) and is gated so the default build
-# of the app itself never touches it. See README for how to point GPUI at the
-# patched checkout and build with `--features capture`.
+# Headless-screenshot harness (bin/shoot, bin/smoke). On macOS this needs no
+# patched GPUI: stock GPUI already exposes `Window::render_to_image` (offscreen
+# Metal readback) behind `test-support`, which `gpui_platform/test-support`
+# turns on (it cascades to `gpui` + `gpui_macos`). Gated so the default build of
+# the app never pulls it in. Build/run with `--features capture`.
 [features]
-capture = []
+capture = ["gpui_platform/test-support"]
 
 [profile.dev]
 debug = 0
@@ -47,4 +53,19 @@ required-features = ["capture"]
 [[bin]]
 name = "smoke"
 path = "src/bin/smoke.rs"
+required-features = ["capture"]
+
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
+required-features = ["capture"]
+
+[[bin]]
+name = "harness"
+path = "src/bin/harness.rs"
+required-features = ["capture"]
+
+[[bin]]
+name = "vtest"
+path = "src/bin/vtest.rs"
 required-features = ["capture"]

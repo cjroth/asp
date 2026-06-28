@@ -63,7 +63,7 @@ fn main() {
                 // does not pump frames on its own under Xvfb.
                 match cx.update_window(handle.into(), |_, window, app| {
                     window.draw(app).clear();
-                    window.capture_image()
+                    window.render_to_image()
                 }) {
                     Ok(Ok(img)) => {
                         img.save(&path).expect("save png");

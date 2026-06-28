@@ -50,7 +50,7 @@ fn main() {
             cx.background_executor()
                 .timer(Duration::from_millis(1200))
                 .await;
-            let result = cx.update_window(handle.into(), |_, window, _| window.capture_image());
+            let result = cx.update_window(handle.into(), |_, window, _| window.render_to_image());
             match result {
                 Ok(Ok(img)) => {
                     img.save(&out).expect("save png");

@@ -84,13 +84,73 @@ cargo run --bin aspgui              # builds lib + app only; Metal on macOS
 ```
 
 Use `--bin aspgui` (not bare `cargo build`/`run`): the `shoot`/`smoke` binaries
-require the `capture` feature and the patched GPUI, so they're skipped by a
-normal build.
+require the `capture` feature (and, on Linux, the patched GPUI), so they're
+skipped by a normal build.
+
+Text rendering needs `gpui_macos`'s `font-kit` feature — it's enabled on the
+`gpui_platform` dep in `Cargo.toml`. Without it GPUI falls back to a no-op text
+system and **nothing but shapes draws** (it logs a warning and renders no
+glyphs). `runtime_shaders` is enabled there too, so the build needs no `metal`
+compiler (i.e. no full Xcode — Command Line Tools are enough).
 
 ## Headless screenshot harness (the feedback loop)
 
-To run the PNG-capture harness you need GPUI with the offscreen
-`render_to_image` patch:
+### macOS (no patch needed)
+
+Stock GPUI already exposes `Window::render_to_image` (an offscreen Metal
+readback) behind its `test-support` feature. The `capture` feature turns that on
+(`capture = ["gpui_platform/test-support"]`), so `shoot`/`smoke` capture real
+rendered frames with **no patched checkout and no virtual display**:
+
+```sh
+./shot-mac.sh /tmp/aspshots          # full scripted driver -> 9 PNGs
+./shot-mac.sh --smoke /tmp/smoke.png # minimal one-frame render test
+# → /tmp/aspshots/{01-connect,02-editor,03-welcome,04-timetravel,05-share,
+#   06-editor-dark,07-connect-dark,08-editing,09-edited-rendered}.png
+```
+
+`shoot` seeds its own temp vault — it does not touch your real vaults. Read the
+PNGs to verify the UI visually (real rendered output, not a DOM/text assertion).
+
+## Performance + interaction harnesses
+
+These build the **real** app and drive it; the perf harness measures the thing
+that actually scales in GPUI — `Window::draw` (layout + element paint), which
+re-runs on every keystroke/scroll/selection. They are the native analog of the
+TypeScript app's `perf-harness/` (see `../perf-harness`). All need `--features
+capture`. Set `HOME` to a throwaway dir so your real saved vaults don't load in
+the background and skew the run.
+
+```sh
+# Perf: seed a vault at scale, time draw() per interaction, assert a budget.
+#   args: <nfiles> <biglines> <nhist> <outdir>
+cargo run --release --bin harness --features capture -- 14000 1500 0 /tmp/h
+#   -> per-step "draw N ms (budget) ink" report; exits non-zero over budget.
+#   Use --release: a debug build inflates absolute ms ~15x.
+
+# Visual + interaction regression. Drives canonical scenes with REAL mouse
+# clicks, asserts the right regions have ink (nothing blank/garbled), and diffs
+# each frame against a committed golden in tests/golden/.
+HOME=/tmp/vth cargo run --bin vtest --features capture            # check
+HOME=/tmp/vth cargo run --bin vtest --features capture -- --update # (re)write goldens
+
+# Real mouse-click probe (dispatches actual MouseDown/Up through GPUI hit-test).
+cargo run --bin probe --features capture
+```
+
+Goldens in `tests/golden/` are machine-specific (text uses the system font
+fallback) — regenerate with `--update` on the machine you test on.
+
+What the harnesses already caught and fixed: the file tree rendered every file
+(O(file-count) per frame → ~2.8s/frame frozen at 14k files; now virtualized via
+`uniform_list`, flat ~20ms); the history bar painted a dot per event (capped at
+~240); and virtualized rows were only clickable over the filename text (needed
+`.w_full()` so the whole row is the hit target).
+
+### Linux (patched GPUI + Xvfb)
+
+Linux renders via wgpu; under Xvfb the swapchain present never reaches a
+readable framebuffer, so you need the offscreen `render_to_image` patch:
 
 ```sh
 git clone https://github.com/zed-industries/zed /path/to/zed
@@ -98,12 +158,9 @@ cd /path/to/zed && git checkout 5837e7e && git apply /path/to/asp/gpui/zed-gpui-
 ```
 
 Point the two GPUI deps in `Cargo.toml` at `/path/to/zed/crates/{gpui,gpui_platform}`
-(add `features = ["x11","wayland"]` to `gpui_platform` on Linux), then:
+(add `features = ["x11","wayland"]` to `gpui_platform`), then:
 
 ```sh
 cargo build --bin shoot --features capture
-bash shot-driver.sh /tmp/aspshots   # Linux: headless under Xvfb + lavapipe
-# macOS has a built-in Metal headless renderer, so capture works there too.
-# → /tmp/aspshots/{01-connect,02-editor,03-welcome,04-timetravel,05-share,
-#   06-editor-dark,07-connect-dark,08-editing,09-edited-rendered}.png
+bash shot-driver.sh /tmp/aspshots   # headless under Xvfb + lavapipe
 ```

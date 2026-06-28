@@ -7,6 +7,9 @@ use crate::theme::Theme;
 use asp_desktop_engine::{FileEntry, HistEvent, VaultInfo};
 use gpui::prelude::*;
 use gpui::{div, px, relative, rgb, Context, FocusHandle, FontWeight, KeyDownEvent, Rgba, SharedString, Window};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Screen {
@@ -35,11 +38,53 @@ pub struct AspApp {
     /// Caret position as a byte offset into `content` (always on a char boundary).
     pub cursor: usize,
     pub focus: FocusHandle,
+    /// Scroll state for the virtualized file list (only visible rows render).
+    pub file_scroll: gpui::UniformListScrollHandle,
 }
 
 impl AspApp {
     pub fn new(backend: Backend, cx: &mut Context<Self>) -> Self {
         let vaults = backend.list_vaults();
+        // Reopen previously-saved vaults *off* the main thread. Their rescan can
+        // take tens of seconds (large vaults / slow mounts); doing it
+        // synchronously before the window opens would block the UI from ever
+        // appearing. The engine registers each vault as soon as it finishes
+        // loading, so we poll `refresh_vaults()` while the rescan runs — each
+        // vault row appears (and becomes clickable) the moment it is ready,
+        // instead of all of them blinking in only when the last one is done.
+        cx.spawn({
+            let backend = backend.clone();
+            async move |this, cx| {
+                let done = Arc::new(AtomicBool::new(false));
+                cx.background_executor()
+                    .spawn({
+                        let backend = backend.clone();
+                        let done = done.clone();
+                        async move {
+                            backend.reopen_saved();
+                            done.store(true, Ordering::SeqCst);
+                        }
+                    })
+                    .detach();
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(300))
+                        .await;
+                    let finished = done.load(Ordering::SeqCst);
+                    if this
+                        .update(cx, |app, cx| {
+                            app.refresh_vaults();
+                            cx.notify();
+                        })
+                        .is_err()
+                        || finished
+                    {
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
         AspApp {
             backend,
             focus: cx.focus_handle(),
@@ -57,6 +102,7 @@ impl AspApp {
             playhead_ts: None,
             share_open: false,
             share_code: None,
+            file_scroll: gpui::UniformListScrollHandle::new(),
         }
     }
 
@@ -615,34 +661,57 @@ impl AspApp {
                     .child("FILES"),
             );
 
-        let mut tree = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .px(px(8.))
-            .overflow_hidden();
-        for (i, f) in self.files.iter().filter(|f| !f.is_dir).enumerate() {
-            let path = f.path.clone();
-            let is_active = self.current_path.as_deref() == Some(path.as_str());
-            let label = path.clone();
-            let row = div()
-                .id(SharedString::from(format!("file-{i}")))
-                .h(px(29.))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(6.))
-                .px(px(7.))
-                .rounded(px(5.))
-                .when(is_active, |d| d.bg(t.accent_soft()))
-                .text_color(if is_active { t.text } else { t.text2 })
-                .text_size(px(13.5))
-                .when(is_active, |d| d.font_weight(FontWeight::MEDIUM))
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _ev, _w, cx| this.select_file(&path, cx)))
-                .child(label);
-            tree = tree.child(row);
-        }
+        // Virtualized file list: only the rows in view are built, so render cost
+        // is O(visible) not O(file-count). The builder runs via `cx.processor`
+        // so it executes inside this view's element/dispatch context — that is
+        // what lets each row's `on_click` listener actually receive events (a
+        // plain closure silently orphans them).
+        let file_count = self.files.iter().filter(|f| !f.is_dir).count();
+        let tree = gpui::uniform_list(
+            "file-tree",
+            file_count,
+            cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                let t = this.theme;
+                let paths: Vec<String> = this
+                    .files
+                    .iter()
+                    .filter(|f| !f.is_dir)
+                    .map(|f| f.path.clone())
+                    .collect();
+                range
+                    .filter_map(|i| paths.get(i).cloned().map(|p| (i, p)))
+                    .map(|(i, path)| {
+                        let is_active = this.current_path.as_deref() == Some(path.as_str());
+                        let click_path = path.clone();
+                        div()
+                            .id(SharedString::from(format!("file-{i}")))
+                            .h(px(29.))
+                            // Full width so the whole row is the click target —
+                            // a `uniform_list` item otherwise shrinks to its
+                            // content width, leaving most of the row dead.
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.))
+                            .px(px(7.))
+                            .rounded(px(5.))
+                            .when(is_active, |d| d.bg(t.accent_soft()))
+                            .text_color(if is_active { t.text } else { t.text2 })
+                            .text_size(px(13.5))
+                            .when(is_active, |d| d.font_weight(FontWeight::MEDIUM))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _ev, _w, cx| {
+                                this.select_file(&click_path, cx)
+                            }))
+                            .child(SharedString::from(path))
+                    })
+                    .collect()
+            }),
+        )
+        .flex_1()
+        .px(px(8.))
+        .track_scroll(&self.file_scroll);
 
         let sidebar = div()
             .w(px(266.))
@@ -1094,7 +1163,17 @@ impl AspApp {
                     .bg(t.line),
             );
 
+        // Cap rendered ticks regardless of event count: a vault with thousands
+        // of history events must not paint thousands of dots every frame (that
+        // dominated editor frame time). Sample evenly to ~MAX_TICKS, always
+        // keeping the last event.
+        const MAX_TICKS: usize = 240;
+        let n = self.history.len();
+        let step = (n / MAX_TICKS).max(1);
         for (i, e) in self.history.iter().enumerate() {
+            if step > 1 && i % step != 0 && i + 1 != n {
+                continue;
+            }
             let frac = frac_of(e.ts);
             let color = kind_color(&e.kind, &t);
             let ts = e.ts;
