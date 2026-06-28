@@ -3,5 +3,7 @@
 //! deterministic core (naming, tree, tabs, history geometry, markdown, prefs).
 pub mod format;
 pub mod history;
+pub mod pretty_names;
 pub mod tabs;
 pub mod tree;
+pub mod vault_meta;
