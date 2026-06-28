@@ -187,6 +187,35 @@ describe('App — editor', () => {
     expect(document.documentElement.getAttribute('data-theme')).toBe('dark');
   });
 
+  it('keeps the theme button in the tab row, with save-status + word count in a separate bar below', async () => {
+    await screen.findByTestId('live-editor');
+    const tabRow = screen.getByTestId('tab-bar').parentElement!;
+    // The theme button shares the tab strip's row.
+    const themeBtns = screen.getAllByTitle('Toggle theme');
+    const themeBtn = themeBtns[themeBtns.length - 1];
+    expect(tabRow.contains(themeBtn)).toBe(true);
+    // The save status and word count are no longer in the tab row.
+    expect(tabRow.textContent).not.toContain('Saved');
+    expect(tabRow.textContent).not.toMatch(/word/);
+    // They moved into a dedicated, non-scrolling bar below the tab row.
+    const status = screen.getByTestId('content-status');
+    expect(tabRow.contains(status)).toBe(false);
+    expect(status.textContent).toContain('Saved');
+    expect(status.textContent).toMatch(/word/);
+    // Pinned (does not scroll with the document).
+    expect(status.style.flexGrow).toBe('0');
+    expect(status.style.flexShrink).toBe('0');
+  });
+
+  it('flips the content status to Saving… while a write is in flight', async () => {
+    const editor = await screen.findByTestId('live-editor');
+    await waitFor(() => expect(editor.textContent).toContain('Readme'));
+    editor.textContent = '# Readme\n\nedited again';
+    fireEvent.input(editor);
+    const status = await screen.findByTestId('content-status');
+    await waitFor(() => expect(status.textContent).toContain('Saving…'));
+  });
+
   it('expands and collapses all folders', async () => {
     const expandBtn = await screen.findByTitle('Expand all');
     fireEvent.click(expandBtn);
