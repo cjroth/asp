@@ -214,9 +214,17 @@ export function renderLiveHtml(src: string, accent = '#3d63dd', fmStyle: Frontma
   return html;
 }
 
+// Extensions with a dedicated syntax highlighter (see `langOf`). Kept as the
+// canonical list of highlightable code languages even though file classification
+// is now markdown-vs-everything-else (below).
 const CODE_EXT = /\.(ts|tsx|js|jsx|mjs|cjs|json|sh|bash|zsh|css|scss|py|rs|go|toml|ya?ml|html|sql)$/i;
+// Only markdown files (`.md`/`.markdown`) get the rich live WYSIWYG render; EVERY
+// other file (code, plain text, logs, unknown/no-extension) renders in the raw
+// monospace code-editing style. `langOf` still picks a highlighter for known code
+// extensions and degrades to '' (unhighlighted monospace) for the rest.
+const MD_EXT = /\.(md|markdown)$/i;
 export function isCodeFile(path: string): boolean {
-  return CODE_EXT.test(path);
+  return !MD_EXT.test(path);
 }
 export function langOf(path: string): string {
   const m = (path.match(/\.([a-z0-9]+)$/i) || ['', ''])[1].toLowerCase();

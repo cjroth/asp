@@ -300,6 +300,13 @@ describe('code files', () => {
   it('isCodeFile / langOf classify by extension', () => {
     expect(isCodeFile('a.ts')).toBe(true);
     expect(isCodeFile('a.md')).toBe(false);
+    // Only markdown is NOT code; everything else (incl. unknown/no-extension) is.
+    expect(isCodeFile('a.markdown')).toBe(false);
+    expect(isCodeFile('A.MD')).toBe(false); // case-insensitive
+    expect(isCodeFile('a.txt')).toBe(true);
+    expect(isCodeFile('a.log')).toBe(true);
+    expect(isCodeFile('a.py')).toBe(true);
+    expect(isCodeFile('Makefile')).toBe(true); // no extension → still code/monospace
     expect(langOf('a.tsx')).toBe('js');
     expect(langOf('a.json')).toBe('json');
     expect(langOf('a.sh')).toBe('sh');
