@@ -25,7 +25,9 @@ pub enum Line {
     Task { indent: usize, done: bool, spans: Vec<Inline> },
     Bullet { indent: usize, spans: Vec<Inline> },
     Ordered { indent: usize, number: String, spans: Vec<Inline> },
-    Code(String),
+    /// A code line. `lang` is `None` for the ``` fence markers, `Some(lang)` for
+    /// content inside a fence (empty string when no language was specified).
+    Code { text: String, lang: Option<String> },
     Para(Vec<Inline>),
 }
 
@@ -48,14 +50,21 @@ fn leading_spaces(s: &str) -> usize {
 pub fn parse(src: &str) -> Vec<Line> {
     let mut out = Vec::new();
     let mut in_fence = false;
+    let mut fence_lang = String::new();
     for ln in src.split('\n') {
         if ln.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-            out.push(Line::Code(ln.to_string()));
+            if in_fence {
+                in_fence = false;
+                fence_lang.clear();
+            } else {
+                in_fence = true;
+                fence_lang = ln.trim_start().trim_start_matches('`').trim().to_string();
+            }
+            out.push(Line::Code { text: ln.to_string(), lang: None });
             continue;
         }
         if in_fence {
-            out.push(Line::Code(ln.to_string()));
+            out.push(Line::Code { text: ln.to_string(), lang: Some(fence_lang.clone()) });
             continue;
         }
         if ln.is_empty() {
@@ -353,15 +362,15 @@ mod tests {
         assert_eq!(parse("---")[0], Line::Hr);
         assert_eq!(parse("***")[0], Line::Hr);
         let fence = parse("```rust\nlet x = 1;\n```");
-        assert_eq!(fence[0], Line::Code("```rust".into()));
-        assert_eq!(fence[1], Line::Code("let x = 1;".into()));
-        assert_eq!(fence[2], Line::Code("```".into()));
+        assert_eq!(fence[0], Line::Code { text: "```rust".into(), lang: None });
+        assert_eq!(fence[1], Line::Code { text: "let x = 1;".into(), lang: Some("rust".into()) });
+        assert_eq!(fence[2], Line::Code { text: "```".into(), lang: None });
     }
 
     #[test]
     fn fence_suppresses_block_parsing_inside() {
         // a '#' inside a fence is code, not a heading.
         let ls = parse("```\n# not a heading\n```");
-        assert_eq!(ls[1], Line::Code("# not a heading".into()));
+        assert_eq!(ls[1], Line::Code { text: "# not a heading".into(), lang: Some(String::new()) });
     }
 }

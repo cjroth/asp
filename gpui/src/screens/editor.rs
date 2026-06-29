@@ -714,18 +714,55 @@ fn render_line(t: &Theme, line: &Line) -> Div {
                     .child(number.clone()),
             )
             .child(styled(t, spans, Hsla::from(t.text), FontWeight::NORMAL, false)),
-        Line::Code(raw) => div()
-            .font_family(FONT_MONO)
-            .text_size(px(13.0))
-            .line_height(px(22.0))
-            .px(px(12.0))
-            .bg(t.bg_input)
-            .text_color(t.text2)
-            .child(if raw.is_empty() { " ".to_string() } else { raw.clone() }),
+        Line::Code { text, lang } => {
+            let base = div()
+                .font_family(FONT_MONO)
+                .text_size(px(13.0))
+                .line_height(px(22.0))
+                .px(px(12.0))
+                .bg(t.bg_input);
+            match lang {
+                Some(l) if !l.is_empty() => base.child(code_line(*t, text, l)),
+                _ => base
+                    .text_color(t.faint)
+                    .child(if text.is_empty() { " ".to_string() } else { text.clone() }),
+            }
+        }
         Line::Para(spans) => div()
             .line_height(px(28.0))
             .child(styled(t, spans, Hsla::from(t.text), FontWeight::NORMAL, false)),
     }
+}
+
+/// Build a syntax-highlighted `StyledText` for one code line.
+fn code_line(t: Theme, text: &str, lang: &str) -> StyledText {
+    use crate::vault::highlight::{highlight, Tok};
+    let mono = font(FONT_MONO);
+    let color = |tok: Tok| -> Hsla {
+        match tok {
+            Tok::Keyword => Hsla::from(t.accent),
+            Tok::Str => Hsla::from(t.create),
+            Tok::Comment => Hsla::from(t.faint),
+            Tok::Number => Hsla::from(t.rename),
+            Tok::Type => gpui::hsla(188.0 / 360.0, 0.5, 0.42, 1.0),
+            Tok::Plain => Hsla::from(t.text2),
+        }
+    };
+    let mut s = String::new();
+    let mut runs: Vec<TextRun> = Vec::new();
+    for (tok, txt) in highlight(text, lang) {
+        let len = txt.len();
+        if len == 0 {
+            continue;
+        }
+        s.push_str(&txt);
+        runs.push(TextRun { len, font: mono.clone(), color: color(tok), ..Default::default() });
+    }
+    if s.is_empty() {
+        s.push(' ');
+        runs.push(TextRun { len: 1, font: mono.clone(), color: Hsla::from(t.text2), ..Default::default() });
+    }
+    StyledText::new(s).with_runs(runs)
 }
 
 /// Build a `StyledText` from inline spans with per-run font/weight/style/color.
