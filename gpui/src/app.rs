@@ -253,6 +253,16 @@ impl AspApp {
         self.connect_rows = rows;
     }
 
+    /// Add a local folder as a vault and open it (from the native picker).
+    pub fn add_local_folder_path(&mut self, path: &std::path::Path) {
+        if let Some(eng) = self.engine.clone() {
+            if let Ok(info) = eng.add_local_folder(path) {
+                self.refresh_vaults();
+                self.open_vault(&info.id);
+            }
+        }
+    }
+
     /// Open a managed vault by engine session id → switch to the editor.
     pub fn open_vault(&mut self, id: &str) {
         if let Some(eng) = self.engine.clone() {
@@ -774,6 +784,18 @@ mod tests {
         app.time_travel_to(0);
         app.begin_edit();
         assert!(!app.editing);
+    }
+
+    #[test]
+    fn add_local_folder_path_opens_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), b"# Hi\n").unwrap();
+        let eng = Engine::with_identity(Identity::from_seed(&[31u8; 32])).unwrap();
+        let mut app = AspApp { engine: Some(Rc::new(eng)), ..AspApp::fixture_base(Theme::light()) };
+        app.add_local_folder_path(dir.path());
+        assert_eq!(app.screen, Screen::Editor);
+        assert!(app.files.iter().any(|(p, _)| p == "README.md"));
+        assert_eq!(app.content, "# Hi\n");
     }
 
     #[test]

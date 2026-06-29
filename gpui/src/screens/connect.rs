@@ -1,6 +1,9 @@
 //! Connect screen — data-driven over `AspApp` (see DESIGN_SPEC.md §3).
 
-use gpui::{div, prelude::*, px, Context, Div, FontWeight, MouseButton, MouseDownEvent, SharedString};
+use gpui::{
+    div, prelude::*, px, Context, Div, FontWeight, MouseButton, MouseDownEvent, PathPromptOptions,
+    SharedString,
+};
 
 use crate::app::{AspApp, ConnectRow};
 use crate::icons::icon;
@@ -92,6 +95,26 @@ pub fn render(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
         .text_size(px(14.0))
         .font_weight(FontWeight(500.0))
         .cursor_pointer()
+        .on_click(cx.listener(|_this, _ev, _window, cx| {
+            let rx = cx.prompt_for_paths(PathPromptOptions {
+                files: false,
+                directories: true,
+                multiple: false,
+                prompt: Some("Open vault folder".into()),
+            });
+            cx.spawn(async move |this, cx| {
+                if let Ok(Ok(Some(paths))) = rx.await {
+                    if let Some(p) = paths.into_iter().next() {
+                        this.update(cx, |this, cx| {
+                            this.add_local_folder_path(&p);
+                            cx.notify();
+                        })
+                        .ok();
+                    }
+                }
+            })
+            .detach();
+        }))
         .child(icon("plus", px(16.0), t.bg))
         .child("New Vault");
 
