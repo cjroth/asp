@@ -195,6 +195,10 @@ fn run_shot(out_path: &str, screen: &str) {
                 cx.new(|_| {
                     let mut a = AspApp::fixture_editor(Theme::light());
                     a.begin_edit();
+                    // place the caret on the bold/italic paragraph to show inline reveal
+                    if let Some(pos) = a.buffer.text.find("end-to-end") {
+                        a.buffer.cursor = pos;
+                    }
                     a
                 })
             })

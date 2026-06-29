@@ -591,13 +591,16 @@ fn edit_surface(app: &AspApp, cx: &mut Context<AspApp>) -> impl IntoElement {
             // mirroring the desktop's live-preview behavior on the focused line.
             let in_line = cur - line_start;
             let (pre, post) = line.split_at(in_line.min(line.len()));
+            // Reveal syntax (faint markers) + style content on the active line,
+            // with the caret between the two halves at the exact cursor column.
             col = col.child(
                 div()
                     .flex()
+                    .items_center()
                     .line_height(px(28.0))
-                    .child(div().child(pre.to_string()))
-                    .child(div().w(px(2.0)).h(px(22.0)).bg(t.accent).mt(px(3.0)))
-                    .child(div().child(post.to_string())),
+                    .child(inline_reveal(t, pre))
+                    .child(div().w(px(2.0)).h(px(22.0)).bg(t.accent))
+                    .child(inline_reveal(t, post)),
             );
         } else {
             // Inactive lines render as styled markdown (syntax hidden) — Obsidian-
@@ -760,6 +763,70 @@ fn render_line(t: &Theme, line: &Line) -> Div {
             .line_height(px(28.0))
             .child(styled(t, spans, Hsla::from(t.text), FontWeight::NORMAL, false)),
     }
+}
+
+/// Render a raw markdown substring with its syntax markers shown (faint) and the
+/// content styled — the caret line's "reveal" view. The output text equals the
+/// input exactly, so caret byte-offsets stay valid when split around the cursor.
+fn inline_reveal(t: Theme, raw: &str) -> StyledText {
+    let serif = |w: FontWeight, italic: bool| -> Font {
+        let mut f = font(FONT_SERIF);
+        f.weight = w;
+        if italic {
+            f.style = gpui::FontStyle::Italic;
+        }
+        f
+    };
+    let base = Hsla::from(t.text);
+    let faint = Hsla::from(t.faint);
+    let mut s = String::new();
+    let mut runs: Vec<TextRun> = Vec::new();
+    let mut push = |txt: &str, fnt: Font, color: Hsla, bg: Option<Hsla>| {
+        if txt.is_empty() {
+            return;
+        }
+        s.push_str(txt);
+        runs.push(TextRun { len: txt.len(), font: fnt, color, background_color: bg, ..Default::default() });
+    };
+    for sp in markdown::parse_inline(raw) {
+        match sp {
+            Inline::Text(x) => push(&x, serif(FontWeight::NORMAL, false), base, None),
+            Inline::Bold(x) => {
+                push("**", serif(FontWeight::NORMAL, false), faint, None);
+                push(&x, serif(FontWeight::BOLD, false), base, None);
+                push("**", serif(FontWeight::NORMAL, false), faint, None);
+            }
+            Inline::Italic(x) => {
+                push("*", serif(FontWeight::NORMAL, false), faint, None);
+                push(&x, serif(FontWeight::NORMAL, true), base, None);
+                push("*", serif(FontWeight::NORMAL, false), faint, None);
+            }
+            Inline::Code(x) => {
+                push("`", font(FONT_MONO), faint, None);
+                push(&x, font(FONT_MONO), base, Some(Hsla::from(t.bg_input)));
+                push("`", font(FONT_MONO), faint, None);
+            }
+            Inline::Link { text, url } => {
+                push("[", serif(FontWeight::NORMAL, false), faint, None);
+                push(&text, serif(FontWeight::NORMAL, false), Hsla::from(t.accent), None);
+                push("](", serif(FontWeight::NORMAL, false), faint, None);
+                push(&url, serif(FontWeight::NORMAL, false), faint, None);
+                push(")", serif(FontWeight::NORMAL, false), faint, None);
+            }
+            Inline::Image { alt, url } => {
+                push("![", serif(FontWeight::NORMAL, false), faint, None);
+                push(&alt, serif(FontWeight::NORMAL, false), faint, None);
+                push("](", serif(FontWeight::NORMAL, false), faint, None);
+                push(&url, serif(FontWeight::NORMAL, false), faint, None);
+                push(")", serif(FontWeight::NORMAL, false), faint, None);
+            }
+        }
+    }
+    if s.is_empty() {
+        s.push(' ');
+        runs.push(TextRun { len: 1, font: serif(FontWeight::NORMAL, false), color: base, ..Default::default() });
+    }
+    StyledText::new(s).with_runs(runs)
 }
 
 /// Build a syntax-highlighted `StyledText` for one code line.
