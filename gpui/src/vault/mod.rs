@@ -8,5 +8,6 @@ pub mod markdown;
 pub mod prefs;
 pub mod pretty_names;
 pub mod tabs;
+pub mod textbuffer;
 pub mod tree;
 pub mod vault_meta;
