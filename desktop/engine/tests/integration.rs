@@ -288,3 +288,50 @@ fn cohosted_local_relay_routes_a_real_clone() {
     assert!(de_a.local_relay_url().is_none());
     std::env::remove_var("ASP_RELAY_URL");
 }
+
+/// The catch-up dedups blobs across the stream (each unique blob shipped once),
+/// the careerbot shape that inflated the wire ~5x. A clone of a vault with many
+/// files sharing few distinct contents must still converge with byte-correct
+/// content — dedup must never mix a row up with the wrong blob.
+#[test]
+fn clone_dedups_duplicate_blobs_without_corrupting_content() {
+    let _serial = serial();
+    std::env::remove_var("ASP_NO_RELAY");
+    std::env::remove_var("ASP_RELAY_URL");
+    let root = tempfile::tempdir().unwrap();
+    std::env::set_var("HOME", root.path());
+
+    let de_a = DesktopEngine::new(Identity::from_seed(&[31; 32])).unwrap();
+    de_a.set_local_relay(true).unwrap();
+    let relay = de_a.local_relay_url().unwrap();
+
+    let dir_a = root.path().join("a");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    // 200 files, only 3 distinct contents → 200 create rows referencing 3 unique
+    // blobs (the heavy-duplication case the dedup targets).
+    for i in 0..200 {
+        std::fs::write(dir_a.join(format!("f{i}.md")), format!("shared-content-{}", i % 3)).unwrap();
+    }
+    let a = de_a.add_local_folder(&dir_a).unwrap();
+    let ticket = de_a.set_allow_connections(&a.id, true, None).unwrap().unwrap();
+
+    std::env::set_var("ASP_RELAY_URL", &relay);
+    let de_b = DesktopEngine::new(Identity::from_seed(&[32; 32])).unwrap();
+    let b = de_b.clone_remote(&root.path().join("b"), &ticket, None).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            de_b.list_files(&b.id).map(|f| f.iter().filter(|x| !x.is_dir).count()).unwrap_or(0) >= 200
+        }),
+        "all 200 files converge despite shipping only 3 blobs"
+    );
+    // Every file must hold EXACTLY its own content — proves the deduped blobs
+    // were matched back to the right rows by hash, not by position.
+    for i in [0usize, 1, 2, 50, 100, 199] {
+        assert_eq!(
+            de_b.read_file(&b.id, &format!("f{i}.md")).unwrap(),
+            format!("shared-content-{}", i % 3),
+            "f{i}.md content after deduped clone"
+        );
+    }
+    std::env::remove_var("ASP_RELAY_URL");
+}

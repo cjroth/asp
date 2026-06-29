@@ -388,16 +388,26 @@ async fn drive(
 
 /// Stream the listener's catch-up to a connector in bounded pages, then a final
 /// `Synced` so the connector finishes promptly (no idle wait).
+///
+/// Blobs are deduplicated across the whole catch-up: a row bundles its content
+/// blob, but a vault with lots of repeated content (e.g. 28k files sharing 3k
+/// unique blobs) would otherwise ship each blob once per referencing row — ~5x
+/// its real size, which the receiver then has to parse and hash. We send each
+/// blob only on its first occurrence (causal/seq order guarantees that's at or
+/// before any later reference); the receiver accumulates blobs in its content
+/// store, so a later row referencing an already-sent hash folds fine without the
+/// bytes. Convergence is unchanged — the receiver's state is byte-identical.
 async fn stream_catchup(
     send: &mut SendStream,
     engine: &EngineRef,
     peer_vv: &std::collections::BTreeMap<String, i64>,
 ) -> Result<()> {
     let our_vv = { engine.lock().unwrap().store.version_vector()? };
+    let mut sent_blobs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (site, _max) in our_vv {
         let mut cursor = peer_vv.get(&site).copied().unwrap_or(-1);
         loop {
-            let page = {
+            let mut page = {
                 let eng = engine.lock().unwrap();
                 eng.rows_after_wire_page(&site, cursor, CATCHUP_PAGE_ROWS)?
             };
@@ -405,6 +415,10 @@ async fn stream_catchup(
                 break;
             }
             cursor = page.last().map(|w| w.row.seq as i64).unwrap_or(cursor);
+            // Keep each blob only on its first occurrence across the catch-up.
+            for wr in &mut page {
+                wr.blobs.retain(|b| sent_blobs.insert(b.hash.clone()));
+            }
             let mut sends = Vec::new();
             crate::session::push_rows_chunked(&mut sends, page);
             for s in sends {
