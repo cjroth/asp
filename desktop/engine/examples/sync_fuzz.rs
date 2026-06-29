@@ -218,7 +218,17 @@ fn wait_converged(hub: &Hub, peers: &[Peer], timeout: Duration) -> (bool, Vec<St
             let eng = snapshot_dir(&p.dir);
             let api = engine_api_snapshot(&p.de, &p.id);
             problems.extend(diff_keys(&cli, &eng, "cli-disk", &format!("eng{i}-disk")));
-            problems.extend(diff_keys(&eng, &api, &format!("eng{i}-disk"), &format!("eng{i}-api")));
+            // The engine's read_file API is utf8-LOSSY by design (the editor
+            // renders text), so a binary file's API view is the lossy view of
+            // its bytes — not byte-identical to disk. Compare the API against the
+            // engine disk passed through the SAME lossy transform: identity for
+            // valid utf8 (text/code), the correct lossy view for binary. This
+            // keeps the invariant honest for binary instead of excluding it.
+            let eng_lossy: BTreeMap<String, Vec<u8>> = eng
+                .iter()
+                .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned().into_bytes()))
+                .collect();
+            problems.extend(diff_keys(&eng_lossy, &api, &format!("eng{i}-disk(lossy)"), &format!("eng{i}-api")));
         }
         if problems.is_empty() {
             return (true, Vec::new());
@@ -249,6 +259,34 @@ fn rand_content(rng: &mut Rng, tag: &str) -> String {
     let mut s = format!("# {tag}\n\n");
     for i in 0..lines {
         s.push_str(&format!("- line {i} :: {}\n", rng.next_u64()));
+    }
+    s
+}
+
+/// Non-utf8, null-containing bytes (classified `Binary`; whole-file LWW). Shaped
+/// like a small binary blob: a fake header, embedded NULs, and high bytes that
+/// are invalid utf8 — so it exercises the binary merge class and the engine's
+/// utf8-lossy API view, not just the text path.
+fn rand_binary(rng: &mut Rng, n: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(n + 8);
+    v.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x00, 0x1a]);
+    for _ in 0..n {
+        v.push((rng.next_u64() & 0xff) as u8); // full 0..=255 range incl. NUL/high
+    }
+    v
+}
+
+/// A realistic code file (classified `Code` — surface-aware merge, distinct from
+/// prose `Text`). Varying the body lets concurrent edits land in different code
+/// regions.
+fn rand_code(rng: &mut Rng, tag: &str) -> String {
+    let mut s = format!("// {tag}\nuse std::collections::HashMap;\n\n");
+    let fns = 1 + rng.below(4);
+    for i in 0..fns {
+        s.push_str(&format!(
+            "pub fn f{i}(x: u64) -> u64 {{\n    let k = {};\n    x.wrapping_mul(k).wrapping_add({i})\n}}\n\n",
+            rng.next_u64()
+        ));
     }
     s
 }
@@ -405,6 +443,9 @@ enum Scenario {
     CaseOnlyRename,
     RenameThenEdit,
     ExternalRescan,
+    BinaryFile,
+    HugeFile,
+    CodeFile,
 }
 
 fn pick_scenario(rng: &mut Rng, round: usize) -> Scenario {
@@ -416,7 +457,7 @@ fn pick_scenario(rng: &mut Rng, round: usize) -> Scenario {
             EditExisting, NewFile, Rename, Delete, DeleteRecreate, RapidBurst,
             LargeFile, ManyFiles, ConcurrentSameFile, EmptyFile, DeepNesting,
             TruncateToEmpty, SwapNames, RenameOntoExisting, CaseOnlyRename, RenameThenEdit,
-            ExternalRescan,
+            ExternalRescan, BinaryFile, HugeFile, CodeFile,
         ]
     };
     rng.pick(&menu).clone()
@@ -637,6 +678,64 @@ fn apply_scenario(
                 live.push(name.clone());
             }
             format!("external-rescan/Engine({i}) {name}")
+        }
+        BinaryFile => {
+            // A binary blob (non-utf8, embedded NULs) — classified Binary, synced
+            // whole-file LWW. The engine API can't author non-utf8 (write_file is
+            // &str), so binary originates on a disk side: either the CLI hub, or
+            // written behind an engine + captured via rescan (engine-origin). Both
+            // must converge byte-exact on every disk; the lossy API view is checked
+            // against the lossy disk in wait_converged.
+            let name = format!("assets/{:04}.bin", rng.next_u64() % 10000);
+            let nbytes = 200 + rng.below(2000);
+            let bytes = rand_binary(rng, nbytes);
+            if rng.below(2) == 0 || np == 0 {
+                write_cli(&hub.dir, &name, &bytes);
+                if !live.contains(&name) { live.push(name.clone()); }
+                format!("binary/Cli {name} ({}B)", bytes.len())
+            } else {
+                let i = rng.below(np);
+                let full = peers[i].dir.join(&name);
+                if let Some(parent) = full.parent() { let _ = std::fs::create_dir_all(parent); }
+                let _ = std::fs::write(&full, &bytes);
+                let t = Instant::now();
+                let _ = peers[i].de.rescan(&peers[i].id);
+                lat.push(t.elapsed().as_millis());
+                if !live.contains(&name) { live.push(name.clone()); }
+                format!("binary/Engine({i})+rescan {name} ({}B)", bytes.len())
+            }
+        }
+        HugeFile => {
+            // A large file up to ~4MB — the upper end the app must stay correct on.
+            // Exercises blob storage, materialize, and convergence of multi-MB
+            // content across surfaces.
+            let path = format!("huge/{}.md", rng.next_u64() % 20);
+            let target = 1_000_000 + rng.below(3_200_000); // ~1–4.2 MB
+            let mut big = String::with_capacity(target + 64);
+            big.push_str("# Huge\n\n");
+            let mut n = 0u64;
+            while big.len() < target {
+                big.push_str(&format!("line {n} :: lorem ipsum dolor sit amet :: {}\n", rng.next_u64()));
+                n += 1;
+            }
+            let side = pick_side(rng, np);
+            do_write(side, hub, peers, &path, &big, lat);
+            if !live.contains(&path) { live.push(path.clone()); }
+            format!("huge(~{}MB)/{side:?}", big.len() / 1_000_000)
+        }
+        CodeFile => {
+            // A code file (Code merge class). Two sides may edit different fns of
+            // the same file → a 3-way code merge that must converge identically.
+            let path = format!("src/mod_{:03}.rs", rng.next_u64() % 200);
+            let side = pick_side(rng, np);
+            do_write(side, hub, peers, &path, &rand_code(rng, "code file"), lat);
+            if !live.contains(&path) { live.push(path.clone()); }
+            // Occasionally a concurrent edit from another side for a real code merge.
+            if np > 0 && rng.below(2) == 0 {
+                let other = pick_side(rng, np);
+                do_write(other, hub, peers, &path, &rand_code(rng, "concurrent code edit"), lat);
+            }
+            format!("code/{side:?} {path}")
         }
     }
 }
