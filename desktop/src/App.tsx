@@ -321,27 +321,10 @@ export default function App() {
     }
   }, [activeId, selectedPath, vidOf]);
 
-  useEffect(() => {
-    const t = setInterval(() => {
-      if (screen === 'editor' && activeIdRef.current) {
-        const id = activeIdRef.current;
-        void api.getStatus(id).then((st) => setStatuses((p) => ({ ...p, [id]: st }))).catch(() => {});
-        // Desktop's engine holds a standing connection and converges in the
-        // background; the UI catches up by re-reading on this tick. Web doesn't
-        // poll for sync at all — it holds a live connection that pushes changes
-        // straight into the UI (see the live-sync effect below) — so we only do
-        // the periodic re-read on desktop.
-        if (desktop) {
-          void refreshFiles(id).catch(() => {});
-          scheduleHistory(id);
-          void refreshActiveContent();
-        }
-      } else {
-        void refreshVaults().then(refreshStatuses);
-      }
-    }, 10000);
-    return () => clearInterval(t);
-  }, [screen, desktop, refreshVaults, refreshStatuses, refreshFiles, scheduleHistory, refreshActiveContent]);
+  // No polling. Refreshes are fully event-driven: desktop reacts to the engine's
+  // realtime `vault-changed` / `vaults-changed` Tauri events (see the effects
+  // below), web to its live-sync push callback. Re-listing a 28k-file tree on a
+  // 10s timer was both wasted work (~1s each tick) and the wrong model.
 
   // Web live sync: a browser can't be *pushed* to, but it can dial the upstream
   // and hold the link open. While a web vault is open in the editor we keep that
@@ -372,24 +355,29 @@ export default function App() {
     };
   }, [desktop, screen, activeId]);
 
-  // Desktop realtime: the engine emits 'vault-changed' the instant a peer's edit
-  // integrates (its background connections are already live). Refresh the open
-  // vault immediately instead of waiting for the poll above. Web has no Tauri
-  // events — it refreshes via the live-sync callback instead.
+  // Desktop realtime: the engine emits 'vault-changed' (the changed vault_id) the
+  // instant a peer's edit integrates — its background connections are already
+  // live. This is the desktop's whole refresh path (no polling): bump that vault's
+  // status (the "last synced" label / status bar) wherever we are, and if it's the
+  // open editor vault, refresh its tree + open file too. Web has no Tauri events —
+  // it refreshes via the live-sync callback instead.
   useEffect(() => {
-    if (!desktop || screen !== 'editor') return;
+    if (!desktop) return;
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     void listen<string>('vault-changed', (e) => {
+      const changedVid = e.payload;
+      const v = vaultsRef.current.find((x) => x.vault_id === changedVid);
+      if (v) void api.getStatus(v.id).then((st) => setStatuses((p) => ({ ...p, [v.id]: st }))).catch(() => {});
       const cur = activeIdRef.current;
-      const vid = vaultsRef.current.find((v) => v.id === cur)?.vault_id;
-      if (cur && e.payload === vid) liveRefreshRef.current(cur);
+      const curVid = vaultsRef.current.find((x) => x.id === cur)?.vault_id;
+      if (cur && changedVid === curVid) liveRefreshRef.current(cur);
     }).then((u) => (cancelled ? u() : (unlisten = u)));
     return () => {
       cancelled = true;
       unlisten?.();
     };
-  }, [desktop, screen]);
+  }, [desktop]);
 
   // Saved folders reopen in the background at startup (a big vault's reconcile is
   // slow), so the window can appear before they're loaded. Refresh the list as the

@@ -1,14 +1,31 @@
 import { mock } from 'bun:test';
 // Live-sync UI test: when a REMOTE peer pushes changes into the vault while the
 // user is sitting in the editor, the desktop backend converges (the engine's
-// standing connector materializes the edit), but does the UI reflect it?
+// standing connector materializes the edit) and emits a realtime `vault-changed`
+// Tauri event — does the UI reflect it? (No polling: the event IS the trigger.)
 //
 // We simulate a remote push by mutating the mock backend's CONTENT directly
-// (exactly what the engine does when a peer's WireRow lands) WITHOUT any local
-// user action, then let the app's 10s poll fire. The file tree and the open
-// editor should both catch up — that is the whole point of "sync".
+// (exactly what the engine does when a peer's WireRow lands) and then emitting
+// `vault-changed` for that vault, exactly as the native engine's change listener
+// does. The file tree and the open editor should both catch up.
+import { mock } from 'bun:test';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from './test-shim';
+
+// Capture the app's Tauri event subscriptions so a test can fire them (overrides
+// the global no-op `listen` stub from the test preload).
+const eventHandlers: Record<string, Array<(e: { payload: unknown }) => void>> = {};
+mock.module('@tauri-apps/api/event', () => ({
+  listen: async (name: string, handler: (e: { payload: unknown }) => void) => {
+    (eventHandlers[name] ||= []).push(handler);
+    return () => {
+      eventHandlers[name] = (eventHandlers[name] || []).filter((h) => h !== handler);
+    };
+  },
+}));
+const emit = (name: string, payload: unknown) => {
+  for (const h of eventHandlers[name] || []) h({ payload });
+};
 
 let CONTENT: Record<string, string> = {};
 function reset() {
@@ -76,8 +93,9 @@ describe('live-sync: UI reflects remote peer pushes', () => {
     // Remote peer pushes a brand-new file (the engine materialized it; no local action).
     CONTENT['from-peer.md'] = '# Pushed by a peer\n\nhi from another vault\n';
 
-    // The app's background poll should pull the new tree state in.
-    await waitFor(() => expect(treeHas('from-peer.md')).toBe(true), { timeout: 12000 });
+    // The engine emits `vault-changed` → the UI refreshes the tree in realtime.
+    emit('vault-changed', 'vid');
+    await waitFor(() => expect(treeHas('from-peer.md')).toBe(true), { timeout: 5000 });
   }, 15000);
 
   it('a remote edit to the OPEN file updates the editor without a manual refresh', async () => {
@@ -90,7 +108,9 @@ describe('live-sync: UI reflects remote peer pushes', () => {
     // A remote peer edits the very file we're viewing (no local action, not dirty).
     CONTENT['note.md'] = '# Note\n\nEDITED BY A PEER over the wire\n';
 
-    await waitFor(() => expect(editor.textContent || '').toContain('EDITED BY A PEER'), { timeout: 12000 });
+    // The engine emits `vault-changed` → the open file refreshes in realtime.
+    emit('vault-changed', 'vid');
+    await waitFor(() => expect(editor.textContent || '').toContain('EDITED BY A PEER'), { timeout: 5000 });
   }, 15000);
 });
 import { afterAll as __aa, mock as __mk } from 'bun:test';
