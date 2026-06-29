@@ -1,3 +1,4 @@
+#![allow(dead_code)] // intentional theme API (FONT_SANS, selection) kept for wiring
 //! Design tokens ported from desktop `src/styles.css` (see docs/DESIGN_SPEC.md §1).
 //! A `Theme` carries the resolved palette + accent; light/dark mirror the CSS vars.
 

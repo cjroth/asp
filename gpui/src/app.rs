@@ -458,6 +458,7 @@ impl AspApp {
     }
 
     /// Rename a file/folder and remap tabs + active + expanded.
+    #[allow(dead_code)]
     pub fn rename_file(&mut self, old: &str, new: &str) {
         let (Some(eng), Some(vid)) = (self.engine.clone(), self.vault_id.clone()) else { return };
         if eng.rename_file(&vid, old, new).is_err() {

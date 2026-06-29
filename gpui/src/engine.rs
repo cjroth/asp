@@ -1,3 +1,5 @@
+//! (dead_code allowed: thin engine API surface kept for later wiring)
+#![allow(dead_code)]
 //! Thin wrapper over `asp_desktop_engine::DesktopEngine` — the same native
 //! backend the Tauri shell uses (links `asp-core` directly). The gpui app calls
 //! these instead of Tauri commands. No protocol/merge/history logic lives here.

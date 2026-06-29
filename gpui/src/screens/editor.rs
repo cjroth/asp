@@ -170,7 +170,7 @@ fn files_label(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
 }
 
 fn file_tree(app: &AspApp, cx: &mut Context<AspApp>) -> impl IntoElement {
-    let t = app.theme;
+    let _t = app.theme;
     let nodes = tree::build_tree(app.files.iter().map(|(p, d)| (p.as_str(), *d)));
     let rows = tree::flatten(&nodes, &app.expanded);
 

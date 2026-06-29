@@ -109,7 +109,7 @@ pub fn derive_log(
 
     let mut out: Vec<LogLine> = Vec::new();
     let mut order: i64 = 0;
-    let mut push = |level: &str, msg: String, ms: i64, out: &mut Vec<LogLine>| {
+    let push = |level: &str, msg: String, ms: i64, out: &mut Vec<LogLine>| {
         let time = fmt_time(ms);
         let lvl_padded: String = format!("{level}     ").chars().take(5).collect();
         let raw = format!("{time}  {lvl_padded}  {msg}");
