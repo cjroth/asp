@@ -86,6 +86,19 @@ fn run_shot(out_path: &str, screen: &str) {
             .open_window(win_size, |_, cx| cx.new(|_| AspApp::fixture_connect(Theme::dark())))
             .expect("open window")
             .into(),
+        "share-modal" => cx
+            .open_window(win_size, |_, cx| {
+                cx.new(|_| {
+                    let mut a = AspApp::fixture_connect(Theme::light());
+                    a.modal = app::Modal::ShareVault {
+                        name: "Research Notes".into(),
+                        ticket: Some("asp1qyqszqgpqyqszqgpqyqszqgpqyqszqgp-key-9f2a".into()),
+                    };
+                    a
+                })
+            })
+            .expect("open window")
+            .into(),
         "remove-modal" => cx
             .open_window(win_size, |_, cx| {
                 cx.new(|_| {

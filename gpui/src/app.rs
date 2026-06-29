@@ -84,6 +84,7 @@ pub enum Menu {
 pub enum Modal {
     None,
     RemoveVault { id: String, name: String, trash: bool },
+    ShareVault { name: String, ticket: Option<String> },
 }
 
 fn now_secs() -> i64 {
@@ -478,6 +479,16 @@ impl AspApp {
         self.menu = Menu::None;
     }
 
+    /// Open the "share vault" modal — enables connections and shows the ticket.
+    pub fn open_share(&mut self, id: &str, name: &str) {
+        self.menu = Menu::None;
+        let ticket = self
+            .engine
+            .clone()
+            .and_then(|eng| eng.set_allow_connections(id, true, None).ok().flatten());
+        self.modal = Modal::ShareVault { name: name.to_string(), ticket };
+    }
+
     /// Open the "remove vault" confirmation modal (also closes any menu).
     pub fn open_remove(&mut self, id: &str, name: &str) {
         self.menu = Menu::None;
@@ -602,6 +613,9 @@ impl Render for AspApp {
             root = root.child(menu);
         }
         if let Some(modal) = crate::screens::overlays::remove_modal(self, cx) {
+            root = root.child(modal);
+        }
+        if let Some(modal) = crate::screens::overlays::share_modal(self, cx) {
             root = root.child(modal);
         }
         root
@@ -730,6 +744,21 @@ mod tests {
         app.restore_version();
         assert!(!app.is_time_travel());
         assert_eq!(app.content, "v1\n");
+    }
+
+    #[test]
+    fn engine_backed_share_opens_ticket_modal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), b"hi\n").unwrap();
+        let eng = Engine::with_identity(Identity::from_seed(&[41u8; 32])).unwrap();
+        let info = eng.add_local_folder(dir.path()).unwrap();
+        let id = info.id.clone();
+        let mut app = AspApp { engine: Some(Rc::new(eng)), ..AspApp::fixture_base(Theme::light()) };
+        app.open_share(&id, "Research");
+        match &app.modal {
+            Modal::ShareVault { ticket, .. } => assert!(ticket.is_some(), "expected a ticket"),
+            other => panic!("expected share modal, got {other:?}"),
+        }
     }
 
     #[test]

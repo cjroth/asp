@@ -53,12 +53,15 @@ pub fn vault_menu(app: &AspApp, cx: &mut Context<AspApp>) -> Option<Div> {
                 cx.notify();
             }),
         ))
-        .child(item("Share this vault…", "share", false).id("menu-share").on_click(cx.listener(
-            |this, _ev, _window, cx| {
-                this.close_menu();
-                cx.notify();
-            },
-        )))
+        .child({
+            let (id, name) = (id.clone(), name.clone());
+            item("Share this vault…", "share", false).id("menu-share").on_click(cx.listener(
+                move |this, _ev, _window, cx| {
+                    this.open_share(&id, &name);
+                    cx.notify();
+                },
+            ))
+        })
         .child(div().h(px(1.0)).my(px(4.0)).mx(px(6.0)).bg(t.line))
         .child({
             let (id, name) = (id.clone(), name.clone());
@@ -74,6 +77,89 @@ pub fn vault_menu(app: &AspApp, cx: &mut Context<AspApp>) -> Option<Div> {
         div().child(
             deferred(anchored().position(point(px(*x), px(*y))).child(menu)).priority(2),
         ),
+    )
+}
+
+/// The "share vault" modal — shows the connection ticket.
+pub fn share_modal(app: &AspApp, cx: &mut Context<AspApp>) -> Option<Div> {
+    let Modal::ShareVault { name, ticket } = &app.modal else {
+        return None;
+    };
+    let t = app.theme;
+    let name = name.clone();
+    let ticket_text = ticket
+        .clone()
+        .unwrap_or_else(|| "Could not start listening.".to_string());
+
+    let card = div()
+        .w(px(424.0))
+        .bg(t.bg)
+        .rounded(px(16.0))
+        .shadow_lg()
+        .p(px(20.0))
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .on_mouse_down_out(cx.listener(|this, _ev, _window, cx| {
+            this.close_modal();
+            cx.notify();
+        }))
+        .child(
+            div()
+                .text_size(px(16.0))
+                .font_weight(FontWeight(600.0))
+                .text_color(t.text)
+                .child(format!("Share “{name}”")),
+        )
+        .child(
+            div()
+                .text_size(px(13.5))
+                .text_color(t.text2)
+                .child("Send this connection code to a peer. They paste it into “Connect Vault” to sync."),
+        )
+        .child(
+            div()
+                .font_family(crate::theme::FONT_MONO)
+                .text_size(px(12.0))
+                .text_color(t.text)
+                .bg(t.bg_input)
+                .border_1()
+                .border_color(t.line)
+                .rounded(px(9.0))
+                .p(px(12.0))
+                .child(ticket_text),
+        )
+        .child(
+            div().mt(px(4.0)).flex().justify_end().child(
+                div()
+                    .id("share-done")
+                    .rounded(px(9.0))
+                    .px(px(14.0))
+                    .py(px(8.0))
+                    .bg(t.text)
+                    .text_color(t.bg)
+                    .text_size(px(13.0))
+                    .font_weight(FontWeight(600.0))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _ev, _window, cx| {
+                        this.close_modal();
+                        cx.notify();
+                    }))
+                    .child("Done"),
+            ),
+        );
+
+    Some(
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(t.overlay)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(card),
     )
 }
 
