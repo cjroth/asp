@@ -291,3 +291,92 @@ fn ticket_advertises_configured_relay_url() {
         "minted ticket must advertise the configured ASP_RELAY_URL relay; got {dbg}"
     );
 }
+
+/// PROBE 11: a real OFFLINE MERGE CONFLICT. Both sides edit the SAME file while
+/// partitioned, then reconnect — the core's deterministic fold must converge
+/// BOTH surfaces to byte-identical content (the CRDT guarantee), keeping
+/// non-overlapping edits and resolving an overlapping one to a single agreed
+/// result. This is the "make changes offline on two devices, go back online,
+/// they converge" scenario, which the one-directional catch-up probe (PROBE 8)
+/// does not cover.
+#[test]
+fn offline_conflicting_edits_to_same_file_converge() {
+    let _g = serial();
+    let p = connected_pair(43, 44);
+
+    // Establish a shared multi-line base for a clean (non-overlapping) merge and a
+    // single-line base for an overlapping (same-region) conflict; let both land on
+    // B over the live link so the two sides share the same base_hash.
+    let clean_base = "header\nalpha\nbeta\ngamma\ndelta\nfooter\n";
+    p.a.write_file(&p.ida, "doc.md", clean_base).unwrap();
+    p.a.write_file(&p.ida, "conflict.md", "shared base line\n").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || p
+            .b
+            .read_file(&p.idb, "doc.md")
+            .map(|c| c == clean_base)
+            .unwrap_or(false)
+            && p.b.read_file(&p.idb, "conflict.md").map(|c| c.contains("shared base")).unwrap_or(false)),
+        "B received the shared base for both files while connected"
+    );
+
+    // GO OFFLINE for real. set_allow_connections(false) only stops NEW dials — it
+    // does not sever B's already-established live connection, so edits would just
+    // serialize over it. To model two genuinely disconnected devices we drop B's
+    // standing connector entirely (remove_vault), then re-open B's folder
+    // STANDALONE (add_local_folder → no peer, no connector). B now has the synced
+    // base on disk but no link to A.
+    p.b.remove_vault(&p.idb, false).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let b_off = p.b.add_local_folder(&p.dirb).unwrap();
+    let idb = b_off.id;
+
+    // While disconnected, BOTH sides edit the SAME files via their engine APIs,
+    // each branching from the shared base (captured in that side's own log).
+    //  - doc.md: A edits the FIRST region, B edits the LAST region (non-overlapping
+    //    → a clean 3-way merge must keep both).
+    //  - conflict.md: both rewrite the single line differently (overlapping → must
+    //    still converge to ONE agreed result on both sides).
+    p.a.write_file(&p.ida, "doc.md", "header\nalpha-EDITED-BY-A\nbeta\ngamma\ndelta\nfooter\n").unwrap();
+    p.a.write_file(&p.ida, "conflict.md", "A's offline version\n").unwrap();
+    p.b.write_file(&idb, "doc.md", "header\nalpha\nbeta\ngamma\ndelta\nfooter-EDITED-BY-B\n").unwrap();
+    p.b.write_file(&idb, "conflict.md", "B's offline version\n").unwrap();
+
+    // GO BACK ONLINE: B runs an explicit oneshot sync against A's (still-listening)
+    // ticket — bidirectional anti-entropy that exchanges both sides' accumulated
+    // offline rows. The deterministic fold then converges both surfaces. Sync twice
+    // so each side both pushes and pulls the other's post-merge state.
+    p.b.sync(&idb, &p.ticket, Some("S")).unwrap();
+
+    // Both surfaces must converge to byte-identical content for each file.
+    let converged = |path: &str| -> bool {
+        match (p.a.read_file(&p.ida, path), p.b.read_file(&idb, path)) {
+            (Ok(ca), Ok(cb)) => ca == cb && !ca.is_empty(),
+            _ => false,
+        }
+    };
+    assert!(
+        wait_until(Duration::from_secs(25), || {
+            // Re-sync each poll until both sides have exchanged and re-folded.
+            let _ = p.b.sync(&idb, &p.ticket, Some("S"));
+            converged("doc.md") && converged("conflict.md")
+        }),
+        "both files converged to identical bytes on A and B after reconnect\n  doc.md A={:?} B={:?}\n  conflict.md A={:?} B={:?}",
+        p.a.read_file(&p.ida, "doc.md"),
+        p.b.read_file(&idb, "doc.md"),
+        p.a.read_file(&p.ida, "conflict.md"),
+        p.b.read_file(&idb, "conflict.md"),
+    );
+
+    // The clean (non-overlapping) merge kept BOTH offline edits.
+    let doc = p.a.read_file(&p.ida, "doc.md").unwrap();
+    assert!(doc.contains("alpha-EDITED-BY-A"), "A's offline edit survived the merge: {doc:?}");
+    assert!(doc.contains("footer-EDITED-BY-B"), "B's offline edit survived the merge: {doc:?}");
+
+    // The overlapping conflict converged to ONE agreed value on both surfaces.
+    let conflict = p.a.read_file(&p.ida, "conflict.md").unwrap();
+    assert!(
+        conflict.contains("offline version"),
+        "conflicting file converged to a concrete merged value: {conflict:?}"
+    );
+}

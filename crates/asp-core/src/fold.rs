@@ -378,6 +378,30 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_disjoint_edits_both_survive_in_the_fold() {
+        // Two devices edit the SAME file from the SAME base, in NON-overlapping
+        // regions, while partitioned (both rows carry base_hash = the base). The
+        // fold's 3-way merge must keep BOTH edits — not pick one wholesale. This
+        // guards the lazy-content fold path (the merge reads `ours` from
+        // content_hash, not an eagerly-stored buffer).
+        let s = crate::store::MemBlobStore::new();
+        let base = "header\nalpha\nbeta\ngamma\ndelta\nfooter\n";
+        let h0 = s.put_blob(base.as_bytes()).unwrap();
+        let create = mkrow("aa", 1, 0, "f1", Kind::Create, None, None, Some(&h0), Some("doc.md"));
+        let ha = s.put_blob(b"header\nalpha-A\nbeta\ngamma\ndelta\nfooter\n").unwrap();
+        let hb = s.put_blob(b"header\nalpha\nbeta\ngamma\ndelta\nfooter-B\n").unwrap();
+        let ea = mkrow("aa", 2, 1, "f1", Kind::Edit, Some(&create.id), Some(&h0), Some(&ha), None);
+        let eb = mkrow("bb", 2, 0, "f1", Kind::Edit, Some(&create.id), Some(&h0), Some(&hb), None);
+        let fwd = compute_files(&s, &[create.clone(), ea.clone(), eb.clone()]).unwrap();
+        let rev = compute_files(&s, &[eb, ea, create]).unwrap();
+        assert_eq!(fwd, rev, "disjoint concurrent edits fold deterministically (order-independent)");
+        let f = fwd.iter().find(|f| f.file_id == "f1" && !f.deleted).unwrap();
+        let merged = String::from_utf8(s.get_blob(f.result_hash.as_ref().unwrap()).unwrap().unwrap()).unwrap();
+        assert!(merged.contains("alpha-A"), "A's edit survived the fold merge: {merged:?}");
+        assert!(merged.contains("footer-B"), "B's edit survived the fold merge: {merged:?}");
+    }
+
+    #[test]
     fn concurrent_dir_entities_dedupe_by_path_no_suffix() {
         let s = crate::store::MemBlobStore::new();
         // Two nodes create the same empty dir (distinct random file_ids).
