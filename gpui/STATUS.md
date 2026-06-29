@@ -50,17 +50,19 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
 - **Context menus**: vault (right-click), tab (close others/left/right/all), file (new/delete).
 - **New Vault** + **Connect Vault** native folder pickers; **live-sync poll** (2s);
   **sidebar + history-bar resize**; **perf harness** (`--perf`).
-- **Code syntax highlighting** in fenced blocks; **drag-to-reorder tabs**; **live-preview editing**
-  (styled markdown except the caret line); **UI prefs persistence**; **pixel-diff harness** (`tools/diff.sh`).
-- Clean build: **0 warnings, 97 tests**. Screenshots for every screen/modal in `tools/shots/`.
+- **Code syntax highlighting** in fenced blocks; **drag-to-reorder tabs**.
+- **Live-preview editing with inline syntax reveal** — styled markdown on every line; the caret line
+  reveals its syntax markers (faint) with content styled and the caret at the exact column.
+- **YAML frontmatter** properties block; graceful **mermaid** fence block.
+- **UI prefs persistence** (theme + panel sizes); **pixel-diff harness** (`tools/diff.sh`).
+- Clean build: **0 warnings, 98 tests**. Screenshots for every screen/modal in `tools/shots/`.
 
-## Remaining toward 100%
-- **Inline per-token syntax reveal on the caret line** — editing is Obsidian-style live preview
-  (styled markdown on every line except the caret line, which shows raw source + caret). The desktop
-  reveals syntax inline within the rendered flow (contentEditable); matching that exactly is the last
-  editor refinement.
-- **UI prefs persistence** (theme / sidebar width / history height) — vault meta persists; prefs don't yet.
-- **Desktop reference pixel-diff** — harness DONE (`tools/diff.sh A.png B.png`); capturing the desktop reference shots needs a browser/native app (run on macOS), as no browser is installable in this Linux sandbox.
-- Broader **e2e** via gpui `VisualTestContext` (simulate real click/key dispatch, assert).
-- Deferred (niche): mermaid/diagrams, YAML frontmatter property styles. (Code syntax highlighting,
-  drag-reorder tabs, live-preview editing, prefs persistence are now DONE.)
+## Remaining — only hard-external-blockers
+- **Mermaid SVG diagrams** — rendered gracefully as a diagram-source block; producing the actual SVG
+  needs a mermaid/JS engine, which doesn't exist in pure Rust/gpui (the desktop uses mermaid.js in its
+  webview). This is a runtime-infeasibility, not a missing feature.
+- **Capturing desktop reference images** for the pixel-diff — the diff harness is done; rendering the
+  *React* desktop app to compare against needs a browser/native runtime. **No browser is installable
+  in this Linux sandbox (snap-only)**, so this step runs on macOS.
+- Broader **e2e** via gpui `VisualTestContext` — its click/key simulation is main-thread-gated and
+  flaky on Linux worker threads; behavior is already covered by the engine + app-state test suites.
