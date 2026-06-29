@@ -146,6 +146,11 @@ export default function App() {
   // folder they take long enough that the UI would otherwise look frozen.
   // The string is the label to show; null hides the overlay.
   const [opening, setOpening] = useState<string | null>(null);
+  // True while the desktop shell is still reopening previously-saved vaults in
+  // the background (see the `vaults-ready` Tauri event). Lets the connect screen
+  // show "Loading your vaults…" instead of a bare empty state on cold start.
+  // Web loads its registry synchronously, so it never enters this state.
+  const [vaultsLoading, setVaultsLoading] = useState(isDesktop());
 
   const [share, setShare] = useState<{ id: string; code: string; requireKey: boolean; accessKey: string; copied: boolean; unavailable?: boolean } | null>(null);
   const [vaultCtx, setVaultCtx] = useState<{ x: number; y: number; id: string; vaultId: string; name: string } | null>(null);
@@ -271,6 +276,11 @@ export default function App() {
     void api.getIdentity().then(setIdentity).catch(() => {});
     void (async () => {
       const vs = await refreshVaults();
+      // Any vaults already available (web registry, or folders the desktop shell
+      // finished reopening before we mounted) means we're not waiting on an empty
+      // cold start — drop the loading hint. The `vaults-ready` event below also
+      // clears it once the background reopen completes.
+      if (vs.length) setVaultsLoading(false);
       // Refresh-restore: on the first mount after a real page load, if the URL
       // hash names a known vault, open it (openVault then picks the hashed file).
       // Works identically on desktop and web — the hash is read the same way.
@@ -292,6 +302,32 @@ export default function App() {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshVaults, refreshStatuses]);
+
+  // The desktop shell reopens previously-saved folders on a background thread and
+  // emits `vaults-ready` when done (so a large saved vault doesn't block first
+  // paint). Refresh the list the moment it fires. Desktop-only; on web the import
+  // resolves but `listen` has no transport, so we swallow it.
+  useEffect(() => {
+    if (!desktop) return;
+    let un: (() => void) | undefined;
+    let cancelled = false;
+    void import('@tauri-apps/api/event')
+      .then(({ listen }) =>
+        listen('vaults-ready', () => {
+          setVaultsLoading(false);
+          void refreshVaults().then(refreshStatuses);
+        }),
+      )
+      .then((u) => {
+        if (cancelled) u();
+        else un = u;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      un?.();
+    };
+  }, [desktop, refreshVaults, refreshStatuses]);
 
   // Persist the active vault's open tabs whenever they change.
   useEffect(() => {
@@ -1363,6 +1399,13 @@ export default function App() {
               <span>Connect Vault</span>
             </button>
           </div>
+
+          {desktop && vaultsLoading && saved.length === 0 && (
+            <div data-testid="vaults-loading" style={{ marginTop: 26, display: 'flex', alignItems: 'center', gap: 10, padding: '14px 15px', border: '1px solid var(--line)', borderRadius: 14, background: 'var(--bg)', color: 'var(--text3)', fontSize: 13 }}>
+              <span style={{ width: 15, height: 15, border: '2px solid var(--faint2)', borderTopColor: 'var(--text2)', borderRadius: '50%', display: 'inline-block', animation: 'aspSpin 0.7s linear infinite', flex: 'none' }} />
+              <span>Loading your vaults…</span>
+            </div>
+          )}
 
           {saved.length > 0 && (
             <>
