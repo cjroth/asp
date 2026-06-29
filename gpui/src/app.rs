@@ -158,8 +158,32 @@ impl AspApp {
             dragging_hist: false,
             polling_started: false,
         };
+        // Apply persisted UI prefs (theme + panel sizes).
+        let prefs = crate::vault::prefs::load_prefs();
+        app.theme = if prefs.theme == theme::Appearance::Dark {
+            Theme::dark()
+        } else {
+            Theme::light()
+        };
+        app.sidebar_w = prefs.sidebar_w;
+        app.hist_bar_h = prefs.hist_bar_h;
         app.refresh_vaults();
         app
+    }
+
+    /// Persist UI prefs (theme + panel sizes). Live app only — fixtures/tests
+    /// (engine = None) must not write to `~/.asp`.
+    fn save_prefs_now(&self) {
+        if self.engine.is_none() {
+            return;
+        }
+        let prefs = crate::vault::prefs::Prefs {
+            theme: self.theme.appearance,
+            sidebar_w: self.sidebar_w,
+            hist_bar_h: self.hist_bar_h,
+            ..Default::default()
+        };
+        crate::vault::prefs::save_prefs(&prefs);
     }
 
     /// Fixture Connect screen (no engine) — for screenshots / visual checks.
@@ -432,6 +456,7 @@ impl AspApp {
             crate::theme::Appearance::Light => Theme::dark(),
             crate::theme::Appearance::Dark => Theme::light(),
         };
+        self.save_prefs_now();
     }
 
     /// Re-list the open vault's files (after a file operation).
@@ -597,8 +622,12 @@ impl AspApp {
     }
 
     pub fn end_drag(&mut self) {
+        let was_dragging = self.dragging_sidebar || self.dragging_hist;
         self.dragging_sidebar = false;
         self.dragging_hist = false;
+        if was_dragging {
+            self.save_prefs_now();
+        }
     }
 
     /// Live-sync poll: pick up peer edits the engine has materialized. Skips while

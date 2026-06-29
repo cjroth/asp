@@ -3,6 +3,7 @@
 //! A `Theme` carries the resolved palette + accent; light/dark mirror the CSS vars.
 
 use gpui::{rgb, rgba, Hsla, Rgba};
+use serde::{Deserialize, Serialize};
 
 /// Font family names. Mono/serif are bundled (see assets); sans falls back to the
 /// platform UI font via the cosmic text system's "sans-serif" alias.
@@ -13,7 +14,7 @@ pub const FONT_MONO: &str = "JetBrains Mono";
 /// The 8 vault accent hues (HSL hue degrees) from the design.
 pub const VAULT_HUES: [f32; 8] = [222.0, 158.0, 32.0, 268.0, 344.0, 188.0, 46.0, 12.0];
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Appearance {
     Light,
     Dark,

@@ -3,16 +3,18 @@
 //! localStorage/DOM bits are the app layer's job; here we keep the data model,
 //! defaults, and the size clamps (pure + tested).
 
+use serde::{Deserialize, Serialize};
+
 use crate::theme::Appearance;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FrontmatterStyle {
     Card,
     Banner,
     Below,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Prefs {
     /// Accent color as 0xRRGGBB (default 0x3d63dd).
     pub accent: u32,
@@ -37,6 +39,30 @@ impl Default for Prefs {
             show_hidden: false,
             pretty_names: false,
         }
+    }
+}
+
+/// Persisted prefs path (`~/.asp/desktop_prefs.json`) — mirrors the desktop's
+/// localStorage `asp.prefs.v1`.
+fn prefs_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home).join(".asp").join("desktop_prefs.json")
+}
+
+pub fn load_prefs() -> Prefs {
+    std::fs::read_to_string(prefs_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_prefs(p: &Prefs) {
+    let path = prefs_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(p) {
+        let _ = std::fs::write(path, s);
     }
 }
 
