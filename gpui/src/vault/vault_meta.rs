@@ -5,10 +5,12 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 /// The 8 swatch hues offered in the Customize modal.
 pub const HUES: [i64; 8] = [222, 158, 32, 268, 344, 188, 46, 12];
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VaultMetaEntry {
     pub name: Option<String>,
     pub hue: f64,
@@ -16,6 +18,30 @@ pub struct VaultMetaEntry {
 }
 
 pub type VaultMetaMap = HashMap<String, VaultMetaEntry>;
+
+/// Path of the persisted per-vault metadata (`~/.asp/desktop_vaultmeta.json`),
+/// keyed by stable `vault_id` — mirrors the desktop's localStorage `asp.vaultmeta.v1`.
+fn meta_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home).join(".asp").join("desktop_vaultmeta.json")
+}
+
+pub fn load_meta() -> VaultMetaMap {
+    std::fs::read_to_string(meta_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_meta(map: &VaultMetaMap) {
+    let p = meta_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(map) {
+        let _ = std::fs::write(p, s);
+    }
+}
 
 /// djb2 over UTF-16 code units, truncated to unsigned 32-bit (matches JS
 /// `((h<<5)+h+charCodeAt(i)) >>> 0`).

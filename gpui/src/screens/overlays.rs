@@ -161,12 +161,15 @@ pub fn vault_menu(app: &AspApp, cx: &mut Context<AspApp>) -> Option<Div> {
             this.close_menu();
             cx.notify();
         }))
-        .child(item("Customize this vault…", "pencil", false).id("menu-customize").on_click(
-            cx.listener(|this, _ev, _window, cx| {
-                this.close_menu();
-                cx.notify();
-            }),
-        ))
+        .child({
+            let id = id.clone();
+            item("Customize this vault…", "pencil", false).id("menu-customize").on_click(
+                cx.listener(move |this, _ev, _window, cx| {
+                    this.open_customize(&id);
+                    cx.notify();
+                }),
+            )
+        })
         .child({
             let (id, name) = (id.clone(), name.clone());
             item("Share this vault…", "share", false).id("menu-share").on_click(cx.listener(
@@ -260,6 +263,142 @@ pub fn share_modal(app: &AspApp, cx: &mut Context<AspApp>) -> Option<Div> {
                         cx.notify();
                     }))
                     .child("Done"),
+            ),
+        );
+
+    Some(
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(t.overlay)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(card),
+    )
+}
+
+/// The "customize vault" modal — rename + pick an accent hue.
+pub fn customize_modal(app: &AspApp, cx: &mut Context<AspApp>) -> Option<Div> {
+    let Modal::Customize { buf, hue, .. } = &app.modal else {
+        return None;
+    };
+    let t = app.theme;
+    let name = buf.text.clone();
+    let cur_hue = *hue;
+
+    let mut field = div()
+        .id("customize-name")
+        .min_h(px(40.0))
+        .w_full()
+        .text_size(px(14.0))
+        .text_color(t.text)
+        .bg(t.bg_input)
+        .border_1()
+        .border_color(t.accent)
+        .rounded(px(9.0))
+        .px(px(12.0))
+        .flex()
+        .items_center();
+    if let Some(f) = app.focus.clone() {
+        field = field.track_focus(&f);
+    }
+    let field = field
+        .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _window, cx| {
+            let ks = &ev.keystroke;
+            match ks.key.as_str() {
+                "backspace" => this.customize_backspace(),
+                _ => {
+                    if !ks.modifiers.control && !ks.modifiers.platform {
+                        if let Some(c) = &ks.key_char {
+                            this.customize_type(c);
+                        }
+                    }
+                }
+            }
+            cx.notify();
+        }))
+        .child(if name.is_empty() {
+            div().text_color(t.faint).child("Vault name")
+        } else {
+            div().child(name)
+        })
+        .child(div().w(px(2.0)).h(px(18.0)).bg(t.accent));
+
+    // Hue swatches.
+    let mut swatches = div().flex().gap(px(8.0)).flex_wrap();
+    for h in crate::vault::vault_meta::HUES {
+        let hf = h as f32;
+        let selected = (cur_hue - hf).abs() < 0.5;
+        swatches = swatches.child(
+            div()
+                .id(("hue", h as usize))
+                .size(px(26.0))
+                .rounded(px(8.0))
+                .bg(crate::theme::vault_avatar_bg(hf))
+                .border_1()
+                .border_color(if selected {
+                    gpui::Hsla::from(t.accent)
+                } else {
+                    crate::theme::vault_avatar_border(hf)
+                })
+                .when(selected, |d| d.border_2())
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _ev, _window, cx| {
+                    this.customize_set_hue(hf);
+                    cx.notify();
+                })),
+        );
+    }
+
+    let card = div()
+        .w(px(424.0))
+        .bg(t.bg)
+        .rounded(px(16.0))
+        .shadow_lg()
+        .p(px(20.0))
+        .flex()
+        .flex_col()
+        .gap(px(14.0))
+        .on_mouse_down_out(cx.listener(|this, _ev, _window, cx| {
+            this.close_modal();
+            cx.notify();
+        }))
+        .child(
+            div()
+                .text_size(px(16.0))
+                .font_weight(FontWeight(600.0))
+                .text_color(t.text)
+                .child("Customize vault"),
+        )
+        .child(field)
+        .child(
+            div()
+                .text_size(px(11.0))
+                .font_weight(FontWeight(600.0))
+                .text_color(t.faint2)
+                .child("ACCENT"),
+        )
+        .child(swatches)
+        .child(
+            div().mt(px(2.0)).flex().justify_end().gap(px(8.0)).child(
+                div()
+                    .id("customize-apply")
+                    .rounded(px(9.0))
+                    .px(px(14.0))
+                    .py(px(8.0))
+                    .bg(t.text)
+                    .text_color(t.bg)
+                    .text_size(px(13.0))
+                    .font_weight(FontWeight(600.0))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _ev, _window, cx| {
+                        this.customize_apply();
+                        cx.notify();
+                    }))
+                    .child("Save"),
             ),
         );
 

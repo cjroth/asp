@@ -151,6 +151,16 @@ fn run_shot(out_path: &str, screen: &str) {
             })
             .expect("open window")
             .into(),
+        "customize-modal" => cx
+            .open_window(win_size, |_, cx| {
+                cx.new(|_| {
+                    let mut a = AspApp::fixture_connect(Theme::light());
+                    a.open_customize("v1");
+                    a
+                })
+            })
+            .expect("open window")
+            .into(),
         "connect-modal" => cx
             .open_window(win_size, |_, cx| {
                 cx.new(|_| {

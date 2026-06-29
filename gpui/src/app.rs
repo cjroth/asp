@@ -26,7 +26,8 @@ pub enum Screen {
 /// View-model for one Connect-screen vault row.
 #[derive(Clone)]
 pub struct ConnectRow {
-    pub id: String, // engine session id (for opening)
+    pub id: String,       // engine session id (for opening)
+    pub vault_id: String, // stable cross-session id (meta key)
     pub name: String,
     pub hue: f32,
     pub emoji: Option<String>,
@@ -45,6 +46,8 @@ pub struct AspApp {
 
     // Connect screen.
     pub connect_rows: Vec<ConnectRow>,
+    /// Persisted per-vault cosmetic metadata, keyed by stable `vault_id`.
+    pub meta: VaultMetaMap,
 
     // Editor screen.
     pub vault_id: Option<String>,
@@ -97,6 +100,12 @@ pub enum Modal {
     RemoveVault { id: String, name: String, trash: bool },
     ShareVault { name: String, ticket: Option<String> },
     ConnectVault { buf: crate::vault::textbuffer::TextBuffer },
+    Customize {
+        vault_id: String,
+        buf: crate::vault::textbuffer::TextBuffer,
+        hue: f32,
+        emoji: Option<String>,
+    },
 }
 
 fn now_secs() -> i64 {
@@ -126,6 +135,7 @@ impl AspApp {
             screen: Screen::Connect,
             is_web: false,
             connect_rows: Vec::new(),
+            meta: vault_meta::load_meta(),
             vault_id: None,
             vault_name: String::new(),
             vault_hue: theme::VAULT_HUES[0],
@@ -157,6 +167,7 @@ impl AspApp {
         let rows = vec![
             ConnectRow {
                 id: "v1".into(),
+                vault_id: "v1".into(),
                 name: "Research Notes".into(),
                 hue: theme::VAULT_HUES[0],
                 emoji: None,
@@ -167,6 +178,7 @@ impl AspApp {
             },
             ConnectRow {
                 id: "v2".into(),
+                vault_id: "v2".into(),
                 name: "Journal".into(),
                 hue: theme::VAULT_HUES[3],
                 emoji: Some("📔".into()),
@@ -177,6 +189,7 @@ impl AspApp {
             },
             ConnectRow {
                 id: "v3".into(),
+                vault_id: "v3".into(),
                 name: "Shared Wiki".into(),
                 hue: theme::VAULT_HUES[1],
                 emoji: None,
@@ -223,6 +236,7 @@ impl AspApp {
             screen: Screen::Connect,
             is_web: false,
             connect_rows: Vec::new(),
+            meta: HashMap::new(),
             vault_id: None,
             vault_name: String::new(),
             vault_hue: theme::VAULT_HUES[0],
@@ -250,7 +264,6 @@ impl AspApp {
     /// Rebuild the Connect rows from live engine data.
     pub fn refresh_vaults(&mut self) {
         let Some(eng) = self.engine.clone() else { return };
-        let meta: VaultMetaMap = HashMap::new(); // persisted meta wired later
         let now = now_secs();
         let mut rows = Vec::new();
         for v in eng.list_vaults() {
@@ -261,9 +274,10 @@ impl AspApp {
                 .and_then(|s| s.to_str())
                 .unwrap_or(&v.path)
                 .to_string();
-            let m = vault_meta::resolve_meta(&meta, &v.vault_id, &base);
+            let m = vault_meta::resolve_meta(&self.meta, &v.vault_id, &base);
             rows.push(ConnectRow {
                 id: v.id.clone(),
+                vault_id: v.vault_id.clone(),
                 name: m.name,
                 hue: m.hue as f32,
                 emoji: m.emoji,
@@ -630,6 +644,53 @@ impl AspApp {
         self.modal = Modal::None;
     }
 
+    /// Open the "customize vault" modal (name + hue), seeded from the row.
+    pub fn open_customize(&mut self, id: &str) {
+        self.menu = Menu::None;
+        if let Some(row) = self.connect_rows.iter().find(|r| r.id == id) {
+            self.modal = Modal::Customize {
+                vault_id: row.vault_id.clone(),
+                buf: crate::vault::textbuffer::TextBuffer::new(row.name.clone()),
+                hue: row.hue,
+                emoji: row.emoji.clone(),
+            };
+        }
+    }
+
+    pub fn customize_type(&mut self, s: &str) {
+        if let Modal::Customize { buf, .. } = &mut self.modal {
+            buf.insert(s);
+        }
+    }
+    pub fn customize_backspace(&mut self) {
+        if let Modal::Customize { buf, .. } = &mut self.modal {
+            buf.backspace();
+        }
+    }
+    pub fn customize_set_hue(&mut self, h: f32) {
+        if let Modal::Customize { hue, .. } = &mut self.modal {
+            *hue = h;
+        }
+    }
+
+    /// Persist the customization (name + hue) keyed by stable `vault_id`.
+    pub fn customize_apply(&mut self) {
+        if let Modal::Customize { vault_id, buf, hue, emoji } = self.modal.clone() {
+            let name = buf.text.trim().to_string();
+            self.meta.insert(
+                vault_id,
+                crate::vault::vault_meta::VaultMetaEntry {
+                    name: if name.is_empty() { None } else { Some(name) },
+                    hue: hue as f64,
+                    emoji,
+                },
+            );
+            crate::vault::vault_meta::save_meta(&self.meta);
+            self.refresh_vaults();
+        }
+        self.modal = Modal::None;
+    }
+
     /// Open the "connect vault" modal (paste a ticket).
     pub fn open_connect(&mut self) {
         self.menu = Menu::None;
@@ -820,6 +881,9 @@ impl Render for AspApp {
         if let Some(modal) = crate::screens::overlays::connect_modal(self, cx) {
             root = root.child(modal);
         }
+        if let Some(modal) = crate::screens::overlays::customize_modal(self, cx) {
+            root = root.child(modal);
+        }
         root
     }
 }
@@ -960,6 +1024,29 @@ mod tests {
         match &app.modal {
             Modal::ShareVault { ticket, .. } => assert!(ticket.is_some(), "expected a ticket"),
             other => panic!("expected share modal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn customize_modal_editing() {
+        let mut a = AspApp::fixture_connect(Theme::light());
+        a.open_customize("v1");
+        match &a.modal {
+            Modal::Customize { vault_id, buf, hue, .. } => {
+                assert_eq!(vault_id, "v1");
+                assert_eq!(buf.text, "Research Notes");
+                assert_eq!(*hue, theme::VAULT_HUES[0]);
+            }
+            other => panic!("expected customize modal, got {other:?}"),
+        }
+        a.customize_backspace(); // delete trailing 's'
+        a.customize_type("X");
+        a.customize_set_hue(158.0);
+        if let Modal::Customize { buf, hue, .. } = &a.modal {
+            assert_eq!(buf.text, "Research NoteX");
+            assert_eq!(*hue, 158.0);
+        } else {
+            panic!("modal changed unexpectedly");
         }
     }
 
