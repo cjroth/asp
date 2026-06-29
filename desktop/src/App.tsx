@@ -140,6 +140,12 @@ export default function App() {
   const [authKey, setAuthKey] = useState('');
   const [connecting, setConnecting] = useState(false);
   const [connectDest, setConnectDest] = useState<string | null>(null);
+  // Non-dismissable "working…" overlay shown while a folder is being added
+  // (capture_rescan hashes every file) or a vault is being opened
+  // (list_files + tree build). Both scale with vault size, so on a large
+  // folder they take long enough that the UI would otherwise look frozen.
+  // The string is the label to show; null hides the overlay.
+  const [opening, setOpening] = useState<string | null>(null);
 
   const [share, setShare] = useState<{ id: string; code: string; requireKey: boolean; accessKey: string; copied: boolean; unavailable?: boolean } | null>(null);
   const [vaultCtx, setVaultCtx] = useState<{ x: number; y: number; id: string; vaultId: string; name: string } | null>(null);
@@ -448,8 +454,25 @@ export default function App() {
   );
 
   // ---------- vault open / switch ----------
+  // Run a potentially-slow open/add operation, showing a non-dismissable
+  // "working…" overlay only if it runs longer than a short threshold — so a
+  // quick vault switch never flashes a spinner, but a large folder (where
+  // capture_rescan / list_files / tree-build take seconds) shows progress
+  // instead of looking frozen. Nesting is safe: the inner call clears the
+  // overlay when its work is done, and the outer's finally is a harmless no-op.
+  const withOpening = useCallback(async (label: string, fn: () => Promise<void>) => {
+    const timer = setTimeout(() => setOpening(label), 140);
+    try {
+      await fn();
+    } finally {
+      clearTimeout(timer);
+      setOpening(null);
+    }
+  }, []);
+
   const openVault = useCallback(
-    async (id: string) => {
+    (id: string) =>
+      withOpening('Opening vault…', async () => {
       await flushSave();
       const fs = await refreshFiles(id);
       const tree = buildTree(fs);
@@ -486,8 +509,8 @@ export default function App() {
       setSelectedPaths(active ? new Set([active]) : new Set());
       setAnchorPath(active);
       scheduleHistory(id);
-    },
-    [flushSave, refreshFiles, scheduleHistory],
+      }),
+    [withOpening, flushSave, refreshFiles, scheduleHistory],
   );
   openVaultRef.current = openVault;
 
@@ -975,15 +998,20 @@ export default function App() {
     try {
       const dir = await open({ directory: true });
       if (typeof dir === 'string') {
-        const info = await api.addLocalFolder(dir);
-        await refreshVaults();
-        await openVault(info.id);
+        // addLocalFolder runs capture_rescan (hashes every file on disk), which
+        // scales with folder size — show the overlay so a large folder doesn't
+        // look frozen. openVault then shows its own (for the list_files step).
+        await withOpening('Opening folder…', async () => {
+          const info = await api.addLocalFolder(dir);
+          await refreshVaults();
+          await openVault(info.id);
+        });
       }
     } catch (err) {
       console.error('open folder failed', err);
       alert('Could not open that folder: ' + String((err as Error)?.message ?? err));
     }
-  }, [openVault, refreshVaults]);
+  }, [openVault, refreshVaults, withOpening]);
 
   const onChooseDest = useCallback(async () => {
     const dir = await open({ directory: true });
@@ -1677,6 +1705,17 @@ export default function App() {
   return (
     <>
       {screen === 'connect' ? renderConnect() : renderEditor()}
+
+      {/* open/add progress overlay — non-dismissable; shown only when an open
+          runs long enough to look frozen (see withOpening). Above every modal. */}
+      {opening && (
+        <div data-testid="opening-overlay" style={{ position: 'fixed', inset: 0, zIndex: 95, background: 'var(--overlay)', backdropFilter: 'blur(2px)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14, background: 'var(--bg)', borderRadius: 16, boxShadow: '0 24px 60px rgba(28,25,23,0.28)', padding: '26px 34px' }}>
+            <span style={{ width: 26, height: 26, border: '3px solid var(--faint2)', borderTopColor: 'var(--text)', borderRadius: '50%', display: 'inline-block', animation: 'aspSpin 0.7s linear infinite' }} />
+            <div style={{ fontSize: 13.5, fontWeight: 500, color: 'var(--text2)' }}>{opening}</div>
+          </div>
+        </div>
+      )}
 
       {/* vault-row context menu (connect screen) */}
       {vaultCtx && (
