@@ -57,6 +57,6 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
   the desktop renders markdown *in place while typing* (contentEditable). This is the single hardest
   remaining piece (≈ Zed-editor-scale) and is the main gap.
 - **UI prefs persistence** (theme / sidebar width / history height) — vault meta persists; prefs don't yet.
-- **Desktop reference pixel-diff** — capture desktop screens (needs a browser/macOS) and diff vs `--shot`.
+- **Desktop reference pixel-diff** — harness DONE (`tools/diff.sh A.png B.png`); capturing the desktop reference shots needs a browser/native app (run on macOS), as no browser is installable in this Linux sandbox.
 - Broader **e2e** via gpui `VisualTestContext` (simulate real click/key dispatch, assert).
 - Deferred: per-language code syntax highlighting, mermaid/diagrams, frontmatter styles, drag-reorder tabs.
