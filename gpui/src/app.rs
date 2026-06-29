@@ -70,6 +70,10 @@ pub struct AspApp {
     pub editing: bool,
     pub buffer: crate::vault::textbuffer::TextBuffer,
     pub focus: Option<gpui::FocusHandle>,
+
+    // Layout (resizable).
+    pub sidebar_w: f32,
+    pub dragging_sidebar: bool,
 }
 
 /// An open context menu (anchored at a click position).
@@ -132,6 +136,8 @@ impl AspApp {
             editing: false,
             buffer: crate::vault::textbuffer::TextBuffer::default(),
             focus: None,
+            sidebar_w: 266.0,
+            dragging_sidebar: false,
         };
         app.refresh_vaults();
         app
@@ -224,6 +230,8 @@ impl AspApp {
             editing: false,
             buffer: crate::vault::textbuffer::TextBuffer::default(),
             focus: None,
+            sidebar_w: 266.0,
+            dragging_sidebar: false,
         }
     }
 
@@ -534,6 +542,23 @@ impl AspApp {
     pub fn close_all_tabs(&mut self) {
         self.tabs.clear();
         self.set_active(None);
+    }
+
+    // -- layout resize --
+
+    pub fn start_sidebar_drag(&mut self) {
+        self.dragging_sidebar = true;
+    }
+
+    /// While dragging, set the sidebar width to the pointer x (clamped).
+    pub fn drag_sidebar(&mut self, x: f32) {
+        if self.dragging_sidebar {
+            self.sidebar_w = crate::vault::prefs::clamp_sidebar(x);
+        }
+    }
+
+    pub fn end_drag(&mut self) {
+        self.dragging_sidebar = false;
     }
 
     /// Open the "share vault" modal — enables connections and shows the ticket.
@@ -888,6 +913,21 @@ mod tests {
         assert_eq!(app.screen, Screen::Editor);
         assert!(app.files.iter().any(|(p, _)| p == "README.md"));
         assert_eq!(app.content, "# Hi\n");
+    }
+
+    #[test]
+    fn sidebar_drag_clamps() {
+        let mut a = AspApp::fixture_editor(Theme::light());
+        a.start_sidebar_drag();
+        a.drag_sidebar(100.0);
+        assert_eq!(a.sidebar_w, 200.0); // min
+        a.drag_sidebar(900.0);
+        assert_eq!(a.sidebar_w, 460.0); // max
+        a.drag_sidebar(320.0);
+        assert_eq!(a.sidebar_w, 320.0);
+        a.end_drag();
+        a.drag_sidebar(100.0); // not dragging → unchanged
+        assert_eq!(a.sidebar_w, 320.0);
     }
 
     #[test]

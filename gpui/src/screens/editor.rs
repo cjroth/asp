@@ -2,7 +2,7 @@
 
 use gpui::{
     div, font, prelude::*, px, Context, Div, Font, FontWeight, Hsla, KeyDownEvent, MouseButton,
-    MouseDownEvent, SharedString, StyledText, TextRun, UnderlineStyle,
+    MouseDownEvent, MouseMoveEvent, SharedString, StyledText, TextRun, UnderlineStyle,
 };
 
 use crate::app::{AspApp, CaretMove};
@@ -24,8 +24,21 @@ pub fn render(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
                 .flex_1()
                 .flex()
                 .min_h(px(0.0))
+                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
+                    if this.dragging_sidebar {
+                        this.drag_sidebar(f32::from(ev.position.x));
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev, _window, cx| {
+                        this.end_drag();
+                        cx.notify();
+                    }),
+                )
                 .child(sidebar(app, cx))
-                .child(resize_handle(app))
+                .child(resize_handle(app, cx))
                 .child(editor_pane(app, cx)),
         )
         .child(history_bar(app, cx))
@@ -34,7 +47,7 @@ pub fn render(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
 fn sidebar(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
     let t = app.theme;
     div()
-        .w(px(266.0))
+        .w(px(app.sidebar_w))
         .flex_none()
         .flex()
         .flex_col()
@@ -248,14 +261,29 @@ fn tree_row(
         )
 }
 
-fn resize_handle(app: &AspApp) -> Div {
+fn resize_handle(app: &AspApp, cx: &mut Context<AspApp>) -> impl IntoElement {
     let t = app.theme;
+    let active = app.dragging_sidebar;
     div()
+        .id("sidebar-resize")
         .w(px(7.0))
         .flex_none()
         .flex()
         .justify_center()
-        .child(div().w(px(1.0)).h_full().bg(t.line))
+        .cursor_col_resize()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _ev, _window, cx| {
+                this.start_sidebar_drag();
+                cx.notify();
+            }),
+        )
+        .child(
+            div()
+                .w(px(1.0))
+                .h_full()
+                .bg(if active { t.accent } else { t.line }),
+        )
 }
 
 fn editor_pane(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
