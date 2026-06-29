@@ -7,7 +7,7 @@
 import { open } from '@tauri-apps/plugin-dialog';
 import { listen } from '@tauri-apps/api/event';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type FileEntry, type HistEvent, type VaultInfo, type VaultStatus } from './lib/api';
+import { api, type ClonePhase, type FileEntry, type HistEvent, type VaultInfo, type VaultStatus } from './lib/api';
 import CustomizeModal, { type CustomizeInit } from './vault/CustomizeModal';
 import FileTree from './vault/FileTree';
 import HistoryBar from './vault/HistoryBar';
@@ -140,6 +140,7 @@ export default function App() {
   const [ticket, setTicket] = useState('');
   const [authKey, setAuthKey] = useState('');
   const [connecting, setConnecting] = useState(false);
+  const [cloneProg, setCloneProg] = useState<{ done: number; total: number; phase: ClonePhase } | null>(null);
   const [connectDest, setConnectDest] = useState<string | null>(null);
 
   const [share, setShare] = useState<{ id: string; code: string; requireKey: boolean; accessKey: string; copied: boolean; unavailable?: boolean } | null>(null);
@@ -1078,8 +1079,11 @@ export default function App() {
       // Desktop needs a destination folder; web clones straight into OPFS.
       if (!t || (desktop && !connectDest)) return;
       setConnecting(true);
+      setCloneProg({ done: 0, total: 0, phase: 'receiving' });
       try {
-        const info = await api.cloneRemote(connectDest || '', t, authKey || undefined);
+        const info = await api.cloneRemote(connectDest || '', t, authKey || undefined, (done, total, phase) =>
+          setCloneProg({ done, total, phase }),
+        );
         setTicket('');
         setAuthKey('');
         setConnectDest(null);
@@ -1090,6 +1094,7 @@ export default function App() {
         console.error('clone failed', err);
       } finally {
         setConnecting(false);
+        setCloneProg(null);
       }
     } else {
       // New vault: desktop adds a chosen folder; web creates a browser (OPFS) vault.
@@ -1813,7 +1818,7 @@ export default function App() {
                 <input autoFocus value={newVaultName} onChange={(e) => setNewVaultName(e.target.value)} spellCheck={false} placeholder="My vault" style={{ fontFamily: 'inherit', fontSize: 14, color: 'var(--text)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '10px 12px', outline: 'none', width: '100%', boxSizing: 'border-box' }} />
               </label>
             )}
-            {entry === 'connect' && (
+            {entry === 'connect' && !cloneProg && (
               <>
                 <label style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
                   <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>Invite code</span>
@@ -1825,7 +1830,34 @@ export default function App() {
                 </label>
               </>
             )}
-            {desktop && (
+            {cloneProg && (() => {
+              const { done, total, phase } = cloneProg;
+              const determinate = phase === 'receiving' && total > 0;
+              const pct = determinate ? Math.min(100, Math.round((done / total) * 100)) : 0;
+              return (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 9, background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 15px' }}>
+                  <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 10 }}>
+                    <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>
+                      {phase === 'saving' ? 'Saving to this device…' : 'Receiving notes…'}
+                    </span>
+                    <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, color: 'var(--faint)' }}>
+                      {determinate ? `${done.toLocaleString()} / ${total.toLocaleString()}` : done > 0 ? done.toLocaleString() : ''}
+                    </span>
+                  </div>
+                  <div style={{ position: 'relative', height: 6, borderRadius: 3, background: 'var(--faint2)', overflow: 'hidden' }}>
+                    {determinate ? (
+                      <div style={{ height: '100%', borderRadius: 3, background: accent, width: `${pct}%`, transition: 'width 0.25s ease' }} />
+                    ) : (
+                      <div style={{ position: 'absolute', top: 0, bottom: 0, width: '40%', borderRadius: 3, background: accent, animation: 'aspIndet 1.1s ease-in-out infinite' }} />
+                    )}
+                  </div>
+                  <span style={{ fontSize: 11.5, color: 'var(--faint)' }}>
+                    {phase === 'saving' ? 'Almost done — writing everything to local storage.' : 'Pulling the vault over a direct connection. Hang tight.'}
+                  </span>
+                </div>
+              );
+            })()}
+            {desktop && !cloneProg && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
                 <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>{entry === 'connect' ? 'Save to' : 'Location'}</span>
                 <div onClick={() => void onChooseDest()} style={{ display: 'flex', alignItems: 'center', gap: 9, background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '10px 13px', cursor: 'pointer' }}>

@@ -9,7 +9,7 @@ import init, { WasmEngine } from 'asp-wasm';
 // `new URL('…', import.meta.url)` breaks under Vite dev: for a linked package it
 // resolves to a `file://` URL the browser refuses to fetch.
 import wasmUrl from 'asp-wasm/asp_wasm_bg.wasm?url';
-import type { Api, FileAt, FileEntry, HistEvent, VaultInfo, VaultStatus } from './api';
+import type { Api, CloneProgress, FileAt, FileEntry, HistEvent, VaultInfo, VaultStatus } from './api';
 import { WELCOME_MD } from '../vault/welcome';
 import { makeCoalescer } from './coalesce';
 
@@ -189,13 +189,25 @@ export function createWebApi(): Api {
       return info({ id, vault_id });
     },
 
-    cloneRemote: async (_dest: string, ticket: string, authKey?: string): Promise<VaultInfo> => {
+    cloneRemote: async (_dest: string, ticket: string, authKey?: string, onProgress?: CloneProgress): Promise<VaultInfo> => {
       await ensureWasm();
       const id = 'w_' + randHex(8);
       const eng = new WasmEngine(await deviceSeed(), ''); // empty → adopt the peer's vault
-      await eng.sync(ticket, authKey ?? null, null);
+      let lastDone = 0;
+      let lastTotal = 0;
+      // Stream catch-up progress to the UI, then flip to the 'saving' phase for the
+      // (one) OPFS write — on a big vault that final write is itself a few seconds.
+      const cb = onProgress
+        ? (done: number, total: number) => {
+            lastDone = done;
+            lastTotal = total;
+            onProgress(done, total, 'receiving');
+          }
+        : undefined;
+      await eng.sync(ticket, authKey ?? null, null, cb);
       const vault_id = eng.vault_id();
       engines.set(id, eng);
+      onProgress?.(lastDone, lastTotal || lastDone, 'saving');
       await persist(id, eng);
       const reg = await registry();
       // Remember the upstream so the poll can keep re-syncing against it — a

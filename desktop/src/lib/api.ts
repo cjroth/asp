@@ -42,13 +42,18 @@ export interface FileAt {
   exists: boolean;
   content: string;
 }
+export type ClonePhase = 'receiving' | 'saving';
+export type CloneProgress = (done: number, total: number, phase: ClonePhase) => void;
 
 export interface Api {
   listVaults(): Promise<VaultInfo[]>;
   addLocalFolder(path: string): Promise<VaultInfo>;
   // Create a fresh browser-storage (OPFS) vault. Web-only.
   createVault(name: string): Promise<VaultInfo>;
-  cloneRemote(dest: string, ticket: string, authKey?: string): Promise<VaultInfo>;
+  // `onProgress` (web clone only) reports catch-up progress so the UI can show a
+  // live bar: `phase` is 'receiving' while pages stream in, then 'saving' while
+  // the state is written to OPFS. `total` may be 0 until the peer's count is known.
+  cloneRemote(dest: string, ticket: string, authKey?: string, onProgress?: CloneProgress): Promise<VaultInfo>;
   setAllowConnections(id: string, on: boolean, authKey?: string): Promise<string | null>;
   // Co-host a local relay so same-machine/LAN peers sync without the public n0
   // relay ("faster local syncing"). Desktop-only; returns the new state.

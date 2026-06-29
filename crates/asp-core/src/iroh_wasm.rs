@@ -74,6 +74,7 @@ pub async fn sync_oneshot(
     ticket: String,
     auth_keys: Vec<String>,
     relay_url: Option<String>,
+    on_progress: &dyn Fn(usize, usize),
 ) -> Result<usize, String> {
     // Parse the ticket first (cheap, fails fast on a malformed/empty ticket
     // before we bind an endpoint or touch the network).
@@ -83,7 +84,7 @@ pub async fn sync_oneshot(
     let seed = eng.device_seed();
     let ep = bind(&seed, relay_url).await?;
 
-    let result = drive(&ep, &eng, addr, auth_keys).await;
+    let result = drive(&ep, &eng, addr, auth_keys, on_progress).await;
     ep.close().await;
     result
 }
@@ -215,6 +216,7 @@ async fn drive(
     eng: &Rc<MemEngine>,
     addr: EndpointAddr,
     auth_keys: Vec<String>,
+    on_progress: &dyn Fn(usize, usize),
 ) -> Result<usize, String> {
     let conn = ep.connect(addr, ALPN).await.map_err(|e| format!("connect: {e}"))?;
     // The listener's key, authenticated by iroh's QUIC handshake — the Session
@@ -244,7 +246,11 @@ async fn drive(
     eng.set_batch(true);
     let result: Result<usize, String> = async {
         let mut integrated = 0usize;
+        // The listener's version vector (its first frame) tells us how many rows
+        // exist, so the UI can show a real "x of N" progress bar during catch-up.
+        let mut total = 0usize;
         let mut synced = false;
+        on_progress(0, 0);
         loop {
             let frame = match read_frame(&mut recv).await? {
                 Some(f) => f,
@@ -254,6 +260,10 @@ async fn drive(
                 Ok(m) => m,
                 Err(_) => continue,
             };
+            if let Msg::Vector { vv } = &msg {
+                // seqs are 0-based per site, so a site's row count is max_seq + 1.
+                total = vv.values().map(|v| (*v + 1).max(0) as usize).sum();
+            }
             let steps = session.on_msg(&**eng, msg).map_err(|e| e.to_string())?;
             let mut done = false;
             for step in steps {
@@ -261,7 +271,10 @@ async fn drive(
                     Step::Send(m) => {
                         write_frame(&mut send, &m.to_bytes().map_err(|e| e.to_string())?).await?
                     }
-                    Step::Integrated(rows) => integrated += rows.len(),
+                    Step::Integrated(rows) => {
+                        integrated += rows.len();
+                        on_progress(integrated, total.max(integrated));
+                    }
                     Step::Closed(reason) => return Err(reason),
                     Step::PeerSynced => {
                         synced = true;

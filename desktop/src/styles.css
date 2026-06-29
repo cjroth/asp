@@ -28,6 +28,8 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
 
 @keyframes aspPulse { 0%, 100% { opacity: 1 } 50% { opacity: .32 } }
 @keyframes aspSpin { to { transform: rotate(360deg) } }
+/* Indeterminate progress sweep (clone "saving" phase / before the row count is known). */
+@keyframes aspIndet { 0% { left: -40% } 100% { left: 100% } }
 
 /* Tab strip — stays horizontally scrollable (trackpad/drag reaches far tabs) but
    hides the scrollbar entirely (cross-browser), so the strip's scrollbar gutter

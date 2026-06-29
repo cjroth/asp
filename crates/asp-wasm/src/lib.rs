@@ -270,12 +270,30 @@ impl WasmEngine {
     /// `relay_url` overrides the default public relays (e.g. a private/test relay).
     /// The whole connect+drive lives in one owned future (no borrow of `self`), so
     /// it satisfies wasm-bindgen's `'static` requirement.
+    /// `on_progress(done, total)` (optional) is invoked as catch-up pages land so
+    /// the UI can show real clone progress; `total` is the peer's row count (from
+    /// its version vector), `done` the rows integrated so far.
     #[cfg(target_arch = "wasm32")]
-    pub fn sync(&self, ticket: String, auth_key: Option<String>, relay_url: Option<String>) -> js_sys::Promise {
+    pub fn sync(
+        &self,
+        ticket: String,
+        auth_key: Option<String>,
+        relay_url: Option<String>,
+        on_progress: Option<js_sys::Function>,
+    ) -> js_sys::Promise {
         let eng = self.eng.clone();
         let auth_keys: Vec<String> = auth_key.into_iter().collect();
         wasm_bindgen_futures::future_to_promise(async move {
-            asp_core::iroh_wasm::sync_oneshot(eng, ticket, auth_keys, relay_url)
+            let cb = move |done: usize, total: usize| {
+                if let Some(f) = &on_progress {
+                    let _ = f.call2(
+                        &wasm_bindgen::JsValue::NULL,
+                        &wasm_bindgen::JsValue::from_f64(done as f64),
+                        &wasm_bindgen::JsValue::from_f64(total as f64),
+                    );
+                }
+            };
+            asp_core::iroh_wasm::sync_oneshot(eng, ticket, auth_keys, relay_url, &cb)
                 .await
                 .map(|n| wasm_bindgen::JsValue::from_f64(n as f64))
                 .map_err(|e| wasm_bindgen::JsValue::from_str(&e))
