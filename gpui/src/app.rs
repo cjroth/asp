@@ -56,6 +56,11 @@ pub struct AspApp {
     pub tabs: Vec<String>,
     pub active: Option<String>,
     pub content: String,
+
+    // History / time-travel.
+    pub history_events: Vec<crate::vault::history::TrackEvent>,
+    /// When `Some(unix_secs)`, the editor shows the vault as-of that time (read-only).
+    pub playhead: Option<i64>,
 }
 
 fn now_secs() -> i64 {
@@ -94,6 +99,8 @@ impl AspApp {
             tabs: Vec::new(),
             active: None,
             content: String::new(),
+            history_events: Vec::new(),
+            playhead: None,
         };
         app.refresh_vaults();
         app
@@ -179,6 +186,8 @@ impl AspApp {
             tabs: Vec::new(),
             active: None,
             content: String::new(),
+            history_events: Vec::new(),
+            playhead: None,
         }
     }
 
@@ -236,7 +245,71 @@ impl AspApp {
             }
         }
         self.vault_id = Some(id.to_string());
+        self.playhead = None;
+        self.load_history(id);
         self.screen = Screen::Editor;
+    }
+
+    /// Load the vault's history into track events (unix-seconds → ms model).
+    fn load_history(&mut self, id: &str) {
+        self.history_events.clear();
+        if let Some(eng) = self.engine.clone() {
+            if let Ok(hist) = eng.history(id) {
+                let tuples: Vec<(String, i64, String, String)> = hist
+                    .into_iter()
+                    .map(|e| (e.id, e.ts, e.kind, e.path))
+                    .collect();
+                self.history_events = crate::vault::history::build_events(&tuples);
+            }
+        }
+    }
+
+    /// Re-read the active file's LIVE content (exits any time-travel view).
+    fn reload_active(&mut self) {
+        if let (Some(eng), Some(vid), Some(p)) =
+            (self.engine.clone(), self.vault_id.clone(), self.active.clone())
+        {
+            self.content = eng.read_file(&vid, &p).unwrap_or_default();
+        }
+    }
+
+    /// True when viewing a past version (read-only).
+    pub fn is_time_travel(&self) -> bool {
+        self.playhead.is_some()
+    }
+
+    /// View the active file as-of `ts_secs` (read-only time-travel).
+    pub fn time_travel_to(&mut self, ts_secs: i64) {
+        self.playhead = Some(ts_secs);
+        if let (Some(eng), Some(vid), Some(p)) =
+            (self.engine.clone(), self.vault_id.clone(), self.active.clone())
+        {
+            match eng.read_file_at(&vid, &p, ts_secs) {
+                Ok(at) if at.exists => self.content = at.content,
+                _ => self.content.clear(),
+            }
+        }
+    }
+
+    /// Exit time-travel, returning to the live (now) version.
+    pub fn return_to_now(&mut self) {
+        self.playhead = None;
+        self.reload_active();
+    }
+
+    /// Restore the active file to the currently-viewed past version.
+    pub fn restore_version(&mut self) {
+        if let (Some(eng), Some(vid), Some(p), Some(ts)) = (
+            self.engine.clone(),
+            self.vault_id.clone(),
+            self.active.clone(),
+            self.playhead,
+        ) {
+            let _ = eng.restore_file_at(&vid, &p, ts);
+            self.playhead = None;
+            self.load_history(&vid);
+            self.reload_active();
+        }
     }
 
     /// Select a file in the tree → load its content + open a tab.
@@ -445,6 +518,43 @@ mod tests {
         app.delete_file("untitled.md");
         assert!(!app.files.iter().any(|(p, _)| p == "untitled.md"));
         assert!(!app.tabs.iter().any(|t| t == "untitled.md"));
+    }
+
+    #[test]
+    fn engine_backed_time_travel_and_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), b"v1\n").unwrap();
+        let eng = Engine::with_identity(Identity::from_seed(&[13u8; 32])).unwrap();
+        let info = eng.add_local_folder(dir.path()).unwrap();
+        let id = info.id.clone();
+        let mut app = AspApp { engine: Some(Rc::new(eng)), ..AspApp::fixture_base(Theme::light()) };
+        app.refresh_vaults();
+        app.open_vault(&id);
+        assert_eq!(app.content, "v1\n");
+        assert!(!app.history_events.is_empty());
+
+        let pre = app.history_events.iter().map(|e| (e.ts / 1000.0) as i64).max().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        app.engine.clone().unwrap().write_file(&id, "README.md", "v2\n").unwrap();
+        app.load_history(&id);
+        app.reload_active();
+        assert_eq!(app.content, "v2\n");
+
+        // travel to the pre-edit second → old content, read-only.
+        app.time_travel_to(pre);
+        assert!(app.is_time_travel());
+        assert_eq!(app.content, "v1\n");
+
+        // back to now → latest content.
+        app.return_to_now();
+        assert!(!app.is_time_travel());
+        assert_eq!(app.content, "v2\n");
+
+        // restore the old version → it becomes the live content.
+        app.time_travel_to(pre);
+        app.restore_version();
+        assert!(!app.is_time_travel());
+        assert_eq!(app.content, "v1\n");
     }
 
     #[test]

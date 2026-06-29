@@ -28,7 +28,7 @@ pub fn render(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
                 .child(resize_handle(app))
                 .child(editor_pane(app, cx)),
         )
-        .child(history_bar(app))
+        .child(history_bar(app, cx))
 }
 
 fn sidebar(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
@@ -246,14 +246,80 @@ fn resize_handle(app: &AspApp) -> Div {
 }
 
 fn editor_pane(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
-    div()
+    let mut pane = div()
         .flex_1()
         .min_w(px(0.0))
         .flex()
         .flex_col()
         .child(tab_bar(app, cx))
-        .child(status_row(app))
-        .child(editor_body(app))
+        .child(status_row(app));
+    if app.is_time_travel() {
+        pane = pane.child(time_travel_banner(app, cx));
+    }
+    pane.child(editor_body(app))
+}
+
+fn time_travel_banner(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
+    let t = app.theme;
+    let when = app
+        .playhead
+        .map(|ts| crate::vault::history::fmt_full(ts as f64 * 1000.0))
+        .unwrap_or_default();
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(12.0))
+        .px(px(18.0))
+        .py(px(9.0))
+        .bg(t.accent_alpha(0.13))
+        .border_b_1()
+        .border_color(t.accent)
+        .child(icon("clock", px(14.0), t.accent))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .text_size(px(12.5))
+                .text_color(t.text2)
+                .child(format!("Viewing this vault as it was on {when} · read-only")),
+        )
+        .child(
+            div()
+                .id("restore-version")
+                .rounded(px(7.0))
+                .px(px(12.0))
+                .py(px(6.0))
+                .bg(t.accent)
+                .text_color(t.bg)
+                .text_size(px(12.0))
+                .font_weight(FontWeight(500.0))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _ev, _window, cx| {
+                    this.restore_version();
+                    cx.notify();
+                }))
+                .child("Restore this version"),
+        )
+        .child(
+            div()
+                .id("return-to-now")
+                .rounded(px(7.0))
+                .px(px(12.0))
+                .py(px(6.0))
+                .border_1()
+                .border_color(t.line)
+                .bg(t.bg)
+                .text_color(t.text2)
+                .text_size(px(12.0))
+                .font_weight(FontWeight(500.0))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _ev, _window, cx| {
+                    this.return_to_now();
+                    cx.notify();
+                }))
+                .child("Return to now"),
+        )
 }
 
 fn tab_bar(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
@@ -548,8 +614,29 @@ fn styled(
     StyledText::new(s).with_runs(runs)
 }
 
-fn history_bar(app: &AspApp) -> Div {
+fn now_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0)
+}
+
+fn kind_color(t: &Theme, kind: &str) -> gpui::Rgba {
+    match kind {
+        "create" => t.create,
+        "rename" => t.rename,
+        "delete" | "reclass" => t.delete,
+        _ => t.edit,
+    }
+}
+
+fn history_bar(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
     let t = app.theme;
+    let now = now_ms();
+    let label = match app.playhead {
+        Some(ts) => crate::vault::history::fmt_full(ts as f64 * 1000.0),
+        None => "now".to_string(),
+    };
     let status = div()
         .h(px(38.0))
         .flex_none()
@@ -559,31 +646,70 @@ fn history_bar(app: &AspApp) -> Div {
         .pl(px(15.0))
         .pr(px(9.0))
         .child(icon("clock", px(14.0), t.faint))
-        .child(div().text_size(px(12.0)).text_color(t.text2).child("History · now"))
+        .child(div().text_size(px(12.0)).text_color(t.text2).child(format!("History · {label}")))
         .child(div().flex_1())
         .child(round_btn(app, "minus"))
         .child(round_btn(app, "plus"));
 
     let mut ticks = div().relative().flex_1().h_full();
-    let positions = [0.08f32, 0.21, 0.34, 0.52, 0.67, 0.79, 0.93];
-    let colors = [t.create, t.edit, t.edit, t.rename, t.edit, t.delete, t.edit];
-    for (i, p) in positions.iter().enumerate() {
-        ticks = ticks.child(
-            div()
-                .absolute()
-                .top(px(14.0))
-                .left(gpui::relative(*p))
-                .w(px(2.0))
-                .h(px(34.0))
-                .rounded(px(1.0))
-                .bg(colors[i % colors.len()]),
-        );
+
+    if app.history_events.is_empty() {
+        // Decorative ticks for the fixture (no engine / no history yet).
+        let positions = [0.08f32, 0.21, 0.34, 0.52, 0.67, 0.79, 0.93];
+        let colors = [t.create, t.edit, t.edit, t.rename, t.edit, t.delete, t.edit];
+        for (i, p) in positions.iter().enumerate() {
+            ticks = ticks.child(
+                div()
+                    .absolute()
+                    .top(px(14.0))
+                    .left(gpui::relative(*p))
+                    .w(px(2.0))
+                    .h(px(34.0))
+                    .rounded(px(1.0))
+                    .bg(colors[i % colors.len()]),
+            );
+        }
+    } else {
+        // Real, clickable event ticks positioned by the ported timeline geometry.
+        let view = crate::vault::history::default_view(now);
+        for (i, e) in app.history_events.iter().enumerate() {
+            let pct = crate::vault::history::to_pct(e.ts, view);
+            if !(0.0..=100.0).contains(&pct) {
+                continue;
+            }
+            let ts_secs = (e.ts / 1000.0) as i64;
+            ticks = ticks.child(
+                div()
+                    .id(SharedString::from(format!("tick-{i}")))
+                    .absolute()
+                    .top(px(10.0))
+                    .left(gpui::relative(pct as f32 / 100.0))
+                    .w(px(6.0))
+                    .h(px(40.0))
+                    .flex()
+                    .justify_center()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _ev, _window, cx| {
+                        this.time_travel_to(ts_secs);
+                        cx.notify();
+                    }))
+                    .child(div().w(px(2.0)).h_full().rounded(px(1.0)).bg(kind_color(&t, &e.kind))),
+            );
+        }
     }
+
+    // Playhead line — at the time-travel instant, else at "now".
+    let view = crate::vault::history::default_view(now);
+    let head_pct = crate::vault::history::to_pct(
+        app.playhead.map(|ts| ts as f64 * 1000.0).unwrap_or(now),
+        view,
+    );
+    let head_pct = head_pct.clamp(0.0, 100.0) as f32 / 100.0;
     ticks = ticks.child(
         div()
             .absolute()
             .top(px(8.0))
-            .right(px(0.0))
+            .left(gpui::relative(head_pct))
             .w(px(2.0))
             .h(px(46.0))
             .rounded(px(1.0))
