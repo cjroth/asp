@@ -7,10 +7,10 @@ Native Rust/gpui port of the Context Desktop vault editor (`../desktop`). Goal:
 ```bash
 cd gpui
 cargo build -j4                              # build (needs cmake; vendored zed at /home/chris/asp/.gpui-vendor/zed)
-cargo test -j4                               # 97 tests (pure-logic parity + engine + app behavior)
+cargo test -j4                               # 104 tests (pure-logic parity + engine + app behavior)
 # headless pixel screenshot of any screen (no display needed):
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
-  ./target/debug/asp-gpui --shot out.png <screen>   # connect | connect-dark | editor | editor-dark
+  ./target/debug/asp-gpui --shot out.png <screen>   # connect[-dark|-web] | editor[-dark|-edit|-mermaid] | {remove,share,connect,customize}-modal
 ./target/debug/asp-gpui                      # live app (needs a display)
 ```
 
@@ -29,7 +29,7 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
   `format, tree, tabs, history, pretty_names, vault_meta, markdown, prefs, log`.
 - `docs/` — `DESIGN_SPEC.md`, `FEATURE_SPEC.md`, `PLAN.md`.
 
-## Done (verified — 84 tests pass)
+## Done (verified — 104 tests pass, 0 warnings)
 - Headless **offscreen pixel capture** on Linux (wgpu render-to-texture; vendored+patched zed).
 - **Connect** + **Editor** screens, light + dark, close visual match (screenshots in tools/shots).
 - **Stateful interactive app**: open vault → editor, select file (loads content), tabs
