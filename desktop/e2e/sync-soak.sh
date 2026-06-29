@@ -11,7 +11,9 @@
 #   bash e2e/sync-soak.sh            # default battery
 #   ROUNDS=500 PEERS=2 bash e2e/sync-soak.sh 1 2 3   # custom seeds
 set -uo pipefail
-ROOT=/home/chris/asp
+# Repo root, derived from this script's location (e2e/ lives at <root>/desktop/e2e)
+# so the battery runs from any checkout, not just one hardcoded path.
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 BIN="$ROOT/target/release/examples/sync_fuzz"
 ROUNDS=${ROUNDS:-250}
 STREAK=${STREAK:-10}

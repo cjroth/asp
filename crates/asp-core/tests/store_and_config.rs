@@ -131,4 +131,17 @@ fn store_row_and_version_queries() {
     let page = s.rows_after_page(&site, -1, 1).unwrap();
     assert!(page.len() <= 1);
     assert!(all.len() >= page.len());
+
+    // Cheap aggregates the status poll relies on (never load every row/file).
+    // max_ts matches the max ts across all rows; live_file_count matches the
+    // live (non-deleted) materialized file count.
+    assert_eq!(s.max_ts().unwrap(), s.all_rows().unwrap().iter().map(|r| r.ts).max());
+    assert_eq!(
+        s.live_file_count().unwrap(),
+        s.live_files().unwrap().iter().filter(|f| !f.deleted).count() as u64
+    );
+    assert_eq!(s.live_file_count().unwrap(), 2);
+    // A delete drops the live count (tombstones are not live).
+    e.record_remove("a.md").unwrap();
+    assert_eq!(s.live_file_count().unwrap(), 1);
 }

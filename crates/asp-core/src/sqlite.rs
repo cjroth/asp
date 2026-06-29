@@ -161,6 +161,21 @@ impl SqliteStore {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM log", [], |r| r.get::<_, i64>(0))? as u64)
     }
 
+    /// Wall-clock timestamp of the most recent log row (for "last synced"), or
+    /// `None` for an empty log. A single aggregate — never load every row just
+    /// to take a max (the status poll runs periodically on the active vault).
+    pub fn max_ts(&self) -> AspResult<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(ts) FROM log", [], |r| r.get::<_, Option<i64>>(0))?)
+    }
+
+    /// Count of live (non-deleted) materialized files — a single aggregate, so
+    /// the status poll never materializes every `FileRow` just to count them.
+    pub fn live_file_count(&self) -> AspResult<u64> {
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM files WHERE deleted=0", [], |r| r.get::<_, i64>(0))? as u64)
+    }
+
     /// Next Lamport tick = max(observed) + 1, derived from the durable log.
     pub fn next_lamport(&self, observed: u64) -> AspResult<u64> {
         let max_log: i64 = self
@@ -185,17 +200,29 @@ impl SqliteStore {
     // ----- materialized files -----
 
     pub fn replace_files(&self, files: &[FileRow]) -> AspResult<()> {
-        self.conn.execute("DELETE FROM files", [])?;
-        for f in files {
-            self.conn.execute(
+        // ONE transaction for the whole rewrite. Without it, every INSERT
+        // auto-commits its own WAL transaction — at 10k+ files that per-row
+        // commit overhead dominated `materialize` (≈585ms of an 824ms write at
+        // 10k files), making every save O(vault) in commits. A single
+        // transaction + a cached prepared statement collapses that to one
+        // commit. `unchecked_transaction` is safe here: `replace_files` is only
+        // called inside `materialize`, which holds the engine lock, so there is
+        // never a nested/concurrent transaction on this connection.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM files", [])?;
+        {
+            let mut stmt = tx.prepare_cached(
                 "INSERT INTO files(file_id, path, result_hash, merge_class, deleted, lamport, site_id, conflict)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![
+            )?;
+            for f in files {
+                stmt.execute(params![
                     f.file_id, f.path, f.result_hash, f.merge_class.as_str(),
                     f.deleted as i64, f.lamport as i64, f.site_id, f.conflict as i64
-                ],
-            )?;
+                ])?;
+            }
         }
+        tx.commit()?;
         Ok(())
     }
 
