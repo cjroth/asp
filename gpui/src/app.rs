@@ -65,6 +65,11 @@ pub struct AspApp {
     // Transient overlays.
     pub menu: Menu,
     pub modal: Modal,
+
+    // Editing.
+    pub editing: bool,
+    pub buffer: crate::vault::textbuffer::TextBuffer,
+    pub focus: Option<gpui::FocusHandle>,
 }
 
 /// An open context menu (anchored at a click position).
@@ -121,6 +126,9 @@ impl AspApp {
             playhead: None,
             menu: Menu::None,
             modal: Modal::None,
+            editing: false,
+            buffer: crate::vault::textbuffer::TextBuffer::default(),
+            focus: None,
         };
         app.refresh_vaults();
         app
@@ -210,6 +218,9 @@ impl AspApp {
             playhead: None,
             menu: Menu::None,
             modal: Modal::None,
+            editing: false,
+            buffer: crate::vault::textbuffer::TextBuffer::default(),
+            focus: None,
         }
     }
 
@@ -268,6 +279,7 @@ impl AspApp {
         }
         self.vault_id = Some(id.to_string());
         self.playhead = None;
+        self.editing = false;
         self.load_history(id);
         self.screen = Screen::Editor;
     }
@@ -303,6 +315,7 @@ impl AspApp {
     /// View the active file as-of `ts_secs` (read-only time-travel).
     pub fn time_travel_to(&mut self, ts_secs: i64) {
         self.playhead = Some(ts_secs);
+        self.editing = false;
         if let (Some(eng), Some(vid), Some(p)) =
             (self.engine.clone(), self.vault_id.clone(), self.active.clone())
         {
@@ -337,6 +350,7 @@ impl AspApp {
     /// Select a file in the tree → load its content + open a tab.
     pub fn select_file(&mut self, path: &str) {
         self.active = Some(path.to_string());
+        self.editing = false;
         self.tabs = tabs::with_tab(&self.tabs, path);
         if let (Some(eng), Some(vid)) = (self.engine.clone(), self.vault_id.clone()) {
             self.content = eng.read_file(&vid, path).unwrap_or_default();
@@ -481,10 +495,94 @@ impl AspApp {
         }
         self.modal = Modal::None;
     }
+
+    // -- editing --
+
+    /// Enter edit mode for the active file (no-op during time-travel).
+    pub fn begin_edit(&mut self) {
+        if self.is_time_travel() || self.active.is_none() {
+            return;
+        }
+        self.buffer = crate::vault::textbuffer::TextBuffer::new(self.content.clone());
+        self.editing = true;
+    }
+
+    pub fn stop_edit(&mut self) {
+        self.editing = false;
+    }
+
+    /// Push the buffer into `content` and persist via the engine.
+    fn after_edit(&mut self) {
+        self.content = self.buffer.text.clone();
+        if let (Some(eng), Some(vid), Some(p)) =
+            (self.engine.clone(), self.vault_id.clone(), self.active.clone())
+        {
+            let _ = eng.write_file(&vid, &p, &self.content);
+        }
+    }
+
+    pub fn type_text(&mut self, s: &str) {
+        if !self.editing {
+            return;
+        }
+        self.buffer.insert(s);
+        self.after_edit();
+    }
+
+    pub fn editor_backspace(&mut self) {
+        if !self.editing {
+            return;
+        }
+        self.buffer.backspace();
+        self.after_edit();
+    }
+
+    pub fn editor_delete(&mut self) {
+        if !self.editing {
+            return;
+        }
+        self.buffer.delete();
+        self.after_edit();
+    }
+
+    pub fn editor_newline(&mut self) {
+        if !self.editing {
+            return;
+        }
+        self.buffer.insert("\n");
+        self.after_edit();
+    }
+
+    pub fn editor_move(&mut self, dir: CaretMove) {
+        if !self.editing {
+            return;
+        }
+        match dir {
+            CaretMove::Left => self.buffer.move_left(),
+            CaretMove::Right => self.buffer.move_right(),
+            CaretMove::Up => self.buffer.move_up(),
+            CaretMove::Down => self.buffer.move_down(),
+            CaretMove::Home => self.buffer.home(),
+            CaretMove::End => self.buffer.end(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum CaretMove {
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
 }
 
 impl Render for AspApp {
     fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.focus.is_none() {
+            self.focus = Some(cx.focus_handle());
+        }
         let screen_el: AnyElement = match self.screen {
             Screen::Connect => connect::render(self, cx).into_any_element(),
             Screen::Editor => editor::render(self, cx).into_any_element(),
@@ -642,6 +740,40 @@ mod tests {
         assert_eq!(app.modal, Modal::None);
         assert!(app.connect_rows.is_empty());
         assert!(app.engine.clone().unwrap().list_vaults().is_empty());
+    }
+
+    #[test]
+    fn engine_backed_editing_types_and_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), b"hello").unwrap();
+        let eng = Engine::with_identity(Identity::from_seed(&[21u8; 32])).unwrap();
+        let info = eng.add_local_folder(dir.path()).unwrap();
+        let id = info.id.clone();
+        let mut app = AspApp { engine: Some(Rc::new(eng)), ..AspApp::fixture_base(Theme::light()) };
+        app.refresh_vaults();
+        app.open_vault(&id);
+        assert_eq!(app.content, "hello");
+
+        app.begin_edit();
+        assert!(app.editing);
+        app.type_text(" world");
+        assert_eq!(app.content, "hello world");
+        // edits persist to the engine immediately.
+        assert_eq!(app.engine.clone().unwrap().read_file(&id, "a.md").unwrap(), "hello world");
+
+        app.editor_backspace();
+        assert_eq!(app.content, "hello worl");
+        app.editor_newline();
+        assert_eq!(app.content, "hello worl\n");
+
+        // navigating away exits edit mode.
+        app.select_file("a.md");
+        assert!(!app.editing);
+
+        // can't edit while time-travelling.
+        app.time_travel_to(0);
+        app.begin_edit();
+        assert!(!app.editing);
     }
 
     #[test]

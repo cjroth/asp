@@ -104,6 +104,16 @@ fn run_shot(out_path: &str, screen: &str) {
             .open_window(win_size, |_, cx| cx.new(|_| AspApp::fixture_editor(Theme::dark())))
             .expect("open window")
             .into(),
+        "editor-edit" => cx
+            .open_window(win_size, |_, cx| {
+                cx.new(|_| {
+                    let mut a = AspApp::fixture_editor(Theme::light());
+                    a.begin_edit();
+                    a
+                })
+            })
+            .expect("open window")
+            .into(),
         _ => cx
             .open_window(win_size, |_, cx| cx.new(|_| AspApp::fixture_connect(Theme::light())))
             .expect("open window")

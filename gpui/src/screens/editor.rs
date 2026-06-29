@@ -1,11 +1,11 @@
 //! Editor screen — data-driven over `AspApp` (see DESIGN_SPEC.md §4–5).
 
 use gpui::{
-    div, font, prelude::*, px, Context, Div, Font, FontWeight, Hsla, SharedString, StyledText,
-    TextRun, UnderlineStyle,
+    div, font, prelude::*, px, Context, Div, Font, FontWeight, Hsla, KeyDownEvent, SharedString,
+    StyledText, TextRun, UnderlineStyle,
 };
 
-use crate::app::AspApp;
+use crate::app::{AspApp, CaretMove};
 use crate::icons::icon;
 use crate::theme::{self, Theme, FONT_MONO, FONT_SERIF};
 use crate::vault::markdown::{self, Inline, Line};
@@ -256,7 +256,7 @@ fn editor_pane(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
     if app.is_time_travel() {
         pane = pane.child(time_travel_banner(app, cx));
     }
-    pane.child(editor_body(app))
+    pane.child(editor_body(app, cx))
 }
 
 fn time_travel_banner(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
@@ -442,7 +442,26 @@ fn status_row(app: &AspApp) -> Div {
         )
 }
 
-fn editor_body(app: &AspApp) -> impl IntoElement {
+fn editor_body(app: &AspApp, cx: &mut Context<AspApp>) -> impl IntoElement {
+    let body = if app.editing {
+        edit_surface(app, cx).into_any_element()
+    } else {
+        rendered_surface(app, cx).into_any_element()
+    };
+
+    div()
+        .id("editor-scroll")
+        .flex_1()
+        .min_h(px(0.0))
+        .flex()
+        .justify_center()
+        .items_start()
+        .overflow_y_scroll()
+        .child(body)
+}
+
+/// Read-mode: the live markdown render. Clicking enters edit mode.
+fn rendered_surface(app: &AspApp, cx: &mut Context<AspApp>) -> impl IntoElement {
     let t = app.theme;
     let mut prose = div()
         .w(px(760.0))
@@ -455,21 +474,100 @@ fn editor_body(app: &AspApp) -> impl IntoElement {
         .font_family(FONT_SERIF)
         .text_size(px(15.5))
         .text_color(t.text);
-
-    // Live markdown render — one block per source line (see markdown.rs).
     for line in markdown::parse(&app.content) {
         prose = prose.child(render_line(&t, &line));
     }
-
+    let editable = app.active.is_some() && !app.is_time_travel();
     div()
-        .id("editor-scroll")
-        .flex_1()
-        .min_h(px(0.0))
-        .flex()
-        .justify_center()
-        .items_start()
-        .overflow_y_scroll()
+        .id("prose")
+        .when(editable, |d| {
+            d.cursor_text().on_click(cx.listener(|this, _ev, window, cx| {
+                this.begin_edit();
+                if let Some(f) = this.focus.clone() {
+                    window.focus(&f, cx);
+                }
+                cx.notify();
+            }))
+        })
         .child(prose)
+}
+
+/// Edit-mode: raw source in the prose font with a caret; receives key input.
+fn edit_surface(app: &AspApp, cx: &mut Context<AspApp>) -> impl IntoElement {
+    let t = app.theme;
+    let text = &app.buffer.text;
+    let cur = app.buffer.cursor.min(text.len());
+    let before = &text[..cur];
+    let cur_line = before.matches('\n').count();
+
+    let mut col = div()
+        .w(px(760.0))
+        .max_w_full()
+        .flex()
+        .flex_col()
+        .pt(px(44.0))
+        .px(px(40.0))
+        .pb(px(140.0))
+        .font_family(FONT_SERIF)
+        .text_size(px(15.5))
+        .text_color(t.text);
+
+    let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    for (i, line) in text.split('\n').enumerate() {
+        let row = if i == cur_line {
+            // split the caret line at the cursor column
+            let in_line = cur - line_start;
+            let (pre, post) = line.split_at(in_line.min(line.len()));
+            div()
+                .flex()
+                .line_height(px(28.0))
+                .child(div().child(pre.to_string()))
+                .child(div().w(px(2.0)).h(px(22.0)).bg(t.accent).mt(px(3.0)))
+                .child(div().child(post.to_string()))
+        } else if line.is_empty() {
+            div().h(px(28.0))
+        } else {
+            div().line_height(px(28.0)).child(line.to_string())
+        };
+        col = col.child(row);
+    }
+
+    let focus = app.focus.clone();
+    let mut surface = div().id("edit-surface");
+    if let Some(f) = focus {
+        surface = surface.track_focus(&f);
+    }
+    surface
+        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+            handle_key(this, ev);
+            cx.notify();
+        }))
+        .child(col)
+}
+
+fn handle_key(app: &mut AspApp, ev: &KeyDownEvent) {
+    let ks = &ev.keystroke;
+    match ks.key.as_str() {
+        "backspace" => app.editor_backspace(),
+        "delete" => app.editor_delete(),
+        "enter" => app.editor_newline(),
+        "left" => app.editor_move(CaretMove::Left),
+        "right" => app.editor_move(CaretMove::Right),
+        "up" => app.editor_move(CaretMove::Up),
+        "down" => app.editor_move(CaretMove::Down),
+        "home" => app.editor_move(CaretMove::Home),
+        "end" => app.editor_move(CaretMove::End),
+        "escape" => app.stop_edit(),
+        _ => {
+            if !ks.modifiers.control && !ks.modifiers.platform && !ks.modifiers.function {
+                if let Some(ch) = &ks.key_char {
+                    if !ch.is_empty() {
+                        app.type_text(ch);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Render one parsed markdown `Line` to a styled gpui block.
