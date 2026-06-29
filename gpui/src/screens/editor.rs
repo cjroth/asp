@@ -728,6 +728,34 @@ fn render_line(t: &Theme, line: &Line) -> Div {
                     .child(if text.is_empty() { " ".to_string() } else { text.clone() }),
             }
         }
+        Line::Front { key, value } => {
+            let is_array = value.starts_with('[') && value.ends_with(']');
+            div()
+                .flex()
+                .gap(px(10.0))
+                .line_height(px(26.0))
+                .child(
+                    div()
+                        .min_w(px(92.0))
+                        .flex_none()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight(600.0))
+                        .text_color(t.faint)
+                        .child(key.to_uppercase()),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(if is_array { t.accent } else { t.text })
+                        .child(value.clone()),
+                )
+        }
+        Line::FrontDivider => div()
+            .mt(px(6.0))
+            .mb(px(18.0))
+            .border_b_1()
+            .border_color(t.line)
+            .h(px(1.0)),
         Line::Para(spans) => div()
             .line_height(px(28.0))
             .child(styled(t, spans, Hsla::from(t.text), FontWeight::NORMAL, false)),

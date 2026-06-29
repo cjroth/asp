@@ -28,7 +28,17 @@ pub enum Line {
     /// A code line. `lang` is `None` for the ``` fence markers, `Some(lang)` for
     /// content inside a fence (empty string when no language was specified).
     Code { text: String, lang: Option<String> },
+    /// A YAML frontmatter property (key + value); rendered as a properties block.
+    Front { key: String, value: String },
+    /// The divider closing the frontmatter block.
+    FrontDivider,
     Para(Vec<Inline>),
+}
+
+/// True when `src` opens with a `---` YAML frontmatter block.
+pub fn has_frontmatter(src: &str) -> bool {
+    let mut lines = src.split('\n');
+    lines.next().map(|l| l.trim()) == Some("---") && lines.any(|l| l.trim() == "---")
 }
 
 /// Heading font sizes by level (1..=4), from the design.
@@ -49,9 +59,31 @@ fn leading_spaces(s: &str) -> usize {
 /// content + fence markers as `Code` lines).
 pub fn parse(src: &str) -> Vec<Line> {
     let mut out = Vec::new();
+    let lines: Vec<&str> = src.split('\n').collect();
+
+    // Leading YAML frontmatter (--- … ---) → a properties block.
+    let mut start = 0;
+    if lines.first().map(|l| l.trim()) == Some("---") {
+        if let Some(end) = (1..lines.len()).find(|&j| lines[j].trim() == "---") {
+            for line in &lines[1..end] {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    out.push(Line::Front { key: k.trim().to_string(), value: v.trim().to_string() });
+                } else {
+                    out.push(Line::Front { key: String::new(), value: line.trim().to_string() });
+                }
+            }
+            out.push(Line::FrontDivider);
+            start = end + 1;
+        }
+    }
+
     let mut in_fence = false;
     let mut fence_lang = String::new();
-    for ln in src.split('\n') {
+    for ln in &lines[start..] {
+        let ln = *ln;
         if ln.trim_start().starts_with("```") {
             if in_fence {
                 in_fence = false;
@@ -365,6 +397,17 @@ mod tests {
         assert_eq!(fence[0], Line::Code { text: "```rust".into(), lang: None });
         assert_eq!(fence[1], Line::Code { text: "let x = 1;".into(), lang: Some("rust".into()) });
         assert_eq!(fence[2], Line::Code { text: "```".into(), lang: None });
+    }
+
+    #[test]
+    fn frontmatter_block() {
+        assert!(has_frontmatter("---\ntitle: Hi\n---\nbody"));
+        assert!(!has_frontmatter("no front\n---\n"));
+        let ls = parse("---\ntitle: My Note\ntags: [a, b]\n---\n# Body");
+        assert_eq!(ls[0], Line::Front { key: "title".into(), value: "My Note".into() });
+        assert_eq!(ls[1], Line::Front { key: "tags".into(), value: "[a, b]".into() });
+        assert_eq!(ls[2], Line::FrontDivider);
+        assert!(matches!(ls[3], Line::Heading { level: 1, .. }));
     }
 
     #[test]
