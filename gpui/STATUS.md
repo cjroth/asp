@@ -65,9 +65,9 @@ empty Connect screen: **1.075% differing pixels (98.9% identical)** — residual
 image surfaced + I fixed two real bugs: theme icon was inverted (light should show a sun) and the
 web platform indicator square should be faint, not accent.
 
-## Remaining — hard-external-blockers
-- **Mermaid SVG diagrams** — rendered gracefully as a diagram-source block; producing the actual SVG
-  needs a mermaid/JS engine, which doesn't exist in pure Rust/gpui (the desktop uses mermaid.js in its
-  webview). This is a runtime-infeasibility, not a missing feature.
+## Mermaid — native flowchart rendering
+Common `graph TD; A[Foo] --> B[Bar]` flowcharts parse (`vault::mermaid`, tested) and render as native
+node boxes + arrows. Full mermaid.js parity (DAG auto-layout, sequence/gantt/class diagrams) would
+need the mermaid.js engine, which can't run in pure Rust/gpui — out of scope for a native port.
 - Broader e2e is DONE — a `#[gpui::test]` dispatches a REAL mouse click over the editor vault-switcher
   and asserts the wired gpui event→listener→state path drives Editor→Connect (runs on Linux).

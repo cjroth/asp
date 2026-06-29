@@ -151,6 +151,16 @@ fn run_shot(out_path: &str, screen: &str) {
             })
             .expect("open window")
             .into(),
+        "editor-mermaid" => cx
+            .open_window(win_size, |_, cx| {
+                cx.new(|_| {
+                    let mut a = AspApp::fixture_editor(Theme::light());
+                    a.content = "# Flow\n\n```mermaid\ngraph TD\nStart[Open vault] --> Edit[Edit note]\nEdit -->|save| Sync[Sync to peers]\n```".into();
+                    a
+                })
+            })
+            .expect("open window")
+            .into(),
         "connect-web" => cx
             .open_window(win_size, |_, cx| {
                 cx.new(|_| {

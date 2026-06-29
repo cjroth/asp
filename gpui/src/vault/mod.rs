@@ -7,6 +7,7 @@ pub mod highlight;
 pub mod history;
 pub mod log;
 pub mod markdown;
+pub mod mermaid;
 pub mod prefs;
 pub mod pretty_names;
 pub mod tabs;

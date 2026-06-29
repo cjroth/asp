@@ -728,11 +728,9 @@ fn render_line(t: &Theme, line: &Line) -> Div {
                 // Mermaid: native SVG diagram rendering needs a mermaid/JS engine
                 // (not available in pure Rust/gpui), so show the source as a
                 // distinct accent-barred "diagram" block instead of plain code.
-                Some(l) if l == "mermaid" => base
-                    .border_l_2()
-                    .border_color(t.accent)
-                    .text_color(t.text2)
-                    .child(if text.is_empty() { " ".to_string() } else { text.clone() }),
+                Some(l) if l == "mermaid" => {
+                    base.border_l_2().border_color(t.accent).child(mermaid_line(*t, text))
+                }
                 Some(l) if !l.is_empty() => base.child(code_line(*t, text, l)),
                 _ => base
                     .text_color(t.faint)
@@ -835,6 +833,41 @@ fn inline_reveal(t: Theme, raw: &str) -> StyledText {
         runs.push(TextRun { len: 1, font: serif(FontWeight::NORMAL, false), color: base, ..Default::default() });
     }
     StyledText::new(s).with_runs(runs)
+}
+
+/// Render one mermaid flowchart line as native node boxes + arrows (best-effort;
+/// full mermaid layout needs the mermaid.js engine — see `vault::mermaid`).
+fn mermaid_line(t: Theme, text: &str) -> Div {
+    use crate::vault::mermaid::{parse_line, Item};
+    let node_box = |label: String| {
+        div()
+            .px(px(10.0))
+            .py(px(3.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(t.accent)
+            .bg(t.bg)
+            .text_color(t.text)
+            .child(label)
+    };
+    match parse_line(text) {
+        Item::Directive(d) => div().text_size(px(10.5)).text_color(t.faint2).child(d),
+        Item::Node { label } => div().flex().child(node_box(label)),
+        Item::Edge { from, to, label } => {
+            let arrow = match label {
+                Some(l) => format!("──{l}──▶"),
+                None => "──▶".to_string(),
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(node_box(from))
+                .child(div().text_color(t.faint).child(arrow))
+                .child(node_box(to))
+        }
+        Item::Raw(r) => div().text_color(t.faint).child(if r.is_empty() { " ".into() } else { r }),
+    }
 }
 
 /// Build a syntax-highlighted `StyledText` for one code line.
