@@ -725,6 +725,14 @@ fn render_line(t: &Theme, line: &Line) -> Div {
                 .px(px(12.0))
                 .bg(t.bg_input);
             match lang {
+                // Mermaid: native SVG diagram rendering needs a mermaid/JS engine
+                // (not available in pure Rust/gpui), so show the source as a
+                // distinct accent-barred "diagram" block instead of plain code.
+                Some(l) if l == "mermaid" => base
+                    .border_l_2()
+                    .border_color(t.accent)
+                    .text_color(t.text2)
+                    .child(if text.is_empty() { " ".to_string() } else { text.clone() }),
                 Some(l) if !l.is_empty() => base.child(code_line(*t, text, l)),
                 _ => base
                     .text_color(t.faint)
