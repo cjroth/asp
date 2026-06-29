@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS authorized_keys(
   added_at INTEGER, source TEXT
 );
 CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT);
+-- Per-file (mtime, size) -> content hash cache, so the startup reconcile can skip
+-- reading + hashing files whose stat is unchanged (the dominant cost on a big
+-- working tree). Purely a local performance cache: never synced, and a miss only
+-- costs a re-read, so it can be dropped at any time without affecting correctness.
+CREATE TABLE IF NOT EXISTS fs_stat(path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL, hash TEXT NOT NULL);
 "#;
 
 pub struct SqliteStore {
@@ -265,6 +270,44 @@ impl SqliteStore {
         let tx = self.conn.unchecked_transaction()?;
         for id in file_ids {
             tx.execute("DELETE FROM files WHERE file_id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load the (mtime_ns, size, content_hash) reconcile cache: path -> stat+hash.
+    pub fn load_fs_stat(&self) -> AspResult<std::collections::HashMap<String, (i64, i64, String)>> {
+        let mut stmt = self.conn.prepare("SELECT path, mtime_ns, size, hash FROM fs_stat")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?)))
+        })?;
+        Ok(rows.collect::<Result<std::collections::HashMap<_, _>, _>>()?)
+    }
+
+    /// Record the stat+hash for files (re)read during a scan (one txn = one fsync).
+    pub fn upsert_fs_stat(&self, entries: &[(String, i64, i64, String)]) -> AspResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for (path, mtime_ns, size, hash) in entries {
+            tx.execute(
+                "INSERT OR REPLACE INTO fs_stat(path, mtime_ns, size, hash) VALUES (?1,?2,?3,?4)",
+                params![path, mtime_ns, size, hash],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop reconcile-cache entries for paths no longer on disk (kept in sync).
+    pub fn delete_fs_stat(&self, paths: &[String]) -> AspResult<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for p in paths {
+            tx.execute("DELETE FROM fs_stat WHERE path = ?1", params![p])?;
         }
         tx.commit()?;
         Ok(())

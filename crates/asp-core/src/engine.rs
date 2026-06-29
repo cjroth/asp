@@ -89,6 +89,51 @@ fn load_or_create_site_id(asp_dir: &Path) -> AspResult<String> {
 
 pub use crate::log::classify;
 
+/// A file's disk state for the reconcile diff: its content hash (reused from the
+/// stat cache when the file is unchanged, else computed from a fresh read) and
+/// its bytes — present only when we actually read it this scan (a changed/new
+/// file, or a cache miss). Unchanged files carry just the cached hash, no bytes.
+struct DiskEntry {
+    hash: String,
+    size: usize,
+    bytes: Option<Vec<u8>>,
+}
+
+/// One walked file: its relative path, absolute path, and stat (mtime + size) —
+/// the key the reconcile cache is matched on.
+struct FileStat {
+    rel: String,
+    abs: PathBuf,
+    mtime_ns: i64,
+    size: i64,
+}
+
+/// Read + content-hash a set of files in parallel (the changed/new subset of a
+/// scan). Returns (rel, mtime_ns, size, bytes, hash) per successfully read file;
+/// unreadable files are dropped (treated as absent), as before.
+fn read_and_hash(files: &[FileStat]) -> Vec<(String, i64, i64, Vec<u8>, String)> {
+    let read_chunk = |chunk: &[FileStat]| {
+        chunk
+            .iter()
+            .filter_map(|f| {
+                fs::read(&f.abs).ok().map(|b| {
+                    let h = crate::oid::content_hash(&b);
+                    (f.rel.clone(), f.mtime_ns, f.size, b, h)
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    if workers <= 1 || files.len() < 64 {
+        return read_chunk(files);
+    }
+    let chunk_size = files.len().div_ceil(workers).max(1);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = files.chunks(chunk_size).map(|chunk| s.spawn(move || read_chunk(chunk))).collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).flatten().collect()
+    })
+}
+
 impl Engine {
     /// Open or create the engine at a vault root, authoring as `identity` (the
     /// device connection key) under a per-vault `site_id`.
@@ -454,6 +499,10 @@ impl Engine {
             self.store.delete_file_rows(&removed_ids)?;
         }
 
+        // Stat each file we (re)write so the reconcile cache knows its content
+        // without a re-read on the next reopen — e.g. a freshly-cloned big vault
+        // reopens instantly instead of re-hashing every materialized file.
+        let mut fs_updates: Vec<(String, i64, i64, String)> = Vec::new();
         for f in &changed {
             let prev = old.get(&f.file_id);
             // A file/dir whose live path went away (rename or delete) is removed
@@ -497,8 +546,18 @@ impl Engine {
                 let tmp = abs.with_extension(format!("asp-tmp-{}", now_unix()));
                 fs::write(&tmp, &bytes)?;
                 fs::rename(&tmp, &abs)?;
+                if let Ok(md) = fs::metadata(&abs) {
+                    let mtime_ns = md
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or(0);
+                    fs_updates.push((f.path.clone(), mtime_ns, md.len() as i64, h.clone()));
+                }
             }
         }
+        self.store.upsert_fs_stat(&fs_updates)?;
 
         if aspignore_changed {
             self.reload_scope();
@@ -587,7 +646,7 @@ impl Engine {
         Ok(authored)
     }
 
-    fn capture_rescan_inner(&self, on_disk: &BTreeMap<String, Vec<u8>>) -> AspResult<Vec<WireRow>> {
+    fn capture_rescan_inner(&self, on_disk: &BTreeMap<String, DiskEntry>) -> AspResult<Vec<WireRow>> {
         // Content files vs directory entities are tracked separately: directories
         // are first-class, content-free entities (§Capture: empty directories).
         let (live_files, live_dirs): (Vec<FileRow>, Vec<FileRow>) =
@@ -610,8 +669,11 @@ impl Engine {
                         disappeared.push(path.clone());
                     }
                 }
-                Some(bytes) => {
-                    if f.result_hash.as_deref() != Some(crate::oid::content_hash(bytes).as_str()) {
+                Some(de) => {
+                    // Compare against the (cached or freshly computed) disk hash —
+                    // no re-hashing here; the scan already did it for read files and
+                    // skipped it for unchanged ones.
+                    if f.result_hash.as_deref() != Some(de.hash.as_str()) {
                         changed.push(path.clone());
                     }
                 }
@@ -624,9 +686,9 @@ impl Engine {
         // non-trivial content only).
         let mut by_hash: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for a in &appeared {
-            if let Some(bytes) = on_disk.get(a) {
-                if bytes.len() > 8 {
-                    by_hash.entry(crate::oid::content_hash(bytes)).or_default().push(a.clone());
+            if let Some(de) = on_disk.get(a) {
+                if de.size > 8 {
+                    by_hash.entry(de.hash.clone()).or_default().push(a.clone());
                 }
             }
         }
@@ -667,10 +729,18 @@ impl Engine {
         appeared.retain(|a| !consumed_appeared.contains(a));
 
         for path in changed.iter().chain(appeared.iter()) {
-            if let Some(bytes) = on_disk.get(path) {
-                if let Some(wr) = self.record_write(path, bytes)? {
-                    authored.push(wr);
-                }
+            // Authoring needs the bytes. A changed/new file was read this scan, so
+            // they're in hand; the rare exception (an on-disk file the cache let us
+            // skip yet the log doesn't have) reads on demand so we never miss it.
+            let bytes: std::borrow::Cow<[u8]> = match on_disk.get(path).and_then(|d| d.bytes.as_ref()) {
+                Some(b) => std::borrow::Cow::Borrowed(b.as_slice()),
+                None => match fs::read(self.root.join(path)) {
+                    Ok(b) => std::borrow::Cow::Owned(b),
+                    Err(_) => continue,
+                },
+            };
+            if let Some(wr) = self.record_write(path, &bytes)? {
+                authored.push(wr);
             }
         }
         for d in still_disappeared {
@@ -788,49 +858,50 @@ impl Engine {
     }
 
     /// Walk the in-scope working tree into a `rel_path -> bytes` map.
-    pub fn scan_disk(&self) -> AspResult<BTreeMap<String, Vec<u8>>> {
-        // Walk the tree first (cheap: directory listing + ignore checks, no file
-        // bodies), then read the bodies in parallel. A big working tree is tens of
-        // thousands of small files whose read cost is dominated by per-file syscall
-        // / IO latency, which overlaps across cores — the startup reconcile's read
-        // of careerbot's 481MB/29k files drops several-fold this way. Same walk,
-        // same ignore scope, same result as the old serial `scan_dir`.
-        let mut paths: Vec<(String, PathBuf)> = Vec::new();
-        self.collect_files(&self.root, &mut paths)?;
+    pub fn scan_disk(&self) -> AspResult<BTreeMap<String, DiskEntry>> {
+        // Walk + stat every file (cheap), then read the body ONLY of files whose
+        // (mtime, size) changed since we last hashed them. On a big working tree
+        // that the user hasn't touched externally, the startup reconcile becomes
+        // ~one stat per file instead of reading + SHA-256-hashing every byte
+        // (careerbot: 481MB/29k files → tens of seconds → ~one walk). The cache is
+        // a pure local accelerator: a miss just re-reads, so it never affects
+        // correctness or convergence.
+        let mut files: Vec<FileStat> = Vec::new();
+        self.collect_files(&self.root, &mut files)?;
 
-        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        if workers <= 1 || paths.len() < 128 {
-            let mut out = BTreeMap::new();
-            for (rel, abs) in &paths {
-                if let Ok(bytes) = fs::read(abs) {
-                    out.insert(rel.clone(), bytes);
+        let cache = self.store.load_fs_stat()?;
+        let mut out: BTreeMap<String, DiskEntry> = BTreeMap::new();
+        let mut to_read: Vec<FileStat> = Vec::new();
+        for fstat in files {
+            match cache.get(&fstat.rel) {
+                // Unchanged stat → trust the cached content hash, skip the read.
+                Some((m, sz, h)) if *m == fstat.mtime_ns && *sz == fstat.size => {
+                    out.insert(fstat.rel, DiskEntry { hash: h.clone(), size: fstat.size.max(0) as usize, bytes: None });
                 }
+                _ => to_read.push(fstat),
             }
-            return Ok(out);
         }
 
-        let chunk_size = paths.len().div_ceil(workers);
-        let parts: Vec<Vec<(String, Vec<u8>)>> = std::thread::scope(|s| {
-            let handles: Vec<_> = paths
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    s.spawn(move || {
-                        chunk
-                            .iter()
-                            .filter_map(|(rel, abs)| fs::read(abs).ok().map(|b| (rel.clone(), b)))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            handles.into_iter().filter_map(|h| h.join().ok()).collect()
-        });
-        Ok(parts.into_iter().flatten().collect())
+        // Read (+ hash) the changed/new files in parallel — reads dominate.
+        let read = read_and_hash(&to_read);
+        let mut updates: Vec<(String, i64, i64, String)> = Vec::with_capacity(read.len());
+        for (rel, mtime_ns, size, bytes, hash) in read {
+            updates.push((rel.clone(), mtime_ns, size, hash.clone()));
+            out.insert(rel, DiskEntry { hash, size: bytes.len(), bytes: Some(bytes) });
+        }
+
+        // Keep the cache in sync: record what we just read, drop vanished paths.
+        self.store.upsert_fs_stat(&updates)?;
+        let vanished: Vec<String> = cache.keys().filter(|p| !out.contains_key(*p)).cloned().collect();
+        self.store.delete_fs_stat(&vanished)?;
+        Ok(out)
     }
 
-    /// Walk the working tree collecting (rel_path, abs_path) for every non-ignored
-    /// file — no file bodies read here, so it's cheap. Directory recursion and the
-    /// ignore scope are resolved exactly as the old recursive `scan_dir` did.
-    fn collect_files(&self, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> AspResult<()> {
+    /// Walk the working tree collecting each non-ignored file's relative + absolute
+    /// path and its stat (mtime, size). One `metadata()` per entry (it follows
+    /// symlinks, exactly as the old `is_dir`/`is_file` did) yields the kind and the
+    /// stat together. No file bodies are read here, so it stays cheap.
+    fn collect_files(&self, dir: &Path, out: &mut Vec<FileStat>) -> AspResult<()> {
         let entries = match fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return Ok(()),
@@ -844,10 +915,20 @@ impl Engine {
             if self.scope.borrow().ignored(&rel) {
                 continue;
             }
-            if path.is_dir() {
+            let md = match path.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if md.is_dir() {
                 self.collect_files(&path, out)?;
-            } else if path.is_file() {
-                out.push((rel, path));
+            } else if md.is_file() {
+                let mtime_ns = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0);
+                out.push(FileStat { rel, abs: path, mtime_ns, size: md.len() as i64 });
             }
         }
         Ok(())
