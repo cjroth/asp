@@ -7,7 +7,7 @@ Native Rust/gpui port of the Context Desktop vault editor (`../desktop`). Goal:
 ```bash
 cd gpui
 cargo build -j4                              # build (needs cmake; vendored zed at /home/chris/asp/.gpui-vendor/zed)
-cargo test -j4                               # 74 tests (pure-logic parity + engine + app behavior)
+cargo test -j4                               # 97 tests (pure-logic parity + engine + app behavior)
 # headless pixel screenshot of any screen (no display needed):
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
   ./target/debug/asp-gpui --shot out.png <screen>   # connect | connect-dark | editor | editor-dark
@@ -50,13 +50,17 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
 - **Context menus**: vault (right-click), tab (close others/left/right/all), file (new/delete).
 - **New Vault** + **Connect Vault** native folder pickers; **live-sync poll** (2s);
   **sidebar + history-bar resize**; **perf harness** (`--perf`).
-- Clean build: **0 warnings, 92 tests**. Screenshots for every screen/modal in `tools/shots/`.
+- **Code syntax highlighting** in fenced blocks; **drag-to-reorder tabs**; **live-preview editing**
+  (styled markdown except the caret line); **UI prefs persistence**; **pixel-diff harness** (`tools/diff.sh`).
+- Clean build: **0 warnings, 97 tests**. Screenshots for every screen/modal in `tools/shots/`.
 
 ## Remaining toward 100%
-- **Live WYSIWYG-while-typing** — editing currently shows the raw source (with a caret) and saves;
-  the desktop renders markdown *in place while typing* (contentEditable). This is the single hardest
-  remaining piece (≈ Zed-editor-scale) and is the main gap.
+- **Inline per-token syntax reveal on the caret line** — editing is Obsidian-style live preview
+  (styled markdown on every line except the caret line, which shows raw source + caret). The desktop
+  reveals syntax inline within the rendered flow (contentEditable); matching that exactly is the last
+  editor refinement.
 - **UI prefs persistence** (theme / sidebar width / history height) — vault meta persists; prefs don't yet.
 - **Desktop reference pixel-diff** — harness DONE (`tools/diff.sh A.png B.png`); capturing the desktop reference shots needs a browser/native app (run on macOS), as no browser is installable in this Linux sandbox.
 - Broader **e2e** via gpui `VisualTestContext` (simulate real click/key dispatch, assert).
-- Deferred: per-language code syntax highlighting, mermaid/diagrams, frontmatter styles, drag-reorder tabs.
+- Deferred (niche): mermaid/diagrams, YAML frontmatter property styles. (Code syntax highlighting,
+  drag-reorder tabs, live-preview editing, prefs persistence are now DONE.)
