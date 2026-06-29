@@ -77,6 +77,8 @@ pub struct AspApp {
 pub enum Menu {
     None,
     Vault { id: String, name: String, x: f32, y: f32 },
+    Tab { path: String, x: f32, y: f32 },
+    File { path: String, is_dir: bool, x: f32, y: f32 },
 }
 
 /// An open modal dialog.
@@ -475,8 +477,63 @@ impl AspApp {
         self.menu = Menu::Vault { id: id.to_string(), name: name.to_string(), x, y };
     }
 
+    pub fn open_tab_menu(&mut self, path: &str, x: f32, y: f32) {
+        self.menu = Menu::Tab { path: path.to_string(), x, y };
+    }
+
+    pub fn open_file_menu(&mut self, path: &str, is_dir: bool, x: f32, y: f32) {
+        self.menu = Menu::File { path: path.to_string(), is_dir, x, y };
+    }
+
     pub fn close_menu(&mut self) {
         self.menu = Menu::None;
+    }
+
+    /// Set the active file (loading its content) — no-op if already active.
+    fn set_active(&mut self, path: Option<String>) {
+        if self.active == path {
+            return;
+        }
+        self.active = path;
+        self.editing = false;
+        match (&self.active, self.engine.clone(), self.vault_id.clone()) {
+            (Some(p), Some(eng), Some(vid)) => {
+                self.content = eng.read_file(&vid, p).unwrap_or_default()
+            }
+            _ => self.content.clear(),
+        }
+    }
+
+    /// Ensure `active` is still an open tab; if not, pick the last one (or none).
+    fn reconcile_active(&mut self) {
+        let still_open = self
+            .active
+            .as_ref()
+            .map(|a| self.tabs.iter().any(|t| t == a))
+            .unwrap_or(false);
+        if !still_open {
+            self.set_active(self.tabs.last().cloned());
+        }
+    }
+
+    pub fn close_others(&mut self, path: &str) {
+        self.tabs = tabs::close_others(&self.tabs, path);
+        self.set_active(Some(path.to_string()));
+    }
+
+    pub fn close_to_left(&mut self, path: &str) {
+        self.tabs = tabs::close_to_left(&self.tabs, path);
+        self.reconcile_active();
+    }
+
+    pub fn close_to_right(&mut self, path: &str) {
+        self.tabs = tabs::close_to_right(&self.tabs, path);
+        self.reconcile_active();
+    }
+
+    pub fn close_all_tabs(&mut self) {
+        self.tabs.clear();
+        self.set_active(None);
     }
 
     /// Open the "share vault" modal — enables connections and shows the ticket.
@@ -610,6 +667,12 @@ impl Render for AspApp {
         };
         let mut root = div().relative().size_full().child(screen_el);
         if let Some(menu) = crate::screens::overlays::vault_menu(self, cx) {
+            root = root.child(menu);
+        }
+        if let Some(menu) = crate::screens::overlays::tab_menu(self, cx) {
+            root = root.child(menu);
+        }
+        if let Some(menu) = crate::screens::overlays::file_menu(self, cx) {
             root = root.child(menu);
         }
         if let Some(modal) = crate::screens::overlays::remove_modal(self, cx) {
@@ -825,6 +888,31 @@ mod tests {
         assert_eq!(app.screen, Screen::Editor);
         assert!(app.files.iter().any(|(p, _)| p == "README.md"));
         assert_eq!(app.content, "# Hi\n");
+    }
+
+    #[test]
+    fn tab_close_variants() {
+        let base = AspApp::fixture_editor(Theme::light());
+        // close others → only the kept tab + it's active
+        let mut a = AspApp { ..AspApp::fixture_editor(Theme::light()) };
+        a.close_others("notes/ideas.md");
+        assert_eq!(a.tabs, vec!["notes/ideas.md".to_string()]);
+        assert_eq!(a.active.as_deref(), Some("notes/ideas.md"));
+        // close to right of README → only README
+        let mut a = AspApp { ..AspApp::fixture_editor(Theme::light()) };
+        a.close_to_right("README.md");
+        assert_eq!(a.tabs, vec!["README.md".to_string()]);
+        // close to left of last → only last; active (was README) reconciles to it
+        let mut a = AspApp { ..AspApp::fixture_editor(Theme::light()) };
+        a.close_to_left("notes/todo.md");
+        assert_eq!(a.tabs, vec!["notes/todo.md".to_string()]);
+        assert_eq!(a.active.as_deref(), Some("notes/todo.md"));
+        // close all → empty, no active
+        let mut a = AspApp { ..AspApp::fixture_editor(Theme::light()) };
+        a.close_all_tabs();
+        assert!(a.tabs.is_empty());
+        assert_eq!(a.active, None);
+        let _ = base;
     }
 
     #[test]

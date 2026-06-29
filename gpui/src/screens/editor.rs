@@ -1,8 +1,8 @@
 //! Editor screen — data-driven over `AspApp` (see DESIGN_SPEC.md §4–5).
 
 use gpui::{
-    div, font, prelude::*, px, Context, Div, Font, FontWeight, Hsla, KeyDownEvent, SharedString,
-    StyledText, TextRun, UnderlineStyle,
+    div, font, prelude::*, px, Context, Div, Font, FontWeight, Hsla, KeyDownEvent, MouseButton,
+    MouseDownEvent, SharedString, StyledText, TextRun, UnderlineStyle,
 };
 
 use crate::app::{AspApp, CaretMove};
@@ -204,6 +204,7 @@ fn tree_row(
     let label_color = if active { t.text } else { t.text2 };
     let weight = if is_dir || active { FontWeight(500.0) } else { FontWeight(400.0) };
     let path = node.path.clone();
+    let menu_path = node.path.clone();
 
     div()
         .id(SharedString::from(format!("row-{idx}")))
@@ -224,6 +225,18 @@ fn tree_row(
                 this.select_file(&path); cx.notify();
             }
         }))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                this.open_file_menu(
+                    &menu_path,
+                    is_dir,
+                    f32::from(ev.position.x),
+                    f32::from(ev.position.y),
+                );
+                cx.notify();
+            }),
+        )
         .child(leading)
         .child(
             div()
@@ -375,6 +388,7 @@ fn tab_item(
     let name = crate::vault::format::basename(&label).to_string();
     let select_path = label.clone();
     let close_path = label.clone();
+    let menu_path = label.clone();
 
     div()
         .flex_none()
@@ -387,6 +401,13 @@ fn tab_item(
         .pr(px(8.0))
         .border_r_1()
         .border_color(t.line)
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                this.open_tab_menu(&menu_path, f32::from(ev.position.x), f32::from(ev.position.y));
+                cx.notify();
+            }),
+        )
         .when(active, |d| d.bg(t.bg).border_t_2().border_color(t.accent))
         .text_size(px(12.5))
         .font_weight(if active { FontWeight(600.0) } else { FontWeight(500.0) })

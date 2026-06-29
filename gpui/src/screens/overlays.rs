@@ -7,6 +7,119 @@ use gpui::{
 
 use crate::app::{AspApp, Menu, Modal};
 use crate::icons::icon;
+use crate::theme::Theme;
+
+/// A menu row.
+fn mitem(t: &Theme, label: &str, icon_name: &'static str, danger: bool) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(10.0))
+        .px(px(9.0))
+        .py(px(8.0))
+        .rounded(px(8.0))
+        .text_size(px(13.0))
+        .text_color(if danger { t.delete } else { t.text })
+        .hover(|s| s.bg(t.bg_sub))
+        .cursor_pointer()
+        .child(icon(icon_name, px(15.0), if danger { t.delete } else { t.faint }))
+        .child(label.to_string())
+}
+
+/// A menu card shell.
+fn menu_card(t: &Theme, w: f32) -> Div {
+    div()
+        .w(px(w))
+        .bg(t.bg)
+        .border_1()
+        .border_color(t.line)
+        .rounded(px(12.0))
+        .shadow_lg()
+        .p(px(6.0))
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+}
+
+/// Float a card at (x, y) via an anchored deferred layer.
+fn floating(x: f32, y: f32, card: Div) -> Div {
+    div().child(deferred(anchored().position(point(px(x), px(y))).child(card)).priority(2))
+}
+
+/// Tab context menu (right-click a tab).
+pub fn tab_menu(app: &AspApp, cx: &mut Context<AspApp>) -> Option<Div> {
+    let Menu::Tab { path, x, y } = &app.menu else {
+        return None;
+    };
+    let t = app.theme;
+    let p = path.clone();
+    let close_item = |id: &'static str, label: &str, f: fn(&mut AspApp, &str)| {
+        let p = p.clone();
+        mitem(&t, label, "x", false).id(id).on_click(cx.listener(move |this, _ev, _window, cx| {
+            f(this, &p);
+            this.close_menu();
+            cx.notify();
+        }))
+    };
+    let card = menu_card(&t, 200.0)
+        .on_mouse_down_out(cx.listener(|this, _ev, _window, cx| {
+            this.close_menu();
+            cx.notify();
+        }))
+        .child(close_item("tm-close", "Close", |a, p| a.close_tab(p)))
+        .child(close_item("tm-others", "Close Others", |a, p| a.close_others(p)))
+        .child(close_item("tm-left", "Close to the Left", |a, p| a.close_to_left(p)))
+        .child(close_item("tm-right", "Close to the Right", |a, p| a.close_to_right(p)))
+        .child(div().h(px(1.0)).my(px(4.0)).mx(px(6.0)).bg(t.line))
+        .child(
+            mitem(&t, "Close All", "x", false).id("tm-all").on_click(cx.listener(
+                |this, _ev, _window, cx| {
+                    this.close_all_tabs();
+                    this.close_menu();
+                    cx.notify();
+                },
+            )),
+        );
+    Some(floating(*x, *y, card))
+}
+
+/// File-tree context menu (right-click a file/folder).
+pub fn file_menu(app: &AspApp, cx: &mut Context<AspApp>) -> Option<Div> {
+    let Menu::File { path, is_dir, x, y } = &app.menu else {
+        return None;
+    };
+    let t = app.theme;
+    let p = path.clone();
+    let is_dir = *is_dir;
+    let mut card = menu_card(&t, 190.0).on_mouse_down_out(cx.listener(|this, _ev, _window, cx| {
+        this.close_menu();
+        cx.notify();
+    }));
+    card = card.child({
+        mitem(&t, "New file", "new-file", false).id("fm-new").on_click(cx.listener(
+            |this, _ev, _window, cx| {
+                this.new_file();
+                this.close_menu();
+                cx.notify();
+            },
+        ))
+    });
+    if !is_dir {
+        let pd = p.clone();
+        card = card
+            .child(div().h(px(1.0)).my(px(4.0)).mx(px(6.0)).bg(t.line))
+            .child(mitem(&t, "Delete", "trash", true).id("fm-del").on_click(cx.listener(
+                move |this, _ev, _window, cx| {
+                    this.delete_file(&pd);
+                    this.close_menu();
+                    cx.notify();
+                },
+            )));
+    }
+    Some(floating(*x, *y, card))
+}
+
+/// The "share vault" modal — shows the connection ticket.
 
 /// The vault context menu (right-click a vault row on the Connect screen).
 pub fn vault_menu(app: &AspApp, cx: &mut Context<AspApp>) -> Option<Div> {
