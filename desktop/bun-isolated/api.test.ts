@@ -27,6 +27,12 @@ describe('api — thin Tauri command surface', () => {
     await api.setAllowConnections('id', true, 'k');
     expect(invoke).toHaveBeenCalledWith('set_allow_connections', { id: 'id', on: true, authKey: 'k' });
 
+    await api.setLocalRelay(true);
+    expect(invoke).toHaveBeenCalledWith('set_local_relay', { on: true });
+
+    await api.getLocalRelay();
+    expect(invoke).toHaveBeenCalledWith('get_local_relay');
+
     await api.syncNow('id', 'tkt');
     expect(invoke).toHaveBeenCalledWith('sync_now', { id: 'id', ticket: 'tkt', authKey: undefined });
 

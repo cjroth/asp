@@ -120,6 +120,12 @@ pub struct DesktopEngine {
     /// updates the instant a change lands (no waiting on a poll). Shared (Arc) so
     /// per-engine notifiers read it at fire time even if it's set after open.
     change_listener: Arc<Mutex<Option<ChangeCb>>>,
+    /// When set, a co-hosted relay's URL — endpoints bind through it (and tickets
+    /// advertise it) so same-machine/LAN peers route locally instead of via the
+    /// public n0 relays. Backs the "faster local syncing" toggle.
+    relay_override: Mutex<Option<String>>,
+    /// The co-hosted relay task (abort to stop it).
+    relay_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 fn random_id() -> String {
@@ -137,7 +143,83 @@ impl DesktopEngine {
             identity,
             folders: Mutex::new(HashMap::new()),
             change_listener: Arc::new(Mutex::new(None)),
+            relay_override: Mutex::new(None),
+            relay_task: Mutex::new(None),
         })
+    }
+
+    /// Whether the co-hosted local relay is currently on.
+    pub fn local_relay_on(&self) -> bool {
+        self.relay_override.lock().unwrap().is_some()
+    }
+
+    /// The co-hosted relay's URL when on (the relay peers route through).
+    pub fn local_relay_url(&self) -> Option<String> {
+        self.relay_override.lock().unwrap().clone()
+    }
+
+    /// Toggle a co-hosted local relay ("faster local syncing"). When on, spin up a
+    /// relay on a free localhost port, pin it as the relay for endpoint binds, and
+    /// re-establish every active share/connector through it (re-minting tickets).
+    /// When off, stop the relay and re-establish back onto the default (n0) relays.
+    pub fn set_local_relay(&self, on: bool) -> Result<bool> {
+        if on == self.local_relay_on() {
+            return Ok(on); // already in the requested state
+        }
+        if on {
+            let bind: std::net::SocketAddr = "127.0.0.1:0".parse().expect("static addr");
+            let (url, task) = self.block(async move { iroh_net::spawn_relay(bind).await })?;
+            *self.relay_override.lock().unwrap() = Some(url);
+            *self.relay_task.lock().unwrap() = Some(task);
+        } else {
+            if let Some(task) = self.relay_task.lock().unwrap().take() {
+                task.abort();
+            }
+            *self.relay_override.lock().unwrap() = None;
+        }
+        self.reestablish_all()?;
+        Ok(on)
+    }
+
+    /// Tear down and re-bind every folder's endpoint so active shares/connectors
+    /// pick up the current relay choice (a new endpoint = a new ticket; the device
+    /// NodeId and per-vault admission set are unchanged).
+    fn reestablish_all(&self) -> Result<()> {
+        let mut folders = self.folders.lock().unwrap();
+        for f in folders.values_mut() {
+            if let Some(h) = f.listener.take() {
+                h.abort();
+            }
+            if let Some(h) = f.connector.take() {
+                h.abort();
+            }
+            let was_sharing = f.listening_ticket.take().is_some();
+            let peer = f.peer.clone();
+            f.endpoint = None;
+            if !was_sharing && peer.is_none() {
+                continue; // a plain local folder binds lazily on first share
+            }
+            let ep = self.bind_ep().context("re-bind endpoint")?;
+            f.endpoint = Some(ep.clone());
+            if let Some(ticket) = &peer {
+                f.connector = Some(self.spawn_connector(f.engine.clone(), f.conns.clone(), ep.clone(), ticket.clone()));
+            }
+            if was_sharing {
+                let relays = Self::use_relays();
+                let relay_url = self.relay_url();
+                let ep_t = ep.clone();
+                let ticket = self
+                    .block(async move { iroh_net::ticket_with_relay(&ep_t, relays, relay_url.as_deref()).await })
+                    .context("re-mint ticket")?;
+                let (engine, conns, auth) = (f.engine.clone(), f.conns.clone(), self.auth_opts(Vec::new()));
+                let ep_s = ep.clone();
+                f.listener = Some(self.rt.spawn(async move {
+                    let _ = iroh_net::serve(engine, ep_s, auth, conns).await;
+                }));
+                f.listening_ticket = Some(ticket);
+            }
+        }
+        Ok(())
     }
 
     /// Register a callback fired (with the vault_id) when a peer's change lands in
@@ -188,7 +270,11 @@ impl DesktopEngine {
     /// the CLI's `--relay-url`. When set it takes precedence over the public n0
     /// relays (and over `ASP_NO_RELAY`), so a NAT'd desktop user can route through
     /// their own relay; without it the endpoint uses n0 / direct per `use_relays`.
-    fn relay_url() -> Option<String> {
+    fn relay_url(&self) -> Option<String> {
+        // The co-hosted local relay takes precedence over the env-pinned one.
+        if let Some(u) = self.relay_override.lock().unwrap().clone() {
+            return Some(u);
+        }
         match std::env::var("ASP_RELAY_URL") {
             Ok(u) if !u.trim().is_empty() => Some(u.trim().to_string()),
             _ => None,
@@ -274,7 +360,7 @@ impl DesktopEngine {
     fn bind_ep(&self) -> Result<iroh_net::Endpoint> {
         let seed = self.identity.seed();
         let relays = Self::use_relays();
-        let relay_url = Self::relay_url();
+        let relay_url = self.relay_url();
         self.block(async move {
             iroh_net::bind_endpoint_relay(&seed, relays, relay_url.as_deref()).await
         })
@@ -448,7 +534,7 @@ impl DesktopEngine {
                 }
             };
             let ep_t = ep.clone();
-            let relay_url = Self::relay_url();
+            let relay_url = self.relay_url();
             let ticket = self
                 .block(async move { iroh_net::ticket_with_relay(&ep_t, relays, relay_url.as_deref()).await })
                 .context("ticket")?;
@@ -478,13 +564,13 @@ impl DesktopEngine {
         let auth = self.auth_opts(auth_key.map(|s| vec![s.to_string()]).unwrap_or_default());
         let addr = iroh_net::parse_peer(ticket)?;
         let seed = self.identity.seed();
+        let relay_url = self.relay_url();
         self.block(async move {
             match shared_ep {
                 // Reuse the folder's standing endpoint (one device key, one socket).
                 Some(ep) => iroh_net::sync_oneshot(engine, &ep, addr, &auth).await,
                 // No standing endpoint (a plain local folder): a throwaway is fine.
                 None => {
-                    let relay_url = Self::relay_url();
                     let ep =
                         iroh_net::bind_endpoint_relay(&seed, Self::use_relays(), relay_url.as_deref()).await?;
                     let r = iroh_net::sync_oneshot(engine, &ep, addr, &auth).await;

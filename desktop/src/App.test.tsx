@@ -38,7 +38,7 @@ const deleteFile = vi.fn(async () => {});
 mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/vault') }));
 mock.module('./lib/api', () => ({
   api: {
-    startLiveSync: vi.fn(), stopLiveSync: vi.fn(),
+    startLiveSync: vi.fn(), stopLiveSync: vi.fn(), setLocalRelay: vi.fn(async () => false), getLocalRelay: vi.fn(async () => false),
     listVaults: (...a: unknown[]) => listVaults(...(a as [])),
     addLocalFolder: (p: string) => addLocalFolder(p),
     cloneRemote: vi.fn(),

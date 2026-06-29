@@ -317,6 +317,9 @@ export function createWebApi(): Api {
     // FROM a web node isn't available; these are no-ops on web.
     addLocalFolder: () => Promise.reject(new Error('addLocalFolder is desktop-only')),
     setAllowConnections: async () => null,
+    // A browser can't co-host a relay (no listening socket); always off on web.
+    setLocalRelay: async () => false,
+    getLocalRelay: async () => false,
     authorize: async () => {},
     createSnapshot: async () => '',
     restore: async () => {},

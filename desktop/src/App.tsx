@@ -143,6 +143,7 @@ export default function App() {
   const [connectDest, setConnectDest] = useState<string | null>(null);
 
   const [share, setShare] = useState<{ id: string; code: string; requireKey: boolean; accessKey: string; copied: boolean; unavailable?: boolean } | null>(null);
+  const [localRelayOn, setLocalRelayOn] = useState(false);
   const [vaultCtx, setVaultCtx] = useState<{ x: number; y: number; id: string; vaultId: string; name: string } | null>(null);
   const [customize, setCustomize] = useState<CustomizeInit | null>(null);
   const [removeVaultState, setRemoveVaultState] = useState<{ id: string; name: string; path: string; trash: boolean } | null>(null);
@@ -1107,6 +1108,7 @@ export default function App() {
       return;
     }
     setShare({ id, code: '', requireKey: false, accessKey: '', copied: false });
+    void api.getLocalRelay().then(setLocalRelayOn).catch(() => {});
     try {
       const tkt = await api.setAllowConnections(id, true);
       setShare((s) => (s && s.id === id ? { ...s, code: tkt || '' } : s));
@@ -1140,6 +1142,25 @@ export default function App() {
       }
     }
   }, [share]);
+
+  // "Faster local syncing": co-host a relay so same-machine/LAN peers connect
+  // locally instead of via the public n0 relay. Re-establishing re-mints the
+  // active share's ticket, so re-fetch it after toggling.
+  const onToggleLocalRelay = useCallback(async () => {
+    const s = share;
+    const next = !localRelayOn;
+    setLocalRelayOn(next);
+    try {
+      await api.setLocalRelay(next);
+      if (s && !s.unavailable) {
+        const tkt = await api.setAllowConnections(s.id, true, s.requireKey ? s.accessKey : undefined);
+        setShare((x) => (x && x.id === s.id ? { ...x, code: tkt || '' } : x));
+      }
+    } catch (err) {
+      console.error(err);
+      setLocalRelayOn(!next); // revert on failure
+    }
+  }, [share, localRelayOn]);
 
   const onCopyCode = useCallback(async () => {
     const s = share;
@@ -1856,6 +1877,15 @@ export default function App() {
                     <span style={{ flex: 1, fontFamily: "'JetBrains Mono', monospace", fontSize: 13, letterSpacing: '0.04em', color: 'var(--text)', textAlign: 'right' }}>{share.accessKey}</span>
                   </div>
                 )}
+                <div onClick={() => void onToggleLocalRelay()} style={{ display: 'flex', alignItems: 'center', gap: 11, cursor: 'pointer', padding: 2 }}>
+                  <span style={{ width: 34, height: 20, borderRadius: 12, flex: 'none', background: localRelayOn ? accent : 'var(--faint2)', position: 'relative', transition: 'background .15s' }}>
+                    <span style={{ position: 'absolute', top: 2, left: localRelayOn ? 16 : 2, width: 16, height: 16, borderRadius: '50%', background: 'var(--bg)', transition: 'left .15s', boxShadow: '0 1px 2px rgba(0,0,0,0.2)' }} />
+                  </span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13.5, fontWeight: 500, color: 'var(--text)' }}>Allow connections directly for faster syncing</div>
+                    <div style={{ fontSize: 12, color: 'var(--faint)' }}>Routes peers on this device/network through your machine instead of a public relay.</div>
+                  </div>
+                </div>
               </>
             )}
             <button autoFocus={share.unavailable} onClick={() => setShare(null)} style={{ alignSelf: 'flex-end', fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: 'var(--bg)', background: 'var(--text)', border: 'none', borderRadius: 9, padding: '8px 18px', cursor: 'pointer' }}>Done</button>

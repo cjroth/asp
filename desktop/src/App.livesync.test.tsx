@@ -32,7 +32,7 @@ const history = vi.fn(async () => { await tick(); return [{ id: 'r', ts: 1_700_0
 mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/mynotes') }));
 mock.module('./lib/api', () => ({
   api: {
-    startLiveSync: vi.fn(), stopLiveSync: vi.fn(),
+    startLiveSync: vi.fn(), stopLiveSync: vi.fn(), setLocalRelay: vi.fn(async () => false), getLocalRelay: vi.fn(async () => false),
     listVaults: () => listVaults(),
     addLocalFolder: vi.fn(),
     cloneRemote: vi.fn(),

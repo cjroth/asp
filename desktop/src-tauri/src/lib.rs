@@ -59,6 +59,8 @@ pub fn run() {
             commands::add_local_folder,
             commands::clone_remote,
             commands::set_allow_connections,
+            commands::set_local_relay,
+            commands::get_local_relay,
             commands::set_enabled,
             commands::sync_now,
             commands::get_status,

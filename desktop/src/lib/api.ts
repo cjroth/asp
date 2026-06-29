@@ -50,6 +50,10 @@ export interface Api {
   createVault(name: string): Promise<VaultInfo>;
   cloneRemote(dest: string, ticket: string, authKey?: string): Promise<VaultInfo>;
   setAllowConnections(id: string, on: boolean, authKey?: string): Promise<string | null>;
+  // Co-host a local relay so same-machine/LAN peers sync without the public n0
+  // relay ("faster local syncing"). Desktop-only; returns the new state.
+  setLocalRelay(on: boolean): Promise<boolean>;
+  getLocalRelay(): Promise<boolean>;
   // Sync once against `ticket`. On web, omit `ticket` to re-dial the upstream the
   // vault was cloned from. (Web also holds a live connection — see startLiveSync.)
   syncNow(id: string, ticket?: string, authKey?: string): Promise<void>;
@@ -85,6 +89,8 @@ const tauriApi: Api = {
   createVault: () => Promise.reject(new Error('createVault is web-only')),
   cloneRemote: (dest, ticket, authKey) => invoke<VaultInfo>('clone_remote', { dest, ticket, authKey }),
   setAllowConnections: (id, on, authKey) => invoke<string | null>('set_allow_connections', { id, on, authKey }),
+  setLocalRelay: (on) => invoke<boolean>('set_local_relay', { on }),
+  getLocalRelay: () => invoke<boolean>('get_local_relay'),
   syncNow: (id, ticket, authKey) => invoke<void>('sync_now', { id, ticket: ticket ?? null, authKey }),
   // Desktop keeps a standing connection in its background engine; nothing for the
   // frontend to hold open, so these are no-ops (the UI refreshes on its poll).

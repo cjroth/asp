@@ -185,6 +185,27 @@ pub async fn run_relay(http_bind: SocketAddr) -> Result<()> {
     Ok(())
 }
 
+/// Spawn a co-hosted relay and return its `http://addr` URL plus a task that owns
+/// it (aborting the task stops the relay). Used by the desktop "faster local
+/// syncing" toggle to route peers through this machine instead of the public n0
+/// relays. Bind `127.0.0.1:0` for a free localhost port.
+pub async fn spawn_relay(http_bind: SocketAddr) -> Result<(String, tokio::task::JoinHandle<()>)> {
+    use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+    let mut config = ServerConfig::default();
+    config.relay = Some(RelayConfig::new(http_bind));
+    config.quic = None;
+    let server = Server::spawn(config).await.map_err(|e| anyhow!("starting relay: {e}"))?;
+    let addr = server.http_addr().ok_or_else(|| anyhow!("relay bound no http address"))?;
+    let url = format!("http://{addr}");
+    tracing::info!(%addr, "co-hosted relay up");
+    // The spawned task owns `server`, keeping it alive until the task is aborted.
+    let handle = tokio::spawn(async move {
+        std::future::pending::<()>().await;
+        drop(server);
+    });
+    Ok((url, handle))
+}
+
 // ---------------- framing ----------------
 
 /// Write one length-delimited frame: a `u32` big-endian length, then the bytes.

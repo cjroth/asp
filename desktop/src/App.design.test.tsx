@@ -40,7 +40,7 @@ const getStatus = vi.fn(async (id: string) => ({ id, vault_id: id === 'v1' ? 'vi
 mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/picked') }));
 mock.module('./lib/api', () => ({
   api: {
-    startLiveSync: vi.fn(), stopLiveSync: vi.fn(),
+    startLiveSync: vi.fn(), stopLiveSync: vi.fn(), setLocalRelay: vi.fn(async () => false), getLocalRelay: vi.fn(async () => false),
     listVaults: () => listVaults(),
     addLocalFolder: (p: string) => addLocalFolder(p),
     cloneRemote: (d: string, t: string, k?: string) => cloneRemote(d, t, k),

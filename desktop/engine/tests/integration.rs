@@ -242,3 +242,49 @@ fn reopen_saved_persists_folders() {
     let de3 = DesktopEngine::new(Identity::from_seed(&[4; 32])).unwrap();
     assert_eq!(de3.reopen_saved().unwrap().len(), 0);
 }
+
+/// The "faster local syncing" toggle: co-host a relay and converge a real clone
+/// through it (no public n0 relay involved), then toggle it back off.
+#[test]
+fn cohosted_local_relay_routes_a_real_clone() {
+    let _serial = serial();
+    std::env::remove_var("ASP_NO_RELAY");
+    std::env::remove_var("ASP_RELAY_URL");
+    let root = tempfile::tempdir().unwrap();
+    std::env::set_var("HOME", root.path());
+
+    let de_a = DesktopEngine::new(Identity::from_seed(&[21; 32])).unwrap();
+    assert!(!de_a.local_relay_on());
+    assert!(de_a.set_local_relay(true).unwrap(), "toggle returns the new state");
+    assert!(de_a.local_relay_on());
+    let relay = de_a.local_relay_url().expect("co-hosted relay url");
+    assert!(relay.starts_with("http://127.0.0.1:"), "binds a localhost relay, got {relay}");
+    // Idempotent: enabling again is a no-op and keeps the same relay.
+    assert!(de_a.set_local_relay(true).unwrap());
+    assert_eq!(de_a.local_relay_url().as_deref(), Some(relay.as_str()));
+
+    let dir_a = root.path().join("a");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::write(dir_a.join("note.md"), b"hello via the local relay\n").unwrap();
+    let a = de_a.add_local_folder(&dir_a).unwrap();
+    let ticket = de_a.set_allow_connections(&a.id, true, None).unwrap().unwrap();
+
+    // Pin the cloner to A's co-hosted relay so the whole exchange is hermetic
+    // (no n0). A itself keeps using its relay_override, which takes precedence.
+    std::env::set_var("ASP_RELAY_URL", &relay);
+    let de_b = DesktopEngine::new(Identity::from_seed(&[22; 32])).unwrap();
+    let dir_b = root.path().join("b");
+    let b = de_b.clone_remote(&dir_b, &ticket, None).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(25), || {
+            de_b.read_file(&b.id, "note.md").map(|c| c.contains("hello via the local relay")).unwrap_or(false)
+        }),
+        "the clone converges through the co-hosted relay"
+    );
+
+    // Toggling off stops the relay and clears the override.
+    assert!(!de_a.set_local_relay(false).unwrap());
+    assert!(!de_a.local_relay_on());
+    assert!(de_a.local_relay_url().is_none());
+    std::env::remove_var("ASP_RELAY_URL");
+}
