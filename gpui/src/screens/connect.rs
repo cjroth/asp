@@ -134,6 +134,13 @@ pub fn render(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
         .text_size(px(14.0))
         .font_weight(FontWeight(500.0))
         .cursor_pointer()
+        .on_click(cx.listener(|this, _ev, window, cx| {
+            this.open_connect();
+            if let Some(f) = this.focus.clone() {
+                window.focus(&f, cx);
+            }
+            cx.notify();
+        }))
         .child(icon("connect", px(15.0), t.text2))
         .child("Connect Vault");
 

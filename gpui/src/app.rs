@@ -96,6 +96,7 @@ pub enum Modal {
     None,
     RemoveVault { id: String, name: String, trash: bool },
     ShareVault { name: String, ticket: Option<String> },
+    ConnectVault { buf: crate::vault::textbuffer::TextBuffer },
 }
 
 fn now_secs() -> i64 {
@@ -629,6 +630,50 @@ impl AspApp {
         self.modal = Modal::None;
     }
 
+    /// Open the "connect vault" modal (paste a ticket).
+    pub fn open_connect(&mut self) {
+        self.menu = Menu::None;
+        self.modal = Modal::ConnectVault { buf: crate::vault::textbuffer::TextBuffer::new("") };
+    }
+
+    /// Insert text into the connect-ticket field.
+    pub fn connect_type(&mut self, s: &str) {
+        if let Modal::ConnectVault { buf } = &mut self.modal {
+            buf.insert(s);
+        }
+    }
+
+    pub fn connect_backspace(&mut self) {
+        if let Modal::ConnectVault { buf } = &mut self.modal {
+            buf.backspace();
+        }
+    }
+
+    pub fn connect_ticket(&self) -> Option<String> {
+        match &self.modal {
+            Modal::ConnectVault { buf } => Some(buf.text.clone()),
+            _ => None,
+        }
+    }
+
+    /// Clone the shared vault (from the typed ticket) into `dest` and open it.
+    pub fn connect_confirm(&mut self, dest: &std::path::Path) {
+        let Some(ticket) = self.connect_ticket() else { return };
+        let ticket = ticket.trim().to_string();
+        if ticket.is_empty() {
+            return;
+        }
+        if let Some(eng) = self.engine.clone() {
+            if let Ok(info) = eng.clone_remote(dest, &ticket, None) {
+                self.modal = Modal::None;
+                self.refresh_vaults();
+                self.open_vault(&info.id);
+                return;
+            }
+        }
+        // on failure, leave the modal open so the user can fix the ticket.
+    }
+
     /// Toggle the "move to trash" checkbox in the remove modal.
     pub fn toggle_remove_trash(&mut self) {
         if let Modal::RemoveVault { trash, .. } = &mut self.modal {
@@ -772,6 +817,9 @@ impl Render for AspApp {
         if let Some(modal) = crate::screens::overlays::share_modal(self, cx) {
             root = root.child(modal);
         }
+        if let Some(modal) = crate::screens::overlays::connect_modal(self, cx) {
+            root = root.child(modal);
+        }
         root
     }
 }
@@ -913,6 +961,20 @@ mod tests {
             Modal::ShareVault { ticket, .. } => assert!(ticket.is_some(), "expected a ticket"),
             other => panic!("expected share modal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn connect_input_editing() {
+        let mut a = AspApp::fixture_connect(Theme::light());
+        a.open_connect();
+        assert!(matches!(a.modal, Modal::ConnectVault { .. }));
+        a.connect_type("asp1");
+        a.connect_type("abc");
+        assert_eq!(a.connect_ticket().as_deref(), Some("asp1abc"));
+        a.connect_backspace();
+        assert_eq!(a.connect_ticket().as_deref(), Some("asp1ab"));
+        a.close_modal();
+        assert_eq!(a.connect_ticket(), None);
     }
 
     #[test]

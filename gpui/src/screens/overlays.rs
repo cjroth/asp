@@ -2,7 +2,8 @@
 //! See DESIGN_SPEC.md §5 (menus/modals).
 
 use gpui::{
-    anchored, deferred, div, point, prelude::*, px, Context, Div, FontWeight,
+    anchored, deferred, div, point, prelude::*, px, Context, Div, FontWeight, KeyDownEvent,
+    PathPromptOptions,
 };
 
 use crate::app::{AspApp, Menu, Modal};
@@ -260,6 +261,163 @@ pub fn share_modal(app: &AspApp, cx: &mut Context<AspApp>) -> Option<Div> {
                     }))
                     .child("Done"),
             ),
+        );
+
+    Some(
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(t.overlay)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(card),
+    )
+}
+
+/// The "connect a vault" modal — paste a ticket, pick a destination, clone.
+pub fn connect_modal(app: &AspApp, cx: &mut Context<AspApp>) -> Option<Div> {
+    let Modal::ConnectVault { buf } = &app.modal else {
+        return None;
+    };
+    let t = app.theme;
+    let text = buf.text.clone();
+    let empty = text.trim().is_empty();
+
+    // The ticket field: monospace text + caret; focusable; handles typing + paste.
+    let mut field = div()
+        .id("connect-field")
+        .min_h(px(40.0))
+        .w_full()
+        .font_family(crate::theme::FONT_MONO)
+        .text_size(px(12.0))
+        .text_color(t.text)
+        .bg(t.bg_input)
+        .border_1()
+        .border_color(t.accent)
+        .rounded(px(9.0))
+        .p(px(12.0))
+        .flex()
+        .items_center();
+    if let Some(f) = app.focus.clone() {
+        field = field.track_focus(&f);
+    }
+    let field = field
+        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+            let ks = &ev.keystroke;
+            match ks.key.as_str() {
+                "backspace" => this.connect_backspace(),
+                "v" if ks.modifiers.platform || ks.modifiers.control => {
+                    if let Some(item) = cx.read_from_clipboard() {
+                        if let Some(txt) = item.text() {
+                            this.connect_type(&txt);
+                        }
+                    }
+                }
+                _ => {
+                    if !ks.modifiers.control && !ks.modifiers.platform {
+                        if let Some(c) = &ks.key_char {
+                            this.connect_type(c);
+                        }
+                    }
+                }
+            }
+            cx.notify();
+        }))
+        .child(if empty {
+            div().text_color(t.faint).child("Paste a connection code…")
+        } else {
+            div().child(text)
+        })
+        .child(div().w(px(2.0)).h(px(16.0)).bg(t.accent));
+
+    let card = div()
+        .w(px(424.0))
+        .bg(t.bg)
+        .rounded(px(16.0))
+        .shadow_lg()
+        .p(px(20.0))
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .on_mouse_down_out(cx.listener(|this, _ev, _window, cx| {
+            this.close_modal();
+            cx.notify();
+        }))
+        .child(
+            div()
+                .text_size(px(16.0))
+                .font_weight(FontWeight(600.0))
+                .text_color(t.text)
+                .child("Connect a vault"),
+        )
+        .child(
+            div()
+                .text_size(px(13.5))
+                .text_color(t.text2)
+                .child("Paste the code a peer shared, then choose where to keep the vault."),
+        )
+        .child(field)
+        .child(
+            div()
+                .mt(px(4.0))
+                .flex()
+                .justify_end()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .id("connect-cancel")
+                        .rounded(px(9.0))
+                        .px(px(14.0))
+                        .py(px(8.0))
+                        .border_1()
+                        .border_color(t.line)
+                        .bg(t.bg)
+                        .text_color(t.text2)
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight(500.0))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _ev, _window, cx| {
+                            this.close_modal();
+                            cx.notify();
+                        }))
+                        .child("Cancel"),
+                )
+                .child(
+                    div()
+                        .id("connect-go")
+                        .rounded(px(9.0))
+                        .px(px(14.0))
+                        .py(px(8.0))
+                        .bg(t.text)
+                        .text_color(t.bg)
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight(600.0))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|_this, _ev, _window, cx| {
+                            let rx = cx.prompt_for_paths(PathPromptOptions {
+                                files: false,
+                                directories: true,
+                                multiple: false,
+                                prompt: Some("Choose where to clone the vault".into()),
+                            });
+                            cx.spawn(async move |this, cx| {
+                                if let Ok(Ok(Some(paths))) = rx.await {
+                                    if let Some(p) = paths.into_iter().next() {
+                                        this.update(cx, |this, cx| {
+                                            this.connect_confirm(&p);
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                    }
+                                }
+                            })
+                            .detach();
+                        }))
+                        .child("Connect"),
+                ),
         );
 
     Some(
