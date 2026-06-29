@@ -83,8 +83,9 @@ describe('App end-to-end wiring', () => {
     fireEvent.click(screen.getByText('Create vault'));
     await waitFor(() => expect(addLocalFolder).toHaveBeenCalledWith('/home/me/vault'));
     await waitFor(() => expect(listFiles).toHaveBeenCalledWith('v1'));
-    // history() is intentionally debounced off the critical path now.
-    await waitFor(() => expect(history).toHaveBeenCalledWith('v1'), { timeout: 2000 });
+    // history() scans the whole log, so it's now fetched lazily — only when the
+    // History/Log view opens (asserted at step 7), never on the editor poll.
+    expect(history).not.toHaveBeenCalled();
 
     // 3. Editor renders the file tree. Dirs start collapsed (vaults can be huge),
     //    so expand "notes" to reveal a.md. "README.md" appears twice on purpose:
@@ -109,6 +110,7 @@ describe('App end-to-end wiring', () => {
 
     // 7. Expand the History tab → the time-travel track + playhead handle render.
     fireEvent.click(screen.getByText('History'));
+    await waitFor(() => expect(history).toHaveBeenCalledWith('v1')); // fetched on open
     const track = await screen.findByTestId('history-track');
     expect(track).toBeTruthy();
     const handle = container.querySelector('[style*="ew-resize"]') as HTMLElement;
