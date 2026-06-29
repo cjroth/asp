@@ -69,5 +69,5 @@ web platform indicator square should be faint, not accent.
 - **Mermaid SVG diagrams** — rendered gracefully as a diagram-source block; producing the actual SVG
   needs a mermaid/JS engine, which doesn't exist in pure Rust/gpui (the desktop uses mermaid.js in its
   webview). This is a runtime-infeasibility, not a missing feature.
-- Broader **e2e** via gpui `VisualTestContext` — its click/key simulation is main-thread-gated and
-  flaky on Linux worker threads; behavior is already covered by the engine + app-state test suites.
+- Broader e2e is DONE — a `#[gpui::test]` dispatches a REAL mouse click over the editor vault-switcher
+  and asserts the wired gpui event→listener→state path drives Editor→Connect (runs on Linux).

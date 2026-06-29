@@ -1230,6 +1230,29 @@ mod tests {
         assert_eq!(a.hist_bar_h, 300.0); // not dragging → unchanged
     }
 
+    /// True end-to-end test: build the real `AspApp` in a window, dispatch an
+    /// actual mouse click over the editor's vault-switcher, and assert the wired
+    /// gpui event → listener path drives the state back to the Connect screen.
+    #[gpui::test]
+    fn e2e_click_vault_switcher_returns_to_connect(cx: &mut gpui::TestAppContext) {
+        use gpui::{point, px, size, Modifiers, VisualTestContext};
+        let window = cx.open_window(size(px(1100.0), px(740.0)), |_, _| {
+            AspApp::fixture_editor(Theme::light())
+        });
+        cx.run_until_parked();
+        let before = window.update(cx, |app, _, _| app.screen).unwrap();
+        assert_eq!(before, Screen::Editor);
+
+        // Dispatch a real click over the vault-switcher header (sidebar top-left, 266×47).
+        let any = window.into();
+        let mut vcx = VisualTestContext::from_window(any, cx);
+        vcx.simulate_click(point(px(130.0), px(23.0)), Modifiers::default());
+        vcx.run_until_parked();
+
+        let after = window.update(&mut vcx, |app, _, _| app.screen).unwrap();
+        assert_eq!(after, Screen::Connect, "clicking the vault switcher should return to Connect");
+    }
+
     #[test]
     fn tab_drag_reorders() {
         let mut a = AspApp::fixture_editor(Theme::light());
