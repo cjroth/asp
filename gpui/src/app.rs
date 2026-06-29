@@ -158,7 +158,7 @@ impl AspApp {
         app.expanded.insert("drafts".into(), true);
         app.tabs = vec!["README.md".into(), "notes/ideas.md".into(), "notes/todo.md".into()];
         app.active = Some("README.md".into());
-        app.content = "Research Notes\n\nA local-first vault for research. Everything here syncs peer-to-peer with end-to-end encryption — no servers in between.\n\nThe editor is a live WYSIWYG surface: Markdown renders as you type, with the source preserved byte-for-byte underneath.\n\nUse the history scrubber below to travel back through every edit and restore any past version of a file.".into();
+        app.content = "# Research Notes\n\nA **local-first** vault for research. Everything syncs *peer-to-peer* with end-to-end encryption — no servers in between.\n\n## Principles\n\n- The source is preserved `byte-for-byte` underneath\n- Edits broadcast to connected peers in real time\n- Every change is in the [history](#history) log\n\n## Today\n\n- [x] Wire the engine to the editor\n- [x] Render markdown live\n- [ ] Port the history scrubber\n\n> Use the scrubber below to travel back through every edit.\n\n```rust\nfn main() {\n    println!(\"hello, vault\");\n}\n```".into();
         app
     }
 

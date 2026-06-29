@@ -1,10 +1,14 @@
 //! Editor screen — data-driven over `AspApp` (see DESIGN_SPEC.md §4–5).
 
-use gpui::{div, prelude::*, px, Context, Div, FontWeight, SharedString};
+use gpui::{
+    div, font, prelude::*, px, Context, Div, Font, FontWeight, Hsla, SharedString, StyledText,
+    TextRun, UnderlineStyle,
+};
 
 use crate::app::AspApp;
 use crate::icons::icon;
-use crate::theme::{self, FONT_MONO, FONT_SERIF};
+use crate::theme::{self, Theme, FONT_MONO, FONT_SERIF};
+use crate::vault::markdown::{self, Inline, Line};
 use crate::vault::tree::{self, NodeKind, TreeNode};
 
 pub fn render(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
@@ -352,7 +356,7 @@ fn status_row(app: &AspApp) -> Div {
         )
 }
 
-fn editor_body(app: &AspApp) -> Div {
+fn editor_body(app: &AspApp) -> impl IntoElement {
     let t = app.theme;
     let mut prose = div()
         .w(px(760.0))
@@ -366,24 +370,162 @@ fn editor_body(app: &AspApp) -> Div {
         .text_size(px(15.5))
         .text_color(t.text);
 
-    // Minimal content render (real markdown WYSIWYG is a later task): one block
-    // per source line, preserving blank lines as vertical space.
-    for line in app.content.split('\n') {
-        if line.is_empty() {
-            prose = prose.child(div().h(px(14.0)));
-        } else {
-            prose = prose.child(div().line_height(px(28.0)).child(line.to_string()));
-        }
+    // Live markdown render — one block per source line (see markdown.rs).
+    for line in markdown::parse(&app.content) {
+        prose = prose.child(render_line(&t, &line));
     }
 
     div()
+        .id("editor-scroll")
         .flex_1()
         .min_h(px(0.0))
         .flex()
         .justify_center()
         .items_start()
-        .overflow_hidden()
+        .overflow_y_scroll()
         .child(prose)
+}
+
+/// Render one parsed markdown `Line` to a styled gpui block.
+fn render_line(t: &Theme, line: &Line) -> Div {
+    match line {
+        Line::Blank => div().h(px(28.0)),
+        Line::Heading { level, spans } => {
+            let sz = markdown::heading_size(*level);
+            let mt = if *level == 1 { 2.0 } else { 18.0 };
+            div()
+                .mt(px(mt))
+                .mb(px(4.0))
+                .text_size(px(sz))
+                .line_height(px(sz * 1.3))
+                .child(styled(t, spans, Hsla::from(t.text), FontWeight(600.0), false))
+        }
+        Line::Quote(spans) => div()
+            .border_l_2()
+            .border_color(t.accent)
+            .pl(px(12.0))
+            .line_height(px(28.0))
+            .text_color(t.text2)
+            .child(styled(t, spans, Hsla::from(t.text2), FontWeight::NORMAL, true)),
+        Line::Hr => div().my(px(8.0)).border_b_1().border_color(t.line).h(px(1.0)),
+        Line::Task { indent, done, spans } => {
+            let box_color = if *done { t.accent } else { t.faint };
+            let checkbox = div()
+                .size(px(15.0))
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(box_color)
+                .when(*done, |d| d.bg(t.accent))
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .when(*done, |d| d.child(icon("check", px(11.0), gpui::white())));
+            div()
+                .ml(px(*indent as f32 * 8.5))
+                .flex()
+                .items_start()
+                .gap(px(8.0))
+                .line_height(px(28.0))
+                .child(div().pt(px(5.0)).child(checkbox))
+                .child(styled(
+                    t,
+                    spans,
+                    if *done { Hsla::from(t.faint) } else { Hsla::from(t.text) },
+                    FontWeight::NORMAL,
+                    false,
+                ))
+        }
+        Line::Bullet { indent, spans } => div()
+            .ml(px(*indent as f32 * 8.5))
+            .flex()
+            .gap(px(8.0))
+            .line_height(px(28.0))
+            .child(div().text_color(t.faint).child("•"))
+            .child(styled(t, spans, Hsla::from(t.text), FontWeight::NORMAL, false)),
+        Line::Ordered { indent, number, spans } => div()
+            .ml(px(*indent as f32 * 8.5))
+            .flex()
+            .gap(px(6.0))
+            .line_height(px(28.0))
+            .child(
+                div()
+                    .text_color(t.accent)
+                    .font_weight(FontWeight(500.0))
+                    .child(number.clone()),
+            )
+            .child(styled(t, spans, Hsla::from(t.text), FontWeight::NORMAL, false)),
+        Line::Code(raw) => div()
+            .font_family(FONT_MONO)
+            .text_size(px(13.0))
+            .line_height(px(22.0))
+            .px(px(12.0))
+            .bg(t.bg_input)
+            .text_color(t.text2)
+            .child(if raw.is_empty() { " ".to_string() } else { raw.clone() }),
+        Line::Para(spans) => div()
+            .line_height(px(28.0))
+            .child(styled(t, spans, Hsla::from(t.text), FontWeight::NORMAL, false)),
+    }
+}
+
+/// Build a `StyledText` from inline spans with per-run font/weight/style/color.
+fn styled(
+    t: &Theme,
+    spans: &[Inline],
+    base: Hsla,
+    base_weight: FontWeight,
+    base_italic: bool,
+) -> StyledText {
+    let serif = |weight: FontWeight, italic: bool| -> Font {
+        let mut f = font(FONT_SERIF);
+        f.weight = weight;
+        if italic {
+            f.style = gpui::FontStyle::Italic;
+        }
+        f
+    };
+    let mut s = String::new();
+    let mut runs: Vec<TextRun> = Vec::new();
+    let mut push = |text: String, fnt: Font, color: Hsla, bg: Option<Hsla>, underline: bool| {
+        let len = text.len();
+        if len == 0 {
+            return;
+        }
+        s.push_str(&text);
+        runs.push(TextRun {
+            len,
+            font: fnt,
+            color,
+            background_color: bg,
+            underline: underline
+                .then(|| UnderlineStyle { thickness: px(1.0), color: Some(color), wavy: false }),
+            strikethrough: None,
+        });
+    };
+
+    for sp in spans {
+        match sp {
+            Inline::Text(x) => push(x.clone(), serif(base_weight, base_italic), base, None, false),
+            Inline::Bold(x) => push(x.clone(), serif(FontWeight::BOLD, base_italic), base, None, false),
+            Inline::Italic(x) => push(x.clone(), serif(base_weight, true), base, None, false),
+            Inline::Code(x) => {
+                push(x.clone(), font(FONT_MONO), Hsla::from(t.text), Some(Hsla::from(t.bg_input)), false)
+            }
+            Inline::Link { text, url: _ } => {
+                push(text.clone(), serif(base_weight, base_italic), Hsla::from(t.accent), None, true)
+            }
+            Inline::Image { alt, url: _ } => {
+                push(format!("🖼 {alt}"), serif(base_weight, base_italic), Hsla::from(t.faint), None, false)
+            }
+        }
+    }
+    if s.is_empty() {
+        // empty line still needs a (zero-content) run to lay out a blank line
+        s.push(' ');
+        runs.push(TextRun { len: 1, font: serif(base_weight, base_italic), color: base, ..Default::default() });
+    }
+    StyledText::new(s).with_runs(runs)
 }
 
 fn history_bar(app: &AspApp) -> Div {
