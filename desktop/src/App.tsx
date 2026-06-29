@@ -320,6 +320,14 @@ export default function App() {
 
   useEffect(() => {
     const t = setInterval(() => {
+      // Web (wasm/OPFS) vaults have no standing connector, so they can't catch up
+      // on their own after the initial clone. Drive it from the poll: for each
+      // vault cloned from a peer, sync against its stored upstream ticket. The
+      // downstream refreshFiles/refreshActiveContent below then surfaces the
+      // pulled-in changes. No-op on desktop (webUpstreams is empty there).
+      void Promise.resolve(api.webUpstreams?.())
+        .then((ups) => Promise.all((ups ?? []).map((u) => api.syncNow(u.id, u.ticket, u.authKey).catch(() => {}))))
+        .catch(() => {});
       if (screen === 'editor' && activeIdRef.current) {
         const id = activeIdRef.current;
         void api.getStatus(id).then((st) => setStatuses((p) => ({ ...p, [id]: st }))).catch(() => {});

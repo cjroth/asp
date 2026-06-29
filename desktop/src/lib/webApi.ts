@@ -19,6 +19,9 @@ const randHex = (n: number) => Array.from(crypto.getRandomValues(new Uint8Array(
 interface RegEntry {
   id: string;
   vault_id: string;
+  // For vaults cloned from a peer: the ticket+authKey to keep syncing against.
+  // Browsers can't listen, so the app's poll uses these to call syncNow.
+  upstream?: { ticket: string; authKey?: string };
 }
 
 // ---- byte store: OPFS when available, in-memory fallback otherwise ----
@@ -169,10 +172,15 @@ export function createWebApi(): Api {
       engines.set(id, eng);
       await persist(id, eng);
       const reg = await registry();
-      reg.unshift({ id, vault_id });
+      reg.unshift({ id, vault_id, upstream: { ticket, authKey } });
       await writeJson('registry.json', reg);
       return info({ id, vault_id });
     },
+
+    webUpstreams: async () =>
+      (await registry())
+        .filter((r) => r.upstream?.ticket)
+        .map((r) => ({ id: r.id, ticket: r.upstream!.ticket, authKey: r.upstream!.authKey })),
 
     syncNow: async (id, ticket, authKey) => {
       const eng = await engineFor(id);
