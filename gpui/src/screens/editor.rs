@@ -574,22 +574,25 @@ fn edit_surface(app: &AspApp, cx: &mut Context<AspApp>) -> impl IntoElement {
 
     let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
     for (i, line) in text.split('\n').enumerate() {
-        let row = if i == cur_line {
-            // split the caret line at the cursor column
+        if i == cur_line {
+            // The active line shows raw source + caret (syntax revealed for editing),
+            // mirroring the desktop's live-preview behavior on the focused line.
             let in_line = cur - line_start;
             let (pre, post) = line.split_at(in_line.min(line.len()));
-            div()
-                .flex()
-                .line_height(px(28.0))
-                .child(div().child(pre.to_string()))
-                .child(div().w(px(2.0)).h(px(22.0)).bg(t.accent).mt(px(3.0)))
-                .child(div().child(post.to_string()))
-        } else if line.is_empty() {
-            div().h(px(28.0))
+            col = col.child(
+                div()
+                    .flex()
+                    .line_height(px(28.0))
+                    .child(div().child(pre.to_string()))
+                    .child(div().w(px(2.0)).h(px(22.0)).bg(t.accent).mt(px(3.0)))
+                    .child(div().child(post.to_string())),
+            );
         } else {
-            div().line_height(px(28.0)).child(line.to_string())
-        };
-        col = col.child(row);
+            // Inactive lines render as styled markdown (syntax hidden) — Obsidian-
+            // style live preview while typing.
+            let parsed = markdown::parse(line).into_iter().next().unwrap_or(Line::Blank);
+            col = col.child(render_line(&t, &parsed));
+        }
     }
 
     let focus = app.focus.clone();
