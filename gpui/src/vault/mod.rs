@@ -4,6 +4,7 @@
 pub mod format;
 pub mod history;
 pub mod markdown;
+pub mod prefs;
 pub mod pretty_names;
 pub mod tabs;
 pub mod tree;
