@@ -74,6 +74,8 @@ pub struct AspApp {
     // Layout (resizable).
     pub sidebar_w: f32,
     pub dragging_sidebar: bool,
+    pub hist_bar_h: f32,
+    pub dragging_hist: bool,
 
     /// Whether the background live-sync poll loop has been started.
     pub polling_started: bool,
@@ -141,6 +143,8 @@ impl AspApp {
             focus: None,
             sidebar_w: 266.0,
             dragging_sidebar: false,
+            hist_bar_h: 150.0,
+            dragging_hist: false,
             polling_started: false,
         };
         app.refresh_vaults();
@@ -236,6 +240,8 @@ impl AspApp {
             focus: None,
             sidebar_w: 266.0,
             dragging_sidebar: false,
+            hist_bar_h: 150.0,
+            dragging_hist: false,
             polling_started: false,
         }
     }
@@ -563,8 +569,21 @@ impl AspApp {
         }
     }
 
+    pub fn start_hist_drag(&mut self) {
+        self.dragging_hist = true;
+    }
+
+    /// While dragging, set the history-bar height (clamped). `h` is the desired
+    /// height (window-bottom minus pointer y, computed by the caller).
+    pub fn drag_hist(&mut self, h: f32) {
+        if self.dragging_hist {
+            self.hist_bar_h = crate::vault::prefs::clamp_hist_bar(h);
+        }
+    }
+
     pub fn end_drag(&mut self) {
         self.dragging_sidebar = false;
+        self.dragging_hist = false;
     }
 
     /// Live-sync poll: pick up peer edits the engine has materialized. Skips while
@@ -999,6 +1018,21 @@ mod tests {
         a.end_drag();
         a.drag_sidebar(100.0); // not dragging → unchanged
         assert_eq!(a.sidebar_w, 320.0);
+    }
+
+    #[test]
+    fn hist_drag_clamps() {
+        let mut a = AspApp::fixture_editor(Theme::light());
+        a.start_hist_drag();
+        a.drag_hist(10.0);
+        assert_eq!(a.hist_bar_h, 96.0); // min
+        a.drag_hist(9999.0);
+        assert_eq!(a.hist_bar_h, 640.0); // max
+        a.drag_hist(300.0);
+        assert_eq!(a.hist_bar_h, 300.0);
+        a.end_drag();
+        a.drag_hist(10.0);
+        assert_eq!(a.hist_bar_h, 300.0); // not dragging → unchanged
     }
 
     #[test]

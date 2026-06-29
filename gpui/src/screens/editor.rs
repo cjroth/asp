@@ -19,24 +19,35 @@ pub fn render(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
         .flex_col()
         .bg(t.bg)
         .text_color(t.text)
+        // Drag handlers live on the root so they keep firing over any child
+        // (sidebar handle, history bar) while a resize drag is in progress.
+        .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
+            let mut changed = false;
+            if this.dragging_sidebar {
+                this.drag_sidebar(f32::from(ev.position.x));
+                changed = true;
+            }
+            if this.dragging_hist {
+                let vh = f32::from(window.viewport_size().height);
+                this.drag_hist(vh - f32::from(ev.position.y));
+                changed = true;
+            }
+            if changed {
+                cx.notify();
+            }
+        }))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _ev, _window, cx| {
+                this.end_drag();
+                cx.notify();
+            }),
+        )
         .child(
             div()
                 .flex_1()
                 .flex()
                 .min_h(px(0.0))
-                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
-                    if this.dragging_sidebar {
-                        this.drag_sidebar(f32::from(ev.position.x));
-                        cx.notify();
-                    }
-                }))
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|this, _ev, _window, cx| {
-                        this.end_drag();
-                        cx.notify();
-                    }),
-                )
                 .child(sidebar(app, cx))
                 .child(resize_handle(app, cx))
                 .child(editor_pane(app, cx)),
@@ -865,14 +876,30 @@ fn history_bar(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
 
     let track = div().flex_1().flex().mx(px(16.0)).mb(px(11.0)).child(ticks);
 
+    let handle = div()
+        .id("hist-resize")
+        .h(px(5.0))
+        .w_full()
+        .flex_none()
+        .cursor_row_resize()
+        .when(app.dragging_hist, |d| d.bg(t.accent))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _ev, _window, cx| {
+                this.start_hist_drag();
+                cx.notify();
+            }),
+        );
+
     div()
-        .h(px(150.0))
+        .h(px(app.hist_bar_h))
         .flex_none()
         .flex()
         .flex_col()
         .bg(t.bg_sub)
         .border_t_1()
         .border_color(t.line)
+        .child(handle)
         .child(status)
         .child(track)
 }
