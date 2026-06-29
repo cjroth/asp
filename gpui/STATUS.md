@@ -44,17 +44,19 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
 - 10 pure-logic modules ported 1:1 with parity tests; engine round-trip + app-behavior tests.
 
 ### Also done since
-- **History time-travel** (clickable ticks, read-only banner, restore), **Share** + **Remove** modals,
-  **tab + file context menus** (close others/left/right/all, new/delete), **New Vault** native picker,
-  **live-sync poll** (2s, picks up peer edits), **sidebar + history-bar resize** handles,
-  **perf harness** (`--perf`), clean build (**0 warnings, 90 tests**).
+- **History time-travel** (clickable ticks, read-only banner, restore).
+- **All modals**: Remove, Share (real ticket), **Connect** (ticket input → clone_remote), and
+  **Customize** (name + hue swatches, persisted to `~/.asp/desktop_vaultmeta.json`).
+- **Context menus**: vault (right-click), tab (close others/left/right/all), file (new/delete).
+- **New Vault** + **Connect Vault** native folder pickers; **live-sync poll** (2s);
+  **sidebar + history-bar resize**; **perf harness** (`--perf`).
+- Clean build: **0 warnings, 92 tests**. Screenshots for every screen/modal in `tools/shots/`.
 
 ## Remaining toward 100%
-- **Live WYSIWYG-while-typing** — current editing is edit-raw / view-rendered toggle; the desktop
-  renders markdown in place while typing (contentEditable). The hardest remaining piece.
-- **Customize modal** (name/hue/emoji) + **Connect-vault** ticket-input dialog (both need a
-  single-line text input in a modal — `TextBuffer` core is ready).
-- **vaultMeta / prefs persistence** to disk (in-memory today).
-- **Desktop reference pixel-diff** — capture desktop screens (browser/macOS) and diff vs `--shot`.
-- Broader **e2e** via gpui `VisualTestContext` (simulate clicks/keys, assert).
-- Deferred: per-language code syntax highlighting, mermaid/diagrams, frontmatter styles.
+- **Live WYSIWYG-while-typing** — editing currently shows the raw source (with a caret) and saves;
+  the desktop renders markdown *in place while typing* (contentEditable). This is the single hardest
+  remaining piece (≈ Zed-editor-scale) and is the main gap.
+- **UI prefs persistence** (theme / sidebar width / history height) — vault meta persists; prefs don't yet.
+- **Desktop reference pixel-diff** — capture desktop screens (needs a browser/macOS) and diff vs `--shot`.
+- Broader **e2e** via gpui `VisualTestContext` (simulate real click/key dispatch, assert).
+- Deferred: per-language code syntax highlighting, mermaid/diagrams, frontmatter styles, drag-reorder tabs.
