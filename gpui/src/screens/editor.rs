@@ -447,6 +447,18 @@ fn tab_item(
                 cx.notify();
             }),
         )
+        // Drag-to-reorder: press starts the drag, release on another tab drops it.
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _ev, _window, _cx| this.start_tab_drag(idx)),
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |this, _ev, _window, cx| {
+                this.drop_tab(idx);
+                cx.notify();
+            }),
+        )
         .when(active, |d| d.bg(t.bg).border_t_2().border_color(t.accent))
         .text_size(px(12.5))
         .font_weight(if active { FontWeight(600.0) } else { FontWeight(500.0) })

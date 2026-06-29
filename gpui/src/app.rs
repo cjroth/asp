@@ -80,6 +80,9 @@ pub struct AspApp {
     pub hist_bar_h: f32,
     pub dragging_hist: bool,
 
+    /// Index of the tab currently being dragged (drag-to-reorder).
+    pub dragging_tab: Option<usize>,
+
     /// Whether the background live-sync poll loop has been started.
     pub polling_started: bool,
 }
@@ -156,6 +159,7 @@ impl AspApp {
             dragging_sidebar: false,
             hist_bar_h: 150.0,
             dragging_hist: false,
+            dragging_tab: None,
             polling_started: false,
         };
         // Apply persisted UI prefs (theme + panel sizes).
@@ -281,6 +285,7 @@ impl AspApp {
             dragging_sidebar: false,
             hist_bar_h: 150.0,
             dragging_hist: false,
+            dragging_tab: None,
             polling_started: false,
         }
     }
@@ -596,6 +601,17 @@ impl AspApp {
         self.set_active(None);
     }
 
+    pub fn start_tab_drag(&mut self, idx: usize) {
+        self.dragging_tab = Some(idx);
+    }
+
+    /// Drop the dragged tab onto `target` index → reorder.
+    pub fn drop_tab(&mut self, target: usize) {
+        if let Some(from) = self.dragging_tab.take() {
+            self.tabs = tabs::reorder_tabs(&self.tabs, from, target);
+        }
+    }
+
     // -- layout resize --
 
     pub fn start_sidebar_drag(&mut self) {
@@ -625,6 +641,7 @@ impl AspApp {
         let was_dragging = self.dragging_sidebar || self.dragging_hist;
         self.dragging_sidebar = false;
         self.dragging_hist = false;
+        self.dragging_tab = None;
         if was_dragging {
             self.save_prefs_now();
         }
@@ -1211,6 +1228,21 @@ mod tests {
         a.end_drag();
         a.drag_hist(10.0);
         assert_eq!(a.hist_bar_h, 300.0); // not dragging → unchanged
+    }
+
+    #[test]
+    fn tab_drag_reorders() {
+        let mut a = AspApp::fixture_editor(Theme::light());
+        // tabs: [README.md, notes/ideas.md, notes/todo.md]
+        a.start_tab_drag(0);
+        a.drop_tab(2);
+        assert_eq!(
+            a.tabs,
+            vec!["notes/ideas.md".to_string(), "notes/todo.md".to_string(), "README.md".to_string()]
+        );
+        // drop with no active drag → no-op
+        a.drop_tab(0);
+        assert_eq!(a.tabs.len(), 3);
     }
 
     #[test]
