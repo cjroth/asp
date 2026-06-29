@@ -344,17 +344,38 @@ impl Engine {
     }
 
     /// Returns the materialized path → content-hash map (for echo suppression).
+    ///
+    /// Reconciles disk + the derived git store to the folded log. Both are kept
+    /// O(changed) rather than O(vault): the previous materialized `files` table is
+    /// the record of what's already on disk, so a content file is only (re)written
+    /// when its hash changed (or it's new, or it went missing from disk); and the
+    /// git export resolves blob oids through a `content_hash → git_oid` cache so an
+    /// unchanged file is never re-read/re-hashed. A single edit on a 50k-file vault
+    /// therefore touches one file's bytes, not all of them. (On the first
+    /// materialize the previous table is empty, so everything is "changed" and the
+    /// full initial reconcile still happens.)
     pub fn materialize(&self) -> AspResult<BTreeMap<String, String>> {
         let rows = self.store.all_rows()?;
-        let old_live: Vec<String> = self.store.live_files()?.into_iter().map(|f| f.path).collect();
+        // Previous materialized live state: path -> content_hash, and the set of
+        // all previously-live paths (content + dir) for stale removal.
+        let prev = self.store.live_files()?;
+        let mut prev_hash: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+        let mut old_live: Vec<String> = Vec::with_capacity(prev.len());
+        for f in &prev {
+            if f.deleted {
+                continue;
+            }
+            old_live.push(f.path.clone());
+            prev_hash.insert(f.path.clone(), f.result_hash.clone());
+        }
+
         let files = compute_files(&self.store, &rows)?;
         self.store.replace_files(&files)?;
 
-        // Desired on-disk set: content files (path -> bytes) and directory
-        // entities (paths to `mkdir`).
-        let mut desired: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        let mut desired_dirs: Vec<String> = Vec::new();
+        // New desired set, built WITHOUT reading blobs: content files (path ->
+        // content_hash, also the returned echo-suppression map) and dir entities.
         let mut hashes: BTreeMap<String, String> = BTreeMap::new();
+        let mut desired_dirs: Vec<String> = Vec::new();
         for f in &files {
             if f.deleted {
                 continue;
@@ -362,20 +383,26 @@ impl Engine {
             if f.merge_class == MergeClass::Dir {
                 desired_dirs.push(f.path.clone());
             } else if let Some(h) = &f.result_hash {
-                let bytes = self.store.get_blob(h)?.unwrap_or_default();
-                desired.insert(f.path.clone(), bytes);
                 hashes.insert(f.path.clone(), h.clone());
             }
         }
 
-        // Write/overwrite desired files atomically (only when content differs).
-        // Track whether `.aspignore` is (re)written this pass so we can refresh
-        // the live scope below without a stat on every materialize.
+        // Write content files whose hash CHANGED vs the previous materialize (or
+        // are new / went missing from disk). An unchanged file present on disk is
+        // skipped with a cheap `exists` stat — no content read, no write. (External
+        // edits are reconciled through `rescan`/`capture_rescan`, not here; this
+        // pass reflects the log to disk.) `.aspignore` (re)writes/removals still
+        // trigger a scope reload below.
         let mut aspignore_changed = false;
-        for (path, bytes) in &desired {
+        for (path, h) in &hashes {
             let abs = self.root.join(path);
+            let unchanged = prev_hash.get(path).map(|ph| ph.as_deref() == Some(h.as_str())).unwrap_or(false);
+            if unchanged && abs.exists() {
+                continue;
+            }
+            let bytes = self.store.get_blob(h)?.unwrap_or_default();
             let differs = match fs::read(&abs) {
-                Ok(cur) => &cur != bytes,
+                Ok(cur) => cur != bytes,
                 Err(_) => true,
             };
             if differs {
@@ -385,11 +412,8 @@ impl Engine {
                 if let Some(parent) = abs.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                let tmp = abs.with_extension(format!(
-                    "asp-tmp-{}",
-                    now_unix()
-                ));
-                fs::write(&tmp, bytes)?;
+                let tmp = abs.with_extension(format!("asp-tmp-{}", now_unix()));
+                fs::write(&tmp, &bytes)?;
                 fs::rename(&tmp, &abs)?;
             }
         }
@@ -402,7 +426,7 @@ impl Engine {
         // Remove files/dirs that were live before but no longer are.
         let desired_dir_set: std::collections::HashSet<&String> = desired_dirs.iter().collect();
         for path in old_live {
-            if !desired.contains_key(&path) && !desired_dir_set.contains(&path) {
+            if !hashes.contains_key(&path) && !desired_dir_set.contains(&path) {
                 if path == ".aspignore" {
                     aspignore_changed = true; // an ignore file was removed
                 }
@@ -420,9 +444,27 @@ impl Engine {
             self.reload_scope();
         }
 
-        // Derived git export at the settle boundary.
+        // Derived git export at the settle boundary — incremental via the
+        // content_hash → git_oid cache, so it reads + sha1s a blob only the first
+        // time that content is seen, not every file on every settle.
         let derived_time = rows.iter().map(|r| r.lamport).max().unwrap_or(0);
-        let _ = gitexport::export(&self.git_dir, &desired, derived_time);
+        let git_dir = &self.git_dir;
+        let store = &self.store;
+        let _ = gitexport::export(git_dir, &hashes, derived_time, |content_hash: &str| -> AspResult<[u8; 20]> {
+            if let Some(oid_hex) = store.git_oid_for(content_hash)? {
+                if let Ok(bytes) = hex::decode(&oid_hex) {
+                    if bytes.len() == 20 {
+                        let mut oid = [0u8; 20];
+                        oid.copy_from_slice(&bytes);
+                        return Ok(oid);
+                    }
+                }
+            }
+            let bytes = store.get_blob(content_hash)?.unwrap_or_default();
+            let oid = gitexport::write_blob_object(git_dir, &bytes)?;
+            store.put_git_oid(content_hash, &hex::encode(oid))?;
+            Ok(oid)
+        });
 
         Ok(hashes)
     }

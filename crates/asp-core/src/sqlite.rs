@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS authorized_keys(
   added_at INTEGER, source TEXT
 );
 CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS git_blobs(content_hash TEXT PRIMARY KEY, git_oid TEXT NOT NULL);
 "#;
 
 pub struct SqliteStore {
@@ -174,6 +175,25 @@ impl SqliteStore {
     /// the status poll never materializes every `FileRow` just to count them.
     pub fn live_file_count(&self) -> AspResult<u64> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM files WHERE deleted=0", [], |r| r.get::<_, i64>(0))? as u64)
+    }
+
+    /// Derived-git blob-object id for a content hash, if already exported. The git
+    /// object id is a pure function of the bytes, so this cache lets `materialize`
+    /// skip re-reading and re-hashing every blob into the git store on every
+    /// settle — only content first seen this session is read + written.
+    pub fn git_oid_for(&self, content_hash: &str) -> AspResult<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT git_oid FROM git_blobs WHERE content_hash=?1", params![content_hash], |r| r.get::<_, String>(0))
+            .optional()?)
+    }
+
+    pub fn put_git_oid(&self, content_hash: &str, git_oid: &str) -> AspResult<()> {
+        self.conn.execute(
+            "INSERT INTO git_blobs(content_hash, git_oid) VALUES(?1,?2) ON CONFLICT(content_hash) DO NOTHING",
+            params![content_hash, git_oid],
+        )?;
+        Ok(())
     }
 
     /// Next Lamport tick = max(observed) + 1, derived from the durable log.

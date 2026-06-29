@@ -99,6 +99,50 @@ fn file_at_matches_state_as_of_across_edits_renames_and_merges() {
     assert_eq!(e.file_at("b.md", t3).unwrap(), None, "deleted file is absent");
 }
 
+// materialize is O(changed): it skips re-writing a file whose hash is unchanged.
+// But it must still RE-HEAL a live file that vanished from disk behind the engine
+// (the cheap `exists()` check), or the on-disk tree would silently drift from the
+// log on the next unrelated edit.
+#[test]
+fn materialize_reheals_a_live_file_deleted_from_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = Engine::init(dir.path(), Identity::from_seed(&[31; 32])).unwrap();
+    e.record_write("keep.md", b"content\n").unwrap();
+    let p = dir.path().join("keep.md");
+    assert!(p.exists());
+
+    // Delete it from disk behind the engine (no rescan). The log still says it's live.
+    std::fs::remove_file(&p).unwrap();
+    assert!(!p.exists());
+
+    // An unrelated edit triggers materialize; it must re-create keep.md (the heal),
+    // not skip it as "unchanged".
+    e.record_write("other.md", b"x\n").unwrap();
+    assert!(p.exists(), "materialize re-healed the externally-deleted live file");
+    assert_eq!(std::fs::read(&p).unwrap(), b"content\n");
+}
+
+// The derived-git head is a deterministic function of the tree + derived time, so
+// the content_hash→git_oid cache must reproduce the exact same SHA on a warm-cache
+// re-export as a cold one — otherwise nodes holding the same log could disagree on
+// the git head.
+#[test]
+fn git_head_is_stable_across_rematerialize_via_the_blob_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = Engine::init(dir.path(), Identity::from_seed(&[33; 32])).unwrap();
+    e.record_write("a/x.md", b"hello\n").unwrap();
+    e.record_write("b.md", b"world\n").unwrap();
+    let head1 = std::fs::read_to_string(e.git_dir.join("refs/heads/main")).unwrap();
+    assert!(!head1.trim().is_empty());
+
+    // capture_rescan with no on-disk changes authors no rows → identical tree and
+    // identical max-lamport → the re-export (now resolving blob oids from the cache)
+    // must yield the SAME commit SHA.
+    e.capture_rescan().unwrap();
+    let head2 = std::fs::read_to_string(e.git_dir.join("refs/heads/main")).unwrap();
+    assert_eq!(head1, head2, "warm-cache re-export reproduces the identical deterministic SHA");
+}
+
 #[test]
 fn authorize_and_revoke_admission_keys() {
     let dir = tempfile::tempdir().unwrap();
