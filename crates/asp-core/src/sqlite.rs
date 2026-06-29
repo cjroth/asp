@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS files(
   file_id TEXT PRIMARY KEY, path TEXT, result_hash TEXT, merge_class TEXT,
   deleted INTEGER NOT NULL DEFAULT 0, lamport INTEGER, site_id TEXT, conflict INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS files_path ON files(path);
 CREATE TABLE IF NOT EXISTS fold_cache(step_key TEXT PRIMARY KEY, output_hash TEXT);
 CREATE TABLE IF NOT EXISTS snapshots(
   snapshot_id TEXT PRIMARY KEY, created_lamport INTEGER, label TEXT, tree_hash TEXT,
@@ -159,6 +160,28 @@ impl SqliteStore {
 
     pub fn row_count(&self) -> AspResult<u64> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM log", [], |r| r.get::<_, i64>(0))? as u64)
+    }
+
+    /// The live (non-tombstone) file at `path`, if any — an indexed lookup, not a
+    /// load of every file row (record_* run it on every edit).
+    pub fn live_file_by_path(&self, path: &str) -> AspResult<Option<FileRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, path, result_hash, merge_class, deleted, lamport, site_id, conflict
+             FROM files WHERE path=?1 AND deleted=0 LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![path], |r| {
+            Ok(FileRow {
+                file_id: r.get(0)?,
+                path: r.get(1)?,
+                result_hash: r.get(2)?,
+                merge_class: MergeClass::parse(&r.get::<_, String>(3)?).unwrap_or(MergeClass::Text),
+                deleted: r.get::<_, i64>(4)? != 0,
+                lamport: r.get::<_, i64>(5)? as u64,
+                site_id: r.get(6)?,
+                conflict: r.get::<_, i64>(7)? != 0,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
     }
 
     /// Count of live (non-tombstone) files — a single aggregate, not a load of

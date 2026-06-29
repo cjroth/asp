@@ -144,8 +144,7 @@ impl Engine {
 
     /// The current materialized content hash for a live path, if any.
     fn current_for_path(&self, rel: &str) -> AspResult<Option<FileRow>> {
-        let files = self.store.live_files()?;
-        Ok(files.into_iter().find(|f| f.path == rel))
+        self.store.live_file_by_path(rel)
     }
 
     /// Highest-OrderKey row id for a file_id (its deterministic local tip).
