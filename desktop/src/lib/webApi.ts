@@ -11,6 +11,7 @@ import init, { WasmEngine } from 'asp-wasm';
 import wasmUrl from 'asp-wasm/asp_wasm_bg.wasm?url';
 import type { Api, FileAt, FileEntry, HistEvent, VaultInfo, VaultStatus } from './api';
 import { WELCOME_MD } from '../vault/welcome';
+import { makeCoalescer } from './coalesce';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -136,6 +137,18 @@ export function createWebApi(): Api {
     return eng;
   }
   const persist = (id: string, eng: WasmEngine) => writeBytes(stateName(id), eng.dump_state());
+  // `dump_state` re-serializes the WHOLE engine (every row + blob) to OPFS, so on
+  // a big vault doing it on every keystroke-save / synced row is the dominant
+  // cost. Coalesce it: edits return immediately and the state is written at most
+  // once per quiet window. Durability is the live peer sync; OPFS is a cache that
+  // a reload re-syncs — and we flush on page-hide so nothing pending is lost.
+  const persistQueue = makeCoalescer<WasmEngine>((id, eng) => void persist(id, eng).catch(() => {}), 700);
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') persistQueue.flush();
+    });
+    window.addEventListener('pagehide', () => persistQueue.flush());
+  }
 
   const fileList = (eng: WasmEngine): FileEntry[] => {
     const detail = JSON.parse(eng.files_detail_json()) as { file_id: string; path: string; merge_class: string; deleted: boolean }[];
@@ -208,7 +221,7 @@ export function createWebApi(): Api {
           try {
             // Resolves when the connection closes; on_change fires per remote push.
             await eng.connect_live(up.ticket, up.authKey ?? undefined, null, () => {
-              void persist(id, eng);
+              persistQueue.schedule(id, eng);
               try {
                 onChange();
               } catch {
@@ -229,6 +242,7 @@ export function createWebApi(): Api {
       const h = live.get(id);
       if (h) h.stop = true;
       live.delete(id);
+      persistQueue.flushKey(id); // leaving the vault — write its latest state now
     },
 
     syncNow: async (id, ticket, authKey) => {
@@ -245,7 +259,7 @@ export function createWebApi(): Api {
       }
       const eng = await engineFor(id);
       await eng.sync(t, k ?? null, null);
-      await persist(id, eng);
+      persistQueue.schedule(id, eng);
     },
 
     getStatus: async (id): Promise<VaultStatus> => {
@@ -263,19 +277,19 @@ export function createWebApi(): Api {
     writeFile: async (id, path, content) => {
       const eng = await engineFor(id);
       eng.record_write(path, enc.encode(content));
-      await persist(id, eng);
+      persistQueue.schedule(id, eng);
     },
 
     renameFile: async (id, oldPath, newPath) => {
       const eng = await engineFor(id);
       eng.record_rename(oldPath, newPath);
-      await persist(id, eng);
+      persistQueue.schedule(id, eng);
     },
 
     deleteFile: async (id, path) => {
       const eng = await engineFor(id);
       eng.record_remove(path);
-      await persist(id, eng);
+      persistQueue.schedule(id, eng);
     },
 
     // Empty directories aren't first-class in the thin (wasm) engine — the folder
@@ -292,6 +306,7 @@ export function createWebApi(): Api {
     rescan: async () => {},
 
     removeVault: async (id) => {
+      persistQueue.cancel(id); // don't let a debounced write resurrect the state file
       engines.delete(id);
       await removeFile(stateName(id));
       const reg = (await registry()).filter((r) => r.id !== id);
