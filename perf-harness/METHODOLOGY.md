@@ -76,3 +76,40 @@ The closing moves: a **slow** mock (`App.content.test.tsx`, 120ms writes),
 **content/scroll assertions** (`FileTree.test.tsx`, harness "editor shows content
 after create"), and **rapid/overlapping actions** (rapid-multi-delete, file
 bouncing). Each new test fails on the pre-fix code.
+
+## Round 2 — the backend WAS the freeze at 10k–50k files
+
+The first round proved the backend was fine at 1k files. At 10k–50k it is not —
+`bench_ops.rs 50000 0` exposed O(vault)-per-op costs that scale right past the
+point a real vault hits. Same loop (measure one op, find the layer, fix the
+smallest thing, re-measure), backend edition.
+
+| # | Problem (at scale) | Fix | Result |
+|---|---|---|---|
+| 13 | every `write_file` was O(vault): `materialize` rewrote the whole `files` table with a per-row INSERT and **no transaction**, so SQLite auto-committed once per row | wrap the rewrite in ONE `unchecked_transaction` + a cached prepared statement | `replace_files` **585ms → 17ms**, `write_file` **824ms → 265ms** @ 10k (3.1×) |
+| 14 | `get_status` (10s poll) loaded **every** log row for `max(ts)` and materialized every `FileRow` to count them | `Store::max_ts()` (`SELECT MAX(ts)`) + `Store::live_file_count()` (`SELECT COUNT`) | `get_status` **220ms → 2.8ms** @ 10k |
+| 15 | the fold read **every** content blob, even on linear edits, to keep an in-memory `content` it only used for merges | lazy content in `compute_files`: track `content_hash`; read `ours/base/theirs` only when a real 3-way merge fires (byte-identical FileRows) | speeds up every materialize + every history fold |
+| 16 | history slider: `read_file_at` rebuilt the **whole-vault** snapshot (read all blobs) to extract one file, fired on every pointermove | `Engine::file_at(path,t)` reads exactly one blob; debounce the time-travel read 60ms in `App.tsx` | `read_file_at` **137ms → 48ms** @ 10k; a scrub is one read, not one-per-pixel |
+
+Each fix is locked by a test that asserts the *behavior*, not the speed:
+`store_and_config` (max_ts/live_file_count match the scan), `engine_snapshot`
+(`file_at` ≡ `state_as_of` across edits/renames/deletes/merges),
+`fold::concurrent_disjoint_edits_both_survive_in_the_fold` (the lazy fold still
+merges), and the full `sync_fuzz` battery (the transaction + fold changes don't
+break convergence: 4 seeds × 3 peers × 300 rounds, 0 divergences).
+
+Frontend companion: a **loading overlay** while opening/adding a large folder
+(`withOpening` in `App.tsx`, 140ms threshold so a quick switch never flashes) —
+the open path is genuinely slow at 50k files (first capture hashes + git-exports
+every file), so it gets the same progress affordance cloning already had.
+
+**Still O(vault), left as-is (deliberately):** the *first* `add_local_folder`
+capture at 50k files is dominated by hashing every file, storing every blob, and
+`gitexport` zlib-compressing every file into the derived git store. `gitexport`
+runs on every settle and writes `refs/heads/main` (the deterministic cross-node
+SHA, surfaced as `status.head`), so taking it off the hot path is a correctness
+decision, not a free win — out of scope for a perf pass. The loading overlay
+covers the one-time open; the per-save path is the 3× win above. Note also that
+`reopen_saved()` runs synchronously before the Tauri window opens, so a large
+saved vault slows cold start — a candidate for deferring reopen to after first
+paint.
