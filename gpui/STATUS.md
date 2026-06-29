@@ -43,12 +43,18 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
 - **Overlays**: vault context menu (right-click) + Remove-vault modal; **New Vault** native folder picker.
 - 10 pure-logic modules ported 1:1 with parity tests; engine round-trip + app-behavior tests.
 
+### Also done since
+- **History time-travel** (clickable ticks, read-only banner, restore), **Share** + **Remove** modals,
+  **tab + file context menus** (close others/left/right/all, new/delete), **New Vault** native picker,
+  **live-sync poll** (2s, picks up peer edits), **sidebar + history-bar resize** handles,
+  **perf harness** (`--perf`), clean build (**0 warnings, 90 tests**).
+
 ## Remaining toward 100%
 - **Live WYSIWYG-while-typing** — current editing is edit-raw / view-rendered toggle; the desktop
   renders markdown in place while typing (contentEditable). The hardest remaining piece.
-- **More overlays** — Share + Customize modals, file/tab context menus, Connect-vault (ticket) dialog.
-- **Live sync → UI** — drain the engine change-receiver, repaint on peer edits + status polling.
-- **Resize handles** — sidebar + history-bar drag (clamps already ported in `vault/prefs.rs`).
-- **Perf harness** (mirror `../desktop/perf-harness`) + broader **e2e** via gpui `VisualTestContext`.
+- **Customize modal** (name/hue/emoji) + **Connect-vault** ticket-input dialog (both need a
+  single-line text input in a modal — `TextBuffer` core is ready).
+- **vaultMeta / prefs persistence** to disk (in-memory today).
 - **Desktop reference pixel-diff** — capture desktop screens (browser/macOS) and diff vs `--shot`.
-- Deferred: per-language code syntax highlighting, mermaid/diagrams, frontmatter styles, prefs persistence.
+- Broader **e2e** via gpui `VisualTestContext` (simulate clicks/keys, assert).
+- Deferred: per-language code syntax highlighting, mermaid/diagrams, frontmatter styles.
