@@ -270,6 +270,75 @@ impl AspApp {
         }
     }
 
+    /// Toggle light/dark theme.
+    pub fn toggle_theme(&mut self) {
+        self.theme = match self.theme.appearance {
+            crate::theme::Appearance::Light => Theme::dark(),
+            crate::theme::Appearance::Dark => Theme::light(),
+        };
+    }
+
+    /// Re-list the open vault's files (after a file operation).
+    fn reload_files(&mut self) {
+        if let (Some(eng), Some(vid)) = (self.engine.clone(), self.vault_id.clone()) {
+            if let Ok(files) = eng.list_files(&vid) {
+                self.files = files.iter().map(|f| (f.path.clone(), f.is_dir)).collect();
+            }
+        }
+    }
+
+    /// Create a fresh `untitled[-n].md` at the vault root and open it.
+    pub fn new_file(&mut self) {
+        let (Some(eng), Some(vid)) = (self.engine.clone(), self.vault_id.clone()) else { return };
+        let siblings: std::collections::HashSet<String> = self
+            .files
+            .iter()
+            .filter(|(p, _)| !p.contains('/'))
+            .map(|(p, _)| p.clone())
+            .collect();
+        let name = crate::vault::format::free_name(&siblings, ".md");
+        if eng.write_file(&vid, &name, "# Untitled\n\n").is_ok() {
+            self.reload_files();
+            self.select_file(&name);
+        }
+    }
+
+    /// Delete a file and fix up tabs/selection.
+    pub fn delete_file(&mut self, path: &str) {
+        let (Some(eng), Some(vid)) = (self.engine.clone(), self.vault_id.clone()) else { return };
+        if eng.delete_file(&vid, path).is_err() {
+            return;
+        }
+        self.reload_files();
+        // drop the tab (and its subtree) and re-point the active file if needed.
+        let was_active = self.active.as_deref() == Some(path);
+        self.tabs = tabs::remove_tabs(&self.tabs, &[path.to_string()]);
+        if was_active {
+            self.active = self.tabs.last().cloned();
+            self.content = match (self.active.clone(), self.engine.clone(), self.vault_id.clone()) {
+                (Some(p), Some(eng), Some(vid)) => eng.read_file(&vid, &p).unwrap_or_default(),
+                _ => String::new(),
+            };
+        }
+    }
+
+    /// Rename a file/folder and remap tabs + active + expanded.
+    pub fn rename_file(&mut self, old: &str, new: &str) {
+        let (Some(eng), Some(vid)) = (self.engine.clone(), self.vault_id.clone()) else { return };
+        if eng.rename_file(&vid, old, new).is_err() {
+            return;
+        }
+        self.reload_files();
+        self.tabs = tabs::remap_tabs(&self.tabs, old, new);
+        if self.active.as_deref() == Some(old) {
+            self.active = Some(new.to_string());
+        } else if let Some(a) = &self.active {
+            if let Some(rest) = a.strip_prefix(&format!("{old}/")) {
+                self.active = Some(format!("{new}/{rest}"));
+            }
+        }
+    }
+
     /// Return to the Connect screen.
     pub fn back_to_connect(&mut self) {
         self.refresh_vaults();
@@ -344,5 +413,47 @@ mod tests {
         app.select_file("notes/a.md");
         assert_eq!(app.content, "alpha\n");
         assert!(app.tabs.iter().any(|t| t == "notes/a.md"));
+    }
+
+    #[test]
+    fn engine_backed_file_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), b"# Hi\n").unwrap();
+        let eng = Engine::with_identity(Identity::from_seed(&[11u8; 32])).unwrap();
+        let info = eng.add_local_folder(dir.path()).unwrap();
+        let id = info.id.clone();
+        let mut app = AspApp { engine: Some(Rc::new(eng)), ..AspApp::fixture_base(Theme::light()) };
+        app.refresh_vaults();
+        app.open_vault(&id);
+
+        // new_file creates untitled.md, selects it, opens a tab.
+        app.new_file();
+        assert_eq!(app.active.as_deref(), Some("untitled.md"));
+        assert!(app.files.iter().any(|(p, _)| p == "untitled.md"));
+        assert!(app.tabs.iter().any(|t| t == "untitled.md"));
+
+        // a second new_file gets a unique name.
+        app.new_file();
+        assert!(app.files.iter().any(|(p, _)| p == "untitled-1.md"));
+
+        // rename remaps the active file + tab.
+        app.rename_file("untitled-1.md", "renamed.md");
+        assert!(app.files.iter().any(|(p, _)| p == "renamed.md"));
+        assert!(!app.files.iter().any(|(p, _)| p == "untitled-1.md"));
+
+        // delete drops the file + its tab.
+        app.delete_file("untitled.md");
+        assert!(!app.files.iter().any(|(p, _)| p == "untitled.md"));
+        assert!(!app.tabs.iter().any(|t| t == "untitled.md"));
+    }
+
+    #[test]
+    fn toggle_theme_flips_appearance() {
+        let mut app = AspApp::fixture_connect(Theme::light());
+        assert_eq!(app.theme.appearance, crate::theme::Appearance::Light);
+        app.toggle_theme();
+        assert_eq!(app.theme.appearance, crate::theme::Appearance::Dark);
+        app.toggle_theme();
+        assert_eq!(app.theme.appearance, crate::theme::Appearance::Light);
     }
 }

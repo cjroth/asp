@@ -42,7 +42,7 @@ fn sidebar(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
         .border_r_1()
         .border_color(t.line)
         .child(vault_switcher(app, cx))
-        .child(files_label(app))
+        .child(files_label(app, cx))
         .child(file_tree(app, cx))
 }
 
@@ -114,7 +114,7 @@ fn vault_switcher(app: &AspApp, cx: &mut Context<AspApp>) -> impl IntoElement {
         .child(icon("caret-down", px(13.0), t.faint))
 }
 
-fn files_label(app: &AspApp) -> Div {
+fn files_label(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
     let t = app.theme;
     let btn = |name: &str| {
         div()
@@ -123,6 +123,7 @@ fn files_label(app: &AspApp) -> Div {
             .flex()
             .items_center()
             .justify_center()
+            .hover(|s| s.bg(t.line))
             .child(icon(name, px(16.0), t.faint))
     };
     div()
@@ -142,7 +143,15 @@ fn files_label(app: &AspApp) -> Div {
                 .text_color(t.faint2)
                 .child("FILES"),
         )
-        .child(btn("plus"))
+        .child(
+            btn("plus")
+                .id("new-file")
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _ev, _window, cx| {
+                    this.new_file();
+                    cx.notify();
+                })),
+        )
         .child(btn("collapse-all"))
         .child(btn("dots"))
 }
@@ -264,18 +273,29 @@ fn tab_bar(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
         .border_b_1()
         .border_color(t.line)
         .child(strip)
-        .child(
-            div()
-                .size(px(28.0))
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(t.line)
-                .bg(t.bg)
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(icon("theme-moon", px(16.0), t.text3)),
-        )
+        .child(theme_toggle(app, cx))
+}
+
+fn theme_toggle(app: &AspApp, cx: &mut Context<AspApp>) -> impl IntoElement {
+    let t = app.theme;
+    let dark = t.appearance == theme::Appearance::Dark;
+    div()
+        .id("theme-toggle")
+        .size(px(28.0))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(t.line)
+        .bg(t.bg)
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|s| s.bg(t.line))
+        .on_click(cx.listener(|this, _ev, _window, cx| {
+            this.toggle_theme();
+            cx.notify();
+        }))
+        .child(icon(if dark { "theme-sun" } else { "theme-moon" }, px(16.0), t.text3))
 }
 
 fn tab_item(

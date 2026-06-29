@@ -49,6 +49,7 @@ pub fn render(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
         .child(platform)
         .child(
             div()
+                .id("theme-toggle")
                 .size(px(28.0))
                 .rounded(px(8.0))
                 .border_1()
@@ -57,6 +58,12 @@ pub fn render(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
                 .flex()
                 .items_center()
                 .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(t.line))
+                .on_click(cx.listener(|this, _ev, _window, cx| {
+                    this.toggle_theme();
+                    cx.notify();
+                }))
                 .child(icon(
                     if t.appearance == Appearance::Dark { "theme-sun" } else { "theme-moon" },
                     px(16.0),
