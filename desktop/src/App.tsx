@@ -346,9 +346,14 @@ export default function App() {
   // live connection up; each remote push lands in the engine and refreshes the
   // tree + open file in realtime. Desktop is excluded (its engine is already
   // live; the poll above re-reads it).
+  // Listing the tree is O(N) (seconds-adjacent on a huge vault), and a sync burst
+  // fires this per row, so coalesce the tree refresh while keeping the open
+  // file's content update immediate (cheap single-file read).
+  const fileRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const liveRefresh = useCallback(
     (id: string) => {
-      void refreshFiles(id).catch(() => {});
+      if (fileRefreshTimer.current) clearTimeout(fileRefreshTimer.current);
+      fileRefreshTimer.current = setTimeout(() => void refreshFiles(id).catch(() => {}), 400);
       scheduleHistory(id);
       void refreshActiveContent();
     },
