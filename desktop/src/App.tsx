@@ -390,6 +390,22 @@ export default function App() {
     };
   }, [desktop, screen]);
 
+  // Saved folders reopen in the background at startup (a big vault's reconcile is
+  // slow), so the window can appear before they're loaded. Refresh the list as the
+  // engine signals vaults have landed, instead of waiting for the 10s poll.
+  useEffect(() => {
+    if (!desktop) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void listen('vaults-changed', () => {
+      void refreshVaults().then(refreshStatuses).catch(() => {});
+    }).then((u) => (cancelled ? u() : (unlisten = u)));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [desktop, refreshVaults, refreshStatuses]);
+
   const metaOf = useCallback(
     (v: VaultInfo) => resolveMeta(metaMap, v.vault_id, basename(v.path)),
     [metaMap],

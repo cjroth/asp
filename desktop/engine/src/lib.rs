@@ -138,14 +138,21 @@ impl DesktopEngine {
     /// the CLI's `~/.asp/id_ed25519`).
     pub fn new(identity: Identity) -> Result<DesktopEngine> {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().context("tokio runtime")?;
-        Ok(DesktopEngine {
+        let de = DesktopEngine {
             rt,
             identity,
             folders: Mutex::new(HashMap::new()),
             change_listener: Arc::new(Mutex::new(None)),
             relay_override: Mutex::new(None),
             relay_task: Mutex::new(None),
-        })
+        };
+        // Restore the persisted "faster local syncing" preference: co-host the
+        // relay up front (before any folder binds) so reopened vaults' tickets
+        // advertise it. A bind failure just falls back to the default relays.
+        if Self::read_local_relay_setting() {
+            let _ = de.set_local_relay(true);
+        }
+        Ok(de)
     }
 
     /// Whether the co-hosted local relay is currently on.
@@ -177,6 +184,7 @@ impl DesktopEngine {
             }
             *self.relay_override.lock().unwrap() = None;
         }
+        Self::write_local_relay_setting(on); // persist across restarts
         self.reestablish_all()?;
         Ok(on)
     }
@@ -419,6 +427,28 @@ impl DesktopEngine {
         PathBuf::from(home).join(".asp").join("desktop_folders.json")
     }
 
+    fn settings_path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join(".asp").join("desktop_settings.json")
+    }
+
+    /// The persisted "faster local syncing" preference (default off).
+    fn read_local_relay_setting() -> bool {
+        std::fs::read_to_string(Self::settings_path())
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("local_relay").and_then(|b| b.as_bool()))
+            .unwrap_or(false)
+    }
+
+    fn write_local_relay_setting(on: bool) {
+        let p = Self::settings_path();
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&p, serde_json::json!({ "local_relay": on }).to_string());
+    }
+
     fn saved_folders() -> Vec<FolderCfg> {
         std::fs::read_to_string(Self::folders_config_path())
             .ok()
@@ -459,19 +489,38 @@ impl DesktopEngine {
     /// persisted upstream peers). Call once at startup. Folders that no longer
     /// exist on disk are skipped (and pruned).
     pub fn reopen_saved(&self) -> Result<Vec<VaultInfo>> {
-        let mut infos = Vec::new();
-        let mut keep = Vec::new();
-        for cfg in Self::saved_folders() {
-            let path = PathBuf::from(&cfg.path);
-            if path.join(".asp/asp.db").exists() {
-                if let Ok(info) = self.add_folder_inner(&path, cfg.peer.clone()) {
-                    infos.push(info);
-                    keep.push(cfg);
-                }
-            }
-        }
+        Ok(self.reopen_saved_streaming(|_| {}))
+    }
+
+    /// Reopen saved folders **concurrently**, invoking `on_each` the moment each
+    /// one is ready. Each folder's open includes a startup reconcile that reads
+    /// every file on disk (the only way external-while-closed edits are caught —
+    /// there's no fs watcher), so a 28k-file vault takes ~tens of seconds. Doing
+    /// them in parallel and streaming each as it lands means a big vault never
+    /// blocks the small ones, and the shell can surface vaults the instant they're
+    /// ready (a realtime `vaults-changed` event) rather than after the slowest.
+    pub fn reopen_saved_streaming(&self, on_each: impl Fn(&VaultInfo) + Send + Sync) -> Vec<VaultInfo> {
+        let cfgs: Vec<FolderCfg> = Self::saved_folders()
+            .into_iter()
+            .filter(|c| PathBuf::from(&c.path).join(".asp/asp.db").exists())
+            .collect();
+        let opened: Vec<(FolderCfg, VaultInfo)> = std::thread::scope(|s| {
+            let handles: Vec<_> = cfgs
+                .iter()
+                .map(|cfg| {
+                    let on_each = &on_each;
+                    s.spawn(move || {
+                        let info = self.add_folder_inner(&PathBuf::from(&cfg.path), cfg.peer.clone()).ok()?;
+                        on_each(&info);
+                        Some((cfg.clone(), info))
+                    })
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
+        });
+        let keep: Vec<FolderCfg> = opened.iter().map(|(c, _)| c.clone()).collect();
         Self::write_saved_folders(&keep);
-        Ok(infos)
+        opened.into_iter().map(|(_, i)| i).collect()
     }
 
     /// Bootstrap a new folder by cloning from a listening peer (by iroh ticket /

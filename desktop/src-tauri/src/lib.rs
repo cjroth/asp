@@ -36,8 +36,6 @@ fn load_identity() -> Identity {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let engine = DesktopEngine::new(load_identity()).expect("init desktop engine");
-    // Re-open folders managed in a previous session so vaults persist across launches.
-    let _ = engine.reopen_saved();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -51,6 +49,22 @@ pub fn run() {
             let handle = app.handle().clone();
             app.state::<AppState>().engine.set_change_listener(move |vault_id| {
                 let _ = handle.emit("vault-changed", vault_id);
+            });
+            // Re-open saved folders in the BACKGROUND so the window opens instantly.
+            // A folder's open includes a startup reconcile that reads every file on
+            // disk — ~tens of seconds for a 28k-file vault — which used to block the
+            // whole app from appearing. Folders reopen concurrently and emit a
+            // realtime `vaults-changed` the instant each lands (no polling), so the
+            // UI surfaces each vault as it's ready. A vault becomes shareable only
+            // after its reconcile, so a clone can never contend with one mid-scan.
+            let h2 = app.handle().clone();
+            std::thread::spawn(move || {
+                let emit_handle = h2.clone();
+                h2.state::<AppState>()
+                    .engine
+                    .reopen_saved_streaming(move |_info| {
+                        let _ = emit_handle.emit("vaults-changed", ());
+                    });
             });
             Ok(())
         })
