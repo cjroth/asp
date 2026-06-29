@@ -10,6 +10,7 @@ mod app;
 mod assets;
 mod engine;
 mod icons;
+mod perf;
 mod screens;
 mod theme;
 mod vault;
@@ -41,6 +42,10 @@ fn main() {
     // Offscreen screenshot mode: `asp-gpui --shot <out.png> [screen]` renders a
     // screen to a PNG via the headless wgpu renderer (no real window/display).
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--perf") {
+        run_perf();
+        return;
+    }
     if let Some(idx) = args.iter().position(|a| a == "--shot") {
         let out = args
             .get(idx + 1)
@@ -64,6 +69,53 @@ fn main() {
         .unwrap();
         cx.activate(true);
     });
+}
+
+/// Performance report — logic hot paths + offscreen render frames, at real scale.
+fn run_perf() {
+    use std::time::Instant;
+    println!("== asp-gpui perf (build profile matters — run with --release for real numbers) ==");
+    let (parse_ms, tree_ms) = perf::time_logic(8000, 2000, 30);
+    println!("markdown parse        (8k lines):        {parse_ms:7.2} ms/iter");
+    println!("tree build+flatten    (2k files):        {tree_ms:7.2} ms/iter");
+
+    let text_system = Arc::new(gpui_wgpu::CosmicTextSystem::new("sans-serif"));
+    let mut cx = HeadlessAppContext::with_platform(
+        text_system,
+        Arc::new(Assets),
+        gpui_platform::current_headless_renderer,
+    );
+    cx.text_system().add_fonts(Assets::font_bytes()).ok();
+    let window = cx
+        .open_window(size(px(1100.0), px(740.0)), |_, cx| {
+            cx.new(|_| {
+                let mut a = AspApp::fixture_editor(Theme::light());
+                a.content = perf::big_doc(1000);
+                a.files = perf::many_files(300);
+                a.expanded = a
+                    .files
+                    .iter()
+                    .filter(|(_, d)| *d)
+                    .map(|(p, _)| (p.clone(), true))
+                    .collect();
+                a
+            })
+        })
+        .expect("open window");
+    let handle: AnyWindowHandle = window.into();
+    cx.run_until_parked();
+    let _ = cx.capture_screenshot(handle); // warmup
+
+    let frames = 15;
+    let t = Instant::now();
+    for _ in 0..frames {
+        cx.update_window(handle, |_, window, _| window.refresh()).ok();
+        cx.run_until_parked();
+        let _ = cx.capture_screenshot(handle);
+    }
+    let frame_ms = t.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+    println!("editor render_to_image (1k-line doc, 300 files): {frame_ms:7.2} ms/frame (software lavapipe)");
+    println!("note: render uses CPU lavapipe; real GPU is far faster. CPU-side scene build is the comparable metric.");
 }
 
 /// Renders the named screen offscreen and writes it to `out_path`.
