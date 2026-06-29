@@ -86,6 +86,16 @@ fn run_shot(out_path: &str, screen: &str) {
             .open_window(win_size, |_, cx| cx.new(|_| AspApp::fixture_connect(Theme::dark())))
             .expect("open window")
             .into(),
+        "remove-modal" => cx
+            .open_window(win_size, |_, cx| {
+                cx.new(|_| {
+                    let mut a = AspApp::fixture_connect(Theme::light());
+                    a.open_remove("v1", "Research Notes");
+                    a
+                })
+            })
+            .expect("open window")
+            .into(),
         "editor" => cx
             .open_window(win_size, |_, cx| cx.new(|_| AspApp::fixture_editor(Theme::light())))
             .expect("open window")

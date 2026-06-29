@@ -1,6 +1,6 @@
 //! Connect screen — data-driven over `AspApp` (see DESIGN_SPEC.md §3).
 
-use gpui::{div, prelude::*, px, Context, Div, FontWeight, SharedString};
+use gpui::{div, prelude::*, px, Context, Div, FontWeight, MouseButton, MouseDownEvent, SharedString};
 
 use crate::app::{AspApp, ConnectRow};
 use crate::icons::icon;
@@ -238,6 +238,8 @@ fn vault_row(
         .child(row.time.clone());
 
     let id = row.id.clone();
+    let menu_id = row.id.clone();
+    let menu_name = row.name.clone();
     div()
         .id(SharedString::from(format!("vault-{idx}")))
         .flex()
@@ -251,6 +253,18 @@ fn vault_row(
             d.cursor_pointer()
                 .hover(|s| s.bg(t.bg_sub))
                 .on_click(cx.listener(move |this, _ev, _window, cx| { this.open_vault(&id); cx.notify(); }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                        this.open_vault_menu(
+                            &menu_id,
+                            &menu_name,
+                            f32::from(ev.position.x),
+                            f32::from(ev.position.y),
+                        );
+                        cx.notify();
+                    }),
+                )
         })
         .child(avatar)
         .child(content)

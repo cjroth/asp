@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gpui::{prelude::*, AnyElement};
+use gpui::{div, prelude::*, AnyElement};
 
 use crate::engine::Engine;
 use crate::screens::{connect, editor};
@@ -61,6 +61,24 @@ pub struct AspApp {
     pub history_events: Vec<crate::vault::history::TrackEvent>,
     /// When `Some(unix_secs)`, the editor shows the vault as-of that time (read-only).
     pub playhead: Option<i64>,
+
+    // Transient overlays.
+    pub menu: Menu,
+    pub modal: Modal,
+}
+
+/// An open context menu (anchored at a click position).
+#[derive(Clone, PartialEq, Debug)]
+pub enum Menu {
+    None,
+    Vault { id: String, name: String, x: f32, y: f32 },
+}
+
+/// An open modal dialog.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Modal {
+    None,
+    RemoveVault { id: String, name: String, trash: bool },
 }
 
 fn now_secs() -> i64 {
@@ -101,6 +119,8 @@ impl AspApp {
             content: String::new(),
             history_events: Vec::new(),
             playhead: None,
+            menu: Menu::None,
+            modal: Modal::None,
         };
         app.refresh_vaults();
         app
@@ -188,6 +208,8 @@ impl AspApp {
             content: String::new(),
             history_events: Vec::new(),
             playhead: None,
+            menu: Menu::None,
+            modal: Modal::None,
         }
     }
 
@@ -421,15 +443,60 @@ impl AspApp {
     pub fn active_path(&self) -> Option<&str> {
         self.active.as_deref()
     }
+
+    // -- context menu / modal --
+
+    pub fn open_vault_menu(&mut self, id: &str, name: &str, x: f32, y: f32) {
+        self.menu = Menu::Vault { id: id.to_string(), name: name.to_string(), x, y };
+    }
+
+    pub fn close_menu(&mut self) {
+        self.menu = Menu::None;
+    }
+
+    /// Open the "remove vault" confirmation modal (also closes any menu).
+    pub fn open_remove(&mut self, id: &str, name: &str) {
+        self.menu = Menu::None;
+        self.modal = Modal::RemoveVault { id: id.to_string(), name: name.to_string(), trash: false };
+    }
+
+    pub fn close_modal(&mut self) {
+        self.modal = Modal::None;
+    }
+
+    /// Toggle the "move to trash" checkbox in the remove modal.
+    pub fn toggle_remove_trash(&mut self) {
+        if let Modal::RemoveVault { trash, .. } = &mut self.modal {
+            *trash = !*trash;
+        }
+    }
+
+    /// Confirm removal: stop managing the vault, refresh the list, close the modal.
+    pub fn confirm_remove(&mut self) {
+        if let Modal::RemoveVault { id, trash, .. } = self.modal.clone() {
+            if let Some(eng) = self.engine.clone() {
+                let _ = eng.remove_vault(&id, trash);
+            }
+            self.refresh_vaults();
+        }
+        self.modal = Modal::None;
+    }
 }
 
 impl Render for AspApp {
     fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let el: AnyElement = match self.screen {
+        let screen_el: AnyElement = match self.screen {
             Screen::Connect => connect::render(self, cx).into_any_element(),
             Screen::Editor => editor::render(self, cx).into_any_element(),
         };
-        el
+        let mut root = div().relative().size_full().child(screen_el);
+        if let Some(menu) = crate::screens::overlays::vault_menu(self, cx) {
+            root = root.child(menu);
+        }
+        if let Some(modal) = crate::screens::overlays::remove_modal(self, cx) {
+            root = root.child(modal);
+        }
+        root
     }
 }
 
@@ -555,6 +622,26 @@ mod tests {
         app.restore_version();
         assert!(!app.is_time_travel());
         assert_eq!(app.content, "v1\n");
+    }
+
+    #[test]
+    fn engine_backed_remove_vault_via_modal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), b"hi\n").unwrap();
+        let eng = Engine::with_identity(Identity::from_seed(&[15u8; 32])).unwrap();
+        let info = eng.add_local_folder(dir.path()).unwrap();
+        let id = info.id.clone();
+        let mut app = AspApp { engine: Some(Rc::new(eng)), ..AspApp::fixture_base(Theme::light()) };
+        app.refresh_vaults();
+        assert_eq!(app.connect_rows.len(), 1);
+
+        app.open_remove(&id, "README");
+        assert!(matches!(app.modal, Modal::RemoveVault { .. }));
+        app.toggle_remove_trash();
+        app.confirm_remove();
+        assert_eq!(app.modal, Modal::None);
+        assert!(app.connect_rows.is_empty());
+        assert!(app.engine.clone().unwrap().list_vaults().is_empty());
     }
 
     #[test]
