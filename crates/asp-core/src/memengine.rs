@@ -812,4 +812,89 @@ mod tests {
         b.set_batch(false);
         assert_eq!(a.files_map().unwrap(), src.files_map().unwrap(), "state unchanged after redundant integrates");
     }
+
+    /// Fuzz the perf paths: random op sequences (create/edit/delete/rename, hitting
+    /// the linear-edit fast-path) integrated in random-sized pages under batch mode
+    /// must converge byte-identically to a single integrate and to the source's own
+    /// fold, and stay idempotent. Seeded → deterministic.
+    #[test]
+    fn fuzz_random_ops_paged_batch_converges() {
+        use rand::{Rng, SeedableRng};
+        for seed in 0..16u64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let src = MemEngine::create(Identity::from_seed(&[7; 32]), "v1");
+            let mut paths: Vec<String> = Vec::new();
+            let mut all: Vec<WireRow> = Vec::new();
+            for _ in 0..70 {
+                match rng.gen_range(0..5) {
+                    // create-or-edit a (maybe new) path
+                    0 | 1 => {
+                        let p = if !paths.is_empty() && rng.gen_bool(0.5) {
+                            paths[rng.gen_range(0..paths.len())].clone()
+                        } else {
+                            format!("d{}/f{}.md", rng.gen_range(0..4), rng.gen_range(0..40))
+                        };
+                        if let Some(r) = src.record_write(&p, format!("v{}", rng.gen_range(0..10_000)).as_bytes()).unwrap() {
+                            all.push(r);
+                            if !paths.contains(&p) {
+                                paths.push(p);
+                            }
+                        }
+                    }
+                    // edit an existing path (linear fast-path)
+                    2 => {
+                        if !paths.is_empty() {
+                            let p = paths[rng.gen_range(0..paths.len())].clone();
+                            if let Some(r) = src.record_write(&p, format!("e{}", rng.gen_range(0..10_000)).as_bytes()).unwrap() {
+                                all.push(r);
+                            }
+                        }
+                    }
+                    // delete
+                    3 => {
+                        if !paths.is_empty() {
+                            let p = paths.remove(rng.gen_range(0..paths.len()));
+                            if let Some(r) = src.record_remove(&p).unwrap() {
+                                all.push(r);
+                            }
+                        }
+                    }
+                    // rename
+                    _ => {
+                        if !paths.is_empty() {
+                            let i = rng.gen_range(0..paths.len());
+                            let old = paths[i].clone();
+                            let new = format!("d{}/r{}.md", rng.gen_range(0..4), rng.gen_range(0..40));
+                            if !paths.contains(&new) {
+                                if let Some(r) = src.record_rename(&old, &new).unwrap() {
+                                    all.push(r);
+                                    paths[i] = new;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let single = MemEngine::create(Identity::from_seed(&[1; 32]), "v1");
+            single.integrate_many(&all).unwrap();
+
+            let paged = MemEngine::create(Identity::from_seed(&[2; 32]), "v1");
+            paged.set_batch(true);
+            let mut i = 0;
+            while i < all.len() {
+                let n = rng.gen_range(1..9).min(all.len() - i);
+                paged.integrate_many(&all[i..i + n]).unwrap();
+                i += n;
+            }
+            paged.set_batch(false);
+            paged.materialize().unwrap();
+
+            let want = src.files_map().unwrap();
+            assert_eq!(single.files_map().unwrap(), want, "seed {seed}: single integrate == source fold");
+            assert_eq!(paged.files_map().unwrap(), want, "seed {seed}: paged batch == source fold");
+            assert!(single.integrate_many(&all).unwrap().iter().all(|f| !*f), "seed {seed}: idempotent");
+            assert_eq!(single.files_map().unwrap(), want, "seed {seed}: unchanged after redundant integrate");
+        }
+    }
 }
