@@ -27,7 +27,7 @@ pub fn render(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
         .gap(px(6.0))
         .text_size(px(12.0))
         .text_color(t.faint)
-        .child(div().size(px(8.0)).rounded(px(2.0)).bg(t.accent))
+        .child(div().size(px(8.0)).rounded(px(2.0)).bg(if app.is_web { t.faint2 } else { t.accent }))
         .child(if app.is_web {
             "Saved in this browser"
         } else {
@@ -68,7 +68,7 @@ pub fn render(app: &AspApp, cx: &mut Context<AspApp>) -> Div {
                     cx.notify();
                 }))
                 .child(icon(
-                    if t.appearance == Appearance::Dark { "theme-sun" } else { "theme-moon" },
+                    if t.appearance == Appearance::Dark { "theme-moon" } else { "theme-sun" },
                     px(16.0),
                     t.text3,
                 )),

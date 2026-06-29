@@ -413,7 +413,7 @@ fn theme_toggle(app: &AspApp, cx: &mut Context<AspApp>) -> impl IntoElement {
             this.toggle_theme();
             cx.notify();
         }))
-        .child(icon(if dark { "theme-sun" } else { "theme-moon" }, px(16.0), t.text3))
+        .child(icon(if dark { "theme-moon" } else { "theme-sun" }, px(16.0), t.text3))
 }
 
 fn tab_item(

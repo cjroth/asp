@@ -57,12 +57,17 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
 - **UI prefs persistence** (theme + panel sizes); **pixel-diff harness** (`tools/diff.sh`).
 - Clean build: **0 warnings, 98 tests**. Screenshots for every screen/modal in `tools/shots/`.
 
-## Remaining — only hard-external-blockers
+## Pixel-diff vs real desktop — DONE
+`tools/desktop-ref.sh` drives the chromium Playwright downloads (no apt/snap needed) to screenshot
+the real desktop web build, then `tools/diff.sh` compares it to the gpui `--shot`. Result for the
+empty Connect screen: **1.075% differing pixels (98.9% identical)** — residual is font rasterization
+(chromium vs cosmic-text), a ~15px vertical-centering offset, and the fixture footer text. The diff
+image surfaced + I fixed two real bugs: theme icon was inverted (light should show a sun) and the
+web platform indicator square should be faint, not accent.
+
+## Remaining — hard-external-blockers
 - **Mermaid SVG diagrams** — rendered gracefully as a diagram-source block; producing the actual SVG
   needs a mermaid/JS engine, which doesn't exist in pure Rust/gpui (the desktop uses mermaid.js in its
   webview). This is a runtime-infeasibility, not a missing feature.
-- **Capturing desktop reference images** for the pixel-diff — the diff harness is done; rendering the
-  *React* desktop app to compare against needs a browser/native runtime. **No browser is installable
-  in this Linux sandbox (snap-only)**, so this step runs on macOS.
 - Broader **e2e** via gpui `VisualTestContext` — its click/key simulation is main-thread-gated and
   flaky on Linux worker threads; behavior is already covered by the engine + app-state test suites.

@@ -151,6 +151,19 @@ fn run_shot(out_path: &str, screen: &str) {
             })
             .expect("open window")
             .into(),
+        "connect-web" => cx
+            .open_window(win_size, |_, cx| {
+                cx.new(|_| {
+                    // Empty web-variant connect screen — matches the desktop web
+                    // build's first-load state for the pixel-diff harness.
+                    let mut a = AspApp::fixture_connect(Theme::light());
+                    a.connect_rows.clear();
+                    a.is_web = true;
+                    a
+                })
+            })
+            .expect("open window")
+            .into(),
         "customize-modal" => cx
             .open_window(win_size, |_, cx| {
                 cx.new(|_| {
