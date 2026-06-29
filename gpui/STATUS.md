@@ -29,24 +29,26 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
   `format, tree, tabs, history, pretty_names, vault_meta, markdown, prefs, log`.
 - `docs/` — `DESIGN_SPEC.md`, `FEATURE_SPEC.md`, `PLAN.md`.
 
-## Done (verified)
+## Done (verified — 84 tests pass)
 - Headless **offscreen pixel capture** on Linux (wgpu render-to-texture; vendored+patched zed).
 - **Connect** + **Editor** screens, light + dark, close visual match (screenshots in tools/shots).
 - **Stateful interactive app**: open vault → editor, select file (loads content), tabs
-  (open/close/neighbor-select), expand/collapse folders, back to connect, theme toggle,
-  **file ops** (new/rename/delete) — all engine-backed.
+  (open/close/neighbor-select), expand/collapse folders, back to connect, theme toggle.
+- **File ops** (new/rename/delete) — engine-backed, tab/selection remap.
 - **Live markdown render**: headings, bold/italic, inline code, links, bullet/ordered lists,
   task checkboxes, blockquotes, code fences (via `StyledText`+`TextRun`).
-- 9 pure-logic modules ported; **74 tests pass** (parity + engine round-trip + app behavior).
+- **Text editing**: click prose → edit raw source with caret; type/backspace/delete/enter/arrows;
+  saves to engine immediately (pure `TextBuffer` core, tested).
+- **History time-travel**: clickable event ticks, read-only banner, "Restore"/"Return to now".
+- **Overlays**: vault context menu (right-click) + Remove-vault modal; **New Vault** native folder picker.
+- 10 pure-logic modules ported 1:1 with parity tests; engine round-trip + app-behavior tests.
 
 ## Remaining toward 100%
-- **Text editing surface** (type + save) — adapt gpui input example to multi-line; the core gap.
-  Live WYSIWYG-while-typing (desktop uses contentEditable) is the hardest piece.
-- **Modals + context menus** — Share/Remove/Customize (overlay) + file/tab/vault menus
-  (`anchored()`/`deferred()`), native folder dialog for New/Connect vault.
-- **History scrubber interactivity** — click/drag playhead, zoom, time-travel read
-  (`read_file_at`) + restore (`restore_file_at`); geometry already ported in `vault/history.rs`.
-- **Live sync → UI** — drain the engine change-receiver, repaint on peer edits.
-- **Perf harness** (mirror `../desktop/perf-harness`) + **e2e/behavior tests** (gpui `VisualTestContext`).
+- **Live WYSIWYG-while-typing** — current editing is edit-raw / view-rendered toggle; the desktop
+  renders markdown in place while typing (contentEditable). The hardest remaining piece.
+- **More overlays** — Share + Customize modals, file/tab context menus, Connect-vault (ticket) dialog.
+- **Live sync → UI** — drain the engine change-receiver, repaint on peer edits + status polling.
+- **Resize handles** — sidebar + history-bar drag (clamps already ported in `vault/prefs.rs`).
+- **Perf harness** (mirror `../desktop/perf-harness`) + broader **e2e** via gpui `VisualTestContext`.
 - **Desktop reference pixel-diff** — capture desktop screens (browser/macOS) and diff vs `--shot`.
-- Deferred: per-language code syntax highlighting, mermaid/diagrams, frontmatter styles.
+- Deferred: per-language code syntax highlighting, mermaid/diagrams, frontmatter styles, prefs persistence.
