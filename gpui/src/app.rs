@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{div, prelude::*, AnyElement};
 
@@ -74,6 +74,9 @@ pub struct AspApp {
     // Layout (resizable).
     pub sidebar_w: f32,
     pub dragging_sidebar: bool,
+
+    /// Whether the background live-sync poll loop has been started.
+    pub polling_started: bool,
 }
 
 /// An open context menu (anchored at a click position).
@@ -138,6 +141,7 @@ impl AspApp {
             focus: None,
             sidebar_w: 266.0,
             dragging_sidebar: false,
+            polling_started: false,
         };
         app.refresh_vaults();
         app
@@ -232,6 +236,7 @@ impl AspApp {
             focus: None,
             sidebar_w: 266.0,
             dragging_sidebar: false,
+            polling_started: false,
         }
     }
 
@@ -561,6 +566,29 @@ impl AspApp {
         self.dragging_sidebar = false;
     }
 
+    /// Live-sync poll: pick up peer edits the engine has materialized. Skips while
+    /// editing (don't clobber unsaved input) or time-travelling.
+    pub fn poll_refresh(&mut self) {
+        if self.screen != Screen::Editor || self.editing || self.is_time_travel() {
+            return;
+        }
+        let (Some(eng), Some(vid)) = (self.engine.clone(), self.vault_id.clone()) else {
+            return;
+        };
+        if let Ok(files) = eng.list_files(&vid) {
+            self.files = files.iter().map(|f| (f.path.clone(), f.is_dir)).collect();
+        }
+        if let Some(p) = self.active.clone() {
+            if let Ok(c) = eng.read_file(&vid, &p) {
+                self.content = c;
+            }
+        }
+        if let Ok(st) = eng.status(&vid) {
+            self.peers = st.peers.len();
+        }
+        self.load_history(&vid);
+    }
+
     /// Open the "share vault" modal — enables connections and shows the ticket.
     pub fn open_share(&mut self, id: &str, name: &str) {
         self.menu = Menu::None;
@@ -685,6 +713,24 @@ impl Render for AspApp {
     fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.focus.is_none() {
             self.focus = Some(cx.focus_handle());
+        }
+        // Start the live-sync poll loop once (live app only).
+        if !self.polling_started && self.engine.is_some() {
+            self.polling_started = true;
+            let bg = cx.background_executor().clone();
+            cx.spawn(async move |this, cx| loop {
+                bg.timer(Duration::from_secs(2)).await;
+                if this
+                    .update(cx, |this, cx| {
+                        this.poll_refresh();
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            })
+            .detach();
         }
         let screen_el: AnyElement = match self.screen {
             Screen::Connect => connect::render(self, cx).into_any_element(),
@@ -913,6 +959,30 @@ mod tests {
         assert_eq!(app.screen, Screen::Editor);
         assert!(app.files.iter().any(|(p, _)| p == "README.md"));
         assert_eq!(app.content, "# Hi\n");
+    }
+
+    #[test]
+    fn poll_refresh_picks_up_external_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), b"v1\n").unwrap();
+        let eng = Engine::with_identity(Identity::from_seed(&[51u8; 32])).unwrap();
+        let info = eng.add_local_folder(dir.path()).unwrap();
+        let id = info.id.clone();
+        let mut app = AspApp { engine: Some(Rc::new(eng)), ..AspApp::fixture_base(Theme::light()) };
+        app.refresh_vaults();
+        app.open_vault(&id);
+        assert_eq!(app.content, "v1\n");
+
+        // a "peer" edit lands via the engine; poll picks it up.
+        app.engine.clone().unwrap().write_file(&id, "README.md", "v2-from-peer\n").unwrap();
+        app.poll_refresh();
+        assert_eq!(app.content, "v2-from-peer\n");
+
+        // while editing, poll does not clobber the buffer.
+        app.begin_edit();
+        app.engine.clone().unwrap().write_file(&id, "README.md", "v3\n").unwrap();
+        app.poll_refresh();
+        assert_eq!(app.content, "v2-from-peer\n");
     }
 
     #[test]
