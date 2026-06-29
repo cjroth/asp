@@ -109,10 +109,17 @@ struct FolderCfg {
     peer: Option<String>,
 }
 
+type ChangeCb = Arc<dyn Fn(String) + Send + Sync>;
+
 pub struct DesktopEngine {
     rt: tokio::runtime::Runtime,
     identity: Identity,
     folders: Mutex<HashMap<String, Folder>>,
+    /// Fired with a vault_id whenever a peer's change integrates into any folder's
+    /// engine — the Tauri shell sets this to emit a `vault-changed` event so the UI
+    /// updates the instant a change lands (no waiting on a poll). Shared (Arc) so
+    /// per-engine notifiers read it at fire time even if it's set after open.
+    change_listener: Arc<Mutex<Option<ChangeCb>>>,
 }
 
 fn random_id() -> String {
@@ -125,7 +132,18 @@ impl DesktopEngine {
     /// the CLI's `~/.asp/id_ed25519`).
     pub fn new(identity: Identity) -> Result<DesktopEngine> {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().context("tokio runtime")?;
-        Ok(DesktopEngine { rt, identity, folders: Mutex::new(HashMap::new()) })
+        Ok(DesktopEngine {
+            rt,
+            identity,
+            folders: Mutex::new(HashMap::new()),
+            change_listener: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Register a callback fired (with the vault_id) when a peer's change lands in
+    /// any managed folder. The Tauri shell uses it to emit a realtime UI event.
+    pub fn set_change_listener(&self, cb: impl Fn(String) + Send + Sync + 'static) {
+        *self.change_listener.lock().unwrap() = Some(Arc::new(cb));
     }
 
     pub fn identity_ssh(&self) -> String {
@@ -178,6 +196,15 @@ impl DesktopEngine {
     }
 
     fn handle(&self, eng: Engine) -> EngineRef {
+        // Bridge this engine's integrate-notifier to the manager's change listener,
+        // tagged with the folder's vault_id so the UI knows which vault moved.
+        let vault_id = VaultConfig::new(&eng.store).vault_id().ok().flatten().unwrap_or_default();
+        let slot = self.change_listener.clone();
+        eng.set_change_listener(Arc::new(move || {
+            if let Some(cb) = slot.lock().unwrap().as_ref() {
+                cb(vault_id.clone());
+            }
+        }));
         Arc::new(Mutex::new(eng))
     }
 

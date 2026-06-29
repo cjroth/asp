@@ -42,6 +42,18 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState { engine })
+        .setup(|app| {
+            // Push a `vault-changed` event to the webview the instant a peer's
+            // change integrates, so the desktop UI updates in realtime (the
+            // in-process analogue of the web node's live on_change callback)
+            // instead of waiting for its periodic re-read.
+            use tauri::{Emitter, Manager};
+            let handle = app.handle().clone();
+            app.state::<AppState>().engine.set_change_listener(move |vault_id| {
+                let _ = handle.emit("vault-changed", vault_id);
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::list_vaults,
             commands::add_local_folder,

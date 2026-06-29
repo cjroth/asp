@@ -5,6 +5,7 @@
 // (name/color/emoji) and view prefs (theme, font, sidebar, hidden/pretty) are
 // local-only and never touch the protocol.
 import { open } from '@tauri-apps/plugin-dialog';
+import { listen } from '@tauri-apps/api/event';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, type FileEntry, type HistEvent, type VaultInfo, type VaultStatus } from './lib/api';
 import CustomizeModal, { type CustomizeInit } from './vault/CustomizeModal';
@@ -357,6 +358,25 @@ export default function App() {
       void api.stopLiveSync(id);
     };
   }, [desktop, screen, activeId]);
+
+  // Desktop realtime: the engine emits 'vault-changed' the instant a peer's edit
+  // integrates (its background connections are already live). Refresh the open
+  // vault immediately instead of waiting for the poll above. Web has no Tauri
+  // events — it refreshes via the live-sync callback instead.
+  useEffect(() => {
+    if (!desktop || screen !== 'editor') return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void listen<string>('vault-changed', (e) => {
+      const cur = activeIdRef.current;
+      const vid = vaultsRef.current.find((v) => v.id === cur)?.vault_id;
+      if (cur && e.payload === vid) liveRefreshRef.current(cur);
+    }).then((u) => (cancelled ? u() : (unlisten = u)));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [desktop, screen]);
 
   const metaOf = useCallback(
     (v: VaultInfo) => resolveMeta(metaMap, v.vault_id, basename(v.path)),

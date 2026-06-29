@@ -41,6 +41,12 @@ pub struct Engine {
     /// (`Engine` is `!Sync` and only ever touched behind a `Mutex`, so a `Cell`
     /// is safe here.)
     batch: std::cell::Cell<bool>,
+    /// Optional notifier fired after a remote row set integrates (live push /
+    /// catch-up). The desktop sets it to emit a Tauri event so the UI refreshes
+    /// the instant a peer's change lands — the in-process equivalent of the web
+    /// node's `on_change` callback, so the desktop screen isn't stuck waiting for
+    /// its periodic re-read. `None` for the CLI / one-shot paths.
+    change_listener: std::cell::RefCell<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
 }
 
 fn now_unix() -> u64 {
@@ -97,6 +103,7 @@ impl Engine {
             scope: std::cell::RefCell::new(scope),
             site,
             batch: std::cell::Cell::new(false),
+            change_listener: std::cell::RefCell::new(None),
         };
         Ok(eng)
     }
@@ -276,6 +283,18 @@ impl Engine {
     // ---------------- integrate ----------------
 
     /// Integrate a received row + its blobs. Returns true if newly added.
+    /// Register a notifier fired whenever a remote row set integrates (see the
+    /// `change_listener` field). Idempotent — the last one wins.
+    pub fn set_change_listener(&self, cb: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        *self.change_listener.borrow_mut() = Some(cb);
+    }
+
+    fn notify_change(&self) {
+        if let Some(cb) = self.change_listener.borrow().as_ref() {
+            cb();
+        }
+    }
+
     pub fn integrate(&self, wr: &WireRow) -> AspResult<bool> {
         if !wr.row.id_valid() {
             return Err(AspError::Protocol("row id does not match its contents".into()));
@@ -289,6 +308,7 @@ impl Engine {
         let added = self.store.append_row(&wr.row)?;
         if added {
             self.materialize()?;
+            self.notify_change();
         }
         Ok(added)
     }
@@ -320,6 +340,7 @@ impl Engine {
         }
         if any {
             self.materialize()?;
+            self.notify_change();
         }
         Ok(flags)
     }

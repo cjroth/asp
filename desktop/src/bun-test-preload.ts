@@ -2,7 +2,13 @@
 // vitest used `environment: 'jsdom'` — so we register a jsdom window/document as
 // globals before any test runs, then apply the project's test setup (in-memory
 // localStorage, an execCommand stub, and the default desktop-platform flag).
+import { mock } from 'bun:test';
 import { JSDOM } from 'jsdom';
+
+// The desktop app subscribes to a Tauri 'vault-changed' event; there's no Tauri
+// runtime under test, so stub the event API globally (a package mock applies to
+// every test file). listen() resolves to a no-op unlisten.
+mock.module('@tauri-apps/api/event', () => ({ listen: async () => () => {} }));
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', {
   url: 'http://localhost/',
