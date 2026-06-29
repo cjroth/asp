@@ -550,10 +550,10 @@ impl DesktopEngine {
         let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
         let eng = f.engine.lock().unwrap();
         let vault_id = VaultConfig::new(&eng.store).vault_id().ok().flatten().unwrap_or_default();
-        let files = eng.store.live_files()?.into_iter().filter(|f| !f.deleted).count();
+        let files = eng.store.live_file_count()?;
         let head = std::fs::read_to_string(eng.git_dir.join("refs/heads/main")).map(|s| s.trim().to_string()).unwrap_or_default();
         let peers = eng.store.peers()?.into_iter().map(|(u, _)| u).collect();
-        let last_ts = eng.store.all_rows()?.iter().map(|r| r.ts).max();
+        let last_ts = eng.store.max_ts()?;
         Ok(VaultStatus {
             id: id.to_string(),
             vault_id,

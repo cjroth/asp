@@ -222,8 +222,14 @@ export default function App() {
     setNow(Date.now());
   }, []);
 
+  // Building the history timeline scans the whole log (seconds on a big vault),
+  // so only fetch it while the History/Log view is actually open. Opening either
+  // triggers an immediate fetch (see onTabHistory/onTabLog).
+  const histNeededRef = useRef(false);
+  histNeededRef.current = histOpen || logOpen;
   const scheduleHistory = useCallback(
     (id: string) => {
+      if (!histNeededRef.current) return;
       if (histTimer.current) clearTimeout(histTimer.current);
       histTimer.current = setTimeout(() => void refreshHistory(id), 700);
     },
@@ -933,13 +939,19 @@ export default function App() {
   }, [refreshFiles, scheduleHistory]);
 
   const onTabHistory = useCallback(() => {
-    setHistOpen((h) => !h);
+    setHistOpen((h) => {
+      if (!h && activeIdRef.current) void refreshHistory(activeIdRef.current); // fetch on open
+      return !h;
+    });
     setLogOpen(false);
-  }, []);
+  }, [refreshHistory]);
   const onTabLog = useCallback(() => {
-    setLogOpen((l) => !l);
+    setLogOpen((l) => {
+      if (!l && activeIdRef.current) void refreshHistory(activeIdRef.current); // fetch on open
+      return !l;
+    });
     setHistOpen(false);
-  }, []);
+  }, [refreshHistory]);
 
   // ---------- sidebar resize ----------
   const onSidebarResize = useCallback(

@@ -161,6 +161,18 @@ impl SqliteStore {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM log", [], |r| r.get::<_, i64>(0))? as u64)
     }
 
+    /// Count of live (non-tombstone) files — a single aggregate, not a load of
+    /// every row (status() is polled, so this must be O(1) on a big vault).
+    pub fn live_file_count(&self) -> AspResult<usize> {
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM files WHERE deleted=0", [], |r| r.get::<_, i64>(0))? as usize)
+    }
+
+    /// Most recent row wall-clock ts (`None` for an empty log) — an aggregate, not
+    /// a scan of every row.
+    pub fn max_ts(&self) -> AspResult<Option<i64>> {
+        Ok(self.conn.query_row("SELECT MAX(ts) FROM log", [], |r| r.get::<_, Option<i64>>(0))?)
+    }
+
     /// Next Lamport tick = max(observed) + 1, derived from the durable log.
     pub fn next_lamport(&self, observed: u64) -> AspResult<u64> {
         let max_log: i64 = self
