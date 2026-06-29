@@ -2,7 +2,7 @@
 // close (and that closing doesn't also select), middle-click close, pretty names,
 // and the hidden-when-empty case.
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from '../test-shim';
 import TabBar from './TabBar';
 
 afterEach(cleanup);

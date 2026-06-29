@@ -1,3 +1,4 @@
+import { mock } from 'bun:test';
 // Integration tests for the redesigned App: theme/font toggles, sidebar resize,
 // new file/folder, hidden + pretty names, breadcrumb rename, customize, share,
 // remove, history/log tabs + time-travel, and the entry modals — all wired to a
@@ -5,7 +6,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from './test-shim';
 
 let CONTENT: Record<string, string>;
 let FILES: { path: string; file_id: string; is_dir: boolean; merge_class: string }[];
@@ -36,9 +37,10 @@ const listVaults = vi.fn(async () => [
 ]);
 const getStatus = vi.fn(async (id: string) => ({ id, vault_id: id === 'v1' ? 'vid1' : 'vid2', rows: 3, files: 3, head: 'h', listening_ticket: null, peers: id === 'v1' ? ['ssh-ed25519 PEERKEY a@b'] : [], last_ts: Math.floor(Date.now() / 1000) - 30 }));
 
-vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/picked') }));
-vi.mock('./lib/api', () => ({
+mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/picked') }));
+mock.module('./lib/api', () => ({
   api: {
+    startLiveSync: vi.fn(), stopLiveSync: vi.fn(),
     listVaults: () => listVaults(),
     addLocalFolder: (p: string) => addLocalFolder(p),
     cloneRemote: (d: string, t: string, k?: string) => cloneRemote(d, t, k),
@@ -675,3 +677,5 @@ describe('.asp-scroll: thin macOS-style scrollbar', () => {
     expect(trackRule).toMatch(/background:\s*transparent/);
   });
 });
+import { afterAll as __aa, mock as __mk } from 'bun:test';
+__aa(() => __mk.restore());

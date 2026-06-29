@@ -1,3 +1,4 @@
+import { mock } from 'bun:test';
 // Web live-sync: a browser (wasm/OPFS) node can't accept inbound connections, so
 // it dials the upstream it cloned from and holds that link OPEN — rows stream
 // both ways in realtime, no polling. The app starts that connection when a web
@@ -7,7 +8,7 @@
 // when a peer's row lands) and asserts the UI catches up — immediately, not on a
 // 10s tick.
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from './test-shim';
 
 let CONTENT: Record<string, string> = {};
 function reset() {
@@ -33,8 +34,8 @@ const getStatus = vi.fn(async (id: string) => ({
 }));
 const listVaults = vi.fn(async () => [{ id: 'w1', path: '', vault_id: 'wv', enabled: true, listening_ticket: null }]);
 
-vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => null) }));
-vi.mock('./lib/api', () => ({
+mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => null) }));
+mock.module('./lib/api', () => ({
   api: {
     listVaults: () => listVaults(),
     addLocalFolder: vi.fn(),
@@ -119,3 +120,5 @@ describe('web live-sync: a held-open connection pushes peer changes into the UI'
     await waitFor(() => expect(stopLiveSync).toHaveBeenCalledWith('w1'));
   }, 15000);
 });
+import { afterAll as __aa, mock as __mk } from 'bun:test';
+__aa(() => __mk.restore());

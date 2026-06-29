@@ -1,9 +1,10 @@
+import { mock } from 'bun:test';
 // Integration test: drive the real <App/> against a mocked backend to verify
 // the end-to-end wiring (connect → open folder → file tree → select → read →
 // edit → debounced write → time-travel read). Catches command-name/param and
 // handler-logic bugs the pure-unit tests can't.
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from './test-shim';
 import { buildHash, parseHash } from './vault/tabs';
 
 // ---- in-memory fake backend ----
@@ -34,9 +35,10 @@ const listVaults = vi.fn(async () => [] as unknown[]);
 const renameFile = vi.fn(async () => {});
 const deleteFile = vi.fn(async () => {});
 
-vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/vault') }));
-vi.mock('./lib/api', () => ({
+mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/vault') }));
+mock.module('./lib/api', () => ({
   api: {
+    startLiveSync: vi.fn(), stopLiveSync: vi.fn(),
     listVaults: (...a: unknown[]) => listVaults(...(a as [])),
     addLocalFolder: (p: string) => addLocalFolder(p),
     cloneRemote: vi.fn(),
@@ -544,3 +546,5 @@ describe('App — tabs + URL hash (desktop)', () => {
     await waitFor(() => expect(renameFile).toHaveBeenCalledWith('v1', 'README.md', 'notes/README.md'));
   });
 });
+import { afterAll as __aa, mock as __mk } from 'bun:test';
+__aa(() => __mk.restore());

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from '../test-shim';
 import type { FileEntry } from '../lib/api';
 import { allDirPaths, buildTree, firstSelectable, flatten } from './tree';
 

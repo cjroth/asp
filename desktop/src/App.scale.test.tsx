@@ -1,9 +1,10 @@
+import { mock } from 'bun:test';
 // Scale test: drive the real <App/> against a mocked backend holding ~1000 files
 // with realistic async latency, to reproduce/lock the large-vault bugs:
 // virtualization (bounded DOM rows), the create race ("adds every other time"),
 // and delete actually removing the row.
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from './test-shim';
 
 const N = 1000;
 // Flat vault (worst case for the tree): N files at the root.
@@ -28,9 +29,10 @@ const history = vi.fn(async () => { await tick(); return [{ id: 'r', ts: 1_700_0
 const getStatus = vi.fn(async (id: string) => ({ id, vault_id: 'vid', rows: N, files: N, head: 'h', listening_ticket: null, peers: [], last_ts: 1_700_000_000 }));
 const listVaults = vi.fn(async () => [{ id: 'v1', path: '/home/me/massive', vault_id: 'vid', enabled: false, listening_ticket: null }]);
 
-vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/massive') }));
-vi.mock('./lib/api', () => ({
+mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/massive') }));
+mock.module('./lib/api', () => ({
   api: {
+    startLiveSync: vi.fn(), stopLiveSync: vi.fn(),
     listVaults: () => listVaults(),
     addLocalFolder: vi.fn(async (p: string) => ({ id: 'v1', path: p, vault_id: 'vid', enabled: false, listening_ticket: null })),
     cloneRemote: vi.fn(),
@@ -167,3 +169,5 @@ describe('App at scale (~1000 files)', () => {
     await waitFor(() => expect(renameFile).toHaveBeenCalledWith('v1', name, 'aaa-renamed.md'));
   });
 });
+import { afterAll as __aa, mock as __mk } from 'bun:test';
+__aa(() => __mk.restore());

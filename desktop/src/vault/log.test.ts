@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from '../test-shim';
 import type { HistEvent, VaultStatus } from '../lib/api';
 import { deriveLog, logColor, logText, shortFinger } from './log';
 

@@ -1,11 +1,12 @@
+import { mock } from 'bun:test';
 import { act, cleanup, fireEvent, render } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from '../test-shim';
 import type { HistEvent, VaultStatus } from '../lib/api';
 import { buildEvents } from './history';
 import HistoryBar, { type HistoryBarProps } from './HistoryBar';
 
 const revealPath = vi.fn(async () => {});
-vi.mock('../lib/api', () => ({ api: { revealPath: (...a: unknown[]) => revealPath(...(a as [])) } }));
+mock.module('../lib/api', () => ({ api: { revealPath: (...a: unknown[]) => revealPath(...(a as [])) } }));
 
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 
@@ -217,3 +218,5 @@ describe('HistoryBar', () => {
     expect(writeText).toHaveBeenCalledTimes(3);
   });
 });
+import { afterAll as __aa, mock as __mk } from 'bun:test';
+__aa(() => __mk.restore());

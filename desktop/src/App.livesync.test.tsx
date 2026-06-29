@@ -1,3 +1,4 @@
+import { mock } from 'bun:test';
 // Live-sync UI test: when a REMOTE peer pushes changes into the vault while the
 // user is sitting in the editor, the desktop backend converges (the engine's
 // standing connector materializes the edit), but does the UI reflect it?
@@ -7,7 +8,7 @@
 // user action, then let the app's 10s poll fire. The file tree and the open
 // editor should both catch up — that is the whole point of "sync".
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from './test-shim';
 
 let CONTENT: Record<string, string> = {};
 function reset() {
@@ -28,9 +29,10 @@ const getStatus = vi.fn(async (id: string) => ({
 const listVaults = vi.fn(async () => [{ id: 'v1', path: '/home/me/mynotes', vault_id: 'vid', enabled: true, listening_ticket: 't' }]);
 const history = vi.fn(async () => { await tick(); return [{ id: 'r', ts: 1_700_000_000, lamport: 1, kind: 'create', path: 'README.md' }]; });
 
-vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/mynotes') }));
-vi.mock('./lib/api', () => ({
+mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/mynotes') }));
+mock.module('./lib/api', () => ({
   api: {
+    startLiveSync: vi.fn(), stopLiveSync: vi.fn(),
     listVaults: () => listVaults(),
     addLocalFolder: vi.fn(),
     cloneRemote: vi.fn(),
@@ -91,3 +93,5 @@ describe('live-sync: UI reflects remote peer pushes', () => {
     await waitFor(() => expect(editor.textContent || '').toContain('EDITED BY A PEER'), { timeout: 12000 });
   }, 15000);
 });
+import { afterAll as __aa, mock as __mk } from 'bun:test';
+__aa(() => __mk.restore());
