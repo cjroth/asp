@@ -577,7 +577,13 @@ impl Engine {
         let result = self.capture_rescan_inner(&self.scan_disk()?);
         self.batch.set(false);
         let authored = result?;
-        self.materialize()?;
+        // Nothing changed on disk → no new rows → the materialized files table and
+        // working tree already match the log. Skip the (full-log) fold + disk diff
+        // that `materialize` would otherwise redo every reopen — the dominant cost
+        // of the startup reconcile on a big, unchanged vault.
+        if !authored.is_empty() {
+            self.materialize()?;
+        }
         Ok(authored)
     }
 
@@ -783,12 +789,48 @@ impl Engine {
 
     /// Walk the in-scope working tree into a `rel_path -> bytes` map.
     pub fn scan_disk(&self) -> AspResult<BTreeMap<String, Vec<u8>>> {
-        let mut out = BTreeMap::new();
-        self.scan_dir(&self.root, &mut out)?;
-        Ok(out)
+        // Walk the tree first (cheap: directory listing + ignore checks, no file
+        // bodies), then read the bodies in parallel. A big working tree is tens of
+        // thousands of small files whose read cost is dominated by per-file syscall
+        // / IO latency, which overlaps across cores — the startup reconcile's read
+        // of careerbot's 481MB/29k files drops several-fold this way. Same walk,
+        // same ignore scope, same result as the old serial `scan_dir`.
+        let mut paths: Vec<(String, PathBuf)> = Vec::new();
+        self.collect_files(&self.root, &mut paths)?;
+
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        if workers <= 1 || paths.len() < 128 {
+            let mut out = BTreeMap::new();
+            for (rel, abs) in &paths {
+                if let Ok(bytes) = fs::read(abs) {
+                    out.insert(rel.clone(), bytes);
+                }
+            }
+            return Ok(out);
+        }
+
+        let chunk_size = paths.len().div_ceil(workers);
+        let parts: Vec<Vec<(String, Vec<u8>)>> = std::thread::scope(|s| {
+            let handles: Vec<_> = paths
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(move || {
+                        chunk
+                            .iter()
+                            .filter_map(|(rel, abs)| fs::read(abs).ok().map(|b| (rel.clone(), b)))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        Ok(parts.into_iter().flatten().collect())
     }
 
-    fn scan_dir(&self, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) -> AspResult<()> {
+    /// Walk the working tree collecting (rel_path, abs_path) for every non-ignored
+    /// file — no file bodies read here, so it's cheap. Directory recursion and the
+    /// ignore scope are resolved exactly as the old recursive `scan_dir` did.
+    fn collect_files(&self, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> AspResult<()> {
         let entries = match fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return Ok(()),
@@ -803,11 +845,9 @@ impl Engine {
                 continue;
             }
             if path.is_dir() {
-                self.scan_dir(&path, out)?;
+                self.collect_files(&path, out)?;
             } else if path.is_file() {
-                if let Ok(bytes) = fs::read(&path) {
-                    out.insert(rel, bytes);
-                }
+                out.push((rel, path));
             }
         }
         Ok(())
