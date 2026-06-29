@@ -670,8 +670,10 @@ impl DesktopEngine {
         let folders = self.folders.lock().unwrap();
         let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
         let eng = f.engine.lock().unwrap();
-        match eng.state_as_of(ts)?.get(path) {
-            Some(bytes) => Ok(FileAt { exists: true, content: String::from_utf8_lossy(bytes).into_owned() }),
+        // Reads exactly the one requested blob (not the whole vault) — see
+        // `Engine::file_at`. Keeps the history slider snappy on large vaults.
+        match eng.file_at(path, ts)? {
+            Some(bytes) => Ok(FileAt { exists: true, content: String::from_utf8_lossy(&bytes).into_owned() }),
             None => Ok(FileAt { exists: false, content: String::new() }),
         }
     }
@@ -683,8 +685,8 @@ impl DesktopEngine {
             let folders = self.folders.lock().unwrap();
             let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
             let eng = f.engine.lock().unwrap();
-            let wr = match eng.state_as_of(ts)?.get(path) {
-                Some(bytes) => eng.record_write(path, bytes)?,
+            let wr = match eng.file_at(path, ts)? {
+                Some(bytes) => eng.record_write(path, &bytes)?,
                 None => None,
             };
             (f.conns.clone(), wr)

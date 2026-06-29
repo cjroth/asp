@@ -402,9 +402,10 @@ export default function App() {
     }
 
     let cancelled = false;
-    void (async () => {
-      try {
-        if (live) {
+    let ttTimer: ReturnType<typeof setTimeout> | undefined;
+    if (live) {
+      void (async () => {
+        try {
           const content = await api.readFile(id, path);
           if (cancelled || seq !== paintSeq.current) return;
           contentRef.current[key] = content;
@@ -412,18 +413,32 @@ export default function App() {
           dirtyRef.current = false;
           setDocText(content);
           setPaint({ source: content, readOnly: false, notExist: false, key: `${path}#live#${seq}` });
-        } else {
-          const at = await api.readFileAt(id, path, Math.floor(ph / 1000));
-          if (cancelled || seq !== paintSeq.current) return;
-          setDocText(at.exists ? at.content : '');
-          setPaint({ source: at.content, readOnly: true, notExist: !at.exists, key: `${path}#tt${ph}#${seq}` });
+        } catch {
+          if (!cancelled) setPaint(null);
         }
-      } catch {
-        if (!cancelled) setPaint(null);
-      }
-    })();
+      })();
+    } else {
+      // Debounce time-travel reads: dragging the history-slider handle fires a
+      // playhead update on every pointermove, and each read_file_at folds the
+      // log as-of that instant. Coalesce a drag into one read after a short
+      // settle (a discrete tick-jump still feels instant at 60ms) so a scrub
+      // never queues dozens of backend reads on a large vault.
+      ttTimer = setTimeout(() => {
+        void (async () => {
+          try {
+            const at = await api.readFileAt(id, path, Math.floor(ph / 1000));
+            if (cancelled || seq !== paintSeq.current) return;
+            setDocText(at.exists ? at.content : '');
+            setPaint({ source: at.content, readOnly: true, notExist: !at.exists, key: `${path}#tt${ph}#${seq}` });
+          } catch {
+            if (!cancelled) setPaint(null);
+          }
+        })();
+      }, 60);
+    }
     return () => {
       cancelled = true;
+      if (ttTimer) clearTimeout(ttTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId, selectedPath, playhead]);

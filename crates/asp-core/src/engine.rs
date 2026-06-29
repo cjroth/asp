@@ -772,6 +772,27 @@ impl Engine {
         Ok(m)
     }
 
+    /// Content of a single `path` as the vault was at wall-clock `t` — `None` if
+    /// it didn't exist (non-deleted) then. The history-slider read: it still
+    /// folds the log as-of `t` for correct path resolution (renames / ` (n)`
+    /// collisions), but reads exactly **one** blob (the target), not every live
+    /// file's blob like `state_as_of`. On a large vault that is the difference
+    /// between a snappy scrub and reading the whole vault on every tick.
+    pub fn file_at(&self, path: &str, t: i64) -> AspResult<Option<Vec<u8>>> {
+        let rows: Vec<LogRow> = self.store.all_rows()?.into_iter().filter(|r| r.ts <= t).collect();
+        let files = compute_files(&self.store, &rows)?;
+        for f in files {
+            if !f.deleted && f.path == path {
+                let bytes = match f.result_hash {
+                    Some(h) => self.store.get_blob(&h)?.unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
+    }
+
     /// Bring the working set to `desired` by recording the necessary edits.
     fn apply_target(&self, desired: &BTreeMap<String, Vec<u8>>) -> AspResult<Vec<WireRow>> {
         let mut authored = Vec::new();

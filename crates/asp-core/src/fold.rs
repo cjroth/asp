@@ -82,7 +82,6 @@ pub fn fold_order(rows: &[LogRow]) -> Vec<LogRow> {
 
 /// Per-`file_id` fold state.
 struct FileState {
-    content: Option<Vec<u8>>,
     content_hash: Option<String>,
     path: Option<String>,
     merge_class: MergeClass,
@@ -102,6 +101,11 @@ pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::As
     let ordered = fold_order(rows);
     let mut states: HashMap<String, FileState> = HashMap::new();
 
+    // Read a blob by hash. Only the genuine 3-way-merge path reads content; the
+    // common linear-edit path just tracks `content_hash` (cheap, no blob I/O) —
+    // so a fold over a vault with no concurrent conflicts is O(rows), not
+    // O(blob bytes). `blob(content_hash)` is byte-identical to the eagerly
+    // materialized content, so the resulting FileRows are unchanged.
     let blob = |h: &Option<String>| -> Vec<u8> {
         match h {
             Some(h) => store.get_blob(h).ok().flatten().unwrap_or_default(),
@@ -112,11 +116,9 @@ pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::As
     for (idx, r) in ordered.iter().enumerate() {
         match r.kind {
             Kind::Create => {
-                let content = blob(&r.result_hash);
                 states.insert(
                     r.file_id.clone(),
                     FileState {
-                        content: Some(content),
                         content_hash: r.result_hash.clone(),
                         path: r.path.clone(),
                         merge_class: r.merge_class,
@@ -134,18 +136,18 @@ pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::As
                 if st.deleted {
                     continue; // remove-wins: a concurrent edit does not resurrect
                 }
-                let theirs = blob(&r.result_hash);
-                let ours = st.content.clone().unwrap_or_default();
                 if st.content_hash == r.base_hash {
-                    // Authored on the current tip — linear apply.
-                    st.content = Some(theirs);
+                    // Authored on the current tip — linear apply, just swap the
+                    // hash (no blob read needed).
                     st.content_hash = r.result_hash.clone();
                 } else {
+                    // Genuine 3-way merge — read the three sides now (rare path).
+                    let theirs = blob(&r.result_hash);
+                    let ours = blob(&st.content_hash);
                     let base = blob(&r.base_hash);
                     let m = merge3(st.merge_class, &base, &ours, &theirs);
                     let h = store.put_blob(&m.bytes)?;
                     st.conflict |= m.conflict;
-                    st.content = Some(m.bytes);
                     st.content_hash = Some(h);
                 }
                 st.lamport = r.lamport;
@@ -164,7 +166,6 @@ pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::As
             Kind::Delete => {
                 if let Some(st) = states.get_mut(&r.file_id) {
                     st.deleted = true;
-                    st.content = None;
                     st.lamport = r.lamport;
                     st.site_id = r.site_id.clone();
                 }
