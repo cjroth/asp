@@ -238,49 +238,62 @@ async fn drive(
         }
     }
 
-    let mut integrated = 0usize;
-    let mut synced = false;
-    loop {
-        let frame = match read_frame(&mut recv).await? {
-            Some(f) => f,
-            None => break,
-        };
-        let msg = match Msg::from_bytes(&frame) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let steps = session.on_msg(&**eng, msg).map_err(|e| e.to_string())?;
-        let mut done = false;
-        for step in steps {
-            match step {
-                Step::Send(m) => {
-                    write_frame(&mut send, &m.to_bytes().map_err(|e| e.to_string())?).await?
+    // Defer the fold across the whole paged catch-up: integrate every page into
+    // the log, then fold ONCE below — not once per page (O(N·pages) → O(N), the
+    // difference between a multi-minute and a few-second clone of a big vault).
+    eng.set_batch(true);
+    let result: Result<usize, String> = async {
+        let mut integrated = 0usize;
+        let mut synced = false;
+        loop {
+            let frame = match read_frame(&mut recv).await? {
+                Some(f) => f,
+                None => break,
+            };
+            let msg = match Msg::from_bytes(&frame) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let steps = session.on_msg(&**eng, msg).map_err(|e| e.to_string())?;
+            let mut done = false;
+            for step in steps {
+                match step {
+                    Step::Send(m) => {
+                        write_frame(&mut send, &m.to_bytes().map_err(|e| e.to_string())?).await?
+                    }
+                    Step::Integrated(rows) => integrated += rows.len(),
+                    Step::Closed(reason) => return Err(reason),
+                    Step::PeerSynced => {
+                        synced = true;
+                        done = true;
+                    }
+                    // A browser connector never lists, so it never streams a catch-up.
+                    Step::Authenticated(_) | Step::CatchUp { .. } => {}
                 }
-                Step::Integrated(rows) => integrated += rows.len(),
-                Step::Closed(reason) => return Err(reason),
-                Step::PeerSynced => {
-                    synced = true;
-                    done = true;
-                }
-                // A browser connector never lists, so it never streams a catch-up.
-                Step::Authenticated(_) | Step::CatchUp { .. } => {}
+            }
+            if done {
+                // Send a graceful `Bye` end-marker, then wait for the listener to
+                // close the connection — it does so only after draining our catch-up
+                // rows (QUIC orders our `Rows` before this `Bye`). This guarantees our
+                // pushed edits were received before we tear down; a fixed delay would
+                // race the relay RTT and silently drop the push.
+                let _ = write_frame(&mut send, &Msg::Bye.to_bytes().map_err(|e| e.to_string())?).await;
+                let _ = send.finish();
+                let _ = timeout(Duration::from_secs(10), conn.closed()).await;
+                break;
             }
         }
-        if done {
-            // Send a graceful `Bye` end-marker, then wait for the listener to
-            // close the connection — it does so only after draining our catch-up
-            // rows (QUIC orders our `Rows` before this `Bye`). This guarantees our
-            // pushed edits were received before we tear down; a fixed delay would
-            // race the relay RTT and silently drop the push.
-            let _ = write_frame(&mut send, &Msg::Bye.to_bytes().map_err(|e| e.to_string())?).await;
+        if !synced {
             let _ = send.finish();
-            let _ = timeout(Duration::from_secs(10), conn.closed()).await;
-            break;
+            return Err("sync closed before completion — catch-up incomplete".into());
         }
+        Ok(integrated)
     }
-    if !synced {
-        let _ = send.finish();
-        return Err("sync closed before completion — catch-up incomplete".into());
-    }
-    Ok(integrated)
+    .await;
+    // Always clear batch and fold once — on success the full history, on an early
+    // exit whatever we integrated — so the engine is never left deferred (`drive`
+    // also backs `syncNow` on a long-lived engine, not just a throwaway clone).
+    eng.set_batch(false);
+    eng.materialize().map_err(|e| e.to_string())?;
+    result
 }

@@ -18,7 +18,7 @@ use crate::order::NodeId;
 use crate::session::SessionVault;
 use crate::store::{BlobStore, FileRow, MemBlobStore};
 use crate::wire::{WireBlob, WireRow};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 fn now_unix() -> i64 {
@@ -66,6 +66,11 @@ pub struct MemEngine {
     files: RefCell<Vec<FileRow>>,
     config: RefCell<BTreeMap<String, String>>,
     authorized: RefCell<Vec<AuthKey>>,
+    /// When set, `integrate_many` appends rows but defers the fold — the clone
+    /// driver turns it on across the paged catch-up so the whole history folds
+    /// ONCE at the end instead of re-folding the growing log on every page
+    /// (O(N·pages) → O(N)). The driver folds + clears it on `Synced`.
+    batch: Cell<bool>,
 }
 
 impl MemEngine {
@@ -88,7 +93,14 @@ impl MemEngine {
             files: RefCell::new(Vec::new()),
             config: RefCell::new(cfg),
             authorized: RefCell::new(Vec::new()),
+            batch: Cell::new(false),
         }
+    }
+
+    /// Defer the fold during a bulk integrate (clone catch-up): append rows
+    /// without re-folding; the caller folds once via `materialize` when done.
+    pub fn set_batch(&self, on: bool) {
+        self.batch.set(on);
     }
 
     /// The device connection key seed — used to bind this node's iroh endpoint
@@ -211,10 +223,30 @@ impl MemEngine {
     pub fn record_write(&self, rel: &str, bytes: &[u8]) -> AspResult<Option<WireRow>> {
         match self.write_row(rel, bytes)? {
             Some(row) => {
-                self.materialize()?;
+                // Fast path: a linear local edit folds to exactly the new bytes for
+                // this one file_id with no cross-file effect, so update just its
+                // FileRow instead of re-folding the whole log. (Creates fall to the
+                // full fold below, which resolves any path collision.)
+                if row.kind == Kind::Edit {
+                    self.apply_one_edit(&row);
+                } else {
+                    self.materialize()?;
+                }
                 Ok(Some(self.wire(row)?))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Update a single file's materialized row for a linear edit — byte-identical
+    /// to what a full fold would produce for it (the edit was authored on the tip,
+    /// so it's a linear apply: new hash + lamport + author, nothing else changes).
+    fn apply_one_edit(&self, row: &LogRow) {
+        if let Some(f) = self.files.borrow_mut().iter_mut().find(|f| f.file_id == row.file_id) {
+            f.result_hash = row.result_hash.clone();
+            f.lamport = row.lamport;
+            f.site_id = row.site_id.clone();
+            f.deleted = false;
         }
     }
 
@@ -381,7 +413,7 @@ impl MemEngine {
                 flags.push(is_new);
             }
         }
-        if added > 0 {
+        if added > 0 && !self.batch.get() {
             self.materialize()?;
         }
         Ok(flags)
