@@ -47,6 +47,11 @@ pub struct Engine {
     /// node's `on_change` callback, so the desktop screen isn't stuck waiting for
     /// its periodic re-read. `None` for the CLI / one-shot paths.
     change_listener: std::cell::RefCell<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    /// Whether `materialize` re-exports the derived read-only git tree. It's
+    /// O(all files) per call, so a host that never reads `.asp/git` (the desktop
+    /// app) turns it off to keep edits O(changed). The CLI leaves it on so
+    /// `asp git` stays current. Default on.
+    export_git: std::cell::Cell<bool>,
 }
 
 fn now_unix() -> u64 {
@@ -104,6 +109,7 @@ impl Engine {
             site,
             batch: std::cell::Cell::new(false),
             change_listener: std::cell::RefCell::new(None),
+            export_git: std::cell::Cell::new(true),
         };
         Ok(eng)
     }
@@ -170,7 +176,8 @@ impl Engine {
         let result_hash = self.store.put_blob(bytes)?;
         let (lamport, seq) = self.next_counters()?;
         let ts = now_unix() as i64;
-        let row = match self.current_for_path(rel)? {
+        let cur_opt = self.current_for_path(rel)?;
+        let row = match &cur_opt {
             Some(cur) => {
                 if cur.result_hash.as_deref() == Some(result_hash.as_str()) {
                     return Ok(None); // no net change
@@ -213,8 +220,43 @@ impl Engine {
             }
         };
         self.store.append_row(&row)?;
-        self.materialize_unless_batched()?;
+        // Fast path: a linear local edit on an existing file. Its folded result is
+        // exactly `bytes` for this one file_id — no path change, no cross-file
+        // effect — so update just this file instead of re-folding + rewriting the
+        // whole vault. (Skipped when batching, or when git export is on, since the
+        // git tree needs the full file set; the CLI takes the full path instead.)
+        if let Some(cur) = cur_opt.filter(|_| !self.batch.get() && !self.export_git.get()) {
+            self.apply_one_edit(&cur.file_id, &cur.path, result_hash, bytes, row.lamport, cur.merge_class, cur.conflict)?;
+        } else {
+            self.materialize_unless_batched()?;
+        }
         Ok(Some(self.wire(row)?))
+    }
+
+    /// Persist a single linear content edit: update just this file's row + bytes
+    /// on disk. Byte-identical to what a full `materialize()` would write for it.
+    fn apply_one_edit(&self, file_id: &str, path: &str, result_hash: String, bytes: &[u8], lamport: u64, merge_class: MergeClass, conflict: bool) -> AspResult<()> {
+        self.store.upsert_files(&[FileRow {
+            file_id: file_id.to_string(),
+            path: path.to_string(),
+            result_hash: Some(result_hash),
+            merge_class,
+            deleted: false,
+            lamport,
+            site_id: self.site_id(),
+            conflict,
+        }])?;
+        let abs = self.root.join(path);
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = abs.with_extension(format!("asp-tmp-{}", now_unix()));
+        fs::write(&tmp, bytes)?;
+        fs::rename(&tmp, &abs)?;
+        if path == ".aspignore" {
+            self.reload_scope();
+        }
+        Ok(())
     }
 
     /// Record a delete for `rel`. Returns the row, or None if no such live file.
@@ -365,87 +407,130 @@ impl Engine {
     }
 
     /// Returns the materialized path → content-hash map (for echo suppression).
+    ///
+    /// Diffs the fresh fold against the previously-persisted file rows and only
+    /// touches what changed: upsert the changed rows, write/remove the changed
+    /// files on disk, prune emptied dirs. The fold itself is canonical and
+    /// unchanged — the persisted state is byte-identical to a full rewrite — but
+    /// an edit to one file now does O(changed) I/O instead of rewriting all N
+    /// rows + re-reading all N files from disk (which was seconds on a big vault).
     pub fn materialize(&self) -> AspResult<BTreeMap<String, String>> {
         let rows = self.store.all_rows()?;
-        let old_live: Vec<String> = self.store.live_files()?.into_iter().map(|f| f.path).collect();
         let files = compute_files(&self.store, &rows)?;
-        self.store.replace_files(&files)?;
+        self.apply_files(&files, rows.iter().map(|r| r.lamport).max().unwrap_or(0))
+    }
 
-        // Desired on-disk set: content files (path -> bytes) and directory
-        // entities (paths to `mkdir`).
-        let mut desired: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        let mut desired_dirs: Vec<String> = Vec::new();
-        let mut hashes: BTreeMap<String, String> = BTreeMap::new();
-        for f in &files {
+    fn apply_files(&self, files: &[FileRow], derived_time: u64) -> AspResult<BTreeMap<String, String>> {
+        let old: std::collections::HashMap<String, FileRow> =
+            self.store.all_files()?.into_iter().map(|f| (f.file_id.clone(), f)).collect();
+
+        // Only the rows whose folded value changed need persisting / disk work.
+        let changed: Vec<FileRow> = files.iter().filter(|f| old.get(&f.file_id) != Some(*f)).cloned().collect();
+        self.store.upsert_files(&changed)?;
+
+        // Rows the fold no longer emits at all (a deleted dir entity has no
+        // tombstone) must be removed — `replace_files` did this implicitly.
+        let new_ids: std::collections::HashSet<&str> = files.iter().map(|f| f.file_id.as_str()).collect();
+        let mut removed_ids: Vec<String> = Vec::new();
+        let mut aspignore_changed = false;
+        for of in old.values() {
+            if new_ids.contains(of.file_id.as_str()) {
+                continue;
+            }
+            if !of.deleted {
+                let abs = self.root.join(&of.path);
+                if of.merge_class == MergeClass::Dir {
+                    self.prune_empty_dirs(Some(abs.as_path()));
+                } else {
+                    if of.path == ".aspignore" {
+                        aspignore_changed = true;
+                    }
+                    let _ = fs::remove_file(&abs);
+                    self.prune_empty_dirs(abs.parent());
+                }
+            }
+            removed_ids.push(of.file_id.clone());
+        }
+        if !removed_ids.is_empty() {
+            self.store.delete_file_rows(&removed_ids)?;
+        }
+
+        for f in &changed {
+            let prev = old.get(&f.file_id);
+            // A file/dir whose live path went away (rename or delete) is removed
+            // from its OLD location on disk.
+            if let Some(p) = prev {
+                let path_gone = f.deleted || f.path != p.path;
+                if !p.deleted && path_gone {
+                    if p.path == ".aspignore" {
+                        aspignore_changed = true;
+                    }
+                    let abs = self.root.join(&p.path);
+                    if p.merge_class == MergeClass::Dir {
+                        self.prune_empty_dirs(Some(abs.as_path()));
+                    } else {
+                        let _ = fs::remove_file(&abs);
+                        self.prune_empty_dirs(abs.parent());
+                    }
+                }
+            }
             if f.deleted {
                 continue;
             }
             if f.merge_class == MergeClass::Dir {
-                desired_dirs.push(f.path.clone());
-            } else if let Some(h) = &f.result_hash {
-                let bytes = self.store.get_blob(h)?.unwrap_or_default();
-                desired.insert(f.path.clone(), bytes);
-                hashes.insert(f.path.clone(), h.clone());
+                let _ = fs::create_dir_all(self.root.join(&f.path));
+                continue;
             }
-        }
-
-        // Write/overwrite desired files atomically (only when content differs).
-        // Track whether `.aspignore` is (re)written this pass so we can refresh
-        // the live scope below without a stat on every materialize.
-        let mut aspignore_changed = false;
-        for (path, bytes) in &desired {
-            let abs = self.root.join(path);
-            let differs = match fs::read(&abs) {
-                Ok(cur) => &cur != bytes,
-                Err(_) => true,
-            };
-            if differs {
-                if path == ".aspignore" {
+            let Some(h) = &f.result_hash else { continue };
+            // Write only when the on-disk content would actually differ — known
+            // from the OLD row (same path + same hash ⇒ already correct), no
+            // 28k-file stat/read sweep.
+            let already_ok = matches!(prev, Some(p) if !p.deleted && p.path == f.path && p.result_hash.as_deref() == Some(h.as_str()));
+            if !already_ok {
+                if f.path == ".aspignore" {
                     aspignore_changed = true;
                 }
+                let abs = self.root.join(&f.path);
                 if let Some(parent) = abs.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                let tmp = abs.with_extension(format!(
-                    "asp-tmp-{}",
-                    now_unix()
-                ));
-                fs::write(&tmp, bytes)?;
+                let bytes = self.store.get_blob(h)?.unwrap_or_default();
+                let tmp = abs.with_extension(format!("asp-tmp-{}", now_unix()));
+                fs::write(&tmp, &bytes)?;
                 fs::rename(&tmp, &abs)?;
             }
         }
 
-        // Materialize empty directories (the content-free dir entities).
-        for path in &desired_dirs {
-            let _ = fs::create_dir_all(self.root.join(path));
-        }
-
-        // Remove files/dirs that were live before but no longer are.
-        let desired_dir_set: std::collections::HashSet<&String> = desired_dirs.iter().collect();
-        for path in old_live {
-            if !desired.contains_key(&path) && !desired_dir_set.contains(&path) {
-                if path == ".aspignore" {
-                    aspignore_changed = true; // an ignore file was removed
-                }
-                let abs = self.root.join(&path);
-                let _ = fs::remove_file(&abs); // no-op if it was a directory
-                self.prune_empty_dirs(Some(abs.as_path()));
-                self.prune_empty_dirs(abs.parent());
-            }
-        }
-
-        // `.aspignore` changed on disk this pass (local edit or a peer push):
-        // refresh the live ignore rules so newly-ignored paths stop syncing and
-        // un-ignored ones resume, instead of the scope staying frozen at open.
         if aspignore_changed {
             self.reload_scope();
         }
 
-        // Derived git export at the settle boundary.
-        let derived_time = rows.iter().map(|r| r.lamport).max().unwrap_or(0);
-        let _ = gitexport::export(&self.git_dir, &desired, derived_time);
+        // Derived read-only git export — O(all files), so skipped on hosts that
+        // never read it (the desktop app turns it off; the CLI keeps it on).
+        if self.export_git.get() {
+            let mut desired: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+            for f in files {
+                if f.deleted || f.merge_class == MergeClass::Dir {
+                    continue;
+                }
+                if let Some(h) = &f.result_hash {
+                    desired.insert(f.path.clone(), self.store.get_blob(h)?.unwrap_or_default());
+                }
+            }
+            let _ = gitexport::export(&self.git_dir, &desired, derived_time);
+        }
 
-        Ok(hashes)
+        // path -> hash for the live content files (echo suppression on capture).
+        Ok(files
+            .iter()
+            .filter(|f| !f.deleted && f.merge_class != MergeClass::Dir)
+            .filter_map(|f| f.result_hash.clone().map(|h| (f.path.clone(), h)))
+            .collect())
+    }
+
+    /// Turn the O(all-files) git export off (a host that never reads `.asp/git`).
+    pub fn set_git_export(&self, on: bool) {
+        self.export_git.set(on);
     }
 
     fn prune_empty_dirs(&self, mut dir: Option<&Path>) {

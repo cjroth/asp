@@ -199,6 +199,60 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Every file row, tombstones included — the prior fold result, for diffing a
+    /// fresh fold so materialize only touches what changed (vs `replace_files`,
+    /// which rewrites the whole table on every edit — O(N) per keystroke).
+    pub fn all_files(&self) -> AspResult<Vec<FileRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, path, result_hash, merge_class, deleted, lamport, site_id, conflict FROM files",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(FileRow {
+                    file_id: r.get(0)?,
+                    path: r.get(1)?,
+                    result_hash: r.get(2)?,
+                    merge_class: MergeClass::parse(&r.get::<_, String>(3)?).unwrap_or(MergeClass::Text),
+                    deleted: r.get::<_, i64>(4)? != 0,
+                    lamport: r.get::<_, i64>(5)? as u64,
+                    site_id: r.get(6)?,
+                    conflict: r.get::<_, i64>(7)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Delete specific file rows by `file_id` — for fold outputs that drop a row
+    /// entirely (a deleted directory entity gets no tombstone, unlike a content
+    /// file), which `replace_files` used to handle by rewriting the whole table.
+    pub fn delete_file_rows(&self, file_ids: &[String]) -> AspResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for id in file_ids {
+            tx.execute("DELETE FROM files WHERE file_id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Insert-or-replace specific file rows by `file_id` (the PK) — the
+    /// incremental counterpart to `replace_files`. One transaction = one fsync.
+    pub fn upsert_files(&self, files: &[FileRow]) -> AspResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for f in files {
+            tx.execute(
+                "INSERT OR REPLACE INTO files(file_id, path, result_hash, merge_class, deleted, lamport, site_id, conflict)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    f.file_id, f.path, f.result_hash, f.merge_class.as_str(),
+                    f.deleted as i64, f.lamport as i64, f.site_id, f.conflict as i64
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn live_files(&self) -> AspResult<Vec<FileRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT file_id, path, result_hash, merge_class, deleted, lamport, site_id, conflict

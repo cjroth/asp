@@ -205,6 +205,10 @@ impl DesktopEngine {
                 cb(vault_id.clone());
             }
         }));
+        // The desktop never reads the derived `.asp/git` tree, so skip the
+        // O(all-files) git export on every edit (it dominated materialize on a
+        // large vault). The CLI keeps it on.
+        eng.set_git_export(false);
         Arc::new(Mutex::new(eng))
     }
 
