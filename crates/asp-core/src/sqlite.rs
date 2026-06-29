@@ -246,6 +246,18 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Update just one file's content hash (+ the authoring clock) in place — the
+    /// incremental-materialize fast path for a local linear edit, which changes
+    /// exactly one file's content and nothing structural (path/class/deleted/
+    /// conflict are untouched, matching what a full fold would leave them).
+    pub fn update_file_hash(&self, file_id: &str, result_hash: &str, lamport: u64, site_id: &str) -> AspResult<()> {
+        self.conn.execute(
+            "UPDATE files SET result_hash=?2, lamport=?3, site_id=?4 WHERE file_id=?1",
+            params![file_id, result_hash, lamport as i64, site_id],
+        )?;
+        Ok(())
+    }
+
     pub fn live_files(&self) -> AspResult<Vec<FileRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT file_id, path, result_hash, merge_class, deleted, lamport, site_id, conflict

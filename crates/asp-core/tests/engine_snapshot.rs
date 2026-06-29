@@ -143,6 +143,45 @@ fn git_head_is_stable_across_rematerialize_via_the_blob_cache() {
     assert_eq!(head1, head2, "warm-cache re-export reproduces the identical deterministic SHA");
 }
 
+// record_write takes an incremental fast path for a local linear edit (skipping
+// the whole-log re-fold). Its result MUST be identical to what a full re-fold
+// produces — same files table, same derived git head, same disk — or the two
+// would drift the first time a peer push forces a full materialize.
+#[test]
+fn fast_path_edit_matches_a_full_refold() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = Engine::init(dir.path(), Identity::from_seed(&[34; 32])).unwrap();
+    e.record_write("a.md", b"one\n").unwrap(); // create — full path
+    e.record_write("a.md", b"one\ntwo\n").unwrap(); // edit — FAST path
+    e.record_write("b/c.md", b"hi\n").unwrap(); // create in subdir — full path
+    e.record_write("b/c.md", b"hi there\n").unwrap(); // edit — FAST path
+
+    let snap = |e: &Engine| -> Vec<(String, Option<String>, bool, String)> {
+        let mut v: Vec<_> = e
+            .store
+            .live_files()
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.path, f.result_hash, f.deleted, f.merge_class.as_str().to_string()))
+            .collect();
+        v.sort();
+        v
+    };
+    let files_before = snap(&e);
+    let head_before = std::fs::read_to_string(e.git_dir.join("refs/heads/main")).unwrap();
+    assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), b"one\ntwo\n");
+    assert_eq!(std::fs::read(dir.path().join("b/c.md")).unwrap(), b"hi there\n");
+
+    // Force a full re-fold from the log; nothing must change.
+    e.materialize().unwrap();
+    assert_eq!(snap(&e), files_before, "fast-path files table matches a full re-fold");
+    assert_eq!(
+        std::fs::read_to_string(e.git_dir.join("refs/heads/main")).unwrap(),
+        head_before,
+        "fast-path git head matches a full re-fold"
+    );
+}
+
 #[test]
 fn authorize_and_revoke_admission_keys() {
     let dir = tempfile::tempdir().unwrap();

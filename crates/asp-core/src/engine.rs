@@ -206,7 +206,15 @@ impl Engine {
             }
         };
         self.store.append_row(&row)?;
-        self.materialize_unless_batched()?;
+        // Fast path: a local linear edit on the tip changed exactly one file's
+        // content (no merge, no path change). Reflect it incrementally instead of
+        // re-folding the whole log. Skipped in a capture batch (one flush at the
+        // end) and for Create / anything structural, which take the full fold.
+        if !self.batch.get() && matches!(row.kind, Kind::Edit) {
+            self.materialize_local_edit(&row.file_id, rel, &result_hash, bytes, row.lamport, &row.site_id)?;
+        } else {
+            self.materialize_unless_batched()?;
+        }
         Ok(Some(self.wire(row)?))
     }
 
@@ -444,13 +452,21 @@ impl Engine {
             self.reload_scope();
         }
 
-        // Derived git export at the settle boundary — incremental via the
-        // content_hash → git_oid cache, so it reads + sha1s a blob only the first
-        // time that content is seen, not every file on every settle.
+        // Derived git export at the settle boundary.
         let derived_time = rows.iter().map(|r| r.lamport).max().unwrap_or(0);
+        self.export_git(&hashes, derived_time);
+
+        Ok(hashes)
+    }
+
+    /// Export the derived git tree from `entries` (path → content_hash for every
+    /// live content file). Blob oids resolve through the content_hash → git_oid
+    /// cache, so an unchanged file is never re-read/re-hashed into the git store.
+    /// Best-effort: a git-store hiccup never fails a write.
+    fn export_git(&self, entries: &BTreeMap<String, String>, derived_time: u64) {
         let git_dir = &self.git_dir;
         let store = &self.store;
-        let _ = gitexport::export(git_dir, &hashes, derived_time, |content_hash: &str| -> AspResult<[u8; 20]> {
+        let _ = gitexport::export(git_dir, entries, derived_time, |content_hash: &str| -> AspResult<[u8; 20]> {
             if let Some(oid_hex) = store.git_oid_for(content_hash)? {
                 if let Ok(bytes) = hex::decode(&oid_hex) {
                     if bytes.len() == 20 {
@@ -465,8 +481,50 @@ impl Engine {
             store.put_git_oid(content_hash, &hex::encode(oid))?;
             Ok(oid)
         });
+    }
 
-        Ok(hashes)
+    /// Incremental-materialize fast path for a LOCAL LINEAR EDIT: an `Edit` row
+    /// authored on the current tip (so `result_hash` is the new content outright —
+    /// no merge — and the path/class/liveness are unchanged). Such a write changes
+    /// exactly one file, so we reflect it in place (one files-table row, one disk
+    /// write) and refresh the derived git tree, instead of re-folding the whole log
+    /// like `materialize`. The full fold stays the source of truth and the path for
+    /// everything else (create/rename/delete, peer pushes, conflicts, capture
+    /// batches); a later full materialize re-derives the identical state, so the
+    /// two never disagree (the sync fuzzer asserts this every round).
+    fn materialize_local_edit(&self, file_id: &str, rel: &str, result_hash: &str, bytes: &[u8], lamport: u64, site: &str) -> AspResult<()> {
+        self.store.update_file_hash(file_id, result_hash, lamport, site)?;
+
+        let abs = self.root.join(rel);
+        let differs = match fs::read(&abs) {
+            Ok(cur) => cur != bytes,
+            Err(_) => true,
+        };
+        if differs {
+            if let Some(parent) = abs.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let tmp = abs.with_extension(format!("asp-tmp-{}", now_unix()));
+            fs::write(&tmp, bytes)?;
+            fs::rename(&tmp, &abs)?;
+        }
+        if rel == ".aspignore" {
+            self.reload_scope();
+        }
+
+        // Refresh the derived git tree from the now-updated files table. The new
+        // local row carries the highest lamport, so it is the derived time.
+        let mut entries: BTreeMap<String, String> = BTreeMap::new();
+        for f in self.store.live_files()? {
+            if f.deleted || f.merge_class == MergeClass::Dir {
+                continue;
+            }
+            if let Some(h) = f.result_hash {
+                entries.insert(f.path, h);
+            }
+        }
+        self.export_git(&entries, lamport);
+        Ok(())
     }
 
     fn prune_empty_dirs(&self, mut dir: Option<&Path>) {
