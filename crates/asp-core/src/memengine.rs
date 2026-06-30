@@ -225,6 +225,10 @@ impl MemEngine {
 
     /// Create a branch off `parent` capturing `fork_vv`. Returns its id.
     pub fn create_branch(&self, name: &str, parent: &str, fork_vv: crate::branch::VersionVector) -> AspResult<String> {
+        crate::branch::validate_branch_name(name)?;
+        if self.branch_set().get(parent).is_none() {
+            return Err(AspError::NotFound(format!("no such parent branch: {parent}")));
+        }
         let created_lamport = self.next_lamport();
         let branch_id = crate::branch::Branch::derive_id(name, parent, &fork_vv, created_lamport, &self.site_id());
         let b = crate::branch::Branch {
@@ -853,6 +857,19 @@ mod tests {
         assert_eq!(e.current_branch(), b, "deleting a non-HEAD branch must not move HEAD");
         e.delete_branch(&b).unwrap();
         assert_eq!(e.current_branch(), MAIN_BRANCH_ID, "must not be stranded on the deleted ancestor a");
+    }
+
+    #[test]
+    fn mem_create_branch_validates_name_and_parent() {
+        // Parity with the native engine: reject empty/whitespace names and unknown
+        // parents instead of creating unaddressable / orphan branches.
+        let e = MemEngine::create(Identity::from_seed(&[9; 32]), "v");
+        e.record_write("a.md", b"v1\n").unwrap().unwrap();
+        let head = e.head_branch();
+        assert!(e.create_branch("", &head, Default::default()).is_err(), "empty name rejected");
+        assert!(e.create_branch("  ", &head, Default::default()).is_err(), "whitespace name rejected");
+        assert!(e.create_branch("x", "no-such-parent", Default::default()).is_err(), "unknown parent rejected");
+        assert!(e.create_branch("ok", &head, Default::default()).is_ok());
     }
 
     #[test]

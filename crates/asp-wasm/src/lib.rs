@@ -239,6 +239,11 @@ impl WasmEngine {
     /// Edit-in-the-past ⇒ branch (§2.5): fork HEAD at wall-clock `t` and switch to
     /// the new branch. Returns its id.
     pub fn fork_at(&self, name: &str, t: f64) -> Result<String, JsError> {
+        // `NaN as i64` saturates to 0 — a silent fork "before the beginning" that
+        // captures no rows. Reject non-finite timestamps at the JS boundary instead.
+        if !t.is_finite() {
+            return Err(JsError::new("fork timestamp must be a finite number"));
+        }
         self.eng.fork_from_time(name, t as i64).map_err(to_err)
     }
 

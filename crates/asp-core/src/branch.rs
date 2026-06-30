@@ -68,6 +68,16 @@ impl Branch {
     }
 }
 
+/// Validate a user-supplied branch name (§4.1). An empty / whitespace-only name
+/// would create a branch that `resolve_branch` can never match by name, leaving
+/// it addressable only by its raw content-hash id — so reject it at creation.
+pub fn validate_branch_name(name: &str) -> crate::error::AspResult<()> {
+    if name.trim().is_empty() {
+        return Err(crate::error::AspError::Invalid("branch name must not be empty".into()));
+    }
+    Ok(())
+}
+
 /// The branch tree: `branch_id -> Branch`. A predicate built from it answers
 /// "is row r visible on branch B?" for the whole log in one pass.
 pub struct BranchSet {

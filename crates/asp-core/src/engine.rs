@@ -1295,6 +1295,7 @@ impl Engine {
     /// Like [`create_branch_here`] but also returns the authored branch-record wire
     /// row, so a live driver (desktop) can push it to peers immediately.
     pub fn create_branch_here_wire(&self, name: &str) -> AspResult<(String, WireRow)> {
+        crate::branch::validate_branch_name(name)?;
         let head = self.head_branch();
         let fork_vv = self.visible_version_vector(&head)?;
         let created_lamport = self.store.next_lamport(0)?;
@@ -1318,6 +1319,10 @@ impl Engine {
     /// switch HEAD. The record is authored as a synced `Kind::Branch` row (§7), so
     /// the branch propagates to every peer — not just the device that made it.
     pub fn create_branch(&self, name: &str, parent: &str, fork_vv: crate::branch::VersionVector) -> AspResult<String> {
+        crate::branch::validate_branch_name(name)?;
+        if self.branch_set()?.get(parent).is_none() {
+            return Err(AspError::NotFound(format!("no such parent branch: {parent}")));
+        }
         let created_lamport = self.store.next_lamport(0)?;
         let created_ts = now_unix() as i64;
         let branch_id = Branch::derive_id(name, parent, &fork_vv, created_lamport, &self.site_id());
@@ -1682,6 +1687,24 @@ mod tests {
         // Delete HEAD: must skip tombstoned parent a and land on main.
         e.delete_branch(&b).unwrap();
         assert_eq!(e.current_branch(), MAIN_BRANCH_ID, "must not be stranded on the deleted ancestor a");
+    }
+
+    #[test]
+    fn create_branch_validates_name_and_parent() {
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        e.record_write("a.md", b"v1\n").unwrap().unwrap();
+        let head = e.head_branch();
+        let vv = crate::branch::version_vector_of(&e.store.all_rows().unwrap());
+        // Empty / whitespace-only names are rejected (would be unaddressable by name).
+        assert!(e.create_branch_here("").is_err(), "empty name rejected");
+        assert!(e.create_branch_here("   ").is_err(), "whitespace-only name rejected");
+        assert!(e.create_branch("", &head, vv.clone()).is_err());
+        // Forking off a non-existent parent is rejected (no orphan branch).
+        assert!(e.create_branch("x", "no-such-parent", vv.clone()).is_err(), "unknown parent rejected");
+        // A valid create still works, and the count reflects exactly one new branch.
+        assert!(e.create_branch("ok", &head, vv).is_ok());
+        assert_eq!(e.branches().unwrap().len(), 2, "only the valid branch was created");
     }
 
     #[test]
