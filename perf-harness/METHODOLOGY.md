@@ -103,13 +103,41 @@ Frontend companion: a **loading overlay** while opening/adding a large folder
 the open path is genuinely slow at 50k files (first capture hashes + git-exports
 every file), so it gets the same progress affordance cloning already had.
 
-**Still O(vault), left as-is (deliberately):** the *first* `add_local_folder`
-capture at 50k files is dominated by hashing every file, storing every blob, and
-`gitexport` zlib-compressing every file into the derived git store. `gitexport`
-runs on every settle and writes `refs/heads/main` (the deterministic cross-node
-SHA, surfaced as `status.head`), so taking it off the hot path is a correctness
-decision, not a free win — out of scope for a perf pass. The loading overlay
-covers the one-time open; the per-save path is the 3× win above. Note also that
-`reopen_saved()` runs synchronously before the Tauri window opens, so a large
-saved vault slows cold start — a candidate for deferring reopen to after first
-paint.
+Cold start: `reopen_saved()` ran synchronously before the Tauri window was
+built, so a large saved vault froze first paint — fixed by moving it to a
+background thread in `.setup()` + a `vaults-ready` event the UI listens for, with
+a "Loading your vaults…" hint until it fires.
+
+**Still O(vault):** the *first* `add_local_folder` capture at 50k files (hash
+every file + store every blob + git-export every file) — inherent one-time
+ingest cost, covered by the loading overlay.
+
+## Round 3 — kill the whole-log re-fold (merges were O(N))
+
+Even after Round 2, every state change re-folded the ENTIRE log: `materialize`
+did `compute_files(all_rows)` on each local save AND each peer row integrated.
+The data model is incremental-friendly (per-`file_id` independence; concurrent
+rows order by an intrinsic `(lamport,site_id,id)` key) but the engine recomputed
+from scratch for trivial correctness. Round 3 makes it incremental.
+
+| # | Problem | Fix | Result |
+|---|---|---|---|
+| 17 | a local save still re-folded the whole log inside `materialize` | fast path in `record_write` for a linear edit on the tip: update one files-table row + write one file + refresh git, no fold | `write_file` edit **1061ms → 485ms** @50k |
+| 18 | path-collision resolution keyed on the global fold-order index (only valid in a whole-log fold) | key it on the path-setting row's intrinsic `OrderKey` (behavior-preserving; collisions are always cross-file ⇒ concurrent ⇒ same order) | enables folding a file in isolation |
+| 19 | peer-row integration and concurrent merges still O(total log) | `FoldState`: per-`file_id` state cache; the engine keeps it in memory + a `dirty` set fed by every append (local & peer), and `materialize` re-folds ONLY dirty files, then resolves paths over all | integration **O(total log) → O(touched files' rows + file count)** |
+
+Deep-history payoff (`bench_ops 100 50000` — 100 files, 50k rows, previously an
+O(n²) seed that had to be killed): it now completes, and `write_file` edit is
+**12.9ms**, `delete_file` **16ms** — versus the old whole-log fold of 50k rows on
+every op. (A structural op right after a long burst of fast-path-only edits pays
+a one-time catch-up to reconcile all the deferred `dirty` files; in real use
+materializes interleave, so `dirty` stays tiny.)
+
+The correctness gate is generative, not a spot check (`tests/fold_props.rs`):
+across 300 random concurrent histories, feed a `FoldState` one row at a time in
+a random arrival order and assert it equals `compute_files` over the rows seen so
+far **after every row** — covering out-of-order arrival, concurrent forks/merges,
+renames that create/break path collisions, and delete+recreate. Plus
+`compute_files` permutation-invariance over 400 histories, and the full
+`sync_fuzz` battery now also asserts the derived **git head** converges across
+every surface (seeds 1/7/13/23/99 × 1/2/3 peers + 240-round runs, 0 divergences).
