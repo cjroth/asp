@@ -160,6 +160,16 @@ impl MemEngine {
         out
     }
 
+    /// The version vector visible on `branch` right now — the fork point a child
+    /// branch captures when forking "from here" (§2.1).
+    pub fn visible_version_vector(&self, branch: &str) -> crate::branch::VersionVector {
+        let bs = self.branch_set();
+        let vis = bs.visibility(branch);
+        let rows = self.rows.borrow();
+        let scoped: Vec<LogRow> = rows.iter().filter(|r| vis.sees(r)).cloned().collect();
+        crate::branch::version_vector_of(&scoped)
+    }
+
     /// Rebuild the branch set from the synced Kind::Branch records (LWW).
     fn reconcile_branches(&self) {
         let recs = crate::branch::reconcile_branches(&self.rows.borrow(), |h| self.blobs.get_blob(h).ok().flatten());

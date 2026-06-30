@@ -179,6 +179,64 @@ impl WasmEngine {
         self.eng.read_file(path).map_err(to_err)
     }
 
+    // ---------------- branches (§2, §7) ----------------
+
+    /// The checked-out branch id (HEAD).
+    pub fn current_branch(&self) -> String {
+        self.eng.current_branch()
+    }
+
+    /// All live branches as JSON: `[{branch_id, name, parent, created_lamport}]`.
+    pub fn branches_json(&self) -> Result<String, JsError> {
+        #[derive(serde::Serialize)]
+        struct B<'a> {
+            branch_id: &'a str,
+            name: &'a str,
+            parent: Option<&'a str>,
+            created_lamport: u64,
+        }
+        let bs = self.eng.branches();
+        let out: Vec<B> = bs
+            .iter()
+            .map(|b| B { branch_id: &b.branch_id, name: &b.name, parent: b.parent.as_deref(), created_lamport: b.created_lamport })
+            .collect();
+        serde_json::to_string(&out).map_err(to_err)
+    }
+
+    /// Create a branch off `parent` (its current version vector becomes the fork
+    /// point). Returns the new branch id. Does not switch HEAD.
+    pub fn create_branch(&self, name: &str, parent: &str) -> Result<String, JsError> {
+        // Fork at the parent branch's current visible vv — the common "branch from
+        // here" case. (Edit-in-the-past forks at a timestamp via fork_at.)
+        let vv = self.fork_vv_now(parent).map_err(to_err)?;
+        self.eng.create_branch(name, parent, vv).map_err(to_err)
+    }
+
+    /// Edit-in-the-past ⇒ branch (§2.5): fork HEAD at wall-clock `t` and switch to
+    /// the new branch. Returns its id.
+    pub fn fork_at(&self, name: &str, t: f64) -> Result<String, JsError> {
+        self.eng.fork_from_time(name, t as i64).map_err(to_err)
+    }
+
+    /// Switch HEAD to `branch_id` and re-materialize its scoped state.
+    pub fn checkout(&self, branch_id: &str) -> Result<(), JsError> {
+        self.eng.checkout(branch_id).map_err(to_err)
+    }
+
+    /// Soft-delete a branch (main cannot be deleted).
+    pub fn delete_branch(&self, branch_id: &str) -> Result<(), JsError> {
+        self.eng.delete_branch(branch_id).map_err(to_err)
+    }
+
+    /// The version vector visible on `branch` right now (the fork point a child
+    /// branch captures). Internal helper for `create_branch`.
+    fn fork_vv_now(&self, branch: &str) -> asp_core::AspResult<asp_core::VersionVector> {
+        // Fork "from now" = the parent's full visible vv (every visible row is an
+        // ancestor). fork_from_time with t=i64::MAX yields exactly this set, but we
+        // only need the vv, not a checkout, so compute it from the engine's rows.
+        Ok(self.eng.visible_version_vector(branch))
+    }
+
     /// This node's version vector as JSON `{site_id: max_seq}` — the catch-up
     /// cursor a peer hands us so we can compute exactly what it lacks.
     pub fn version_vector(&self) -> Result<String, JsError> {

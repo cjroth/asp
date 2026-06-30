@@ -4,7 +4,10 @@
 // is host glue only.
 
 import { WasmEngine, type WasmEngineInstance } from './engine.ts';
-import type { FileMeta } from './engine-types.ts';
+import type { BranchInfo, FileMeta } from './engine-types.ts';
+
+/** The stable id of the root branch every vault starts on (matches the engine). */
+export const MAIN_BRANCH = 'main';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -136,6 +139,36 @@ export class Vault {
   /** Per-file fold metadata (path + content hash, no content). */
   filesDetail(): FileMeta[] {
     return JSON.parse(this.eng.files_detail_json()) as FileMeta[];
+  }
+
+  // ---- branches (§2, §7): scoped views over the shared log ----
+
+  /** The checked-out branch id (HEAD). */
+  currentBranch(): string {
+    return this.eng.current_branch();
+  }
+  /** All live branches (`main` first). */
+  branches(): BranchInfo[] {
+    return JSON.parse(this.eng.branches_json()) as BranchInfo[];
+  }
+  /** Create a branch off `parent` (defaults to HEAD), forking at its current
+   * version vector. Returns the new branch id. Does not switch HEAD. */
+  createBranch(name: string, parent: string = this.eng.current_branch()): string {
+    return this.eng.create_branch(name, parent);
+  }
+  /** Edit-in-the-past ⇒ branch (§2.5): fork HEAD at wall-clock `t` (unix seconds)
+   * and switch to the new branch. Returns its id. */
+  forkAt(name: string, t: number): string {
+    return this.eng.fork_at(name, t);
+  }
+  /** Switch HEAD and re-materialize the branch's scoped state. */
+  checkout(branchId: string): void {
+    this.eng.checkout(branchId);
+  }
+  /** Soft-delete a branch (main cannot be deleted; deleting HEAD checks out its
+   * parent). */
+  deleteBranch(branchId: string): void {
+    this.eng.delete_branch(branchId);
   }
 
   /** Serialize all rows+blobs as JSON (LEGACY — see {@link EngineVault.dump}). */
