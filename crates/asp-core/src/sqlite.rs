@@ -234,6 +234,66 @@ impl SqliteStore {
 
     // ----- materialized files -----
 
+    /// Reconcile the `files` table to `files` by DELTA: read the current rows,
+    /// upsert only the file_ids whose row actually changed, and delete any that
+    /// disappeared. Same end state as `replace_files`, but a single-file change
+    /// writes one row instead of rewriting the whole table — turning the per-op
+    /// files-table cost from O(vault) writes (DELETE all + reinsert all, which
+    /// also churns the WAL) into O(changed) writes + one O(vault) read. The reads
+    /// are far cheaper than the writes/fsync they replace.
+    pub fn sync_files(&self, files: &[FileRow]) -> AspResult<()> {
+        // Current table state keyed by file_id (includes tombstones).
+        let mut old: std::collections::HashMap<String, FileRow> = std::collections::HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT file_id, path, result_hash, merge_class, deleted, lamport, site_id, conflict FROM files",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(FileRow {
+                    file_id: r.get(0)?,
+                    path: r.get(1)?,
+                    result_hash: r.get(2)?,
+                    merge_class: MergeClass::parse(&r.get::<_, String>(3)?).unwrap_or(MergeClass::Text),
+                    deleted: r.get::<_, i64>(4)? != 0,
+                    lamport: r.get::<_, i64>(5)? as u64,
+                    site_id: r.get(6)?,
+                    conflict: r.get::<_, i64>(7)? != 0,
+                })
+            })?;
+            for r in rows {
+                let f = r?;
+                old.insert(f.file_id.clone(), f);
+            }
+        }
+        let new_ids: std::collections::HashSet<&str> = files.iter().map(|f| f.file_id.as_str()).collect();
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut up = tx.prepare_cached(
+                "INSERT INTO files(file_id, path, result_hash, merge_class, deleted, lamport, site_id, conflict)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                 ON CONFLICT(file_id) DO UPDATE SET
+                   path=?2, result_hash=?3, merge_class=?4, deleted=?5, lamport=?6, site_id=?7, conflict=?8",
+            )?;
+            for f in files {
+                if old.get(&f.file_id) == Some(f) {
+                    continue; // row unchanged — no write
+                }
+                up.execute(params![
+                    f.file_id, f.path, f.result_hash, f.merge_class.as_str(),
+                    f.deleted as i64, f.lamport as i64, f.site_id, f.conflict as i64
+                ])?;
+            }
+            let mut del = tx.prepare_cached("DELETE FROM files WHERE file_id=?1")?;
+            for id in old.keys() {
+                if !new_ids.contains(id.as_str()) {
+                    del.execute(params![id])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn replace_files(&self, files: &[FileRow]) -> AspResult<()> {
         // ONE transaction for the whole rewrite. Without it, every INSERT
         // auto-commits its own WAL transaction — at 10k+ files that per-row

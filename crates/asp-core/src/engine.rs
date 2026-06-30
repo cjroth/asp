@@ -431,7 +431,7 @@ impl Engine {
                 }
             }
         };
-        self.store.replace_files(&files)?;
+        self.store.sync_files(&files)?;
 
         // New desired set, built WITHOUT reading blobs: content files (path ->
         // content_hash, also the returned echo-suppression map) and dir entities.
