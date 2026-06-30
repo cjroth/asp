@@ -152,7 +152,7 @@ fn wrong_auth_key_is_rejected_and_leaks_no_data() {
     let dir_bad = root.path().join("B-bad");
     std::fs::create_dir_all(&dir_bad).unwrap();
     let bad = de_b.clone_remote(&dir_bad, &ticket, Some("WRONGKEY"));
-    assert!(bad.is_ok() == false, "clone with the wrong auth key must be rejected (it succeeded)");
+    assert!(bad.is_err(), "clone with the wrong auth key must be rejected (it succeeded)");
     // Give any (incorrect) background materialize a moment, then assert no leak.
     std::thread::sleep(Duration::from_millis(500));
     assert!(!dir_bad.join("SECRET.md").exists(), "rejected peer must not receive any vault content");

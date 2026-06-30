@@ -12,8 +12,11 @@ use std::collections::BTreeMap;
 /// Wire protocol version. A handshake or framing change bumps this so skew
 /// surfaces as a clear version mismatch. v2 dropped the app-level nonce/signature
 /// handshake — iroh's QUIC connection authenticates both node keys, so the
-/// `Hello` just binds proto/vault/identity and carries the auth-key.
-pub const PROTO: u32 = 2;
+/// `Hello` just binds proto/vault/identity and carries the auth-key. v3 added the
+/// `branch_id`/`merge_parent` fields to every `LogRow` (§9): they extend the
+/// Merkle-id payload, so a v3 row id is computed differently — new↔new speak
+/// branches; an old peer would reject v3 rows on the id check.
+pub const PROTO: u32 = 3;
 
 /// One content blob shipped alongside a row.
 #[derive(Clone, Debug, Serialize, Deserialize)]

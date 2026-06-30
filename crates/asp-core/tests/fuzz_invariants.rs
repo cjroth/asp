@@ -206,6 +206,8 @@ fn fold_on_arbitrary_rows_never_panics_and_is_permutation_invariant() {
                 base_hash: pick_hash(&mut r, &hashes),
                 result_hash: pick_hash(&mut r, &hashes),
                 path: Some(format!("d{}/x{}.md", r.gen_range(0..2), r.gen_range(0..3))),
+                branch_id: asp_core::MAIN_BRANCH_ID.to_string(),
+                merge_parent: None,
                 sig: vec![],
             }
             .seal();

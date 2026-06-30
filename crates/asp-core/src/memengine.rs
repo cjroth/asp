@@ -13,7 +13,7 @@ use crate::authkeys::{decide_admission, expiry_from_ttl_days, AdmitCtx, AdmitDec
 use crate::error::{AspError, AspResult};
 use crate::fold::compute_files;
 use crate::identity::Identity;
-use crate::log::{classify, Kind, LogRow};
+use crate::log::{classify, Kind, LogRow, MAIN_BRANCH_ID};
 use crate::order::NodeId;
 use crate::session::SessionVault;
 use crate::store::{BlobStore, FileRow, MemBlobStore};
@@ -159,6 +159,8 @@ impl MemEngine {
                     base_hash: cur.result_hash.clone(),
                     result_hash: Some(result_hash),
                     path: None,
+                    branch_id: MAIN_BRANCH_ID.to_string(),
+                    merge_parent: None,
                     sig: vec![],
                 }
                 .seal()
@@ -176,6 +178,8 @@ impl MemEngine {
                 base_hash: None,
                 result_hash: Some(result_hash),
                 path: Some(rel.to_string()),
+                branch_id: MAIN_BRANCH_ID.to_string(),
+                merge_parent: None,
                 sig: vec![],
             }
             .seal(),
@@ -201,6 +205,8 @@ impl MemEngine {
             base_hash: cur.result_hash.clone(),
             result_hash: None,
             path: None,
+            branch_id: MAIN_BRANCH_ID.to_string(),
+            merge_parent: None,
             sig: vec![],
         }
         .seal();
@@ -278,6 +284,8 @@ impl MemEngine {
             base_hash: cur.result_hash.clone(),
             result_hash: cur.result_hash.clone(),
             path: Some(new.to_string()),
+            branch_id: MAIN_BRANCH_ID.to_string(),
+            merge_parent: None,
             sig: vec![],
         }
         .seal();

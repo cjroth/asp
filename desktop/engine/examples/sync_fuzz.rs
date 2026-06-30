@@ -219,7 +219,6 @@ fn git_head(dir: &Path) -> Option<String> {
 /// of the converged tree — a mismatch means a stale/incorrect git export).
 fn wait_converged(hub: &Hub, peers: &[Peer], timeout: Duration) -> (bool, Vec<String>) {
     let start = Instant::now();
-    let mut last = Vec::new();
     loop {
         let cli = snapshot_dir(&hub.dir);
         let cli_head = git_head(&hub.dir);
@@ -250,9 +249,8 @@ fn wait_converged(hub: &Hub, peers: &[Peer], timeout: Duration) -> (bool, Vec<St
         if problems.is_empty() {
             return (true, Vec::new());
         }
-        last = problems;
         if start.elapsed() >= timeout {
-            return (false, last);
+            return (false, problems);
         }
         std::thread::sleep(Duration::from_millis(120));
     }
@@ -637,8 +635,8 @@ fn apply_scenario(
             // Every side writes the SAME path near-simultaneously → must converge to one.
             let path = "shared/contended.md".to_string();
             write_cli(&hub.dir, &path, format!("# shared\n\nCLI {}\n", rng.next_u64()).as_bytes());
-            for i in 0..np {
-                let _ = peers[i].de.write_file(&peers[i].id, &path, &format!("# shared\n\nENG{i} {}\n", rng.next_u64()));
+            for (i, peer) in peers.iter().enumerate().take(np) {
+                let _ = peer.de.write_file(&peer.id, &path, &format!("# shared\n\nENG{i} {}\n", rng.next_u64()));
             }
             if !live.contains(&path) { live.push(path); }
             "concurrent-same-file".into()

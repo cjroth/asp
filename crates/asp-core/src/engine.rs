@@ -5,13 +5,14 @@
 //! driver (the `asp` CLI) supplies file watching, debounce, and sockets.
 
 use crate::authkeys::{decide_admission, expiry_from_ttl_days, AdmitCtx, AdmitDecision, AuthKey};
+use crate::branch::{version_vector_of, Branch, BranchSet};
 use crate::config::VaultConfig;
 use crate::error::{AspError, AspResult};
 use crate::fold::compute_files;
 use crate::gitexport;
 use crate::identity::Identity;
-use crate::log::{Kind, LogRow, MergeClass};
-use crate::order::NodeId;
+use crate::log::{Kind, LogRow, MergeClass, MAIN_BRANCH_ID};
+use crate::order::{NodeId, OrderKey};
 use crate::session::SessionVault;
 use crate::sqlite::SqliteStore;
 use crate::store::{BlobStore, FileRow};
@@ -145,25 +146,60 @@ impl Engine {
         self.site.clone()
     }
 
+    // ---------------- branches (§2) ----------------
+
+    /// The checked-out branch (HEAD). New rows are authored on it; the engine
+    /// materializes its scoped state to disk.
+    pub fn head_branch(&self) -> String {
+        self.store.head().unwrap_or_else(|_| MAIN_BRANCH_ID.to_string())
+    }
+
+    /// The branch tree (the implicit `main` is always present).
+    fn branch_set(&self) -> AspResult<BranchSet> {
+        Ok(BranchSet::new(self.store.branches()?))
+    }
+
+    /// True for a vault that has never created a branch — HEAD is `main` and there
+    /// are no records, so `visible(HEAD)` is every row: the fold/tip fast paths
+    /// stay byte-identical to the pre-branching engine (§2.2 back-compat).
+    fn single_branch(&self) -> bool {
+        self.head_branch() == MAIN_BRANCH_ID && self.store.branches().map(|b| b.is_empty()).unwrap_or(true)
+    }
+
     // ---------------- capture ----------------
 
-    /// The current materialized content hash for a live path, if any.
+    /// The current materialized content hash for a live path, if any. The `files`
+    /// table holds HEAD's materialized state, so this is already branch-scoped.
     fn current_for_path(&self, rel: &str) -> AspResult<Option<FileRow>> {
         let files = self.store.live_files()?;
         Ok(files.into_iter().find(|f| f.path == rel))
     }
 
-    /// Highest-OrderKey row id for a file_id (its deterministic local tip).
+    /// Highest-OrderKey row id for a file_id **within the checked-out branch's
+    /// visible rows** (§2.4) — the deterministic branch-scoped tip a new row chains
+    /// onto. On a single-branch vault this is the whole-log max (fast SQL path).
     fn tip(&self, file_id: &str) -> AspResult<Option<String>> {
+        if self.single_branch() {
+            return Ok(self
+                .store
+                .conn()
+                .query_row(
+                    "SELECT id FROM log WHERE file_id=?1 ORDER BY lamport DESC, site_id DESC, id DESC LIMIT 1",
+                    rusqlite::params![file_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok());
+        }
+        let bs = self.branch_set()?;
+        let vis = bs.visibility(&self.head_branch());
+        let key = |r: &LogRow| OrderKey { lamport: r.lamport, site_id: r.site_id.clone(), id: r.id.clone() };
         Ok(self
             .store
-            .conn()
-            .query_row(
-                "SELECT id FROM log WHERE file_id=?1 ORDER BY lamport DESC, site_id DESC, id DESC LIMIT 1",
-                rusqlite::params![file_id],
-                |r| r.get::<_, String>(0),
-            )
-            .ok())
+            .rows_for_file(file_id)?
+            .into_iter()
+            .filter(|r| vis.sees(r))
+            .max_by(|a, b| key(a).cmp(&key(b)))
+            .map(|r| r.id))
     }
 
     fn next_counters(&self) -> AspResult<(u64, u64)> {
@@ -199,6 +235,8 @@ impl Engine {
                     base_hash: cur.result_hash.clone(),
                     result_hash: Some(result_hash.clone()),
                     path: None,
+                    branch_id: self.head_branch(),
+                    merge_parent: None,
                     sig: vec![],
                 }
                 .seal()
@@ -218,6 +256,8 @@ impl Engine {
                     base_hash: None,
                     result_hash: Some(result_hash.clone()),
                     path: Some(rel.to_string()),
+                    branch_id: self.head_branch(),
+                    merge_parent: None,
                     sig: vec![],
                 }
                 .seal()
@@ -256,6 +296,8 @@ impl Engine {
             base_hash: cur.result_hash.clone(),
             result_hash: None,
             path: None,
+            branch_id: self.head_branch(),
+            merge_parent: None,
             sig: vec![],
         }
         .seal();
@@ -282,6 +324,8 @@ impl Engine {
             base_hash: cur.result_hash.clone(),
             result_hash: cur.result_hash.clone(),
             path: Some(new.to_string()),
+            branch_id: self.head_branch(),
+            merge_parent: None,
             sig: vec![],
         }
         .seal();
@@ -415,16 +459,26 @@ impl Engine {
         // files, so a path-collision side effect (e.g. a delete promoting a
         // suffixed file) is handled even though only the deleted file was dirty —
         // the differential test pins this equal to a from-scratch fold.
+        // Fold is scoped to the checked-out branch's visible rows (§2.3). On a
+        // single-branch vault `visible(main)` is every row, so this is a no-op
+        // filter — byte-identical to the pre-branching fold. The incremental cache
+        // is per-checked-out-branch; `checkout` rebuilds it (clears `self.fold`).
+        let head = self.head_branch();
+        let bs = self.branch_set()?;
+        let vis = bs.visibility(&head);
         let files = {
             let mut fg = self.fold.borrow_mut();
             let dirty: Vec<String> = self.dirty.borrow_mut().drain().collect();
             match fg.as_mut() {
                 Some(fs) => {
-                    fs.refold_files(&self.store, &dirty, |fid| self.store.rows_for_file(fid))?;
+                    fs.refold_files(&self.store, &dirty, |fid| {
+                        Ok(self.store.rows_for_file(fid)?.into_iter().filter(|r| vis.sees(r)).collect())
+                    })?;
                     fs.files()
                 }
                 None => {
-                    let fs = crate::FoldState::from_rows(&self.store, &self.store.all_rows()?)?;
+                    let scoped: Vec<LogRow> = self.store.all_rows()?.into_iter().filter(|r| vis.sees(r)).collect();
+                    let fs = crate::FoldState::from_rows(&self.store, &scoped)?;
                     let f = fs.files();
                     *fg = Some(fs);
                     f
@@ -813,6 +867,8 @@ impl Engine {
             base_hash: None,
             result_hash: None,
             path: Some(rel.to_string()),
+            branch_id: self.head_branch(),
+            merge_parent: None,
             sig: vec![],
         }
         .seal();
@@ -837,6 +893,8 @@ impl Engine {
             base_hash: None,
             result_hash: None,
             path: None,
+            branch_id: self.head_branch(),
+            merge_parent: None,
             sig: vec![],
         }
         .seal();
@@ -989,6 +1047,94 @@ impl Engine {
         Ok(authored)
     }
 
+    // ---------------- branch ops (§4.2) ----------------
+
+    /// All live branches, `main` first — the switcher/list source.
+    pub fn branches(&self) -> AspResult<Vec<Branch>> {
+        let mut out = vec![Branch::main()];
+        for b in self.store.branches()? {
+            if !b.deleted {
+                out.push(b);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The checked-out branch id.
+    pub fn current_branch(&self) -> String {
+        self.head_branch()
+    }
+
+    /// Create a branch off `parent` capturing `fork_vv` (the parent's version
+    /// vector at the fork). Returns the new content-hashed branch id. Does **not**
+    /// switch HEAD.
+    pub fn create_branch(&self, name: &str, parent: &str, fork_vv: crate::branch::VersionVector) -> AspResult<String> {
+        let created_lamport = self.store.next_lamport(0)?;
+        let created_ts = now_unix() as i64;
+        let branch_id = Branch::derive_id(name, parent, &fork_vv, created_lamport, &self.site_id());
+        let b = Branch {
+            branch_id: branch_id.clone(),
+            name: name.to_string(),
+            parent: Some(parent.to_string()),
+            fork_vv,
+            created_lamport,
+            created_ts,
+            deleted: false,
+        };
+        self.store.put_branch(&b)?;
+        Ok(branch_id)
+    }
+
+    /// Switch HEAD to `branch_id` and re-materialize its scoped state to disk +
+    /// `files` table (§3.3). The one expensive user action (full re-materialize):
+    /// the fold cache is per-branch, so it is rebuilt from `visible(new HEAD)`.
+    pub fn checkout(&self, branch_id: &str) -> AspResult<()> {
+        if self.store.branch(branch_id)?.is_none() {
+            return Err(AspError::NotFound(format!("no such branch: {branch_id}")));
+        }
+        self.store.set_head(branch_id)?;
+        *self.fold.borrow_mut() = None; // rebuild the scoped cache for the new HEAD
+        self.dirty.borrow_mut().clear();
+        self.materialize()?;
+        Ok(())
+    }
+
+    /// Edit-in-the-past ⇒ branch (§2.5): fork the current branch at wall-clock `t`
+    /// (`fork_vv` = version vector of HEAD's rows with `ts ≤ t`), switch HEAD to the
+    /// new branch, and re-materialize the historical state. A subsequent
+    /// `record_write` then authors on the new branch, chaining on the historical
+    /// tip — main is left untouched. Returns the new branch id.
+    pub fn fork_from_time(&self, name: &str, t: i64) -> AspResult<String> {
+        let head = self.head_branch();
+        let bs = self.branch_set()?;
+        let vis = bs.visibility(&head);
+        let rows: Vec<LogRow> =
+            self.store.all_rows()?.into_iter().filter(|r| vis.sees(r) && r.ts <= t).collect();
+        let fork_vv = version_vector_of(&rows);
+        let id = self.create_branch(name, &head, fork_vv)?;
+        self.checkout(&id)?;
+        Ok(id)
+    }
+
+    /// Soft-delete a branch (§4.2): its rows remain for sync/history. The root
+    /// `main` cannot be deleted; deleting the checked-out branch auto-checks-out its
+    /// parent (or `main`).
+    pub fn delete_branch(&self, branch_id: &str) -> AspResult<()> {
+        if branch_id == MAIN_BRANCH_ID {
+            return Err(AspError::Invalid("cannot delete the main branch".into()));
+        }
+        let Some(mut b) = self.store.branch(branch_id)? else {
+            return Err(AspError::NotFound(format!("no such branch: {branch_id}")));
+        };
+        if self.head_branch() == branch_id {
+            let parent = b.parent.clone().unwrap_or_else(|| MAIN_BRANCH_ID.to_string());
+            self.checkout(&parent)?;
+        }
+        b.deleted = true;
+        self.store.put_branch(&b)?;
+        Ok(())
+    }
+
     // ---------------- admission (§Security) ----------------
 
     /// Seed the admission set at `init`/`authorize`/env.
@@ -1124,6 +1270,92 @@ mod tests {
         assert!(db.path().join("g.md").exists());
         assert_eq!(fs::read(da.path().join("g.md")).unwrap(), b"line1\nline2\nline3\n");
         assert!(!db.path().join("f.md").exists());
+    }
+
+    #[test]
+    fn edit_in_past_forks_a_branch_and_isolates_from_main() {
+        // §2.5 + §2.2 isolation: fork the current state onto a new branch, edit on
+        // it, and main must be untouched; switching back and forth shows each
+        // branch's own state.
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        e.record_write("a.md", b"main-v1\n").unwrap().unwrap();
+        assert_eq!(e.current_branch(), MAIN_BRANCH_ID);
+
+        // Fork capturing everything up to now (t = MAX → fork_vv = full main vv).
+        let b = e.fork_from_time("feature", i64::MAX).unwrap();
+        assert_eq!(e.current_branch(), b, "HEAD followed the new branch");
+        assert_eq!(fs::read(d.path().join("a.md")).unwrap(), b"main-v1\n", "branch starts from the forked state");
+
+        // Edit on the branch + add a branch-only file.
+        e.record_write("a.md", b"branch-v2\n").unwrap().unwrap();
+        e.record_write("only-on-branch.md", b"x\n").unwrap().unwrap();
+        assert_eq!(fs::read(d.path().join("a.md")).unwrap(), b"branch-v2\n");
+
+        // Back to main: original content, and the branch-only file is gone.
+        e.checkout(MAIN_BRANCH_ID).unwrap();
+        assert_eq!(fs::read(d.path().join("a.md")).unwrap(), b"main-v1\n", "main is isolated from branch edits");
+        assert!(!d.path().join("only-on-branch.md").exists(), "branch-only file not visible on main");
+
+        // Back to the branch: its edits are intact.
+        e.checkout(&b).unwrap();
+        assert_eq!(fs::read(d.path().join("a.md")).unwrap(), b"branch-v2\n");
+        assert!(d.path().join("only-on-branch.md").exists());
+    }
+
+    #[test]
+    fn delete_branch_rules() {
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        e.record_write("a.md", b"v1\n").unwrap().unwrap();
+        let b = e.fork_from_time("feature", i64::MAX).unwrap();
+        assert_eq!(e.current_branch(), b);
+        // Deleting the checked-out branch auto-checks-out main.
+        e.delete_branch(&b).unwrap();
+        assert_eq!(e.current_branch(), MAIN_BRANCH_ID);
+        assert!(e.branches().unwrap().iter().all(|x| x.branch_id != b), "deleted branch dropped from the live list");
+        // main can never be deleted.
+        assert!(e.delete_branch(MAIN_BRANCH_ID).is_err());
+        // Checking out a non-existent branch errors.
+        assert!(e.checkout("nope").is_err());
+    }
+
+    #[test]
+    fn create_branch_checkout_and_scoped_tip() {
+        // create_branch (explicit fork_vv) + checkout + authoring on a non-main
+        // branch exercises the branch-scoped tip path and isolation.
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        e.record_write("a.md", b"m1\n").unwrap().unwrap();
+        let head = e.head_branch();
+        let vv = crate::branch::version_vector_of(&e.store.all_rows().unwrap());
+        let bid = e.create_branch("topic", &head, vv).unwrap();
+        assert_ne!(bid, MAIN_BRANCH_ID);
+        assert_eq!(e.branches().unwrap().len(), 2, "main + topic");
+        e.checkout(&bid).unwrap();
+        assert_eq!(e.current_branch(), bid);
+        // Two edits on the branch chain through the branch-scoped tip.
+        e.record_write("a.md", b"m1\nb2\n").unwrap().unwrap();
+        e.record_write("a.md", b"m1\nb2\nb3\n").unwrap().unwrap();
+        assert_eq!(fs::read(d.path().join("a.md")).unwrap(), b"m1\nb2\nb3\n");
+        e.checkout(MAIN_BRANCH_ID).unwrap();
+        assert_eq!(fs::read(d.path().join("a.md")).unwrap(), b"m1\n", "main untouched by branch edits");
+        // Deleting a non-existent branch is an error (not a panic).
+        assert!(e.delete_branch("does-not-exist").is_err());
+    }
+
+    #[test]
+    fn single_branch_vault_is_byte_identical_back_compat() {
+        // §2.2 back-compat: with no branch ever created, HEAD=main and every row is
+        // visible, so the materialized tree matches a plain whole-log fold.
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        e.record_write("a.md", b"hello\n").unwrap().unwrap();
+        e.record_write("dir/b.md", b"world\n").unwrap().unwrap();
+        let scoped = e.store.live_files().unwrap();
+        let full = compute_files(&e.store, &e.store.all_rows().unwrap()).unwrap();
+        let live: Vec<_> = full.into_iter().filter(|f| !f.deleted).collect();
+        assert_eq!(scoped.len(), live.len());
     }
 
     #[test]
