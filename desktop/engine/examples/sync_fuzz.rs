@@ -464,6 +464,7 @@ enum Scenario {
     HugeFile,
     CodeFile,
     TimeTravelRestore,
+    VaultRestore,
 }
 
 fn pick_scenario(rng: &mut Rng, round: usize) -> Scenario {
@@ -475,7 +476,7 @@ fn pick_scenario(rng: &mut Rng, round: usize) -> Scenario {
             EditExisting, NewFile, Rename, Delete, DeleteRecreate, RapidBurst,
             LargeFile, ManyFiles, ConcurrentSameFile, EmptyFile, DeepNesting,
             TruncateToEmpty, SwapNames, RenameOntoExisting, CaseOnlyRename, RenameThenEdit,
-            ExternalRescan, BinaryFile, HugeFile, CodeFile, TimeTravelRestore,
+            ExternalRescan, BinaryFile, HugeFile, CodeFile, TimeTravelRestore, VaultRestore,
         ]
     };
     rng.pick(&menu).clone()
@@ -772,6 +773,20 @@ fn apply_scenario(
             let _ = peers[i].de.restore_file_at(&peers[i].id, &path, ts);
             lat.push(t.elapsed().as_millis());
             format!("tt-restore/Engine({i}) {path}@-{}s", now - ts)
+        }
+        VaultRestore => {
+            // Revert the WHOLE vault to a recent past instant (engine.restore with
+            // a unix-ts target), which authors revert rows for every file changed
+            // since and broadcasts them. Far heavier than a one-file restore: it
+            // races a live, concurrently-mutating sync and must still converge
+            // across all surfaces (the revert rows are normal latest-wins edits).
+            let i = rng.below(np);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+            let target = (now - 1 - (rng.below(3) as i64)).to_string();
+            let t = Instant::now();
+            let _ = peers[i].de.restore(&peers[i].id, &target);
+            lat.push(t.elapsed().as_millis());
+            format!("vault-restore/Engine({i}) @-{}s", now - target.parse::<i64>().unwrap_or(now))
         }
     }
 }
