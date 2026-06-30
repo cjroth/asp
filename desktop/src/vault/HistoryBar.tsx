@@ -307,12 +307,10 @@ export default function HistoryBar(props: HistoryBarProps) {
         <>
           <div onClick={() => setLocCtx(null)} onContextMenu={(e) => { e.preventDefault(); setLocCtx(null); }} style={{ position: 'fixed', inset: 0, zIndex: 64 }} />
           <div style={{ position: 'fixed', left: locCtx.x, top: locCtx.y, zIndex: 65, width: 200, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, boxShadow: '0 10px 28px rgba(28,25,23,0.15)', padding: 4 }}>
-            <div className="asp-hover-soft" onClick={() => { copyPath(); setLocCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-              <Icon.CopyIcon size={14} stroke="#78716c" style={{ flex: 'none' }} />
+            <div className="asp-hover-soft" onClick={() => { copyPath(); setLocCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
               <span>Copy path</span>
             </div>
-            <div className="asp-hover-soft" onClick={() => { revealLoc(); setLocCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-              <Icon.FolderIcon size={14} stroke="#78716c" style={{ flex: 'none' }} />
+            <div className="asp-hover-soft" onClick={() => { revealLoc(); setLocCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
               <span>Open in file manager</span>
             </div>
           </div>
@@ -323,12 +321,10 @@ export default function HistoryBar(props: HistoryBarProps) {
         <>
           <div onClick={() => setLogCtx(null)} onContextMenu={(e) => { e.preventDefault(); setLogCtx(null); }} style={{ position: 'fixed', inset: 0, zIndex: 64 }} />
           <div style={{ position: 'fixed', left: logCtx.x, top: logCtx.y, zIndex: 65, width: 156, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, boxShadow: '0 10px 28px rgba(28,25,23,0.15)', padding: 4 }}>
-            <div className="asp-hover-soft" onClick={() => { copy(logCtx.line); setLogCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-              <Icon.CopyIcon size={14} stroke="#78716c" style={{ flex: 'none' }} />
+            <div className="asp-hover-soft" onClick={() => { copy(logCtx.line); setLogCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
               <span>Copy line</span>
             </div>
-            <div className="asp-hover-soft" onClick={onCopyAll} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-              <Icon.ListIcon size={14} stroke="#78716c" style={{ flex: 'none' }} />
+            <div className="asp-hover-soft" onClick={onCopyAll} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
               <span>Copy all</span>
             </div>
           </div>

@@ -1,6 +1,7 @@
+import { mock } from 'bun:test';
 import { cleanup, fireEvent, render } from '@testing-library/react';
 import React from 'react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from '../test-shim';
 import { _clearDiagramCache } from './diagram';
 import LiveEditor, { type LiveEditorProps } from './LiveEditor';
 import { caretOffset, readLive } from './markdown';
@@ -11,7 +12,7 @@ import { caretOffset, readLive } from './markdown';
 const { mockRender } = vi.hoisted(() => ({
   mockRender: vi.fn(async (_id: string, src: string) => ({ svg: '<svg class="rendered">' + src + '</svg>' })),
 }));
-vi.mock('./mermaid', () => ({
+mock.module('./mermaid', () => ({
   loadMermaid: async () => ({ initialize: vi.fn(), render: mockRender }),
 }));
 
@@ -344,3 +345,5 @@ describe('LiveEditor', () => {
     expect(el.textContent).toContain('second');
   });
 });
+import { afterAll as __aa, mock as __mk } from 'bun:test';
+__aa(() => __mk.restore());

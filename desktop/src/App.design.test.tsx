@@ -1,3 +1,4 @@
+import { mock } from 'bun:test';
 // Integration tests for the redesigned App: theme/font toggles, sidebar resize,
 // new file/folder, hidden + pretty names, breadcrumb rename, customize, share,
 // remove, history/log tabs + time-travel, and the entry modals — all wired to a
@@ -5,7 +6,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from './test-shim';
 
 let CONTENT: Record<string, string>;
 let FILES: { path: string; file_id: string; is_dir: boolean; merge_class: string }[];
@@ -36,9 +37,10 @@ const listVaults = vi.fn(async () => [
 ]);
 const getStatus = vi.fn(async (id: string) => ({ id, vault_id: id === 'v1' ? 'vid1' : 'vid2', rows: 3, files: 3, head: 'h', listening_ticket: null, peers: id === 'v1' ? ['ssh-ed25519 PEERKEY a@b'] : [], last_ts: Math.floor(Date.now() / 1000) - 30 }));
 
-vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/picked') }));
-vi.mock('./lib/api', () => ({
+mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/picked') }));
+mock.module('./lib/api', () => ({
   api: {
+    startLiveSync: vi.fn(), stopLiveSync: vi.fn(), setLocalRelay: vi.fn(async () => false), getLocalRelay: vi.fn(async () => false),
     listVaults: () => listVaults(),
     addLocalFolder: (p: string) => addLocalFolder(p),
     cloneRemote: (d: string, t: string, k?: string) => cloneRemote(d, t, k),
@@ -86,7 +88,10 @@ describe('App — connect screen', () => {
     render(<App />);
     const row = await screen.findByText('notes');
     fireEvent.contextMenu(row);
-    fireEvent.click(await screen.findByText('Customize…'));
+    const customize = await screen.findByText('Customize…');
+    // Vault-row context menu is text-only (no leading icon).
+    expect((customize.closest('.asp-hover-soft') as HTMLElement).querySelector('svg')).toBeNull();
+    fireEvent.click(customize);
     fireEvent.change(screen.getByDisplayValue('notes'), { target: { value: 'My Notes' } });
     fireEvent.change(screen.getByPlaceholderText('Search emojis'), { target: { value: 'rocket' } });
     const grid = (Array.from(document.querySelectorAll('.asp-hover-list')) as HTMLElement[]).find((e) => e.textContent === '🚀');
@@ -646,33 +651,31 @@ describe('App — empty + edge states', () => {
 // The `.asp-scroll` regions (file tree, editor, history bar, vault list, customize
 // modal) hold genuinely overflowing content, so e2e measurement confirmed the
 // scrollbars are real (not a layout-overflow bug) — see e2e/scroll-metrics.mjs.
-// The fix makes them UNOBTRUSIVE on web (Chromium forces an always-on classic bar
-// when `::-webkit-scrollbar` is styled, whereas the macOS desktop WebView overlays
-// /auto-hides them): the thumb is transparent until the region is hovered, while
-// the scrollbar BOX stays so the gutter is stable and layout never shifts. These
-// pin that contract so the soften-scrollbar fix can't silently regress.
-describe('.asp-scroll soften: auto-hiding (hover-reveal) scrollbar thumb', () => {
+// They get a thin macOS-style scrollbar: narrow (8px), a rounded translucent
+// thumb over a transparent track — close to the native overlay bar instead of
+// the chunky classic one. These pin that contract.
+describe('.asp-scroll: thin macOS-style scrollbar', () => {
   const cssText = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
 
-  it('keeps the scrollbar box (width/height) so the gutter is stable, not removed', () => {
-    expect(cssText).toMatch(/\.asp-scroll::-webkit-scrollbar\s*\{[^}]*width:\s*10px/);
-    // Scrollability is NOT removed: the bar/track is preserved (no display:none).
+  it('gives the WebKit scrollbar a narrow 8px width (not display:none)', () => {
     const barRule = (cssText.match(/\.asp-scroll::-webkit-scrollbar\s*\{([^}]*)\}/) || ['', ''])[1];
+    expect(barRule).toMatch(/width:\s*8px/);
     expect(barRule).not.toMatch(/display\s*:\s*none/);
   });
 
-  it('makes the thumb transparent by default so it auto-hides like the desktop overlay', () => {
-    const thumbRule = (cssText.match(/\.asp-scroll::-webkit-scrollbar-thumb\s*\{([^}]*)\}/) || ['', ''])[1];
-    expect(thumbRule).not.toBe('');
-    expect(thumbRule).toMatch(/background:\s*transparent/);
+  it('uses thin Firefox scrollbars (scrollbar-width:thin, not none)', () => {
+    const rule = (cssText.match(/\.asp-scroll\s*\{([^}]*)\}/) || ['', ''])[1];
+    expect(rule).toMatch(/scrollbar-width:\s*thin/);
+    expect(rule).not.toMatch(/scrollbar-width:\s*none/);
   });
 
-  it('reveals the thumb only on container hover (light + dark), keeping it functional', () => {
-    // Light: hovering the region paints the thumb.
-    expect(cssText).toMatch(/\.asp-scroll:hover::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*#00000016/);
-    // Dark: theme override also gates on container hover.
-    expect(cssText).toMatch(/\[data-theme="dark"\]\s*\.asp-scroll:hover::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*#ffffff1f/);
-    // The default (non-hover) thumb is NOT given a visible color anywhere.
-    expect(cssText).not.toMatch(/\.asp-scroll::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*#00000016/);
+  it('paints a rounded, translucent thumb over a transparent track', () => {
+    const thumbRule = (cssText.match(/\.asp-scroll::-webkit-scrollbar-thumb\s*\{([^}]*)\}/) || ['', ''])[1];
+    expect(thumbRule).toMatch(/border-radius/);
+    expect(thumbRule).toMatch(/background:\s*rgba\(/);
+    const trackRule = (cssText.match(/\.asp-scroll::-webkit-scrollbar-track\s*\{([^}]*)\}/) || ['', ''])[1];
+    expect(trackRule).toMatch(/background:\s*transparent/);
   });
 });
+import { afterAll as __aa, mock as __mk } from 'bun:test';
+__aa(() => __mk.restore());

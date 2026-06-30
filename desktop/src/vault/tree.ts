@@ -13,17 +13,22 @@ export interface TreeNode {
 
 export function buildTree(files: FileEntry[]): TreeNode[] {
   const root: TreeNode = { type: 'dir', name: '', path: '', children: [] };
+  // A path -> dir-node index and a seen-path set make the build O(total path
+  // segments) instead of O(N × siblings): the old linear `find`/`some` scans
+  // turned a 28k-file vault (with big flat directories) into a quadratic stall.
+  const dirIndex = new Map<string, TreeNode>([['', root]]);
+  const seen = new Set<string>();
 
-  const ensureDir = (parts: string[]): TreeNode => {
+  const ensureDir = (parts: string[], upto: number): TreeNode => {
     let node = root;
     let acc = '';
-    for (const part of parts) {
-      acc = acc ? acc + '/' + part : part;
-      const kids = node.children!;
-      let next = kids.find((c) => c.type === 'dir' && c.name === part);
+    for (let i = 0; i < upto; i++) {
+      acc = acc ? acc + '/' + parts[i] : parts[i];
+      let next = dirIndex.get(acc);
       if (!next) {
-        next = { type: 'dir', name: part, path: acc, children: [] };
-        kids.push(next);
+        next = { type: 'dir', name: parts[i], path: acc, children: [] };
+        node.children!.push(next);
+        dirIndex.set(acc, next);
       }
       node = next;
     }
@@ -31,17 +36,16 @@ export function buildTree(files: FileEntry[]): TreeNode[] {
   };
 
   for (const f of files) {
+    if (seen.has(f.path)) continue;
     const parts = f.path.split('/').filter(Boolean);
     if (parts.length === 0) continue;
+    seen.add(f.path);
     if (f.is_dir) {
-      ensureDir(parts);
+      ensureDir(parts, parts.length);
       continue;
     }
-    const name = parts[parts.length - 1];
-    const parent = ensureDir(parts.slice(0, -1));
-    if (!parent.children!.some((c) => c.type === 'file' && c.name === name)) {
-      parent.children!.push({ type: 'file', name, path: f.path });
-    }
+    const parent = ensureDir(parts, parts.length - 1);
+    parent.children!.push({ type: 'file', name: parts[parts.length - 1], path: f.path });
   }
 
   const sortRec = (n: TreeNode) => {

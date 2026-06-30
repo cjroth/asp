@@ -1,12 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mock } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, vi } from '../src/test-shim';
 
 const invoke = vi.fn(async () => 'ok');
-vi.mock('@tauri-apps/api/core', () => ({ invoke: (...a: unknown[]) => invoke(...(a as [])) }));
-vi.mock('./webApi', () => ({
+mock.module('@tauri-apps/api/core', () => ({ invoke: (...a: unknown[]) => invoke(...(a as [])) }));
+mock.module('../src/lib/webApi', () => ({
   createWebApi: () => ({ listVaults: async () => [{ id: 'w1', path: '', vault_id: 'wv', enabled: true, listening_ticket: null }] }),
 }));
 
-import { api } from './api';
+import { api } from '../src/lib/api';
 
 const w = window as unknown as Record<string, unknown>;
 beforeEach(() => invoke.mockClear());
@@ -25,6 +26,12 @@ describe('api — thin Tauri command surface', () => {
 
     await api.setAllowConnections('id', true, 'k');
     expect(invoke).toHaveBeenCalledWith('set_allow_connections', { id: 'id', on: true, authKey: 'k' });
+
+    await api.setLocalRelay(true);
+    expect(invoke).toHaveBeenCalledWith('set_local_relay', { on: true });
+
+    await api.getLocalRelay();
+    expect(invoke).toHaveBeenCalledWith('get_local_relay');
 
     await api.syncNow('id', 'tkt');
     expect(invoke).toHaveBeenCalledWith('sync_now', { id: 'id', ticket: 'tkt', authKey: undefined });
@@ -92,3 +99,5 @@ describe('api — thin Tauri command surface', () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 });
+import { afterAll as __aa, mock as __mk } from 'bun:test';
+__aa(() => __mk.restore());

@@ -28,6 +28,8 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
 
 @keyframes aspPulse { 0%, 100% { opacity: 1 } 50% { opacity: .32 } }
 @keyframes aspSpin { to { transform: rotate(360deg) } }
+/* Indeterminate progress sweep (clone "saving" phase / before the row count is known). */
+@keyframes aspIndet { 0% { left: -40% } 100% { left: 100% } }
 
 /* Tab strip — stays horizontally scrollable (trackpad/drag reaches far tabs) but
    hides the scrollbar entirely (cross-browser), so the strip's scrollbar gutter
@@ -35,25 +37,21 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
 .tab-strip { scrollbar-width: none; }
 .tab-strip::-webkit-scrollbar { display: none; }
 
-/* Themed scrollbars for the real scroll regions (file tree, editor, history bar,
-   vault list, customize modal). The content here genuinely overflows, so these
-   bars stay fully functional — but the THUMB is transparent until you hover the
-   region, so it auto-hides to match the unobtrusive overlay scrollbars the macOS
-   desktop WebView draws. Styling `::-webkit-scrollbar` at all otherwise forces
-   Chromium/web into an always-on CLASSIC bar (the "scrollbars appeared on web"
-   report). Crucially we keep the scrollbar BOX (width/height) at all times, so the
-   gutter is reserved whenever content overflows and hover only RECOLORS the
-   already-present thumb — it never adds/removes the bar, so layout never shifts. */
-.asp-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+/* Real scroll regions (file tree, editor, history bar, vault list, customize
+   modal). A thin macOS-style scrollbar: narrow, rounded, translucent thumb over
+   a transparent track — close to the native overlay bar instead of the chunky
+   10px classic one that styling a wide `::-webkit-scrollbar` forces on web. */
+.asp-scroll { scrollbar-width: thin; scrollbar-color: rgba(0,0,0,0.25) transparent; }
+.asp-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.asp-scroll::-webkit-scrollbar-track { background: transparent; }
 .asp-scroll::-webkit-scrollbar-thumb {
-  background: transparent; border-radius: 8px;
-  border: 3px solid transparent; background-clip: padding-box;
-  transition: background 0.18s ease;
+  background: rgba(0,0,0,0.22); border-radius: 8px;
+  border: 2px solid transparent; background-clip: padding-box;
 }
-.asp-scroll:hover::-webkit-scrollbar-thumb { background: #00000016; background-clip: padding-box; }
-.asp-scroll:hover::-webkit-scrollbar-thumb:hover { background: #00000026; background-clip: padding-box; }
-[data-theme="dark"] .asp-scroll:hover::-webkit-scrollbar-thumb { background: #ffffff1f; background-clip: padding-box; }
-[data-theme="dark"] .asp-scroll:hover::-webkit-scrollbar-thumb:hover { background: #ffffff2e; background-clip: padding-box; }
+.asp-scroll::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.34); background-clip: padding-box; }
+[data-theme="dark"] .asp-scroll { scrollbar-color: rgba(255,255,255,0.26) transparent; }
+[data-theme="dark"] .asp-scroll::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.24); background-clip: padding-box; }
+[data-theme="dark"] .asp-scroll::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.36); background-clip: padding-box; }
 
 /* Hover affordances — the design applies these via `style-hover`; in React they
    are CSS classes so the same elements light up on hover, theme-aware. */

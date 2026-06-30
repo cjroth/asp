@@ -1,5 +1,5 @@
 // Exhaustive unit tests for the pure tab/hash helpers. Pinned at 100% coverage.
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from '../test-shim';
 import { buildHash, closeAll, closeOthers, closeTab, closeToLeft, closeToRight, loadOpenTabs, parseHash, remapTabs, removeTabs, reorderTabs, saveOpenTabs, withTab } from './tabs';
 
 describe('buildHash / parseHash', () => {

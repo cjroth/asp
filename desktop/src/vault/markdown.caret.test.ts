@@ -1,6 +1,6 @@
 // Branch coverage for the contentEditable caret helpers — deep-element walks,
 // line boundaries, and beyond-end fallbacks.
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from '../test-shim';
 import { caretOffset, renderLiveHtml, setCaret, setTextOffsetIn, textOffsetIn } from './markdown';
 
 let el: HTMLDivElement;

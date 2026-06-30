@@ -20,6 +20,10 @@ wasm-bindgen = "0.2"
 serde = { workspace = true }
 serde_json.workspace = true
 hex.workspace = true
+# Outbound channel for the live connector: record_* hand freshly-authored rows to
+# the open connection. Pure Rust, so it builds for the native rlib too (where the
+# live connector is cfg'd out and the channel simply stays empty).
+futures-channel = "0.3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1"

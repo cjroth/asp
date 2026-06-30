@@ -3,7 +3,7 @@
 // styled element rather than a text node), edits must round-trip the YAML source
 // byte-for-byte for every `frontmatterStyle`, and adding/removing a property line
 // must reconstruct cleanly. A doc without frontmatter must be unaffected.
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from '../test-shim';
 import type { FrontmatterStyle } from './prefs';
 import { caretOffset, readLive, renderLiveHtml, setCaret } from './markdown';
 

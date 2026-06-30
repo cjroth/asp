@@ -1,9 +1,10 @@
+import { mock } from 'bun:test';
 // Integration test: drive the real <App/> against a mocked backend to verify
 // the end-to-end wiring (connect → open folder → file tree → select → read →
 // edit → debounced write → time-travel read). Catches command-name/param and
 // handler-logic bugs the pure-unit tests can't.
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from './test-shim';
 import { buildHash, parseHash } from './vault/tabs';
 
 // ---- in-memory fake backend ----
@@ -34,9 +35,10 @@ const listVaults = vi.fn(async () => [] as unknown[]);
 const renameFile = vi.fn(async () => {});
 const deleteFile = vi.fn(async () => {});
 
-vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/vault') }));
-vi.mock('./lib/api', () => ({
+mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/vault') }));
+mock.module('./lib/api', () => ({
   api: {
+    startLiveSync: vi.fn(), stopLiveSync: vi.fn(), setLocalRelay: vi.fn(async () => false), getLocalRelay: vi.fn(async () => false),
     listVaults: (...a: unknown[]) => listVaults(...(a as [])),
     addLocalFolder: (p: string) => addLocalFolder(p),
     cloneRemote: vi.fn(),
@@ -81,8 +83,9 @@ describe('App end-to-end wiring', () => {
     fireEvent.click(screen.getByText('Create vault'));
     await waitFor(() => expect(addLocalFolder).toHaveBeenCalledWith('/home/me/vault'));
     await waitFor(() => expect(listFiles).toHaveBeenCalledWith('v1'));
-    // history() is intentionally debounced off the critical path now.
-    await waitFor(() => expect(history).toHaveBeenCalledWith('v1'), { timeout: 2000 });
+    // history() scans the whole log, so it's now fetched lazily — only when the
+    // History/Log view opens (asserted at step 7), never on the editor poll.
+    expect(history).not.toHaveBeenCalled();
 
     // 3. Editor renders the file tree. Dirs start collapsed (vaults can be huge),
     //    so expand "notes" to reveal a.md. "README.md" appears twice on purpose:
@@ -107,6 +110,7 @@ describe('App end-to-end wiring', () => {
 
     // 7. Expand the History tab → the time-travel track + playhead handle render.
     fireEvent.click(screen.getByText('History'));
+    await waitFor(() => expect(history).toHaveBeenCalledWith('v1')); // fetched on open
     const track = await screen.findByTestId('history-track');
     expect(track).toBeTruthy();
     const handle = container.querySelector('[style*="ew-resize"]') as HTMLElement;
@@ -370,8 +374,11 @@ describe('App — tabs + URL hash (desktop)', () => {
     const close = await screen.findByText('Close');
     // The menu container holds the items in DOM order.
     const menu = close.closest('div[style*="position: fixed"]') as HTMLElement;
-    const rendered = Array.from(menu.querySelectorAll('.asp-hover-soft')).map((el) => (el.textContent || '').replace('×', ''));
+    const rendered = Array.from(menu.querySelectorAll('.asp-hover-soft')).map((el) => el.textContent || '');
     expect(rendered).toEqual(['Close', 'Close Others', 'Close to the Left', 'Close to the Right', 'Close All', 'Rename', 'Delete']);
+    // Right-click context menu is text-only: no leading icons or × glyphs.
+    expect(menu.querySelector('svg')).toBeNull();
+    expect(menu.textContent).not.toContain('×');
   });
 
   it('Close Others closes every tab but the right-clicked one (switching active when needed)', async () => {
@@ -541,3 +548,5 @@ describe('App — tabs + URL hash (desktop)', () => {
     await waitFor(() => expect(renameFile).toHaveBeenCalledWith('v1', 'README.md', 'notes/README.md'));
   });
 });
+import { afterAll as __aa, mock as __mk } from 'bun:test';
+__aa(() => __mk.restore());

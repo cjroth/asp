@@ -5,7 +5,7 @@
 // mapping (via the exported `fenceLang`), (2) that body lines actually gain color
 // spans, (3) the byte-exact readLive round-trip of a highlighted fence, (4) that
 // ```mermaid stays a diagram (not code), and (5) blank/unknown fences don't crash.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from '../test-shim';
 import { fenceLang, readLive, renderLiveHtml } from './markdown';
 
 const html = (s: string): HTMLDivElement => {
