@@ -143,6 +143,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AuthCmd,
     },
+    /// Branches: scoped views over the shared log (list / create / checkout /
+    /// delete). Branch records sync to every peer like content does.
+    Branch {
+        #[command(subcommand)]
+        cmd: BranchCmd,
+    },
     /// Node identity, peers, sync state, head SHA.
     Status {
         #[arg(long)]
@@ -175,6 +181,26 @@ enum AuthCmd {
         json: bool,
     },
     Extend { peer: String, ttl: String },
+}
+
+#[derive(Subcommand)]
+enum BranchCmd {
+    /// List branches; the checked-out one is marked `*`.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a branch from HEAD at the current point (does not switch to it).
+    Create {
+        name: String,
+        /// Also check out the new branch.
+        #[arg(long)]
+        checkout: bool,
+    },
+    /// Switch HEAD to a branch (by id or name) and re-materialize its state.
+    Checkout { branch: String },
+    /// Soft-delete a branch (by id or name); `main` cannot be deleted.
+    Delete { branch: String },
 }
 
 fn now_unix() -> u64 {
@@ -343,6 +369,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Auth { cmd } => auth_cmd(&cli, cmd),
+        Cmd::Branch { cmd } => branch_cmd(&cli, cmd),
         Cmd::Status { json } => status_cmd(&cli, *json),
         Cmd::Snapshot { name } => {
             let engine = open_engine(&cli)?;
@@ -484,6 +511,71 @@ fn auth_cmd(cli: &Cli, cmd: &AuthCmd) -> Result<()> {
             } else {
                 println!("no such key");
             }
+            Ok(())
+        }
+    }
+}
+
+/// Resolve a branch CLI arg (an exact branch id, else a unique live name).
+fn resolve_branch(engine: &Engine, arg: &str) -> Result<String> {
+    let branches = engine.branches().map_err(|e| anyhow!("{e}"))?;
+    if branches.iter().any(|b| b.branch_id == arg) {
+        return Ok(arg.to_string());
+    }
+    let by_name: Vec<&asp_core::Branch> = branches.iter().filter(|b| b.name == arg).collect();
+    match by_name.as_slice() {
+        [b] => Ok(b.branch_id.clone()),
+        [] => Err(anyhow!("no such branch: {arg}")),
+        _ => Err(anyhow!("ambiguous branch name '{arg}'; pass the branch id")),
+    }
+}
+
+fn branch_cmd(cli: &Cli, cmd: &BranchCmd) -> Result<()> {
+    let engine = open_engine(cli)?;
+    let head = engine.current_branch();
+    match cmd {
+        BranchCmd::List { json } => {
+            let branches = engine.branches().map_err(|e| anyhow!("{e}"))?;
+            if *json {
+                let arr: Vec<_> = branches
+                    .iter()
+                    .map(|b| {
+                        serde_json::json!({
+                            "branch_id": b.branch_id,
+                            "name": b.name,
+                            "parent": b.parent,
+                            "current": b.branch_id == head,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else {
+                for b in &branches {
+                    let mark = if b.branch_id == head { "*" } else { " " };
+                    println!("{mark} {}  ({})", b.name, &b.branch_id[..8.min(b.branch_id.len())]);
+                }
+            }
+            Ok(())
+        }
+        BranchCmd::Create { name, checkout } => {
+            let id = engine.create_branch_here(name).map_err(|e| anyhow!("branch create: {e}"))?;
+            if *checkout {
+                engine.checkout(&id).map_err(|e| anyhow!("checkout: {e}"))?;
+            }
+            let short = &id[..8.min(id.len())];
+            println!("created branch {name} ({short}){}", if *checkout { " — checked out" } else { "" });
+            Ok(())
+        }
+        BranchCmd::Checkout { branch } => {
+            let id = resolve_branch(&engine, branch)?;
+            engine.checkout(&id).map_err(|e| anyhow!("checkout: {e}"))?;
+            println!("switched to branch {branch}");
+            Ok(())
+        }
+        BranchCmd::Delete { branch } => {
+            let id = resolve_branch(&engine, branch)?;
+            engine.delete_branch(&id).map_err(|e| anyhow!("branch delete: {e}"))?;
+            println!("deleted branch {branch}");
             Ok(())
         }
     }

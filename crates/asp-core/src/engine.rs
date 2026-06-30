@@ -1081,6 +1081,23 @@ impl Engine {
         self.head_branch()
     }
 
+    /// The version vector visible on `branch` right now — the fork point a child
+    /// captures when forking "from here" (§2.1).
+    pub fn visible_version_vector(&self, branch: &str) -> AspResult<crate::branch::VersionVector> {
+        let bs = self.branch_set()?;
+        let vis = bs.visibility(branch);
+        let rows: Vec<LogRow> = self.store.all_rows()?.into_iter().filter(|r| vis.sees(r)).collect();
+        Ok(version_vector_of(&rows))
+    }
+
+    /// Create a branch off HEAD at the current point and return its id (the CLI's
+    /// `branch create`). Does not switch HEAD.
+    pub fn create_branch_here(&self, name: &str) -> AspResult<String> {
+        let head = self.head_branch();
+        let vv = self.visible_version_vector(&head)?;
+        self.create_branch(name, &head, vv)
+    }
+
     /// Create a branch off `parent` capturing `fork_vv` (the parent's version
     /// vector at the fork). Returns the new content-hashed branch id. Does **not**
     /// switch HEAD. The record is authored as a synced `Kind::Branch` row (§7), so
