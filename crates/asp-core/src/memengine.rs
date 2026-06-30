@@ -177,6 +177,13 @@ impl MemEngine {
         out
     }
 
+    /// The GitHub-network-style branch/commit DAG (§4.5), bounded to `cap` commits
+    /// per lane — same builder as native, so web and desktop render identically.
+    pub fn graph(&self, cap: usize) -> crate::branch::Graph {
+        let live: Vec<crate::branch::Branch> = self.branches.borrow().iter().filter(|b| !b.deleted).cloned().collect();
+        crate::branch::build_graph(&self.rows.borrow(), &live, &self.head_branch(), cap)
+    }
+
     /// The version vector visible on `branch` right now — the fork point a child
     /// branch captures when forking "from here" (§2.1).
     pub fn visible_version_vector(&self, branch: &str) -> crate::branch::VersionVector {

@@ -11,6 +11,7 @@ import { api, type ClonePhase, type FileEntry, type HistEvent, type VaultInfo, t
 import CustomizeModal, { type CustomizeInit } from './vault/CustomizeModal';
 import FileTree from './vault/FileTree';
 import HistoryBar from './vault/HistoryBar';
+import BranchControls from './vault/BranchControls';
 import { buildEvents, createTsByPath, defaultView, type TrackEvent, type View, viewForNow } from './vault/history';
 import * as Icon from './vault/icons';
 import LiveEditor from './vault/LiveEditor';
@@ -1565,6 +1566,10 @@ export default function App() {
                 </>
               )}
             </div>
+
+            {activeId && (
+              <BranchControls vaultId={activeId} accent={accent} onChanged={() => { if (activeId) void openVault(activeId); }} />
+            )}
 
             <div style={{ display: 'flex', alignItems: 'center', gap: 1, padding: '9px 9px 7px', position: 'relative' }}>
               <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--faint2)', flex: 1, paddingLeft: 3 }}>Files</span>

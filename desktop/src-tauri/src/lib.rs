@@ -95,6 +95,13 @@ pub fn run() {
             commands::rescan,
             commands::remove_vault,
             commands::reveal_path,
+            commands::list_branches,
+            commands::current_branch,
+            commands::branch_graph,
+            commands::create_branch,
+            commands::checkout_branch,
+            commands::fork_branch_at,
+            commands::delete_branch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Context Desktop");

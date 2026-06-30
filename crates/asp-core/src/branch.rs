@@ -187,6 +187,151 @@ pub fn reconcile_branches(rows: &[LogRow], blob: impl Fn(&str) -> Option<Vec<u8>
     out
 }
 
+/// One node in the branch/commit DAG (§4.5) — a coarsened "settle commit": a run
+/// of rows authored close together on one branch, so the graph isn't one node per
+/// keystroke. `parents` are commit ids (the prior commit on the lane, plus a fork
+/// edge into the parent lane for a branch's first commit).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GraphNode {
+    pub commit_id: String,
+    pub branch_id: String,
+    pub parents: Vec<String>,
+    pub ts: i64,
+    pub lamport: u64,
+    pub label: String,
+    /// Horizontal lane (0 = main); the UI draws one column per branch.
+    pub lane: usize,
+}
+
+/// A branch lane in the graph.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GraphBranch {
+    pub id: String,
+    pub name: String,
+    pub parent: Option<String>,
+    pub head_commit: Option<String>,
+    pub lane: usize,
+    pub current: bool,
+}
+
+/// The full network graph: lanes (branches) + the commit DAG over them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Graph {
+    pub nodes: Vec<GraphNode>,
+    pub branches: Vec<GraphBranch>,
+}
+
+/// Build the GitHub-network-style branch/commit DAG from the log + branch set
+/// (§4.5, §6). Pure + wasm-safe so native and web render identically. Rows are
+/// coarsened per branch into settle-commits (a new commit starts when the author
+/// changes or the Lamport gap exceeds `COARSEN`), bounded to `cap` nodes per
+/// branch (keeping the most recent) so it stays fast at thousands of commits.
+/// `head` marks the checked-out lane.
+pub fn build_graph(rows: &[LogRow], live_branches: &[Branch], head: &str, cap: usize) -> Graph {
+    const COARSEN: u64 = 3; // Lamport gap that starts a new settle-commit.
+
+    // Lanes: main first, then live branches by creation order. Deterministic.
+    let mut lanes: Vec<Branch> = vec![Branch::main()];
+    let mut ordered: Vec<Branch> = live_branches.iter().filter(|b| b.branch_id != MAIN_BRANCH_ID && !b.deleted).cloned().collect();
+    ordered.sort_by(|a, b| a.created_lamport.cmp(&b.created_lamport).then_with(|| a.branch_id.cmp(&b.branch_id)));
+    lanes.extend(ordered);
+    let lane_of: HashMap<String, usize> = lanes.iter().enumerate().map(|(i, b)| (b.branch_id.clone(), i)).collect();
+
+    // Rows authored on each branch, in fold-order key, coarsened into commits.
+    let mut nodes: Vec<GraphNode> = Vec::new();
+    // branch_id -> its commit ids in order (for parent chaining + fork lookup).
+    let mut chain: HashMap<String, Vec<(u64, String)>> = HashMap::new();
+
+    for (lane, b) in lanes.iter().enumerate() {
+        let mut mine: Vec<&LogRow> = rows.iter().filter(|r| r.branch_id == b.branch_id && r.kind != Kind::Branch).collect();
+        mine.sort_by(|x, y| {
+            x.lamport.cmp(&y.lamport).then_with(|| x.site_id.cmp(&y.site_id)).then_with(|| x.id.cmp(&y.id))
+        });
+        // Coarsen into commit buckets.
+        let mut commits: Vec<GraphNode> = Vec::new();
+        let mut i = 0;
+        while i < mine.len() {
+            let start = i;
+            let mut last = mine[i];
+            i += 1;
+            while i < mine.len()
+                && mine[i].site_id == last.site_id
+                && mine[i].lamport.saturating_sub(last.lamport) <= COARSEN
+            {
+                last = mine[i];
+                i += 1;
+            }
+            let bucket = &mine[start..i];
+            let label = commit_label(bucket);
+            commits.push(GraphNode {
+                commit_id: last.id.clone(),
+                branch_id: b.branch_id.clone(),
+                parents: Vec::new(), // filled below
+                ts: last.ts,
+                lamport: last.lamport,
+                label,
+                lane,
+            });
+        }
+        // Cap: keep the most recent `cap` commits on this lane.
+        if commits.len() > cap {
+            commits = commits.split_off(commits.len() - cap);
+        }
+        // Chain parents within the lane.
+        for w in 1..commits.len() {
+            let prev = commits[w - 1].commit_id.clone();
+            commits[w].parents.push(prev);
+        }
+        chain.insert(b.branch_id.clone(), commits.iter().map(|c| (c.lamport, c.commit_id.clone())).collect());
+        nodes.extend(commits);
+    }
+
+    // Fork edges: a branch's FIRST commit's parent is the parent branch's commit
+    // at the fork point (the highest-lamport parent commit at or before the fork).
+    for b in lanes.iter() {
+        if b.branch_id == MAIN_BRANCH_ID {
+            continue;
+        }
+        let Some(parent_id) = &b.parent else { continue };
+        let fork_at = b.fork_vv.values().copied().max().unwrap_or(0).max(0) as u64;
+        let fork_lamport = b.created_lamport.max(fork_at);
+        let parent_commit = chain.get(parent_id).and_then(|cs| {
+            cs.iter().rfind(|(lam, _)| *lam <= fork_lamport).or_else(|| cs.last()).map(|(_, id)| id.clone())
+        });
+        if let (Some(first), Some(pc)) = (
+            nodes.iter_mut().find(|n| n.branch_id == b.branch_id && n.parents.is_empty()),
+            parent_commit,
+        ) {
+            first.parents.push(pc);
+        }
+    }
+
+    let branches: Vec<GraphBranch> = lanes
+        .iter()
+        .map(|b| GraphBranch {
+            id: b.branch_id.clone(),
+            name: b.name.clone(),
+            parent: b.parent.clone(),
+            head_commit: chain.get(&b.branch_id).and_then(|cs| cs.last().map(|(_, id)| id.clone())),
+            lane: *lane_of.get(&b.branch_id).unwrap_or(&0),
+            current: b.branch_id == head,
+        })
+        .collect();
+
+    Graph { nodes, branches }
+}
+
+/// A short human label for a coarsened commit: the file it touched (or "N changes").
+fn commit_label(bucket: &[&LogRow]) -> String {
+    let path = bucket.iter().rev().find_map(|r| r.path.clone());
+    match (path, bucket.len()) {
+        (Some(p), 1) => p,
+        (Some(p), n) => format!("{p} +{}", n - 1),
+        (None, 1) => "1 change".to_string(),
+        (None, n) => format!("{n} changes"),
+    }
+}
+
 /// The version vector of a row set: `site_id -> max seq`. A branch's `fork_vv` is
 /// this over the parent branch's visible rows at the fork instant (§2.1).
 pub fn version_vector_of(rows: &[LogRow]) -> VersionVector {
@@ -318,6 +463,45 @@ mod tests {
         let bs = BranchSet::new([]);
         let ghost = row("aa", 0, "no-such-branch");
         assert!(!bs.visibility(MAIN_BRANCH_ID).sees(&ghost));
+    }
+
+    #[test]
+    fn build_graph_lanes_chain_and_fork_edges() {
+        // main has two commits; a feature branch forks after the first and adds a
+        // commit. The graph must place main on lane 0, feature on lane 1, chain
+        // feature's commit to its predecessor, and draw a fork edge into main.
+        let m0 = row("aa", 0, MAIN_BRANCH_ID); // lamport 1
+        let mut m1 = row("aa", 1, MAIN_BRANCH_ID);
+        m1.lamport = 10; // gap > COARSEN → a second commit
+        let m1 = m1.clone().seal();
+        let feature = Branch {
+            branch_id: "feat".into(),
+            name: "feature".into(),
+            parent: Some(MAIN_BRANCH_ID.into()),
+            fork_vv: vv(&[("aa", 0)]),
+            created_lamport: 2,
+            created_ts: 0,
+            deleted: false,
+        };
+        let mut fb = row("aa", 0, "feat");
+        fb.lamport = 5;
+        let fb = fb.clone().seal();
+        let g = build_graph(&[m0.clone(), m1.clone(), fb.clone()], &[feature], "feat", 100);
+
+        // Two lanes: main (0) + feature (1).
+        assert_eq!(g.branches.len(), 2);
+        assert_eq!(g.branches.iter().find(|b| b.id == MAIN_BRANCH_ID).unwrap().lane, 0);
+        let feat_lane = g.branches.iter().find(|b| b.id == "feat").unwrap();
+        assert_eq!(feat_lane.lane, 1);
+        assert!(feat_lane.current, "HEAD lane marked current");
+
+        // main has two coarsened commits (the lamport gap split them).
+        let main_nodes: Vec<_> = g.nodes.iter().filter(|n| n.branch_id == MAIN_BRANCH_ID).collect();
+        assert_eq!(main_nodes.len(), 2);
+        // feature's single commit forks off a main commit (non-empty parents).
+        let feat_nodes: Vec<_> = g.nodes.iter().filter(|n| n.branch_id == "feat").collect();
+        assert_eq!(feat_nodes.len(), 1);
+        assert!(!feat_nodes[0].parents.is_empty(), "fork edge into the parent lane");
     }
 
     #[test]

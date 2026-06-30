@@ -1259,6 +1259,24 @@ impl Engine {
         self.head_branch()
     }
 
+    /// The latest `Kind::Branch` record row for `branch_id`, as a wire row — for a
+    /// live driver to push after a fork (where the create path doesn't hand back
+    /// the row directly). None if the branch has no record.
+    pub fn branch_record_wire(&self, branch_id: &str) -> Option<WireRow> {
+        let rows = self.store.rows_for_file(branch_id).ok()?;
+        let key = |r: &LogRow| OrderKey { lamport: r.lamport, site_id: r.site_id.clone(), id: r.id.clone() };
+        let latest = rows.into_iter().filter(|r| r.kind == Kind::Branch).max_by(|a, b| key(a).cmp(&key(b)))?;
+        self.wire(latest).ok()
+    }
+
+    /// The GitHub-network-style branch/commit DAG (§4.5) — lanes per branch + a
+    /// coarsened commit graph, bounded to `cap` commits per lane.
+    pub fn graph(&self, cap: usize) -> AspResult<crate::branch::Graph> {
+        let rows = self.store.all_rows()?;
+        let live: Vec<Branch> = self.store.branches()?.into_iter().filter(|b| !b.deleted).collect();
+        Ok(crate::branch::build_graph(&rows, &live, &self.head_branch(), cap))
+    }
+
     /// The version vector visible on `branch` right now — the fork point a child
     /// captures when forking "from here" (§2.1).
     pub fn visible_version_vector(&self, branch: &str) -> AspResult<crate::branch::VersionVector> {
@@ -1271,9 +1289,28 @@ impl Engine {
     /// Create a branch off HEAD at the current point and return its id (the CLI's
     /// `branch create`). Does not switch HEAD.
     pub fn create_branch_here(&self, name: &str) -> AspResult<String> {
+        Ok(self.create_branch_here_wire(name)?.0)
+    }
+
+    /// Like [`create_branch_here`] but also returns the authored branch-record wire
+    /// row, so a live driver (desktop) can push it to peers immediately.
+    pub fn create_branch_here_wire(&self, name: &str) -> AspResult<(String, WireRow)> {
         let head = self.head_branch();
-        let vv = self.visible_version_vector(&head)?;
-        self.create_branch(name, &head, vv)
+        let fork_vv = self.visible_version_vector(&head)?;
+        let created_lamport = self.store.next_lamport(0)?;
+        let created_ts = now_unix() as i64;
+        let branch_id = Branch::derive_id(name, &head, &fork_vv, created_lamport, &self.site_id());
+        let b = Branch {
+            branch_id: branch_id.clone(),
+            name: name.to_string(),
+            parent: Some(head),
+            fork_vv,
+            created_lamport,
+            created_ts,
+            deleted: false,
+        };
+        let wr = self.author_branch_record(&b)?;
+        Ok((branch_id, wr))
     }
 
     /// Create a branch off `parent` capturing `fork_vv` (the parent's version
@@ -1374,7 +1411,11 @@ impl Engine {
     /// Soft-delete a branch (§4.2): its rows remain for sync/history. The root
     /// `main` cannot be deleted; deleting the checked-out branch auto-checks-out its
     /// parent (or `main`).
-    pub fn delete_branch(&self, branch_id: &str) -> AspResult<()> {
+    /// Soft-delete a branch (§4.2). Returns the authored tombstone wire row so a
+    /// live driver can push it to peers immediately (it also converges via
+    /// catch-up). Root `main` cannot be deleted; deleting HEAD auto-checks-out the
+    /// parent.
+    pub fn delete_branch(&self, branch_id: &str) -> AspResult<WireRow> {
         if branch_id == MAIN_BRANCH_ID {
             return Err(AspError::Invalid("cannot delete the main branch".into()));
         }
@@ -1387,8 +1428,7 @@ impl Engine {
         }
         b.deleted = true;
         // Author a synced deletion record so the tombstone converges everywhere.
-        self.author_branch_record(&b)?;
-        Ok(())
+        self.author_branch_record(&b)
     }
 
     // ---------------- admission (§Security) ----------------

@@ -308,6 +308,39 @@ export function createWebApi(): Api {
     // shows optimistically in the UI and persists once it holds a file.
     createDir: async () => {},
 
+    // ---- branches (§2, §7): the SAME wasm engine the desktop drives ----
+    listBranches: async (id) => {
+      const eng = await engineFor(id);
+      const head = eng.current_branch();
+      return (JSON.parse(eng.branches_json()) as { branch_id: string; name: string; parent: string | null }[]).map(
+        (b) => ({ branch_id: b.branch_id, name: b.name, parent: b.parent ?? null, current: b.branch_id === head }),
+      );
+    },
+    currentBranch: async (id) => (await engineFor(id)).current_branch(),
+    branchGraph: async (id, cap) => JSON.parse((await engineFor(id)).graph_json(cap)),
+    createBranch: async (id, name) => {
+      const eng = await engineFor(id);
+      const bid = eng.create_branch(name, eng.current_branch());
+      persistQueue.schedule(id, eng);
+      return bid;
+    },
+    checkoutBranch: async (id, branchId) => {
+      // HEAD is per-device (not synced/persisted) — switching just re-materializes
+      // the in-memory working set; the caller re-reads the files.
+      (await engineFor(id)).checkout(branchId);
+    },
+    forkBranchAt: async (id, name, ts) => {
+      const eng = await engineFor(id);
+      const bid = eng.fork_at(name, ts);
+      persistQueue.schedule(id, eng);
+      return bid;
+    },
+    deleteBranch: async (id, branchId) => {
+      const eng = await engineFor(id);
+      eng.delete_branch(branchId);
+      persistQueue.schedule(id, eng);
+    },
+
     // Time-travel and on-disk rescan are desktop-only; degrade gracefully on web.
     history: async () => [] as HistEvent[],
     readFileAt: async (id, path): Promise<FileAt> => {

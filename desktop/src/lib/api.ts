@@ -42,6 +42,34 @@ export interface FileAt {
   exists: boolean;
   content: string;
 }
+// ---- branches (§2, §7): scoped views over the shared log ----
+export interface BranchInfo {
+  branch_id: string;
+  name: string;
+  parent: string | null;
+  current: boolean;
+}
+export interface GraphNode {
+  commit_id: string;
+  branch_id: string;
+  parents: string[];
+  ts: number;
+  lamport: number;
+  label: string;
+  lane: number;
+}
+export interface GraphBranch {
+  id: string;
+  name: string;
+  parent: string | null;
+  head_commit: string | null;
+  lane: number;
+  current: boolean;
+}
+export interface BranchGraphData {
+  nodes: GraphNode[];
+  branches: GraphBranch[];
+}
 export type ClonePhase = 'receiving' | 'saving';
 export type CloneProgress = (done: number, total: number, phase: ClonePhase) => void;
 
@@ -79,6 +107,14 @@ export interface Api {
   createDir(id: string, path: string): Promise<void>;
   deleteFile(id: string, path: string): Promise<void>;
   history(id: string): Promise<HistEvent[]>;
+  // ---- branches ----
+  listBranches(id: string): Promise<BranchInfo[]>;
+  currentBranch(id: string): Promise<string>;
+  branchGraph(id: string, cap: number): Promise<BranchGraphData>;
+  createBranch(id: string, name: string): Promise<string>;
+  checkoutBranch(id: string, branchId: string): Promise<void>;
+  forkBranchAt(id: string, name: string, ts: number): Promise<string>;
+  deleteBranch(id: string, branchId: string): Promise<void>;
   readFileAt(id: string, path: string, ts: number): Promise<FileAt>;
   restoreFileAt(id: string, path: string, ts: number): Promise<void>;
   rescan(id: string): Promise<void>;
@@ -113,6 +149,13 @@ const tauriApi: Api = {
   createDir: (id, path) => invoke<void>('create_dir', { id, path }),
   deleteFile: (id, path) => invoke<void>('delete_file', { id, path }),
   history: (id) => invoke<HistEvent[]>('history', { id }),
+  listBranches: (id) => invoke<BranchInfo[]>('list_branches', { id }),
+  currentBranch: (id) => invoke<string>('current_branch', { id }),
+  branchGraph: (id, cap) => invoke<BranchGraphData>('branch_graph', { id, cap }),
+  createBranch: (id, name) => invoke<string>('create_branch', { id, name }),
+  checkoutBranch: (id, branchId) => invoke<void>('checkout_branch', { id, branchId }),
+  forkBranchAt: (id, name, ts) => invoke<string>('fork_branch_at', { id, name, ts }),
+  deleteBranch: (id, branchId) => invoke<void>('delete_branch', { id, branchId }),
   readFileAt: (id, path, ts) => invoke<FileAt>('read_file_at', { id, path, ts }),
   restoreFileAt: (id, path, ts) => invoke<void>('restore_file_at', { id, path, ts }),
   rescan: (id) => invoke<void>('rescan', { id }),

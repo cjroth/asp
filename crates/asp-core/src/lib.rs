@@ -44,8 +44,8 @@ pub mod sqlite;
 
 pub use authkeys::{AdmitCtx, AuthKey};
 pub use branch::{
-    encode_branch_record, reconcile_branches, version_vector_of, visible_rows, Branch, BranchSet,
-    VersionVector, Visibility,
+    build_graph, encode_branch_record, reconcile_branches, version_vector_of, visible_rows, Branch,
+    BranchSet, Graph, GraphBranch, GraphNode, VersionVector, Visibility,
 };
 pub use error::{AspError, AspResult};
 pub use fold::{compute_files, fold_order, FoldState};

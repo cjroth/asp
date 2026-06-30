@@ -252,6 +252,12 @@ impl WasmEngine {
         self.eng.delete_branch(branch_id).map_err(to_err)
     }
 
+    /// The branch/commit DAG (GitHub-network-style) as JSON `{nodes, branches}`,
+    /// bounded to `cap` commits per lane.
+    pub fn graph_json(&self, cap: u32) -> Result<String, JsError> {
+        serde_json::to_string(&self.eng.graph(cap as usize)).map_err(to_err)
+    }
+
     /// The version vector visible on `branch` right now (the fork point a child
     /// branch captures). Internal helper for `create_branch`.
     fn fork_vv_now(&self, branch: &str) -> asp_core::AspResult<asp_core::VersionVector> {
