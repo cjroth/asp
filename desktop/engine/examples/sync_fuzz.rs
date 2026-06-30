@@ -318,6 +318,7 @@ fn main() {
     let mut conv_timeout = Duration::from_secs(20);
     let mut debounce_ms = 60u64;
     let mut npeers = 1usize;
+    let mut prefill = 0usize;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -328,6 +329,10 @@ fn main() {
             "--timeout" => { conv_timeout = Duration::from_secs(args[i + 1].parse().unwrap()); i += 2; }
             "--debounce" => { debounce_ms = args[i + 1].parse().unwrap(); i += 2; }
             "--peers" => { npeers = args[i + 1].parse::<usize>().unwrap().max(1); i += 2; }
+            // Pre-seed N files into the CLI vault before the engines clone, so the
+            // fuzz starts at scale (large clone catch-up + per-op convergence on a
+            // big vault) instead of growing there slowly via ManyFiles rounds.
+            "--prefill" => { prefill = args[i + 1].parse().unwrap(); i += 2; }
             _ => { i += 1; }
         }
     }
@@ -339,6 +344,26 @@ fn main() {
     eprintln!("[setup] starting CLI vault (asp watch --listen, debounce={debounce_ms}ms)…");
     let hub = Hub::start(root.path(), auth, debounce_ms);
     eprintln!("[setup] CLI ticket: {}…", &hub.ticket[..hub.ticket.len().min(40)]);
+
+    // Pre-seed N files on the CLI disk; the watcher captures them, then the
+    // engines clone the whole set. Lets a run start at real scale.
+    let prefill_paths: Vec<String> = (0..prefill).map(|k| format!("seed/{:02}/f{:06}.md", k % 50, k)).collect();
+    if prefill > 0 {
+        eprintln!("[setup] prefilling {prefill} files into the CLI vault…");
+        for (k, p) in prefill_paths.iter().enumerate() {
+            let abs = hub.dir.join(p);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&abs, format!("# seed {k}\n\nbody {k}\n")).unwrap();
+        }
+        // Let the CLI watcher capture the batch before the engines clone.
+        std::thread::sleep(Duration::from_millis(1000 + prefill as u64));
+    }
+
+    // A generous initial-convergence budget — a large prefill means a big clone
+    // catch-up on first connect.
+    let initial_timeout = conv_timeout.max(Duration::from_secs(30 + prefill as u64 / 50));
 
     let mut peers: Vec<Peer> = Vec::new();
     for n in 0..npeers {
@@ -355,15 +380,19 @@ fn main() {
         peers.push(Peer { de, id: v.id, dir });
     }
 
-    let (ok, problems) = wait_converged(&hub, &peers, conv_timeout);
+    let (ok, problems) = wait_converged(&hub, &peers, initial_timeout);
     if !ok {
         eprintln!("[FAIL] initial convergence failed:\n{}", problems.join("\n"));
         std::process::exit(1);
     }
-    eprintln!("[setup] initial convergence OK across {npeers} engine(s)\n");
+    eprintln!(
+        "[setup] initial convergence OK across {npeers} engine(s) ({} files)\n",
+        snapshot_dir(&peers[0].dir).len()
+    );
 
     let mut rng = Rng::new(seed);
     let mut live: Vec<String> = vec!["README.md".into()];
+    live.extend(prefill_paths.iter().cloned());
     let mut streak = 0usize;
     let mut conv_latencies: Vec<u128> = Vec::new();
     let mut op_latencies: Vec<u128> = Vec::new();
