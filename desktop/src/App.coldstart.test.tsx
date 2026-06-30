@@ -17,10 +17,12 @@ vi.mock('@tauri-apps/api/event', () => ({
 }));
 
 let VAULTS: { id: string; path: string; vault_id: string; enabled: boolean; listening_ticket: string | null }[] = [];
+let READY = false;
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }));
 vi.mock('./lib/api', () => ({
   api: {
     listVaults: vi.fn(async () => VAULTS),
+    vaultsReady: vi.fn(async () => READY),
     getStatus: vi.fn(async (id: string) => ({ id, vault_id: 'vid', rows: 0, files: 0, head: 'h', listening_ticket: null, peers: [], last_ts: null })),
     getIdentity: vi.fn(async () => 'ssh-ed25519 AAAA me@host'),
     listFiles: vi.fn(async () => []),
@@ -41,6 +43,7 @@ afterEach(cleanup);
 beforeEach(() => {
   ev.handler = null;
   VAULTS = [];
+  READY = false;
   localStorage.clear();
 });
 
@@ -59,5 +62,18 @@ describe('cold-start vaults-ready', () => {
     // The vault appears and the loading hint goes away — no manual reload.
     await waitFor(() => expect(screen.getByText('notes')).toBeTruthy());
     expect(screen.queryByTestId('vaults-loading')).toBeNull();
+  }, 10000);
+
+  // Regression: the one-shot `vaults-ready` event fires from the shell's startup
+  // thread and is missed if the reopen finishes before our listener attaches (an
+  // empty config reopens instantly). With no vaults and the event never delivered,
+  // the loading hint must still clear by querying readiness — not hang forever.
+  it('clears the loading hint via readiness query when the event is missed', async () => {
+    READY = true; // reopen already finished by the time the webview queries
+    render(<App />);
+    // The connect screen is up and the perpetual spinner is gone, even though
+    // ev.handler is never invoked.
+    await waitFor(() => expect(screen.queryByTestId('vaults-loading')).toBeNull());
+    expect(screen.getByText('Your vaults')).toBeTruthy();
   }, 10000);
 });

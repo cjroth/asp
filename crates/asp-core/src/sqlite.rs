@@ -29,7 +29,10 @@ CREATE TABLE IF NOT EXISTS log(
 );
 CREATE INDEX IF NOT EXISTS log_file ON log(file_id);
 CREATE INDEX IF NOT EXISTS log_site ON log(site_id, seq);
-CREATE INDEX IF NOT EXISTS log_branch ON log(branch_id);
+-- NOTE: the `log_branch` index on log(branch_id) is created in `migrate_branching`,
+-- NOT here. On a pre-branching DB the `log` table already exists (so the CREATE
+-- TABLE above is a no-op) and still lacks `branch_id`; indexing it before the
+-- migration's ALTER adds the column fails the whole batch with "no such column".
 -- Branch records (§2.1). `fork_vv` is JSON (site_id -> max seq at the fork).
 -- Synced as Kind::Branch rows in P4; for now node-local + replicated by checkout/
 -- merge broadcasts. `main` is implicit (BranchSet injects it) so the table may be
@@ -103,6 +106,9 @@ impl SqliteStore {
         if !have.contains("merge_parent") {
             self.conn.execute_batch("ALTER TABLE log ADD COLUMN merge_parent TEXT")?;
         }
+        // Index on branch_id — created here (not in SCHEMA) so it runs only once the
+        // column is guaranteed to exist, on both fresh and migrated DBs. Idempotent.
+        self.conn.execute_batch("CREATE INDEX IF NOT EXISTS log_branch ON log(branch_id)")?;
         Ok(())
     }
 
@@ -739,5 +745,59 @@ mod tests {
         s.put_embedding(&ch, "m1", &[5, 6]).unwrap();
         assert_eq!(s.get_embedding(&ch, "m1").unwrap().as_deref(), Some(&[5, 6][..]));
         assert_eq!(s.row_count().unwrap(), 0, "embeddings never write the log");
+    }
+
+    // Regression: opening a vault created *before* branching must not fail. The
+    // pre-branching `log` table has no `branch_id` column; the `log_branch` index
+    // must therefore be created only after `migrate_branching` ALTERs the column in,
+    // not eagerly in SCHEMA (which would fail the whole batch with "no such column:
+    // branch_id" and abort the open — the bug behind "create vault failed").
+    #[test]
+    fn opens_pre_branching_db_and_migrates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asp.db");
+
+        // Author a pre-branching DB: just the old `log` table (no branch_id /
+        // merge_parent, no log_branch index) with one row, exactly as an older
+        // build would have left it on disk.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE log(
+                   id TEXT PRIMARY KEY, site_id TEXT NOT NULL, lamport INTEGER NOT NULL, seq INTEGER NOT NULL,
+                   ts INTEGER NOT NULL, file_id TEXT NOT NULL, kind TEXT NOT NULL, merge_class TEXT NOT NULL,
+                   parent TEXT, base_hash TEXT, result_hash TEXT, path TEXT, sig BLOB,
+                   UNIQUE(site_id, seq)
+                 );
+                 INSERT INTO log(id, site_id, lamport, seq, ts, file_id, kind, merge_class)
+                 VALUES('r1','aa',1,0,0,'f1','create','text');",
+            )
+            .unwrap();
+        }
+
+        // Opening must succeed (previously errored before the migration could run).
+        let s = SqliteStore::open(&path).unwrap();
+
+        // The column was added and the index now exists.
+        let have: std::collections::HashSet<String> = {
+            let mut stmt = s.conn.prepare("PRAGMA table_info(log)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1)).unwrap().collect::<Result<_, _>>().unwrap()
+        };
+        assert!(have.contains("branch_id") && have.contains("merge_parent"));
+        let has_index: bool = s
+            .conn
+            .query_row("SELECT 1 FROM sqlite_master WHERE type='index' AND name='log_branch'", [], |_| Ok(()))
+            .optional()
+            .unwrap()
+            .is_some();
+        assert!(has_index, "log_branch index created after the migration");
+
+        // The pre-existing row reads back on the implicit `main` branch, and a
+        // re-open is idempotent (no error from re-running the migration/index).
+        assert_eq!(s.head().unwrap(), crate::log::MAIN_BRANCH_ID);
+        let branch: String = s.conn.query_row("SELECT branch_id FROM log WHERE id='r1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(branch, "main");
+        drop(s);
+        SqliteStore::open(&path).unwrap(); // idempotent second open
     }
 }

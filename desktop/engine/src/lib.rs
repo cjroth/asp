@@ -18,6 +18,7 @@ use asp_core::{Engine, Identity, Msg, VaultConfig, WireRow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -113,6 +114,12 @@ pub struct DesktopEngine {
     rt: tokio::runtime::Runtime,
     identity: Identity,
     folders: Mutex<HashMap<String, Folder>>,
+    /// Set once `reopen_saved` (the background startup rehydrate) has finished, so
+    /// the UI can deterministically clear its "Loading your vaults…" gate by
+    /// querying instead of having to catch the one-shot `vaults-ready` event — which
+    /// it misses if the webview's listener isn't attached before the (often instant,
+    /// e.g. empty-config) reopen emits it.
+    ready: AtomicBool,
 }
 
 fn random_id() -> String {
@@ -125,7 +132,13 @@ impl DesktopEngine {
     /// the CLI's `~/.asp/id_ed25519`).
     pub fn new(identity: Identity) -> Result<DesktopEngine> {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().context("tokio runtime")?;
-        Ok(DesktopEngine { rt, identity, folders: Mutex::new(HashMap::new()) })
+        Ok(DesktopEngine { rt, identity, folders: Mutex::new(HashMap::new()), ready: AtomicBool::new(false) })
+    }
+
+    /// Whether `reopen_saved` has completed. The UI polls this once on mount as a
+    /// race-proof fallback to the `vaults-ready` event (see the `ready` field).
+    pub fn vaults_ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
     }
 
     pub fn identity_ssh(&self) -> String {
@@ -354,6 +367,7 @@ impl DesktopEngine {
             }
         }
         Self::write_saved_folders(&keep);
+        self.ready.store(true, Ordering::SeqCst);
         Ok(infos)
     }
 

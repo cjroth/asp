@@ -45,6 +45,10 @@ export interface FileAt {
 
 export interface Api {
   listVaults(): Promise<VaultInfo[]>;
+  // Desktop: true once the background startup reopen has finished, so the UI can
+  // clear its "Loading your vaults…" gate without racing the `vaults-ready` event.
+  // Web has no background reopen, so it's always ready.
+  vaultsReady(): Promise<boolean>;
   addLocalFolder(path: string): Promise<VaultInfo>;
   // Create a fresh browser-storage (OPFS) vault. Web-only.
   createVault(name: string): Promise<VaultInfo>;
@@ -84,6 +88,7 @@ export interface WebUpstream {
 // ---- desktop backend: Tauri commands (a thin pass-through) ----
 const tauriApi: Api = {
   listVaults: () => invoke<VaultInfo[]>('list_vaults'),
+  vaultsReady: () => invoke<boolean>('vaults_ready'),
   addLocalFolder: (path) => invoke<VaultInfo>('add_local_folder', { path }),
   createVault: () => Promise.reject(new Error('createVault is web-only')),
   cloneRemote: (dest, ticket, authKey) => invoke<VaultInfo>('clone_remote', { dest, ticket, authKey }),

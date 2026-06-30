@@ -58,6 +58,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_vaults,
+            commands::vaults_ready,
             commands::add_local_folder,
             commands::clone_remote,
             commands::set_allow_connections,

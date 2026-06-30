@@ -25,6 +25,14 @@ pub fn list_vaults(state: State<AppState>) -> Vec<VaultInfo> {
     state.engine.list_vaults()
 }
 
+/// True once the background startup reopen has finished. The UI queries this to
+/// clear its "Loading your vaults…" gate without depending on catching the
+/// one-shot `vaults-ready` event.
+#[tauri::command(async)]
+pub fn vaults_ready(state: State<AppState>) -> bool {
+    state.engine.vaults_ready()
+}
+
 #[tauri::command(async)]
 pub fn add_local_folder(state: State<AppState>, path: String) -> R<VaultInfo> {
     e(state.engine.add_local_folder(&PathBuf::from(path)))
