@@ -291,6 +291,18 @@ export default function App() {
       // cold start — drop the loading hint. The `vaults-changed` event below also
       // clears it as each background-reopened vault lands.
       if (vs.length) setVaultsLoading(false);
+      // Race-proof fallback: the `vaults-ready` event is one-shot and fires from
+      // the shell's startup thread, often before our listener attaches (e.g. an
+      // empty config reopens instantly), so it can be missed entirely. Querying
+      // readiness here clears the gate deterministically once reopen has finished,
+      // regardless of whether we caught the event.
+      else if (desktop) {
+        try {
+          if (await api.vaultsReady()) setVaultsLoading(false);
+        } catch {
+          /* not the desktop shell, or command unavailable — leave it to the event */
+        }
+      }
       // Refresh-restore: on the first mount after a real page load, if the URL
       // hash names a known vault, open it (openVault then picks the hashed file).
       // Works identically on desktop and web — the hash is read the same way.

@@ -169,6 +169,10 @@ export function createWebApi(): Api {
   return {
     listVaults: async () => (await registry()).map(info),
 
+    // No background reopen on web (the registry is read synchronously above), so
+    // the vault list is ready as soon as the app mounts.
+    vaultsReady: async () => true,
+
     getIdentity: async () => {
       await ensureWasm();
       // A throwaway engine just to derive the device's ssh identity.

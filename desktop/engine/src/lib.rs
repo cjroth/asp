@@ -19,6 +19,7 @@ pub use asp_core::Graph;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -137,6 +138,12 @@ pub struct DesktopEngine {
     relay_override: Mutex<Option<String>>,
     /// The co-hosted relay task (abort to stop it).
     relay_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Set once `reopen_saved` (the background startup rehydrate) has finished, so
+    /// the UI can deterministically clear its "Loading your vaults…" gate by
+    /// querying instead of having to catch the one-shot `vaults-ready` event — which
+    /// it misses if the webview's listener isn't attached before the (often instant,
+    /// e.g. empty-config) reopen emits it.
+    ready: AtomicBool,
 }
 
 fn random_id() -> String {
@@ -156,6 +163,7 @@ impl DesktopEngine {
             change_listener: Arc::new(Mutex::new(None)),
             relay_override: Mutex::new(None),
             relay_task: Mutex::new(None),
+            ready: AtomicBool::new(false),
         };
         // Restore the persisted "faster local syncing" preference: co-host the
         // relay up front (before any folder binds) so reopened vaults' tickets
@@ -245,6 +253,12 @@ impl DesktopEngine {
     /// any managed folder. The Tauri shell uses it to emit a realtime UI event.
     pub fn set_change_listener(&self, cb: impl Fn(String) + Send + Sync + 'static) {
         *self.change_listener.lock().unwrap() = Some(Arc::new(cb));
+    }
+
+    /// Whether `reopen_saved` has completed. The UI polls this once on mount as a
+    /// race-proof fallback to the `vaults-ready` event (see the `ready` field).
+    pub fn vaults_ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
     }
 
     pub fn identity_ssh(&self) -> String {
@@ -531,6 +545,9 @@ impl DesktopEngine {
         });
         let keep: Vec<FolderCfg> = opened.iter().map(|(c, _)| c.clone()).collect();
         Self::write_saved_folders(&keep);
+        // Startup rehydrate is done — let the UI clear its loading gate (querying
+        // `vaults_ready`) even if it missed the one-shot `vaults-ready` event.
+        self.ready.store(true, Ordering::SeqCst);
         opened.into_iter().map(|(_, i)| i).collect()
     }
 
