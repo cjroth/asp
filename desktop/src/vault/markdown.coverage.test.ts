@@ -1,6 +1,6 @@
 // Exhaustive branch coverage for the markdown/code renderers — many small inputs
 // hitting every construct and empty-content path.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from '../test-shim';
 import { inlineMd, readLive, renderCodeHtml, renderLiveHtml } from './markdown';
 
 const html = (s: string) => { const d = document.createElement('div'); d.innerHTML = s; return d; };

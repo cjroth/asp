@@ -2,7 +2,7 @@
 // load-bearing logic of tab reordering (the React/pointer plumbing is exercised
 // by the keyboard-sensor test in TabBar.test.tsx and the e2e drag), so it is
 // pinned at 100%.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from '../test-shim';
 import { reorderFromDragEnd } from './tabDnd';
 
 const tabs = ['a.md', 'b.md', 'c.md'];

@@ -5,7 +5,7 @@
 // tables extra scroll room on the right. The wrappers nest the row divs two
 // levels deep, so these tests pin down that `readLive`/caret helpers still flatten
 // it back to the strict 1:1 line↔node mapping the source reconstruction relies on.
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from '../test-shim';
 import { caretOffset, readLive, renderLiveHtml, setCaret } from './markdown';
 
 const html = (s: string): HTMLDivElement => {

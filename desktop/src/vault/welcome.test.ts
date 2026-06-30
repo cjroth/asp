@@ -1,7 +1,7 @@
 // Guards the welcome README showcase: every rich feature the editor renders must
 // stay present in WELCOME_MD, so the seeded note can't silently lose a demo of a
 // feature over time.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from '../test-shim';
 import { WELCOME_MD } from './welcome';
 
 describe('WELCOME_MD', () => {

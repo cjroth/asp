@@ -5,8 +5,9 @@
 // (name/color/emoji) and view prefs (theme, font, sidebar, hidden/pretty) are
 // local-only and never touch the protocol.
 import { open } from '@tauri-apps/plugin-dialog';
+import { listen } from '@tauri-apps/api/event';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type FileEntry, type HistEvent, type VaultInfo, type VaultStatus } from './lib/api';
+import { api, type ClonePhase, type FileEntry, type HistEvent, type VaultInfo, type VaultStatus } from './lib/api';
 import CustomizeModal, { type CustomizeInit } from './vault/CustomizeModal';
 import FileTree from './vault/FileTree';
 import HistoryBar from './vault/HistoryBar';
@@ -139,6 +140,7 @@ export default function App() {
   const [ticket, setTicket] = useState('');
   const [authKey, setAuthKey] = useState('');
   const [connecting, setConnecting] = useState(false);
+  const [cloneProg, setCloneProg] = useState<{ done: number; total: number; phase: ClonePhase } | null>(null);
   const [connectDest, setConnectDest] = useState<string | null>(null);
   // Non-dismissable "working…" overlay shown while a folder is being added
   // (capture_rescan hashes every file) or a vault is being opened
@@ -153,6 +155,7 @@ export default function App() {
   const [vaultsLoading, setVaultsLoading] = useState(isDesktop());
 
   const [share, setShare] = useState<{ id: string; code: string; requireKey: boolean; accessKey: string; copied: boolean; unavailable?: boolean } | null>(null);
+  const [localRelayOn, setLocalRelayOn] = useState(false);
   const [vaultCtx, setVaultCtx] = useState<{ x: number; y: number; id: string; vaultId: string; name: string } | null>(null);
   const [customize, setCustomize] = useState<CustomizeInit | null>(null);
   const [removeVaultState, setRemoveVaultState] = useState<{ id: string; name: string; path: string; trash: boolean } | null>(null);
@@ -232,8 +235,14 @@ export default function App() {
     setNow(Date.now());
   }, []);
 
+  // Building the history timeline scans the whole log (seconds on a big vault),
+  // so only fetch it while the History/Log view is actually open. Opening either
+  // triggers an immediate fetch (see onTabHistory/onTabLog).
+  const histNeededRef = useRef(false);
+  histNeededRef.current = histOpen || logOpen;
   const scheduleHistory = useCallback(
     (id: string) => {
+      if (!histNeededRef.current) return;
       if (histTimer.current) clearTimeout(histTimer.current);
       histTimer.current = setTimeout(() => void refreshHistory(id), 700);
     },
@@ -278,8 +287,8 @@ export default function App() {
       const vs = await refreshVaults();
       // Any vaults already available (web registry, or folders the desktop shell
       // finished reopening before we mounted) means we're not waiting on an empty
-      // cold start — drop the loading hint. The `vaults-ready` event below also
-      // clears it once the background reopen completes.
+      // cold start — drop the loading hint. The `vaults-changed` event below also
+      // clears it as each background-reopened vault lands.
       if (vs.length) setVaultsLoading(false);
       // Refresh-restore: on the first mount after a real page load, if the URL
       // hash names a known vault, open it (openVault then picks the hashed file).
@@ -302,32 +311,6 @@ export default function App() {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshVaults, refreshStatuses]);
-
-  // The desktop shell reopens previously-saved folders on a background thread and
-  // emits `vaults-ready` when done (so a large saved vault doesn't block first
-  // paint). Refresh the list the moment it fires. Desktop-only; on web the import
-  // resolves but `listen` has no transport, so we swallow it.
-  useEffect(() => {
-    if (!desktop) return;
-    let un: (() => void) | undefined;
-    let cancelled = false;
-    void import('@tauri-apps/api/event')
-      .then(({ listen }) =>
-        listen('vaults-ready', () => {
-          setVaultsLoading(false);
-          void refreshVaults().then(refreshStatuses);
-        }),
-      )
-      .then((u) => {
-        if (cancelled) u();
-        else un = u;
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-      un?.();
-    };
-  }, [desktop, refreshVaults, refreshStatuses]);
 
   // Persist the active vault's open tabs whenever they change.
   useEffect(() => {
@@ -354,32 +337,81 @@ export default function App() {
     }
   }, [activeId, selectedPath, vidOf]);
 
+  // No polling. Refreshes are fully event-driven: desktop reacts to the engine's
+  // realtime `vault-changed` / `vaults-changed` Tauri events (see the effects
+  // below), web to its live-sync push callback. Re-listing a 28k-file tree on a
+  // 10s timer was both wasted work (~1s each tick) and the wrong model.
+
+  // Web live sync: a browser can't be *pushed* to, but it can dial the upstream
+  // and hold the link open. While a web vault is open in the editor we keep that
+  // live connection up; each remote push lands in the engine and refreshes the
+  // tree + open file in realtime. Desktop is excluded (its engine is already
+  // live; the poll above re-reads it).
+  // Listing the tree is O(N) (seconds-adjacent on a huge vault), and a sync burst
+  // fires this per row, so coalesce the tree refresh while keeping the open
+  // file's content update immediate (cheap single-file read).
+  const fileRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const liveRefresh = useCallback(
+    (id: string) => {
+      if (fileRefreshTimer.current) clearTimeout(fileRefreshTimer.current);
+      fileRefreshTimer.current = setTimeout(() => void refreshFiles(id).catch(() => {}), 400);
+      scheduleHistory(id);
+      void refreshActiveContent();
+    },
+    [refreshFiles, scheduleHistory, refreshActiveContent],
+  );
+  const liveRefreshRef = useRef(liveRefresh);
+  liveRefreshRef.current = liveRefresh;
   useEffect(() => {
-    const t = setInterval(() => {
-      // Web (wasm/OPFS) vaults have no standing connector, so they can't catch up
-      // on their own after the initial clone. Drive it from the poll: for each
-      // vault cloned from a peer, sync against its stored upstream ticket. The
-      // downstream refreshFiles/refreshActiveContent below then surfaces the
-      // pulled-in changes. No-op on desktop (webUpstreams is empty there).
-      void Promise.resolve(api.webUpstreams?.())
-        .then((ups) => Promise.all((ups ?? []).map((u) => api.syncNow(u.id, u.ticket, u.authKey).catch(() => {}))))
-        .catch(() => {});
-      if (screen === 'editor' && activeIdRef.current) {
-        const id = activeIdRef.current;
-        void api.getStatus(id).then((st) => setStatuses((p) => ({ ...p, [id]: st }))).catch(() => {});
-        // Pull in changes a peer pushed while we sit in the editor: the file tree,
-        // the derived history, and the bytes of the file we're looking at. Without
-        // this the backend converges but the UI shows a stale snapshot until the
-        // vault is reopened.
-        void refreshFiles(id).catch(() => {});
-        scheduleHistory(id);
-        void refreshActiveContent();
-      } else {
-        void refreshVaults().then(refreshStatuses);
-      }
-    }, 10000);
-    return () => clearInterval(t);
-  }, [screen, refreshVaults, refreshStatuses, refreshFiles, scheduleHistory, refreshActiveContent]);
+    if (desktop || screen !== 'editor' || !activeId) return;
+    const id = activeId;
+    void api.startLiveSync(id, () => liveRefreshRef.current(id));
+    return () => {
+      void api.stopLiveSync(id);
+    };
+  }, [desktop, screen, activeId]);
+
+  // Desktop realtime: the engine emits 'vault-changed' (the changed vault_id) the
+  // instant a peer's edit integrates — its background connections are already
+  // live. This is the desktop's whole refresh path (no polling): bump that vault's
+  // status (the "last synced" label / status bar) wherever we are, and if it's the
+  // open editor vault, refresh its tree + open file too. Web has no Tauri events —
+  // it refreshes via the live-sync callback instead.
+  useEffect(() => {
+    if (!desktop) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void listen<string>('vault-changed', (e) => {
+      const changedVid = e.payload;
+      const v = vaultsRef.current.find((x) => x.vault_id === changedVid);
+      if (v) void api.getStatus(v.id).then((st) => setStatuses((p) => ({ ...p, [v.id]: st }))).catch(() => {});
+      const cur = activeIdRef.current;
+      const curVid = vaultsRef.current.find((x) => x.id === cur)?.vault_id;
+      if (cur && changedVid === curVid) liveRefreshRef.current(cur);
+    }).then((u) => (cancelled ? u() : (unlisten = u)));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [desktop]);
+
+  // Saved folders reopen in the background at startup (a big vault's reconcile is
+  // slow), so the window can appear before they're loaded. The engine emits
+  // `vaults-changed` the instant each reopened vault lands; refresh the list and
+  // drop the cold-start loading hint then, instead of waiting on a poll.
+  useEffect(() => {
+    if (!desktop) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void listen('vaults-changed', () => {
+      setVaultsLoading(false);
+      void refreshVaults().then(refreshStatuses).catch(() => {});
+    }).then((u) => (cancelled ? u() : (unlisten = u)));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [desktop, refreshVaults, refreshStatuses]);
 
   const metaOf = useCallback(
     (v: VaultInfo) => resolveMeta(metaMap, v.vault_id, basename(v.path)),
@@ -968,13 +1000,19 @@ export default function App() {
   }, [refreshFiles, scheduleHistory]);
 
   const onTabHistory = useCallback(() => {
-    setHistOpen((h) => !h);
+    setHistOpen((h) => {
+      if (!h && activeIdRef.current) void refreshHistory(activeIdRef.current); // fetch on open
+      return !h;
+    });
     setLogOpen(false);
-  }, []);
+  }, [refreshHistory]);
   const onTabLog = useCallback(() => {
-    setLogOpen((l) => !l);
+    setLogOpen((l) => {
+      if (!l && activeIdRef.current) void refreshHistory(activeIdRef.current); // fetch on open
+      return !l;
+    });
     setHistOpen(false);
-  }, []);
+  }, [refreshHistory]);
 
   // ---------- sidebar resize ----------
   const onSidebarResize = useCallback(
@@ -1084,8 +1122,11 @@ export default function App() {
       // Desktop needs a destination folder; web clones straight into OPFS.
       if (!t || (desktop && !connectDest)) return;
       setConnecting(true);
+      setCloneProg({ done: 0, total: 0, phase: 'receiving' });
       try {
-        const info = await api.cloneRemote(connectDest || '', t, authKey || undefined);
+        const info = await api.cloneRemote(connectDest || '', t, authKey || undefined, (done, total, phase) =>
+          setCloneProg({ done, total, phase }),
+        );
         setTicket('');
         setAuthKey('');
         setConnectDest(null);
@@ -1096,6 +1137,7 @@ export default function App() {
         console.error('clone failed', err);
       } finally {
         setConnecting(false);
+        setCloneProg(null);
       }
     } else {
       // New vault: desktop adds a chosen folder; web creates a browser (OPFS) vault.
@@ -1130,6 +1172,7 @@ export default function App() {
       return;
     }
     setShare({ id, code: '', requireKey: false, accessKey: '', copied: false });
+    void api.getLocalRelay().then(setLocalRelayOn).catch(() => {});
     try {
       const tkt = await api.setAllowConnections(id, true);
       setShare((s) => (s && s.id === id ? { ...s, code: tkt || '' } : s));
@@ -1163,6 +1206,25 @@ export default function App() {
       }
     }
   }, [share]);
+
+  // "Faster local syncing": co-host a relay so same-machine/LAN peers connect
+  // locally instead of via the public n0 relay. Re-establishing re-mints the
+  // active share's ticket, so re-fetch it after toggling.
+  const onToggleLocalRelay = useCallback(async () => {
+    const s = share;
+    const next = !localRelayOn;
+    setLocalRelayOn(next);
+    try {
+      await api.setLocalRelay(next);
+      if (s && !s.unavailable) {
+        const tkt = await api.setAllowConnections(s.id, true, s.requireKey ? s.accessKey : undefined);
+        setShare((x) => (x && x.id === s.id ? { ...x, code: tkt || '' } : x));
+      }
+    } catch (err) {
+      console.error(err);
+      setLocalRelayOn(!next); // revert on failure
+    }
+  }, [share, localRelayOn]);
 
   const onCopyCode = useCallback(async () => {
     const s = share;
@@ -1702,23 +1764,19 @@ export default function App() {
             <div style={{ position: 'fixed', left: ctxMenu.x, top: ctxMenu.y, zIndex: 61, width: 172, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, boxShadow: '0 12px 32px rgba(28,25,23,0.16)', padding: 5 }}>
               {ctxMenu.root ? (
                 <>
-                  <div className="asp-hover-soft" onClick={() => void createFile(ctxTargetDir(ctxMenu))} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                    <Icon.NewFileIcon size={14} style={{ flex: 'none' }} />
+                  <div className="asp-hover-soft" onClick={() => void createFile(ctxTargetDir(ctxMenu))} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                     <span>New file</span>
                   </div>
-                  <div className="asp-hover-soft" onClick={() => void createFolder(ctxTargetDir(ctxMenu))} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                    <Icon.NewFolderIcon size={14} style={{ flex: 'none' }} />
+                  <div className="asp-hover-soft" onClick={() => void createFolder(ctxTargetDir(ctxMenu))} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                     <span>New folder</span>
                   </div>
                 </>
               ) : (
                 <>
-                  <div className="asp-hover-soft" onClick={() => { setRenaming(ctxMenu.path!); setRenameValue(ctxMenu.name!); setCtxMenu(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                    <Icon.PencilIcon style={{ flex: 'none' }} />
+                  <div className="asp-hover-soft" onClick={() => { setRenaming(ctxMenu.path!); setRenameValue(ctxMenu.name!); setCtxMenu(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                     <span>Rename</span>
                   </div>
-                  <div className="asp-hover-soft" onClick={() => deleteNode(ctxMenu.path!, !!ctxMenu.isDir)} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                    <Icon.TrashIcon stroke="var(--text2)" style={{ flex: 'none' }} />
+                  <div className="asp-hover-soft" onClick={() => deleteNode(ctxMenu.path!, !!ctxMenu.isDir)} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                     <span>Delete</span>
                   </div>
                 </>
@@ -1732,33 +1790,26 @@ export default function App() {
           <>
             <div onClick={() => setTabCtx(null)} onContextMenu={(e) => { e.preventDefault(); setTabCtx(null); }} style={{ position: 'fixed', inset: 0, zIndex: 60 }} />
             <div style={{ position: 'fixed', left: tabCtx.x, top: tabCtx.y, zIndex: 61, width: 188, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, boxShadow: '0 12px 32px rgba(28,25,23,0.16)', padding: 5 }}>
-              <div className="asp-hover-soft" onClick={() => { onTabClose(tabCtx.path); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
+              <div className="asp-hover-soft" onClick={() => { onTabClose(tabCtx.path); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <span>Close</span>
               </div>
-              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeOthers(openTabs, tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
+              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeOthers(openTabs, tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <span>Close Others</span>
               </div>
-              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeToLeft(openTabs, tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
+              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeToLeft(openTabs, tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <span>Close to the Left</span>
               </div>
-              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeToRight(openTabs, tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
+              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeToRight(openTabs, tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <span>Close to the Right</span>
               </div>
-              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeAll()); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', flex: 'none', fontSize: 15, lineHeight: 1, color: 'var(--text2)' }}>×</span>
+              <div className="asp-hover-soft" onClick={() => { applyTabClose(closeAll()); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <span>Close All</span>
               </div>
               <div style={{ height: 1, background: 'var(--line)', margin: '4px 6px' }} />
-              <div className="asp-hover-soft" onClick={() => { setTabRenaming(tabCtx.path); setTabRenameValue(basename(tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                <Icon.PencilIcon style={{ flex: 'none' }} />
+              <div className="asp-hover-soft" onClick={() => { setTabRenaming(tabCtx.path); setTabRenameValue(basename(tabCtx.path)); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <span>Rename</span>
               </div>
-              <div className="asp-hover-soft" onClick={() => { deleteNode(tabCtx.path, false); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
-                <Icon.TrashIcon stroke="var(--text2)" style={{ flex: 'none' }} />
+              <div className="asp-hover-soft" onClick={() => { deleteNode(tabCtx.path, false); setTabCtx(null); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text)' }}>
                 <span>Delete</span>
               </div>
             </div>
@@ -1788,12 +1839,10 @@ export default function App() {
         <>
           <div onClick={() => setVaultCtx(null)} onContextMenu={(e) => { e.preventDefault(); setVaultCtx(null); }} style={{ position: 'fixed', inset: 0, zIndex: 62 }} />
           <div style={{ position: 'fixed', left: vaultCtx.x, top: vaultCtx.y, zIndex: 63, width: 176, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, boxShadow: '0 10px 28px rgba(28,25,23,0.15)', padding: 4 }}>
-            <div className="asp-hover-soft" onClick={() => { const v = vaults.find((x) => x.id === vaultCtx.id); setVaultCtx(null); if (v) openCustomize(v); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text2)' }}>
-              <Icon.WandIcon size={14} style={{ flex: 'none' }} />
+            <div className="asp-hover-soft" onClick={() => { const v = vaults.find((x) => x.id === vaultCtx.id); setVaultCtx(null); if (v) openCustomize(v); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: 'var(--text2)' }}>
               <span>Customize…</span>
             </div>
-            <div className="asp-hover-danger" onClick={() => { const v = vaultMetas.find((x) => x.id === vaultCtx.id); setVaultCtx(null); if (v) setRemoveVaultState({ id: v.id, name: v.displayName, path: v.path, trash: false }); }} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: '#c0392b' }}>
-              <Icon.TrashIcon stroke="#c0392b" size={14} style={{ flex: 'none' }} />
+            <div className="asp-hover-danger" onClick={() => { const v = vaultMetas.find((x) => x.id === vaultCtx.id); setVaultCtx(null); if (v) setRemoveVaultState({ id: v.id, name: v.displayName, path: v.path, trash: false }); }} style={{ display: 'flex', alignItems: 'center', padding: '7px 11px', borderRadius: 7, cursor: 'pointer', fontSize: 13, color: '#c0392b' }}>
               <span>Remove vault…</span>
             </div>
           </div>
@@ -1830,7 +1879,7 @@ export default function App() {
                 <input autoFocus value={newVaultName} onChange={(e) => setNewVaultName(e.target.value)} spellCheck={false} placeholder="My vault" style={{ fontFamily: 'inherit', fontSize: 14, color: 'var(--text)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '10px 12px', outline: 'none', width: '100%', boxSizing: 'border-box' }} />
               </label>
             )}
-            {entry === 'connect' && (
+            {entry === 'connect' && !cloneProg && (
               <>
                 <label style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
                   <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>Invite code</span>
@@ -1842,7 +1891,34 @@ export default function App() {
                 </label>
               </>
             )}
-            {desktop && (
+            {cloneProg && (() => {
+              const { done, total, phase } = cloneProg;
+              const determinate = phase === 'receiving' && total > 0;
+              const pct = determinate ? Math.min(100, Math.round((done / total) * 100)) : 0;
+              return (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 9, background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 15px' }}>
+                  <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 10 }}>
+                    <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>
+                      {phase === 'saving' ? 'Saving to this device…' : 'Receiving notes…'}
+                    </span>
+                    <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, color: 'var(--faint)' }}>
+                      {determinate ? `${done.toLocaleString()} / ${total.toLocaleString()}` : done > 0 ? done.toLocaleString() : ''}
+                    </span>
+                  </div>
+                  <div style={{ position: 'relative', height: 6, borderRadius: 3, background: 'var(--faint2)', overflow: 'hidden' }}>
+                    {determinate ? (
+                      <div style={{ height: '100%', borderRadius: 3, background: accent, width: `${pct}%`, transition: 'width 0.25s ease' }} />
+                    ) : (
+                      <div style={{ position: 'absolute', top: 0, bottom: 0, width: '40%', borderRadius: 3, background: accent, animation: 'aspIndet 1.1s ease-in-out infinite' }} />
+                    )}
+                  </div>
+                  <span style={{ fontSize: 11.5, color: 'var(--faint)' }}>
+                    {phase === 'saving' ? 'Almost done — writing everything to local storage.' : 'Pulling the vault over a direct connection. Hang tight.'}
+                  </span>
+                </div>
+              );
+            })()}
+            {desktop && !cloneProg && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
                 <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>{entry === 'connect' ? 'Save to' : 'Location'}</span>
                 <div onClick={() => void onChooseDest()} style={{ display: 'flex', alignItems: 'center', gap: 9, background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '10px 13px', cursor: 'pointer' }}>
@@ -1910,6 +1986,15 @@ export default function App() {
                     <span style={{ flex: 1, fontFamily: "'JetBrains Mono', monospace", fontSize: 13, letterSpacing: '0.04em', color: 'var(--text)', textAlign: 'right' }}>{share.accessKey}</span>
                   </div>
                 )}
+                <div onClick={() => void onToggleLocalRelay()} style={{ display: 'flex', alignItems: 'center', gap: 11, cursor: 'pointer', padding: 2 }}>
+                  <span style={{ width: 34, height: 20, borderRadius: 12, flex: 'none', background: localRelayOn ? accent : 'var(--faint2)', position: 'relative', transition: 'background .15s' }}>
+                    <span style={{ position: 'absolute', top: 2, left: localRelayOn ? 16 : 2, width: 16, height: 16, borderRadius: '50%', background: 'var(--bg)', transition: 'left .15s', boxShadow: '0 1px 2px rgba(0,0,0,0.2)' }} />
+                  </span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13.5, fontWeight: 500, color: 'var(--text)' }}>Allow connections directly for faster syncing</div>
+                    <div style={{ fontSize: 12, color: 'var(--faint)' }}>Routes peers on this device/network through your machine instead of a public relay.</div>
+                  </div>
+                </div>
               </>
             )}
             <button autoFocus={share.unavailable} onClick={() => setShare(null)} style={{ alignSelf: 'flex-end', fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: 'var(--bg)', background: 'var(--text)', border: 'none', borderRadius: 9, padding: '8px 18px', cursor: 'pointer' }}>Done</button>

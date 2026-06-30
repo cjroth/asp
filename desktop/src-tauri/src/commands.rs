@@ -41,6 +41,16 @@ pub fn set_allow_connections(state: State<AppState>, id: String, on: bool, auth_
 }
 
 #[tauri::command(async)]
+pub fn set_local_relay(state: State<AppState>, on: bool) -> R<bool> {
+    e(state.engine.set_local_relay(on))
+}
+
+#[tauri::command(async)]
+pub fn get_local_relay(state: State<AppState>) -> bool {
+    state.engine.local_relay_on()
+}
+
+#[tauri::command(async)]
 pub fn set_enabled(state: State<AppState>, id: String, on: bool) -> R<()> {
     e(state.engine.set_enabled(&id, on))
 }

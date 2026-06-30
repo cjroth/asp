@@ -1,16 +1,18 @@
+import { mock } from 'bun:test';
 // Web-platform behavior: in a plain browser (no Tauri) the app uses OPFS browser
 // storage — it must NOT ask to open a folder, and "New Vault" creates a vault
 // directly via api.createVault.
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from './test-shim';
 
 const createVault = vi.fn(async (name: string) => ({ id: 'w1', path: '', vault_id: 'wv1', enabled: true, listening_ticket: null }));
 const listFiles = vi.fn(async () => [{ path: 'README.md', file_id: 'README.md', is_dir: false, merge_class: 'text' }]);
 const setAllowConnections = vi.fn(async () => null);
 
-vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => null) }));
-vi.mock('./lib/api', () => ({
+mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => null) }));
+mock.module('./lib/api', () => ({
   api: {
+    startLiveSync: vi.fn(), stopLiveSync: vi.fn(), setLocalRelay: vi.fn(async () => false), getLocalRelay: vi.fn(async () => false),
     listVaults: vi.fn(async () => [{ id: 'w0', path: '', vault_id: 'wv0', enabled: true, listening_ticket: null }]),
     getIdentity: vi.fn(async () => 'ssh-ed25519 WEBKEY me@browser'),
     getStatus: vi.fn(async (id: string) => ({ id, vault_id: 'wv1', rows: 1, files: 1, head: '', listening_ticket: null, peers: [], last_ts: null })),
@@ -118,3 +120,5 @@ describe('App on the web (OPFS, no Tauri)', () => {
     await waitFor(() => expect(parseHash(window.location.hash)).toEqual({ vaultId: 'wv0', path: 'README.md' }));
   });
 });
+import { afterAll as __aa, mock as __mk } from 'bun:test';
+__aa(() => __mk.restore());

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from '../test-shim';
 import { EMOJI_CATEGORIES, emojiResults } from './emoji';
 
 describe('emoji', () => {

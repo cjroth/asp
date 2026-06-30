@@ -217,3 +217,34 @@ fn aspignore_added_after_open_takes_effect_without_reopen() {
     assert!(!files.contains_key("late.log"), "API-authored *.log never materialized");
     assert_eq!(rows.len(), 1, "only kept.md authored from the rescan, not the *.log files");
 }
+
+#[test]
+fn reconcile_cache_skips_unchanged_yet_catches_external_edits() {
+    let (dir, e) = open_vault();
+    let p = dir.path().join("n.md");
+
+    fs::write(&p, b"v1\n").unwrap();
+    assert_eq!(e.capture_rescan().unwrap().len(), 1, "create");
+    e.materialize().unwrap();
+
+    // The cache-skip path must be behavior-identical to a full re-hash: an
+    // unchanged tree re-scans to a no-op, every time.
+    for _ in 0..3 {
+        assert!(e.capture_rescan().unwrap().is_empty(), "unchanged tree → no-op (cache skip)");
+    }
+
+    // A normal external edit bumps mtime → caught despite the cache.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    fs::write(&p, b"v2 edited\n").unwrap();
+    assert_eq!(e.capture_rescan().unwrap().len(), 1, "external edit (new mtime) caught");
+    e.materialize().unwrap();
+    assert!(e.capture_rescan().unwrap().is_empty(), "settles back to no-op");
+
+    // Size-keyed detection: rewrite to a DIFFERENT size but RESTORE the prior
+    // mtime, so mtime alone would call it unchanged — the size half of the key
+    // still catches it.
+    let prior_mtime = fs::metadata(&p).unwrap().modified().unwrap();
+    fs::write(&p, b"v3 a noticeably longer body so the byte size differs\n").unwrap();
+    fs::OpenOptions::new().write(true).open(&p).unwrap().set_modified(prior_mtime).unwrap();
+    assert_eq!(e.capture_rescan().unwrap().len(), 1, "size change caught even with a restored mtime");
+}

@@ -138,7 +138,7 @@ fn store_row_and_version_queries() {
     assert_eq!(s.max_ts().unwrap(), s.all_rows().unwrap().iter().map(|r| r.ts).max());
     assert_eq!(
         s.live_file_count().unwrap(),
-        s.live_files().unwrap().iter().filter(|f| !f.deleted).count() as u64
+        s.live_files().unwrap().iter().filter(|f| !f.deleted).count()
     );
     assert_eq!(s.live_file_count().unwrap(), 2);
     // A delete drops the live count (tombstones are not live).

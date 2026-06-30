@@ -84,6 +84,9 @@ pub fn fold_files(rows_json: &str, blobs_json: &str) -> Result<String, JsError> 
 #[wasm_bindgen]
 pub struct WasmEngine {
     eng: std::rc::Rc<MemEngine>,
+    // When a live connection is open, freshly-authored rows are handed to it here
+    // so they push to the peer immediately (None when there's no live link).
+    live_tx: std::cell::RefCell<Option<futures_channel::mpsc::UnboundedSender<WireRow>>>,
 }
 
 #[wasm_bindgen]
@@ -94,7 +97,19 @@ impl WasmEngine {
     pub fn new(seed: &[u8], vault_id: &str) -> WasmEngine {
         #[cfg(target_arch = "wasm32")]
         console_error_panic_hook::set_once();
-        WasmEngine { eng: std::rc::Rc::new(MemEngine::create(ident(seed), vault_id)) }
+        WasmEngine {
+            eng: std::rc::Rc::new(MemEngine::create(ident(seed), vault_id)),
+            live_tx: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Hand newly-authored rows to an open live connection (a no-op otherwise).
+    fn push_live(&self, rows: Vec<WireRow>) {
+        if let Some(tx) = self.live_tx.borrow().as_ref() {
+            for r in rows {
+                let _ = tx.unbounded_send(r);
+            }
+        }
     }
 
     pub fn node_id(&self) -> String {
@@ -115,24 +130,31 @@ impl WasmEngine {
 
     /// Author a create/edit for `path`.
     pub fn record_write(&self, path: &str, content: &[u8]) -> Result<(), JsError> {
-        self.eng.record_write(path, content).map_err(to_err)?;
+        if let Some(wr) = self.eng.record_write(path, content).map_err(to_err)? {
+            self.push_live(vec![wr]);
+        }
         Ok(())
     }
 
     pub fn record_remove(&self, path: &str) -> Result<(), JsError> {
-        self.eng.record_remove(path).map_err(to_err)?;
+        if let Some(wr) = self.eng.record_remove(path).map_err(to_err)? {
+            self.push_live(vec![wr]);
+        }
         Ok(())
     }
 
     pub fn record_rename(&self, from: &str, to: &str) -> Result<(), JsError> {
-        self.eng.record_rename(from, to).map_err(to_err)?;
+        if let Some(wr) = self.eng.record_rename(from, to).map_err(to_err)? {
+            self.push_live(vec![wr]);
+        }
         Ok(())
     }
 
     /// Whole-set commit from the host's current vault contents (`{path: [u8]}`).
     pub fn commit_files(&self, files_json: &str) -> Result<(), JsError> {
         let files: BTreeMap<String, Vec<u8>> = serde_json::from_str(files_json).map_err(to_err)?;
-        self.eng.commit_files(&files).map_err(to_err)?;
+        let rows = self.eng.commit_files(&files).map_err(to_err)?;
+        self.push_live(rows);
         Ok(())
     }
 
@@ -141,7 +163,8 @@ impl WasmEngine {
     /// record_write per file — per-file re-folding is O(n²) over a large vault.
     pub fn write_files(&self, files_json: &str) -> Result<(), JsError> {
         let files: BTreeMap<String, Vec<u8>> = serde_json::from_str(files_json).map_err(to_err)?;
-        self.eng.record_writes(&files).map_err(to_err)?;
+        let rows = self.eng.record_writes(&files).map_err(to_err)?;
+        self.push_live(rows);
         Ok(())
     }
 
@@ -151,7 +174,8 @@ impl WasmEngine {
     /// resurrects them on the next materialize).
     pub fn remove_files(&self, paths_json: &str) -> Result<(), JsError> {
         let paths: Vec<String> = serde_json::from_str(paths_json).map_err(to_err)?;
-        self.eng.record_removes(&paths).map_err(to_err)?;
+        let rows = self.eng.record_removes(&paths).map_err(to_err)?;
+        self.push_live(rows);
         Ok(())
     }
 
@@ -304,14 +328,61 @@ impl WasmEngine {
     /// `relay_url` overrides the default public relays (e.g. a private/test relay).
     /// The whole connect+drive lives in one owned future (no borrow of `self`), so
     /// it satisfies wasm-bindgen's `'static` requirement.
+    /// `on_progress(done, total)` (optional) is invoked as catch-up pages land so
+    /// the UI can show real clone progress; `total` is the peer's row count (from
+    /// its version vector), `done` the rows integrated so far.
     #[cfg(target_arch = "wasm32")]
-    pub fn sync(&self, ticket: String, auth_key: Option<String>, relay_url: Option<String>) -> js_sys::Promise {
+    pub fn sync(
+        &self,
+        ticket: String,
+        auth_key: Option<String>,
+        relay_url: Option<String>,
+        on_progress: Option<js_sys::Function>,
+    ) -> js_sys::Promise {
         let eng = self.eng.clone();
         let auth_keys: Vec<String> = auth_key.into_iter().collect();
         wasm_bindgen_futures::future_to_promise(async move {
-            asp_core::iroh_wasm::sync_oneshot(eng, ticket, auth_keys, relay_url)
+            let cb = move |done: usize, total: usize| {
+                if let Some(f) = &on_progress {
+                    let _ = f.call2(
+                        &wasm_bindgen::JsValue::NULL,
+                        &wasm_bindgen::JsValue::from_f64(done as f64),
+                        &wasm_bindgen::JsValue::from_f64(total as f64),
+                    );
+                }
+            };
+            asp_core::iroh_wasm::sync_oneshot(eng, ticket, auth_keys, relay_url, &cb)
                 .await
                 .map(|n| wasm_bindgen::JsValue::from_f64(n as f64))
+                .map_err(|e| wasm_bindgen::JsValue::from_str(&e))
+        })
+    }
+
+    /// Open a **live** connection to `ticket` and keep it open: dial out once,
+    /// catch up, then stream rows both ways in realtime (no polling). Remote
+    /// pushes are integrated and `on_change(rows)` is invoked so the host can
+    /// refresh; locally-authored rows (via `record_*`) push to the peer over the
+    /// same connection. The returned Promise resolves when the connection closes,
+    /// so the caller can reconnect.
+    #[cfg(target_arch = "wasm32")]
+    pub fn connect_live(
+        &self,
+        ticket: String,
+        auth_key: Option<String>,
+        relay_url: Option<String>,
+        on_change: js_sys::Function,
+    ) -> js_sys::Promise {
+        let eng = self.eng.clone();
+        let auth_keys: Vec<String> = auth_key.into_iter().collect();
+        let (tx, rx) = futures_channel::mpsc::unbounded::<WireRow>();
+        *self.live_tx.borrow_mut() = Some(tx);
+        let on_change = move |n: usize| {
+            let _ = on_change.call1(&wasm_bindgen::JsValue::NULL, &wasm_bindgen::JsValue::from_f64(n as f64));
+        };
+        wasm_bindgen_futures::future_to_promise(async move {
+            asp_core::iroh_wasm::connect_live(eng, ticket, auth_keys, relay_url, rx, on_change)
+                .await
+                .map(|_| wasm_bindgen::JsValue::UNDEFINED)
                 .map_err(|e| wasm_bindgen::JsValue::from_str(&e))
         })
     }

@@ -8,7 +8,7 @@
     "build:web": "tsc && vite build",
     "dev": "tauri dev",
     "build": "tauri build",
-    "test": "vitest run",
+    "test": "bun test src && bun test bun-isolated",
     "typecheck": "tsc --noEmit",
     "e2e:web": "bun run build:web && bash e2e/web-run.sh",
     "e2e:webapp": "xvfb-run -a node e2e/webapp-check.mjs",

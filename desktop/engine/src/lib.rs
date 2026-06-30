@@ -109,10 +109,23 @@ struct FolderCfg {
     peer: Option<String>,
 }
 
+type ChangeCb = Arc<dyn Fn(String) + Send + Sync>;
+
 pub struct DesktopEngine {
     rt: tokio::runtime::Runtime,
     identity: Identity,
     folders: Mutex<HashMap<String, Folder>>,
+    /// Fired with a vault_id whenever a peer's change integrates into any folder's
+    /// engine — the Tauri shell sets this to emit a `vault-changed` event so the UI
+    /// updates the instant a change lands (no waiting on a poll). Shared (Arc) so
+    /// per-engine notifiers read it at fire time even if it's set after open.
+    change_listener: Arc<Mutex<Option<ChangeCb>>>,
+    /// When set, a co-hosted relay's URL — endpoints bind through it (and tickets
+    /// advertise it) so same-machine/LAN peers route locally instead of via the
+    /// public n0 relays. Backs the "faster local syncing" toggle.
+    relay_override: Mutex<Option<String>>,
+    /// The co-hosted relay task (abort to stop it).
+    relay_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 fn random_id() -> String {
@@ -125,7 +138,102 @@ impl DesktopEngine {
     /// the CLI's `~/.asp/id_ed25519`).
     pub fn new(identity: Identity) -> Result<DesktopEngine> {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().context("tokio runtime")?;
-        Ok(DesktopEngine { rt, identity, folders: Mutex::new(HashMap::new()) })
+        let de = DesktopEngine {
+            rt,
+            identity,
+            folders: Mutex::new(HashMap::new()),
+            change_listener: Arc::new(Mutex::new(None)),
+            relay_override: Mutex::new(None),
+            relay_task: Mutex::new(None),
+        };
+        // Restore the persisted "faster local syncing" preference: co-host the
+        // relay up front (before any folder binds) so reopened vaults' tickets
+        // advertise it. A bind failure just falls back to the default relays.
+        if Self::read_local_relay_setting() {
+            let _ = de.set_local_relay(true);
+        }
+        Ok(de)
+    }
+
+    /// Whether the co-hosted local relay is currently on.
+    pub fn local_relay_on(&self) -> bool {
+        self.relay_override.lock().unwrap().is_some()
+    }
+
+    /// The co-hosted relay's URL when on (the relay peers route through).
+    pub fn local_relay_url(&self) -> Option<String> {
+        self.relay_override.lock().unwrap().clone()
+    }
+
+    /// Toggle a co-hosted local relay ("faster local syncing"). When on, spin up a
+    /// relay on a free localhost port, pin it as the relay for endpoint binds, and
+    /// re-establish every active share/connector through it (re-minting tickets).
+    /// When off, stop the relay and re-establish back onto the default (n0) relays.
+    pub fn set_local_relay(&self, on: bool) -> Result<bool> {
+        if on == self.local_relay_on() {
+            return Ok(on); // already in the requested state
+        }
+        if on {
+            let bind: std::net::SocketAddr = "127.0.0.1:0".parse().expect("static addr");
+            let (url, task) = self.block(async move { iroh_net::spawn_relay(bind).await })?;
+            *self.relay_override.lock().unwrap() = Some(url);
+            *self.relay_task.lock().unwrap() = Some(task);
+        } else {
+            if let Some(task) = self.relay_task.lock().unwrap().take() {
+                task.abort();
+            }
+            *self.relay_override.lock().unwrap() = None;
+        }
+        Self::write_local_relay_setting(on); // persist across restarts
+        self.reestablish_all()?;
+        Ok(on)
+    }
+
+    /// Tear down and re-bind every folder's endpoint so active shares/connectors
+    /// pick up the current relay choice (a new endpoint = a new ticket; the device
+    /// NodeId and per-vault admission set are unchanged).
+    fn reestablish_all(&self) -> Result<()> {
+        let mut folders = self.folders.lock().unwrap();
+        for f in folders.values_mut() {
+            if let Some(h) = f.listener.take() {
+                h.abort();
+            }
+            if let Some(h) = f.connector.take() {
+                h.abort();
+            }
+            let was_sharing = f.listening_ticket.take().is_some();
+            let peer = f.peer.clone();
+            f.endpoint = None;
+            if !was_sharing && peer.is_none() {
+                continue; // a plain local folder binds lazily on first share
+            }
+            let ep = self.bind_ep().context("re-bind endpoint")?;
+            f.endpoint = Some(ep.clone());
+            if let Some(ticket) = &peer {
+                f.connector = Some(self.spawn_connector(f.engine.clone(), f.conns.clone(), ep.clone(), ticket.clone()));
+            }
+            if was_sharing {
+                let relays = Self::use_relays();
+                let relay_url = self.relay_url();
+                let ep_t = ep.clone();
+                let ticket = self
+                    .block(async move { iroh_net::ticket_with_relay(&ep_t, relays, relay_url.as_deref()).await })
+                    .context("re-mint ticket")?;
+                let (engine, conns, auth) = (f.engine.clone(), f.conns.clone(), self.auth_opts(Vec::new()));
+                let ep_s = ep.clone();
+                f.listener = Some(self.rt.spawn(async move {
+                    let _ = iroh_net::serve(engine, ep_s, auth, conns).await;
+                }));
+                f.listening_ticket = Some(ticket);
+            }
+        }
+        Ok(())
+    }
+
+    /// Register a callback fired (with the vault_id) when a peer's change lands in
+    /// any managed folder. The Tauri shell uses it to emit a realtime UI event.
+    pub fn set_change_listener(&self, cb: impl Fn(String) + Send + Sync + 'static) {
+        *self.change_listener.lock().unwrap() = Some(Arc::new(cb));
     }
 
     pub fn identity_ssh(&self) -> String {
@@ -170,7 +278,11 @@ impl DesktopEngine {
     /// the CLI's `--relay-url`. When set it takes precedence over the public n0
     /// relays (and over `ASP_NO_RELAY`), so a NAT'd desktop user can route through
     /// their own relay; without it the endpoint uses n0 / direct per `use_relays`.
-    fn relay_url() -> Option<String> {
+    fn relay_url(&self) -> Option<String> {
+        // The co-hosted local relay takes precedence over the env-pinned one.
+        if let Some(u) = self.relay_override.lock().unwrap().clone() {
+            return Some(u);
+        }
         match std::env::var("ASP_RELAY_URL") {
             Ok(u) if !u.trim().is_empty() => Some(u.trim().to_string()),
             _ => None,
@@ -178,6 +290,19 @@ impl DesktopEngine {
     }
 
     fn handle(&self, eng: Engine) -> EngineRef {
+        // Bridge this engine's integrate-notifier to the manager's change listener,
+        // tagged with the folder's vault_id so the UI knows which vault moved.
+        let vault_id = VaultConfig::new(&eng.store).vault_id().ok().flatten().unwrap_or_default();
+        let slot = self.change_listener.clone();
+        eng.set_change_listener(Arc::new(move || {
+            if let Some(cb) = slot.lock().unwrap().as_ref() {
+                cb(vault_id.clone());
+            }
+        }));
+        // The desktop never reads the derived `.asp/git` tree, so skip the
+        // O(all-files) git export on every edit (it dominated materialize on a
+        // large vault). The CLI keeps it on.
+        eng.set_git_export(false);
         Arc::new(Mutex::new(eng))
     }
 
@@ -243,7 +368,7 @@ impl DesktopEngine {
     fn bind_ep(&self) -> Result<iroh_net::Endpoint> {
         let seed = self.identity.seed();
         let relays = Self::use_relays();
-        let relay_url = Self::relay_url();
+        let relay_url = self.relay_url();
         self.block(async move {
             iroh_net::bind_endpoint_relay(&seed, relays, relay_url.as_deref()).await
         })
@@ -302,6 +427,28 @@ impl DesktopEngine {
         PathBuf::from(home).join(".asp").join("desktop_folders.json")
     }
 
+    fn settings_path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join(".asp").join("desktop_settings.json")
+    }
+
+    /// The persisted "faster local syncing" preference (default off).
+    fn read_local_relay_setting() -> bool {
+        std::fs::read_to_string(Self::settings_path())
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("local_relay").and_then(|b| b.as_bool()))
+            .unwrap_or(false)
+    }
+
+    fn write_local_relay_setting(on: bool) {
+        let p = Self::settings_path();
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&p, serde_json::json!({ "local_relay": on }).to_string());
+    }
+
     fn saved_folders() -> Vec<FolderCfg> {
         std::fs::read_to_string(Self::folders_config_path())
             .ok()
@@ -342,19 +489,38 @@ impl DesktopEngine {
     /// persisted upstream peers). Call once at startup. Folders that no longer
     /// exist on disk are skipped (and pruned).
     pub fn reopen_saved(&self) -> Result<Vec<VaultInfo>> {
-        let mut infos = Vec::new();
-        let mut keep = Vec::new();
-        for cfg in Self::saved_folders() {
-            let path = PathBuf::from(&cfg.path);
-            if path.join(".asp/asp.db").exists() {
-                if let Ok(info) = self.add_folder_inner(&path, cfg.peer.clone()) {
-                    infos.push(info);
-                    keep.push(cfg);
-                }
-            }
-        }
+        Ok(self.reopen_saved_streaming(|_| {}))
+    }
+
+    /// Reopen saved folders **concurrently**, invoking `on_each` the moment each
+    /// one is ready. Each folder's open includes a startup reconcile that reads
+    /// every file on disk (the only way external-while-closed edits are caught —
+    /// there's no fs watcher), so a 28k-file vault takes ~tens of seconds. Doing
+    /// them in parallel and streaming each as it lands means a big vault never
+    /// blocks the small ones, and the shell can surface vaults the instant they're
+    /// ready (a realtime `vaults-changed` event) rather than after the slowest.
+    pub fn reopen_saved_streaming(&self, on_each: impl Fn(&VaultInfo) + Send + Sync) -> Vec<VaultInfo> {
+        let cfgs: Vec<FolderCfg> = Self::saved_folders()
+            .into_iter()
+            .filter(|c| PathBuf::from(&c.path).join(".asp/asp.db").exists())
+            .collect();
+        let opened: Vec<(FolderCfg, VaultInfo)> = std::thread::scope(|s| {
+            let handles: Vec<_> = cfgs
+                .iter()
+                .map(|cfg| {
+                    let on_each = &on_each;
+                    s.spawn(move || {
+                        let info = self.add_folder_inner(&PathBuf::from(&cfg.path), cfg.peer.clone()).ok()?;
+                        on_each(&info);
+                        Some((cfg.clone(), info))
+                    })
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
+        });
+        let keep: Vec<FolderCfg> = opened.iter().map(|(c, _)| c.clone()).collect();
         Self::write_saved_folders(&keep);
-        Ok(infos)
+        opened.into_iter().map(|(_, i)| i).collect()
     }
 
     /// Bootstrap a new folder by cloning from a listening peer (by iroh ticket /
@@ -417,7 +583,7 @@ impl DesktopEngine {
                 }
             };
             let ep_t = ep.clone();
-            let relay_url = Self::relay_url();
+            let relay_url = self.relay_url();
             let ticket = self
                 .block(async move { iroh_net::ticket_with_relay(&ep_t, relays, relay_url.as_deref()).await })
                 .context("ticket")?;
@@ -447,13 +613,13 @@ impl DesktopEngine {
         let auth = self.auth_opts(auth_key.map(|s| vec![s.to_string()]).unwrap_or_default());
         let addr = iroh_net::parse_peer(ticket)?;
         let seed = self.identity.seed();
+        let relay_url = self.relay_url();
         self.block(async move {
             match shared_ep {
                 // Reuse the folder's standing endpoint (one device key, one socket).
                 Some(ep) => iroh_net::sync_oneshot(engine, &ep, addr, &auth).await,
                 // No standing endpoint (a plain local folder): a throwaway is fine.
                 None => {
-                    let relay_url = Self::relay_url();
                     let ep =
                         iroh_net::bind_endpoint_relay(&seed, Self::use_relays(), relay_url.as_deref()).await?;
                     let r = iroh_net::sync_oneshot(engine, &ep, addr, &auth).await;
@@ -523,7 +689,7 @@ impl DesktopEngine {
         // vault, so it must never load every row/file (O(N)) just to take a count
         // or a max. `live_file_count` matches the previous `live_files().count()`
         // (both include dir entities; files are stored with deleted=0).
-        let files = eng.store.live_file_count()? as usize;
+        let files = eng.store.live_file_count()?;
         let head = std::fs::read_to_string(eng.git_dir.join("refs/heads/main")).map(|s| s.trim().to_string()).unwrap_or_default();
         let peers = eng.store.peers()?.into_iter().map(|(u, _)| u).collect();
         let last_ts = eng.store.max_ts()?;

@@ -42,15 +42,31 @@ export interface FileAt {
   exists: boolean;
   content: string;
 }
+export type ClonePhase = 'receiving' | 'saving';
+export type CloneProgress = (done: number, total: number, phase: ClonePhase) => void;
 
 export interface Api {
   listVaults(): Promise<VaultInfo[]>;
   addLocalFolder(path: string): Promise<VaultInfo>;
   // Create a fresh browser-storage (OPFS) vault. Web-only.
   createVault(name: string): Promise<VaultInfo>;
-  cloneRemote(dest: string, ticket: string, authKey?: string): Promise<VaultInfo>;
+  // `onProgress` (web clone only) reports catch-up progress so the UI can show a
+  // live bar: `phase` is 'receiving' while pages stream in, then 'saving' while
+  // the state is written to OPFS. `total` may be 0 until the peer's count is known.
+  cloneRemote(dest: string, ticket: string, authKey?: string, onProgress?: CloneProgress): Promise<VaultInfo>;
   setAllowConnections(id: string, on: boolean, authKey?: string): Promise<string | null>;
-  syncNow(id: string, ticket: string, authKey?: string): Promise<void>;
+  // Co-host a local relay so same-machine/LAN peers sync without the public n0
+  // relay ("faster local syncing"). Desktop-only; returns the new state.
+  setLocalRelay(on: boolean): Promise<boolean>;
+  getLocalRelay(): Promise<boolean>;
+  // Sync once against `ticket`. On web, omit `ticket` to re-dial the upstream the
+  // vault was cloned from. (Web also holds a live connection — see startLiveSync.)
+  syncNow(id: string, ticket?: string, authKey?: string): Promise<void>;
+  // Web: open and hold a live connection to the upstream, calling `onChange`
+  // whenever a remote push lands (realtime, no polling). Desktop syncs live in
+  // its background engine, so this is a no-op there. Idempotent per id.
+  startLiveSync(id: string, onChange: () => void): Promise<void>;
+  stopLiveSync(id: string): Promise<void>;
   getStatus(id: string): Promise<VaultStatus>;
   getIdentity(): Promise<string>;
   authorize(id: string, pubkey: string): Promise<void>;
@@ -69,16 +85,6 @@ export interface Api {
   removeVault(id: string, trash: boolean): Promise<void>;
   // Reveal a folder/file in the OS file manager (Finder/Explorer). Desktop-only.
   revealPath(path: string): Promise<void>;
-  // Web-only: vaults cloned from a peer, with the ticket+authKey to sync against.
-  // Browsers have no standing connector, so the app's poll drives catch-up by
-  // calling syncNow for each of these. Empty on desktop (it live-syncs natively).
-  webUpstreams(): Promise<WebUpstream[]>;
-}
-
-export interface WebUpstream {
-  id: string;
-  ticket: string;
-  authKey?: string;
 }
 
 // ---- desktop backend: Tauri commands (a thin pass-through) ----
@@ -88,7 +94,13 @@ const tauriApi: Api = {
   createVault: () => Promise.reject(new Error('createVault is web-only')),
   cloneRemote: (dest, ticket, authKey) => invoke<VaultInfo>('clone_remote', { dest, ticket, authKey }),
   setAllowConnections: (id, on, authKey) => invoke<string | null>('set_allow_connections', { id, on, authKey }),
-  syncNow: (id, ticket, authKey) => invoke<void>('sync_now', { id, ticket, authKey }),
+  setLocalRelay: (on) => invoke<boolean>('set_local_relay', { on }),
+  getLocalRelay: () => invoke<boolean>('get_local_relay'),
+  syncNow: (id, ticket, authKey) => invoke<void>('sync_now', { id, ticket: ticket ?? null, authKey }),
+  // Desktop keeps a standing connection in its background engine; nothing for the
+  // frontend to hold open, so these are no-ops (the UI refreshes on its poll).
+  startLiveSync: async () => {},
+  stopLiveSync: async () => {},
   getStatus: (id) => invoke<VaultStatus>('get_status', { id }),
   getIdentity: () => invoke<string>('get_identity'),
   authorize: (id, pubkey) => invoke<void>('authorize', { id, pubkey }),
@@ -106,8 +118,6 @@ const tauriApi: Api = {
   rescan: (id) => invoke<void>('rescan', { id }),
   removeVault: (id, trash) => invoke<void>('remove_vault', { id, trash }),
   revealPath: (path) => invoke<void>('reveal_path', { path }),
-  // Desktop syncs continuously via its persistent connector — no poll-driven catch-up.
-  webUpstreams: async () => [],
 };
 
 // The web backend (wasm + OPFS) is heavy, so it's loaded lazily only when we're
