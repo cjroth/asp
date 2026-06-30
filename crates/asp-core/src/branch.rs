@@ -505,6 +505,90 @@ mod tests {
     }
 
     #[test]
+    fn build_graph_fuzz_invariants_hold_and_is_permutation_invariant() {
+        // build_graph has the most moving parts (coarsen → cap → chain → fork-edge
+        // resolution) yet only one example test. Fuzz it: on random rows over an
+        // adversarial branch set (incl. deleted/cyclic/dangling lineage and tiny
+        // caps that force split_off), the graph must (a) never panic, (b) be a
+        // function of the row *set* not its order, and (c) satisfy structural
+        // invariants — every parent id resolves to a node, lanes are consistent,
+        // and the per-lane cap is honoured. A regression in capping or fork lookup
+        // (e.g. an edge into a commit that capping dropped) trips invariant (c).
+        let live = vec![
+            Branch { branch_id: "a".into(), name: "a".into(), parent: Some(MAIN_BRANCH_ID.into()), fork_vv: vv(&[("aa", 1)]), created_lamport: 2, created_ts: 0, deleted: false },
+            Branch { branch_id: "b".into(), name: "b".into(), parent: Some("a".into()), fork_vv: vv(&[("aa", 4)]), created_lamport: 6, created_ts: 0, deleted: false },
+            // A deleted lane (must be filtered out of lanes) and a dangling-parent lane.
+            Branch { branch_id: "z".into(), name: "z".into(), parent: Some(MAIN_BRANCH_ID.into()), fork_vv: vv(&[]), created_lamport: 3, created_ts: 0, deleted: true },
+            Branch { branch_id: "orphan".into(), name: "orphan".into(), parent: Some("no-such".into()), fork_vv: vv(&[("bb", 2)]), created_lamport: 7, created_ts: 0, deleted: false },
+        ];
+        let branch_ids = ["main", "a", "b", "z", "orphan", "ghost"];
+
+        // Deterministic LCG (no Math.random / Date in this env).
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let mut rows = Vec::new();
+        for _ in 0..120u64 {
+            let mut r = row(&format!("s{}", next() % 3), next() % 10, branch_ids[(next() as usize) % branch_ids.len()]);
+            r.lamport = next() % 30; // independent lamports → exercises coarsening gaps
+            rows.push(r.seal());
+        }
+
+        let norm = |g: &Graph| {
+            let mut ns: Vec<(String, String, usize, Vec<String>)> = g
+                .nodes
+                .iter()
+                .map(|n| {
+                    let mut ps = n.parents.clone();
+                    ps.sort();
+                    (n.commit_id.clone(), n.branch_id.clone(), n.lane, ps)
+                })
+                .collect();
+            ns.sort();
+            let mut bs: Vec<(String, usize, bool, Option<String>)> =
+                g.branches.iter().map(|b| (b.id.clone(), b.lane, b.current, b.head_commit.clone())).collect();
+            bs.sort();
+            (ns, bs)
+        };
+
+        for &head in &["main", "a", "b", "orphan", "deleted-head-z", "ghost"] {
+            for &cap in &[1usize, 2, 3, 1000] {
+                let g = build_graph(&rows, &live, head, cap);
+
+                // Structural invariants.
+                let ids: std::collections::HashSet<&str> = g.nodes.iter().map(|n| n.commit_id.as_str()).collect();
+                let lane_of: HashMap<&str, usize> = g.branches.iter().map(|b| (b.id.as_str(), b.lane)).collect();
+                let mut per_lane: HashMap<&str, usize> = HashMap::new();
+                for n in &g.nodes {
+                    *per_lane.entry(n.branch_id.as_str()).or_default() += 1;
+                    assert_eq!(Some(&n.lane), lane_of.get(n.branch_id.as_str()), "node lane disagrees with its branch lane");
+                    for p in &n.parents {
+                        assert!(ids.contains(p.as_str()), "parent {p} of {} references a non-existent node (cap={cap}, head={head})", n.commit_id);
+                    }
+                }
+                for (br, count) in &per_lane {
+                    assert!(*count <= cap, "lane {br} has {count} commits > cap {cap}");
+                }
+                // Deleted branch `z` must never be a lane; main always is.
+                assert!(g.branches.iter().all(|b| b.id != "z"), "deleted branch leaked into lanes");
+                assert!(g.branches.iter().any(|b| b.id == MAIN_BRANCH_ID), "main lane missing");
+                // At most one current lane, and it only exists when head is a real lane.
+                assert!(g.branches.iter().filter(|b| b.current).count() <= 1, "more than one current lane");
+
+                // Permutation invariance: shuffle rows, identical graph.
+                let mut shuffled = rows.clone();
+                shuffled.reverse();
+                let rot = (next() as usize) % shuffled.len();
+                shuffled.rotate_left(rot);
+                let g2 = build_graph(&shuffled, &live, head, cap);
+                assert_eq!(norm(&g), norm(&g2), "build_graph not permutation-invariant (cap={cap}, head={head})");
+            }
+        }
+    }
+
+    #[test]
     fn reconcile_branches_is_lww_and_order_invariant() {
         use crate::store::{BlobStore, MemBlobStore};
         let store = MemBlobStore::new();
