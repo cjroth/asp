@@ -43,7 +43,10 @@ pub mod iroh_wasm;
 pub mod sqlite;
 
 pub use authkeys::{AdmitCtx, AuthKey};
-pub use branch::{version_vector_of, visible_rows, Branch, BranchSet, VersionVector, Visibility};
+pub use branch::{
+    encode_branch_record, reconcile_branches, version_vector_of, visible_rows, Branch, BranchSet,
+    VersionVector, Visibility,
+};
 pub use error::{AspError, AspResult};
 pub use fold::{compute_files, fold_order, FoldState};
 pub use identity::Identity;

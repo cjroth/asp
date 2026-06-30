@@ -164,6 +164,15 @@ impl SqliteStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Every `Kind::Branch` record row (§7) — the synced branch metadata, which
+    /// `reconcile_branches` folds (LWW) into the branch set. Cheap: branch records
+    /// are few relative to content rows.
+    pub fn branch_rows(&self) -> AspResult<Vec<LogRow>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM log WHERE kind='branch'")?;
+        let rows = stmt.query_map([], Self::row_from)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Every row for one `file_id` (uses the `log_file` index) — the incremental
     /// fold re-folds a touched file from exactly these. Order is irrelevant;
     /// `fold_order` re-sorts.

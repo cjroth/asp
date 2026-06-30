@@ -363,6 +363,11 @@ impl Engine {
         }
         let added = self.store.append_row(&wr.row)?;
         if added {
+            // A synced branch record (§7) updates the branch set before the fold, so
+            // a freshly-arrived branch's fork_vv is in scope when HEAD folds.
+            if wr.row.kind == Kind::Branch {
+                self.reconcile_branches()?;
+            }
             self.note_dirty(&wr.row.file_id);
             self.materialize()?;
         }
@@ -387,13 +392,18 @@ impl Engine {
         }
         let mut flags = Vec::with_capacity(wrs.len());
         let mut any = false;
+        let mut any_branch = false;
         for wr in wrs {
             let added = self.store.append_row(&wr.row)?;
             if added {
                 any = true;
+                any_branch |= wr.row.kind == Kind::Branch;
                 self.note_dirty(&wr.row.file_id);
             }
             flags.push(added);
+        }
+        if any_branch {
+            self.reconcile_branches()?;
         }
         if any {
             self.materialize()?;
@@ -1073,7 +1083,8 @@ impl Engine {
 
     /// Create a branch off `parent` capturing `fork_vv` (the parent's version
     /// vector at the fork). Returns the new content-hashed branch id. Does **not**
-    /// switch HEAD.
+    /// switch HEAD. The record is authored as a synced `Kind::Branch` row (§7), so
+    /// the branch propagates to every peer — not just the device that made it.
     pub fn create_branch(&self, name: &str, parent: &str, fork_vv: crate::branch::VersionVector) -> AspResult<String> {
         let created_lamport = self.store.next_lamport(0)?;
         let created_ts = now_unix() as i64;
@@ -1087,8 +1098,51 @@ impl Engine {
             created_ts,
             deleted: false,
         };
-        self.store.put_branch(&b)?;
+        self.author_branch_record(&b)?;
         Ok(branch_id)
+    }
+
+    /// Author a synced branch record (§7): a `Kind::Branch` row whose result blob
+    /// is the JSON-encoded `Branch`, keyed by `file_id = branch_id` so create →
+    /// rename → delete (and concurrent variants) converge last-writer-wins. Returns
+    /// the wire row so a live driver can push it immediately; either way the record
+    /// also ships via ordinary version-vector catch-up.
+    pub fn author_branch_record(&self, b: &Branch) -> AspResult<WireRow> {
+        let blob = crate::branch::encode_branch_record(b);
+        let result_hash = self.store.put_blob(&blob)?;
+        let (lamport, seq) = self.next_counters()?;
+        let row = LogRow {
+            id: String::new(),
+            site_id: self.site_id(),
+            lamport,
+            seq,
+            ts: now_unix() as i64,
+            file_id: b.branch_id.clone(),
+            kind: Kind::Branch,
+            merge_class: MergeClass::Text,
+            parent: None,
+            base_hash: None,
+            result_hash: Some(result_hash),
+            path: Some(b.name.clone()),
+            branch_id: MAIN_BRANCH_ID.to_string(),
+            merge_parent: None,
+            sig: vec![],
+        }
+        .seal();
+        self.store.append_row(&row)?;
+        self.reconcile_branches()?;
+        self.wire(row)
+    }
+
+    /// Rebuild the local `branches` table from the synced `Kind::Branch` records
+    /// (LWW). Idempotent; run after authoring or integrating a branch record so a
+    /// peer holds the same branch set as everyone else.
+    fn reconcile_branches(&self) -> AspResult<()> {
+        let rows = self.store.branch_rows()?;
+        for b in crate::branch::reconcile_branches(&rows, |h| self.store.get_blob(h).ok().flatten()) {
+            self.store.put_branch(&b)?;
+        }
+        Ok(())
     }
 
     /// Switch HEAD to `branch_id` and re-materialize its scoped state to disk +
@@ -1137,7 +1191,8 @@ impl Engine {
             self.checkout(&parent)?;
         }
         b.deleted = true;
-        self.store.put_branch(&b)?;
+        // Author a synced deletion record so the tombstone converges everywhere.
+        self.author_branch_record(&b)?;
         Ok(())
     }
 
@@ -1371,6 +1426,52 @@ mod tests {
         assert_eq!(fs::read(d.path().join("a.md")).unwrap(), b"m1\n", "main untouched by branch edits");
         // Deleting a non-existent branch is an error (not a panic).
         assert!(e.delete_branch("does-not-exist").is_err());
+    }
+
+    #[test]
+    fn branches_sync_to_peers_not_just_the_checked_out_one() {
+        // The user's requirement: every branch syncs, not only HEAD. A forks a
+        // branch, edits on it, then edits main; B catches up ALL of A's rows and
+        // must (1) learn the branch record, (2) hold main's state, and (3) be able
+        // to check out the branch and see its isolated state.
+        let da = tempdir().unwrap();
+        let db = tempdir().unwrap();
+        let a = eng(da.path(), 1);
+        let b = eng(db.path(), 2);
+
+        a.record_write("a.md", b"m1\n").unwrap().unwrap();
+        let bid = a.fork_from_time("feature", i64::MAX).unwrap();
+        a.record_write("a.md", b"branch2\n").unwrap().unwrap();
+        a.record_write("feat-only.md", b"x\n").unwrap().unwrap();
+        a.checkout(MAIN_BRANCH_ID).unwrap();
+        a.record_write("a.md", b"m2\n").unwrap().unwrap(); // divergent edit on main
+
+        // Full catch-up: ship every one of A's rows (content + branch records) to B.
+        let all: Vec<WireRow> = a.store.all_rows().unwrap().into_iter().map(|r| a.wire(r).unwrap()).collect();
+        b.integrate_many(&all).unwrap();
+
+        // B is on main and converges to main's state.
+        assert_eq!(fs::read(db.path().join("a.md")).unwrap(), b"m2\n");
+        assert!(!db.path().join("feat-only.md").exists(), "branch-only file not on main");
+
+        // B learned the branch record purely from sync.
+        assert!(
+            b.branches().unwrap().iter().any(|x| x.branch_id == bid && x.name == "feature" && !x.deleted),
+            "the feature branch synced to B"
+        );
+
+        // B can check out the synced branch and see its isolated state.
+        b.checkout(&bid).unwrap();
+        assert_eq!(fs::read(db.path().join("a.md")).unwrap(), b"branch2\n", "branch state on B");
+        assert!(db.path().join("feat-only.md").exists());
+
+        // A delete on A also converges (tombstone syncs).
+        a.delete_branch(&bid).unwrap();
+        let more: Vec<WireRow> = a.store.all_rows().unwrap().into_iter().map(|r| a.wire(r).unwrap()).collect();
+        // B is currently on the branch being deleted on A; integrate the tombstone.
+        b.checkout(MAIN_BRANCH_ID).unwrap();
+        b.integrate_many(&more).unwrap();
+        assert!(b.branches().unwrap().iter().all(|x| x.branch_id != bid), "branch deletion synced to B");
     }
 
     #[test]

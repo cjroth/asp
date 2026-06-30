@@ -10,7 +10,8 @@
 //! the branch records, so the native engine and the in-memory wasm node compute
 //! byte-identical scoped state.
 
-use crate::log::{LogRow, MAIN_BRANCH_ID};
+use crate::log::{Kind, LogRow, MAIN_BRANCH_ID};
+use crate::order::OrderKey;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -151,6 +152,41 @@ pub fn visible_rows(rows: &[LogRow], branches: &BranchSet, target: &str) -> Vec<
     rows.iter().filter(|r| vis.sees(r)).cloned().collect()
 }
 
+/// JSON-encode a branch record into the bytes carried by its `Kind::Branch` row's
+/// result blob (§7). The row's `file_id` is the `branch_id`; multiple records for
+/// one branch (create → rename → delete, possibly concurrent) converge by fold
+/// order key. Same surface on native + wasm, so the synced branch set converges.
+pub fn encode_branch_record(b: &Branch) -> Vec<u8> {
+    serde_json::to_vec(b).unwrap_or_default()
+}
+
+/// Reconcile the synced branch set from the `Kind::Branch` records among `rows`
+/// (§7): group by `file_id` (= `branch_id`), keep the highest-order-key record
+/// (last-writer-wins on name/parent/deleted), and decode its blob via `blob`.
+/// Tombstoned (`deleted`) branches are included — their rows persist for history;
+/// callers filter for the live set. Deterministic on any arrival order.
+pub fn reconcile_branches(rows: &[LogRow], blob: impl Fn(&str) -> Option<Vec<u8>>) -> Vec<Branch> {
+    let mut best: HashMap<String, (OrderKey, Branch)> = HashMap::new();
+    for r in rows {
+        if r.kind != Kind::Branch {
+            continue;
+        }
+        let Some(h) = &r.result_hash else { continue };
+        let Some(bytes) = blob(h) else { continue };
+        let Ok(b) = serde_json::from_slice::<Branch>(&bytes) else { continue };
+        let key = OrderKey { lamport: r.lamport, site_id: r.site_id.clone(), id: r.id.clone() };
+        match best.get(&r.file_id) {
+            Some((k, _)) if *k >= key => {}
+            _ => {
+                best.insert(r.file_id.clone(), (key, b));
+            }
+        }
+    }
+    let mut out: Vec<Branch> = best.into_values().map(|(_, b)| b).collect();
+    out.sort_by(|a, b| a.created_lamport.cmp(&b.created_lamport).then_with(|| a.branch_id.cmp(&b.branch_id)));
+    out
+}
+
 /// The version vector of a row set: `site_id -> max seq`. A branch's `fork_vv` is
 /// this over the parent branch's visible rows at the fork instant (§2.1).
 pub fn version_vector_of(rows: &[LogRow]) -> VersionVector {
@@ -282,6 +318,58 @@ mod tests {
         let bs = BranchSet::new([]);
         let ghost = row("aa", 0, "no-such-branch");
         assert!(!bs.visibility(MAIN_BRANCH_ID).sees(&ghost));
+    }
+
+    #[test]
+    fn reconcile_branches_is_lww_and_order_invariant() {
+        use crate::store::{BlobStore, MemBlobStore};
+        let store = MemBlobStore::new();
+        let mk_record = |branch_id: &str, name: &str, deleted: bool, lamport: u64, site: &str| {
+            let b = Branch {
+                branch_id: branch_id.into(),
+                name: name.into(),
+                parent: Some(MAIN_BRANCH_ID.into()),
+                fork_vv: vv(&[("aa", 1)]),
+                created_lamport: 5,
+                created_ts: 0,
+                deleted,
+            };
+            let h = store.put_blob(&encode_branch_record(&b)).unwrap();
+            LogRow {
+                site_id: site.into(),
+                lamport,
+                seq: lamport,
+                file_id: branch_id.into(),
+                kind: Kind::Branch,
+                merge_class: MergeClass::Text,
+                result_hash: Some(h),
+                path: Some(name.into()),
+                ..LogRow::default()
+            }
+            .seal()
+        };
+        // Branch x1: created, then renamed (higher lamport wins), then a CONCURRENT
+        // rename at the same lamport from a different site (LWW by site_id/id).
+        let r_create = mk_record("x1", "feature", false, 5, "aa");
+        let r_rename = mk_record("x1", "feature-v2", false, 7, "aa");
+        let r_concurrent = mk_record("x1", "feature-zz", false, 7, "zz");
+        // Branch x2: a tombstone.
+        let r_del = mk_record("x2", "gone", true, 6, "aa");
+        let rows = vec![r_create, r_rename.clone(), r_concurrent.clone(), r_del];
+
+        let get = |h: &str| store.get_blob(h).ok().flatten();
+        let recs = reconcile_branches(&rows, get);
+        let x1 = recs.iter().find(|b| b.branch_id == "x1").unwrap();
+        // Highest order key (lamport 7) wins; among the two lamport-7 rows, site "zz"
+        // > "aa", so feature-zz is the converged name.
+        assert_eq!(x1.name, "feature-zz");
+        assert!(recs.iter().find(|b| b.branch_id == "x2").unwrap().deleted);
+
+        // Order-invariant: shuffle the records, same result.
+        let mut shuffled = rows.clone();
+        shuffled.reverse();
+        let recs2 = reconcile_branches(&shuffled, get);
+        assert_eq!(recs2.iter().find(|b| b.branch_id == "x1").unwrap().name, "feature-zz");
     }
 
     #[test]
