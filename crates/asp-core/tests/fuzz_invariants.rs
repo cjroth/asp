@@ -206,6 +206,8 @@ fn fold_on_arbitrary_rows_never_panics_and_is_permutation_invariant() {
                 base_hash: pick_hash(&mut r, &hashes),
                 result_hash: pick_hash(&mut r, &hashes),
                 path: Some(format!("d{}/x{}.md", r.gen_range(0..2), r.gen_range(0..3))),
+                branch_id: asp_core::MAIN_BRANCH_ID.to_string(),
+                merge_parent: None,
                 sig: vec![],
             }
             .seal();
@@ -249,5 +251,111 @@ fn parsers_never_panic_on_arbitrary_input() {
         let _ = asp_core::authkeys::parse_date_ymd_utc(&s);
         let _ = asp_core::authkeys::parse_ttl(&s);
         let _ = asp_core::NodeId::from_hex(&s);
+    }
+}
+
+/// Multi-peer branch convergence (§8.4, deterministic — no network): N in-memory
+/// peers run random branch ops (create / fork-in-past / checkout / edit / delete)
+/// interleaved with full gossip, then gossip to a fixpoint. Every peer MUST then
+/// agree on (a) the live branch set and (b) the byte-identical materialized state
+/// of EACH branch. This is the cross-surface "all branches sync + converge per
+/// branch" guarantee, hammered over many random histories.
+#[test]
+fn multi_peer_branch_convergence_under_random_ops() {
+    use asp_core::SessionVault;
+    use std::collections::BTreeMap;
+
+    fn all_wire(e: &MemEngine) -> Vec<WireRow> {
+        let vv = SessionVault::version_vector(e).unwrap();
+        let mut out = Vec::new();
+        for site in vv.keys() {
+            out.extend(SessionVault::rows_after_wire(e, site, -1).unwrap());
+        }
+        out
+    }
+    // One all-pairs gossip round from a consistent pre-round snapshot.
+    fn gossip(peers: &[MemEngine]) {
+        let snaps: Vec<Vec<WireRow>> = peers.iter().map(all_wire).collect();
+        for (i, p) in peers.iter().enumerate() {
+            for (j, s) in snaps.iter().enumerate() {
+                if i != j {
+                    p.integrate_many(s).unwrap();
+                }
+            }
+        }
+    }
+
+    for seed in 0..30u64 {
+        let mut r = rng(0xB4A5 ^ seed);
+        let n = 3usize;
+        let peers: Vec<MemEngine> = (0..n)
+            .map(|i| MemEngine::create(Identity::from_seed(&[(seed as u8).wrapping_add(i as u8 * 7).wrapping_add(1); 32]), "v"))
+            .collect();
+        // Shared base.
+        peers[0].record_write("base.md", b"0\n").unwrap();
+        gossip(&peers);
+
+        let mut known: Vec<String> = vec!["main".to_string()];
+        for _ in 0..50 {
+            let p = &peers[r.gen_range(0..n)];
+            match r.gen_range(0..7) {
+                0 => {
+                    let name = format!("b{}", r.gen_range(0..5));
+                    let head = p.current_branch();
+                    let vv = p.visible_version_vector(&head);
+                    if let Ok(id) = p.create_branch(&name, &head, vv) {
+                        known.push(id);
+                    }
+                }
+                1 => {
+                    let name = format!("k{}", r.gen_range(0..5));
+                    if let Ok(id) = p.fork_from_time(&name, r.gen_range(0..6)) {
+                        known.push(id);
+                    }
+                }
+                2 => {
+                    let b = known[r.gen_range(0..known.len())].clone();
+                    let _ = p.checkout(&b);
+                }
+                3 | 4 => {
+                    let f = format!("d{}/f{}.md", r.gen_range(0..3), r.gen_range(0..4));
+                    let _ = p.record_write(&f, format!("{}-{}\n", r.gen::<u16>(), p.current_branch().len()).as_bytes());
+                }
+                5 => {
+                    let b = known[r.gen_range(0..known.len())].clone();
+                    if b != "main" {
+                        let _ = p.delete_branch(&b);
+                    }
+                }
+                _ => gossip(&peers),
+            }
+        }
+        // Converge to a fixpoint.
+        for _ in 0..(n + 2) {
+            gossip(&peers);
+        }
+
+        // (a) identical LIVE branch sets.
+        let ids = |e: &MemEngine| {
+            let mut v: Vec<String> = e.branches().iter().map(|b| b.branch_id.clone()).collect();
+            v.sort();
+            v
+        };
+        let ref_ids = ids(&peers[0]);
+        for (i, p) in peers.iter().enumerate() {
+            assert_eq!(ids(p), ref_ids, "seed {seed}: peer {i} branch set diverged");
+        }
+
+        // (b) per-branch byte-identical materialized state.
+        for b in &ref_ids {
+            let mut states: Vec<BTreeMap<String, Vec<u8>>> = Vec::new();
+            for p in &peers {
+                p.checkout(b).unwrap();
+                states.push(p.files_map().unwrap());
+            }
+            for (i, s) in states.iter().enumerate().skip(1) {
+                assert_eq!(s, &states[0], "seed {seed}: branch {b} state diverged on peer {i}");
+            }
+        }
     }
 }

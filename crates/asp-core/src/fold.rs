@@ -186,6 +186,11 @@ fn apply_rows(store: &dyn BlobStore, ordered: &[LogRow], states: &mut HashMap<St
                     }
                 }
             }
+            // A merge marker (§2.6) carries no content of its own — the per-file
+            // merge results are separate Edit rows — so it is a no-op on file state;
+            // it exists for the graph / derived-git DAG. A branch record (§7) is
+            // metadata, never a file mutation. Neither touches the fold.
+            Kind::Merge | Kind::Branch => {}
         }
     }
     Ok(())
@@ -355,11 +360,9 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn mkrow(site: &str, lamport: u64, seq: u64, file_id: &str, kind: Kind, parent: Option<&str>, base: Option<&str>, result: Option<&str>, path: Option<&str>) -> LogRow {
         LogRow {
-            id: String::new(),
             site_id: site.into(),
             lamport,
             seq,
-            ts: 0,
             file_id: file_id.into(),
             kind,
             merge_class: MergeClass::Text,
@@ -367,7 +370,7 @@ mod tests {
             base_hash: base.map(|s| s.to_string()),
             result_hash: result.map(|s| s.to_string()),
             path: path.map(|s| s.to_string()),
-            sig: vec![],
+            ..LogRow::default()
         }
         .seal()
     }

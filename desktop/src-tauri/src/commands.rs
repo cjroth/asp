@@ -7,7 +7,9 @@
 //! `capture_rescan`, `rt.block_on` for network) — on the main thread they would
 //! freeze rendering/input. `(async)` dispatches each to a worker thread.
 
-use asp_desktop_engine::{DesktopEngine, FileAt, FileEntry, HistEvent, VaultInfo, VaultStatus};
+use asp_desktop_engine::{
+    BranchDto, DesktopEngine, FileAt, FileEntry, Graph, HistEvent, VaultInfo, VaultStatus,
+};
 use std::path::PathBuf;
 use tauri::State;
 
@@ -23,6 +25,14 @@ fn e<T>(r: anyhow::Result<T>) -> R<T> {
 #[tauri::command(async)]
 pub fn list_vaults(state: State<AppState>) -> Vec<VaultInfo> {
     state.engine.list_vaults()
+}
+
+/// True once the background startup reopen has finished. The UI queries this to
+/// clear its "Loading your vaults…" gate without depending on catching the
+/// one-shot `vaults-ready` event.
+#[tauri::command(async)]
+pub fn vaults_ready(state: State<AppState>) -> bool {
+    state.engine.vaults_ready()
 }
 
 #[tauri::command(async)]
@@ -125,6 +135,43 @@ pub fn delete_file(state: State<AppState>, id: String, path: String) -> R<()> {
 #[tauri::command(async)]
 pub fn history(state: State<AppState>, id: String) -> R<Vec<HistEvent>> {
     e(state.engine.history(&id))
+}
+
+// ---- Branches (thin pass-throughs to the engine) ----
+
+#[tauri::command(async)]
+pub fn list_branches(state: State<AppState>, id: String) -> R<Vec<BranchDto>> {
+    e(state.engine.list_branches(&id))
+}
+
+#[tauri::command(async)]
+pub fn current_branch(state: State<AppState>, id: String) -> R<String> {
+    e(state.engine.current_branch(&id))
+}
+
+#[tauri::command(async)]
+pub fn branch_graph(state: State<AppState>, id: String, cap: usize) -> R<Graph> {
+    e(state.engine.graph(&id, cap))
+}
+
+#[tauri::command(async)]
+pub fn create_branch(state: State<AppState>, id: String, name: String) -> R<String> {
+    e(state.engine.create_branch(&id, &name))
+}
+
+#[tauri::command(async)]
+pub fn checkout_branch(state: State<AppState>, id: String, branch_id: String) -> R<()> {
+    e(state.engine.checkout_branch(&id, &branch_id))
+}
+
+#[tauri::command(async)]
+pub fn fork_branch_at(state: State<AppState>, id: String, name: String, ts: i64) -> R<String> {
+    e(state.engine.fork_branch_at(&id, &name, ts))
+}
+
+#[tauri::command(async)]
+pub fn delete_branch(state: State<AppState>, id: String, branch_id: String) -> R<()> {
+    e(state.engine.delete_branch(&id, &branch_id))
 }
 
 #[tauri::command(async)]

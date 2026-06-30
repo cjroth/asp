@@ -32,7 +32,7 @@ fn main() {
     let info = de.add_local_folder(&dir).unwrap();
 
     for k in 0..nedits {
-        let i = k % nfiles.min(200).max(1);
+        let i = k % nfiles.clamp(1, 200);
         let path = format!("dir{:02}/note-{:05}.md", i % 20, i);
         let _ = de.write_file(&info.id, &path, &format!("# Note {i}\n\nedit pass {k}\n\n- a\n- b\n"));
     }

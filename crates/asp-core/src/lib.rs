@@ -12,6 +12,7 @@
 
 // Always-on / wasm-safe surface.
 pub mod authkeys;
+pub mod branch;
 pub mod error;
 pub mod fold;
 pub mod identity;
@@ -42,10 +43,14 @@ pub mod iroh_wasm;
 pub mod sqlite;
 
 pub use authkeys::{AdmitCtx, AuthKey};
+pub use branch::{
+    build_graph, encode_branch_record, reconcile_branches, version_vector_of, visible_rows, Branch,
+    BranchSet, Graph, GraphBranch, GraphNode, VersionVector, Visibility,
+};
 pub use error::{AspError, AspResult};
 pub use fold::{compute_files, fold_order, FoldState};
 pub use identity::Identity;
-pub use log::{Kind, LogRow, MergeClass};
+pub use log::{Kind, LogRow, MergeClass, MAIN_BRANCH_ID};
 pub use memengine::MemEngine;
 pub use order::{NodeId, OrderKey};
 pub use session::{Role, Session, SessionVault, Step};

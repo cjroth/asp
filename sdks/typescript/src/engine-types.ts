@@ -35,7 +35,28 @@ export interface WasmEngineInstance {
    * number of rows integrated from the peer. `relayUrl` overrides the default
    * public relays (a private/test relay). iroh runs inside the wasm module. */
   sync(ticket: string, authKey?: string, relayUrl?: string): Promise<number>;
+  // ---- branches (§2, §7): scoped views over the shared log ----
+  /** The checked-out branch id (HEAD). */
+  current_branch(): string;
+  /** All live branches as JSON `BranchInfo[]`. */
+  branches_json(): string;
+  /** Create a branch off `parent` (forks at its current vv); returns its id. */
+  create_branch(name: string, parent: string): string;
+  /** Edit-in-the-past ⇒ branch: fork HEAD at wall-clock `t` and switch to it. */
+  fork_at(name: string, t: number): string;
+  /** Switch HEAD and re-materialize the branch's scoped state. */
+  checkout(branchId: string): void;
+  /** Soft-delete a branch (main cannot be deleted). */
+  delete_branch(branchId: string): void;
   free(): void;
+}
+
+/** A branch record (`branches_json`). */
+export interface BranchInfo {
+  branch_id: string;
+  name: string;
+  parent: string | null;
+  created_lamport: number;
 }
 
 /** Per-file fold metadata (`files_detail_json`). */

@@ -5,13 +5,14 @@
 //! driver (the `asp` CLI) supplies file watching, debounce, and sockets.
 
 use crate::authkeys::{decide_admission, expiry_from_ttl_days, AdmitCtx, AdmitDecision, AuthKey};
+use crate::branch::{version_vector_of, Branch, BranchSet};
 use crate::config::VaultConfig;
 use crate::error::{AspError, AspResult};
 use crate::fold::compute_files;
 use crate::gitexport;
 use crate::identity::Identity;
-use crate::log::{Kind, LogRow, MergeClass};
-use crate::order::NodeId;
+use crate::log::{Kind, LogRow, MergeClass, MAIN_BRANCH_ID};
+use crate::order::{NodeId, OrderKey};
 use crate::session::SessionVault;
 use crate::sqlite::SqliteStore;
 use crate::store::{BlobStore, FileRow};
@@ -203,24 +204,59 @@ impl Engine {
         self.site.clone()
     }
 
+    // ---------------- branches (§2) ----------------
+
+    /// The checked-out branch (HEAD). New rows are authored on it; the engine
+    /// materializes its scoped state to disk.
+    pub fn head_branch(&self) -> String {
+        self.store.head().unwrap_or_else(|_| MAIN_BRANCH_ID.to_string())
+    }
+
+    /// The branch tree (the implicit `main` is always present).
+    fn branch_set(&self) -> AspResult<BranchSet> {
+        Ok(BranchSet::new(self.store.branches()?))
+    }
+
+    /// True for a vault that has never created a branch — HEAD is `main` and there
+    /// are no records, so `visible(HEAD)` is every row: the fold/tip fast paths
+    /// stay byte-identical to the pre-branching engine (§2.2 back-compat).
+    fn single_branch(&self) -> bool {
+        self.head_branch() == MAIN_BRANCH_ID && self.store.branches().map(|b| b.is_empty()).unwrap_or(true)
+    }
+
     // ---------------- capture ----------------
 
-    /// The current materialized content hash for a live path, if any.
+    /// The current materialized content hash for a live path, if any. The `files`
+    /// table holds HEAD's materialized state, so this is already branch-scoped.
     fn current_for_path(&self, rel: &str) -> AspResult<Option<FileRow>> {
         self.store.live_file_by_path(rel)
     }
 
-    /// Highest-OrderKey row id for a file_id (its deterministic local tip).
+    /// Highest-OrderKey row id for a file_id **within the checked-out branch's
+    /// visible rows** (§2.4) — the deterministic branch-scoped tip a new row chains
+    /// onto. On a single-branch vault this is the whole-log max (fast SQL path).
     fn tip(&self, file_id: &str) -> AspResult<Option<String>> {
+        if self.single_branch() {
+            return Ok(self
+                .store
+                .conn()
+                .query_row(
+                    "SELECT id FROM log WHERE file_id=?1 ORDER BY lamport DESC, site_id DESC, id DESC LIMIT 1",
+                    rusqlite::params![file_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok());
+        }
+        let bs = self.branch_set()?;
+        let vis = bs.visibility(&self.head_branch());
+        let key = |r: &LogRow| OrderKey { lamport: r.lamport, site_id: r.site_id.clone(), id: r.id.clone() };
         Ok(self
             .store
-            .conn()
-            .query_row(
-                "SELECT id FROM log WHERE file_id=?1 ORDER BY lamport DESC, site_id DESC, id DESC LIMIT 1",
-                rusqlite::params![file_id],
-                |r| r.get::<_, String>(0),
-            )
-            .ok())
+            .rows_for_file(file_id)?
+            .into_iter()
+            .filter(|r| vis.sees(r))
+            .max_by(|a, b| key(a).cmp(&key(b)))
+            .map(|r| r.id))
     }
 
     fn next_counters(&self) -> AspResult<(u64, u64)> {
@@ -257,6 +293,8 @@ impl Engine {
                     base_hash: cur.result_hash.clone(),
                     result_hash: Some(result_hash.clone()),
                     path: None,
+                    branch_id: self.head_branch(),
+                    merge_parent: None,
                     sig: vec![],
                 }
                 .seal()
@@ -276,6 +314,8 @@ impl Engine {
                     base_hash: None,
                     result_hash: Some(result_hash.clone()),
                     path: Some(rel.to_string()),
+                    branch_id: self.head_branch(),
+                    merge_parent: None,
                     sig: vec![],
                 }
                 .seal()
@@ -314,6 +354,8 @@ impl Engine {
             base_hash: cur.result_hash.clone(),
             result_hash: None,
             path: None,
+            branch_id: self.head_branch(),
+            merge_parent: None,
             sig: vec![],
         }
         .seal();
@@ -340,6 +382,8 @@ impl Engine {
             base_hash: cur.result_hash.clone(),
             result_hash: cur.result_hash.clone(),
             path: Some(new.to_string()),
+            branch_id: self.head_branch(),
+            merge_parent: None,
             sig: vec![],
         }
         .seal();
@@ -389,6 +433,11 @@ impl Engine {
         }
         let added = self.store.append_row(&wr.row)?;
         if added {
+            // A synced branch record (§7) updates the branch set before the fold, so
+            // a freshly-arrived branch's fork_vv is in scope when HEAD folds.
+            if wr.row.kind == Kind::Branch {
+                self.reconcile_branches()?;
+            }
             self.note_dirty(&wr.row.file_id);
             self.materialize()?;
             self.notify_change();
@@ -414,13 +463,18 @@ impl Engine {
         }
         let mut flags = Vec::with_capacity(wrs.len());
         let mut any = false;
+        let mut any_branch = false;
         for wr in wrs {
             let added = self.store.append_row(&wr.row)?;
             if added {
                 any = true;
+                any_branch |= wr.row.kind == Kind::Branch;
                 self.note_dirty(&wr.row.file_id);
             }
             flags.push(added);
+        }
+        if any_branch {
+            self.reconcile_branches()?;
         }
         if any {
             self.materialize()?;
@@ -491,16 +545,26 @@ impl Engine {
         // files, so a path-collision side effect (e.g. a delete promoting a
         // suffixed file) is handled even though only the deleted file was dirty —
         // the differential test pins this equal to a from-scratch fold.
+        // Fold is scoped to the checked-out branch's visible rows (§2.3). On a
+        // single-branch vault `visible(main)` is every row, so this is a no-op
+        // filter — byte-identical to the pre-branching fold. The incremental cache
+        // is per-checked-out-branch; `checkout` rebuilds it (clears `self.fold`).
+        let head = self.head_branch();
+        let bs = self.branch_set()?;
+        let vis = bs.visibility(&head);
         let files = {
             let mut fg = self.fold.borrow_mut();
             let dirty: Vec<String> = self.dirty.borrow_mut().drain().collect();
             match fg.as_mut() {
                 Some(fs) => {
-                    fs.refold_files(&self.store, &dirty, |fid| self.store.rows_for_file(fid))?;
+                    fs.refold_files(&self.store, &dirty, |fid| {
+                        Ok(self.store.rows_for_file(fid)?.into_iter().filter(|r| vis.sees(r)).collect())
+                    })?;
                     fs.files()
                 }
                 None => {
-                    let fs = crate::FoldState::from_rows(&self.store, &self.store.all_rows()?)?;
+                    let scoped: Vec<LogRow> = self.store.all_rows()?.into_iter().filter(|r| vis.sees(r)).collect();
+                    let fs = crate::FoldState::from_rows(&self.store, &scoped)?;
                     let f = fs.files();
                     *fg = Some(fs);
                     f
@@ -946,6 +1010,8 @@ impl Engine {
             base_hash: None,
             result_hash: None,
             path: Some(rel.to_string()),
+            branch_id: self.head_branch(),
+            merge_parent: None,
             sig: vec![],
         }
         .seal();
@@ -970,6 +1036,8 @@ impl Engine {
             base_hash: None,
             result_hash: None,
             path: None,
+            branch_id: self.head_branch(),
+            merge_parent: None,
             sig: vec![],
         }
         .seal();
@@ -1104,9 +1172,13 @@ impl Engine {
         self.apply_target(&desired)
     }
 
-    /// Materialized state at wall-clock T (best-effort): fold rows with ts ≤ T.
+    /// Materialized state at wall-clock T (best-effort): fold the checked-out
+    /// branch's visible rows with ts ≤ T (§4.6 — time-travel is branch-scoped, so a
+    /// scrub on a branch never mixes in sibling/parent-after-fork history).
     pub fn state_as_of(&self, t: i64) -> AspResult<BTreeMap<String, Vec<u8>>> {
-        let rows: Vec<LogRow> = self.store.all_rows()?.into_iter().filter(|r| r.ts <= t).collect();
+        let bs = self.branch_set()?;
+        let vis = bs.visibility(&self.head_branch());
+        let rows: Vec<LogRow> = self.store.all_rows()?.into_iter().filter(|r| vis.sees(r) && r.ts <= t).collect();
         let files = compute_files(&self.store, &rows)?;
         let mut m = BTreeMap::new();
         for f in files {
@@ -1127,7 +1199,9 @@ impl Engine {
     /// file's blob like `state_as_of`. On a large vault that is the difference
     /// between a snappy scrub and reading the whole vault on every tick.
     pub fn file_at(&self, path: &str, t: i64) -> AspResult<Option<Vec<u8>>> {
-        let rows: Vec<LogRow> = self.store.all_rows()?.into_iter().filter(|r| r.ts <= t).collect();
+        let bs = self.branch_set()?;
+        let vis = bs.visibility(&self.head_branch());
+        let rows: Vec<LogRow> = self.store.all_rows()?.into_iter().filter(|r| vis.sees(r) && r.ts <= t).collect();
         let files = compute_files(&self.store, &rows)?;
         for f in files {
             if !f.deleted && f.path == path {
@@ -1165,6 +1239,225 @@ impl Engine {
             }
         }
         Ok(authored)
+    }
+
+    // ---------------- branch ops (§4.2) ----------------
+
+    /// All live branches, `main` first — the switcher/list source.
+    pub fn branches(&self) -> AspResult<Vec<Branch>> {
+        let mut out = vec![Branch::main()];
+        for b in self.store.branches()? {
+            if !b.deleted {
+                out.push(b);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The checked-out branch id.
+    pub fn current_branch(&self) -> String {
+        self.head_branch()
+    }
+
+    /// The latest `Kind::Branch` record row for `branch_id`, as a wire row — for a
+    /// live driver to push after a fork (where the create path doesn't hand back
+    /// the row directly). None if the branch has no record.
+    pub fn branch_record_wire(&self, branch_id: &str) -> Option<WireRow> {
+        let rows = self.store.rows_for_file(branch_id).ok()?;
+        let key = |r: &LogRow| OrderKey { lamport: r.lamport, site_id: r.site_id.clone(), id: r.id.clone() };
+        let latest = rows.into_iter().filter(|r| r.kind == Kind::Branch).max_by(|a, b| key(a).cmp(&key(b)))?;
+        self.wire(latest).ok()
+    }
+
+    /// The GitHub-network-style branch/commit DAG (§4.5) — lanes per branch + a
+    /// coarsened commit graph, bounded to `cap` commits per lane.
+    pub fn graph(&self, cap: usize) -> AspResult<crate::branch::Graph> {
+        let rows = self.store.all_rows()?;
+        let live: Vec<Branch> = self.store.branches()?.into_iter().filter(|b| !b.deleted).collect();
+        Ok(crate::branch::build_graph(&rows, &live, &self.head_branch(), cap))
+    }
+
+    /// The version vector visible on `branch` right now — the fork point a child
+    /// captures when forking "from here" (§2.1).
+    pub fn visible_version_vector(&self, branch: &str) -> AspResult<crate::branch::VersionVector> {
+        let bs = self.branch_set()?;
+        let vis = bs.visibility(branch);
+        let rows: Vec<LogRow> = self.store.all_rows()?.into_iter().filter(|r| vis.sees(r)).collect();
+        Ok(version_vector_of(&rows))
+    }
+
+    /// Create a branch off HEAD at the current point and return its id (the CLI's
+    /// `branch create`). Does not switch HEAD.
+    pub fn create_branch_here(&self, name: &str) -> AspResult<String> {
+        Ok(self.create_branch_here_wire(name)?.0)
+    }
+
+    /// Like [`create_branch_here`] but also returns the authored branch-record wire
+    /// row, so a live driver (desktop) can push it to peers immediately.
+    pub fn create_branch_here_wire(&self, name: &str) -> AspResult<(String, WireRow)> {
+        crate::branch::validate_branch_name(name)?;
+        let head = self.head_branch();
+        let fork_vv = self.visible_version_vector(&head)?;
+        let created_lamport = self.store.next_lamport(0)?;
+        let created_ts = now_unix() as i64;
+        let branch_id = Branch::derive_id(name, &head, &fork_vv, created_lamport, &self.site_id());
+        let b = Branch {
+            branch_id: branch_id.clone(),
+            name: name.to_string(),
+            parent: Some(head),
+            fork_vv,
+            created_lamport,
+            created_ts,
+            deleted: false,
+        };
+        let wr = self.author_branch_record(&b)?;
+        Ok((branch_id, wr))
+    }
+
+    /// Create a branch off `parent` capturing `fork_vv` (the parent's version
+    /// vector at the fork). Returns the new content-hashed branch id. Does **not**
+    /// switch HEAD. The record is authored as a synced `Kind::Branch` row (§7), so
+    /// the branch propagates to every peer — not just the device that made it.
+    pub fn create_branch(&self, name: &str, parent: &str, fork_vv: crate::branch::VersionVector) -> AspResult<String> {
+        crate::branch::validate_branch_name(name)?;
+        if self.branch_set()?.get(parent).is_none() {
+            return Err(AspError::NotFound(format!("no such parent branch: {parent}")));
+        }
+        let created_lamport = self.store.next_lamport(0)?;
+        let created_ts = now_unix() as i64;
+        let branch_id = Branch::derive_id(name, parent, &fork_vv, created_lamport, &self.site_id());
+        let b = Branch {
+            branch_id: branch_id.clone(),
+            name: name.to_string(),
+            parent: Some(parent.to_string()),
+            fork_vv,
+            created_lamport,
+            created_ts,
+            deleted: false,
+        };
+        self.author_branch_record(&b)?;
+        Ok(branch_id)
+    }
+
+    /// Author a synced branch record (§7): a `Kind::Branch` row whose result blob
+    /// is the JSON-encoded `Branch`, keyed by `file_id = branch_id` so create →
+    /// rename → delete (and concurrent variants) converge last-writer-wins. Returns
+    /// the wire row so a live driver can push it immediately; either way the record
+    /// also ships via ordinary version-vector catch-up.
+    pub fn author_branch_record(&self, b: &Branch) -> AspResult<WireRow> {
+        let blob = crate::branch::encode_branch_record(b);
+        let result_hash = self.store.put_blob(&blob)?;
+        let (lamport, seq) = self.next_counters()?;
+        let row = LogRow {
+            id: String::new(),
+            site_id: self.site_id(),
+            lamport,
+            seq,
+            ts: now_unix() as i64,
+            file_id: b.branch_id.clone(),
+            kind: Kind::Branch,
+            merge_class: MergeClass::Text,
+            parent: None,
+            base_hash: None,
+            result_hash: Some(result_hash),
+            path: Some(b.name.clone()),
+            branch_id: MAIN_BRANCH_ID.to_string(),
+            merge_parent: None,
+            sig: vec![],
+        }
+        .seal();
+        self.store.append_row(&row)?;
+        self.reconcile_branches()?;
+        self.wire(row)
+    }
+
+    /// Rebuild the local `branches` table from the synced `Kind::Branch` records
+    /// (LWW). Idempotent; run after authoring or integrating a branch record so a
+    /// peer holds the same branch set as everyone else.
+    fn reconcile_branches(&self) -> AspResult<()> {
+        let rows = self.store.branch_rows()?;
+        for b in crate::branch::reconcile_branches(&rows, |h| self.store.get_blob(h).ok().flatten()) {
+            self.store.put_branch(&b)?;
+        }
+        Ok(())
+    }
+
+    /// Switch HEAD to `branch_id` and re-materialize its scoped state to disk +
+    /// `files` table (§3.3). The one expensive user action (full re-materialize):
+    /// the fold cache is per-branch, so it is rebuilt from `visible(new HEAD)`.
+    pub fn checkout(&self, branch_id: &str) -> AspResult<()> {
+        if self.store.branch(branch_id)?.is_none() {
+            return Err(AspError::NotFound(format!("no such branch: {branch_id}")));
+        }
+        self.store.set_head(branch_id)?;
+        *self.fold.borrow_mut() = None; // rebuild the scoped cache for the new HEAD
+        self.dirty.borrow_mut().clear();
+        self.materialize()?;
+        Ok(())
+    }
+
+    /// Edit-in-the-past ⇒ branch (§2.5): fork the current branch at wall-clock `t`
+    /// (`fork_vv` = version vector of HEAD's rows with `ts ≤ t`), switch HEAD to the
+    /// new branch, and re-materialize the historical state. A subsequent
+    /// `record_write` then authors on the new branch, chaining on the historical
+    /// tip — main is left untouched. Returns the new branch id.
+    pub fn fork_from_time(&self, name: &str, t: i64) -> AspResult<String> {
+        let head = self.head_branch();
+        let bs = self.branch_set()?;
+        let vis = bs.visibility(&head);
+        let rows: Vec<LogRow> =
+            self.store.all_rows()?.into_iter().filter(|r| vis.sees(r) && r.ts <= t).collect();
+        let fork_vv = version_vector_of(&rows);
+        let id = self.create_branch(name, &head, fork_vv)?;
+        self.checkout(&id)?;
+        Ok(id)
+    }
+
+    /// Soft-delete a branch (§4.2): its rows remain for sync/history. The root
+    /// `main` cannot be deleted; deleting the checked-out branch auto-checks-out its
+    /// parent (or `main`).
+    /// Soft-delete a branch (§4.2). Returns the authored tombstone wire row so a
+    /// live driver can push it to peers immediately (it also converges via
+    /// catch-up). Root `main` cannot be deleted; deleting HEAD auto-checks-out the
+    /// parent.
+    pub fn delete_branch(&self, branch_id: &str) -> AspResult<WireRow> {
+        if branch_id == MAIN_BRANCH_ID {
+            return Err(AspError::Invalid("cannot delete the main branch".into()));
+        }
+        let Some(mut b) = self.store.branch(branch_id)? else {
+            return Err(AspError::NotFound(format!("no such branch: {branch_id}")));
+        };
+        if self.head_branch() == branch_id {
+            // Land on the nearest *live* ancestor — never another tombstone, which
+            // would strand HEAD on a branch absent from the switcher.
+            let target = self.nearest_live_ancestor(&b)?;
+            self.checkout(&target)?;
+        }
+        b.deleted = true;
+        // Author a synced deletion record so the tombstone converges everywhere.
+        self.author_branch_record(&b)
+    }
+
+    /// The nearest ancestor of `start` that is still live (not tombstoned),
+    /// defaulting to `main`. Walks the parent chain; cycle- and dangling-safe.
+    fn nearest_live_ancestor(&self, start: &Branch) -> AspResult<String> {
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(start.branch_id.clone());
+        let mut cur = start.parent.clone();
+        while let Some(id) = cur {
+            if !seen.insert(id.clone()) {
+                break; // cycle
+            }
+            if id == MAIN_BRANCH_ID {
+                return Ok(id); // main is always live
+            }
+            match self.store.branch(&id)? {
+                Some(p) if !p.deleted => return Ok(p.branch_id),
+                Some(p) => cur = p.parent.clone(),
+                None => break, // dangling parent
+            }
+        }
+        Ok(MAIN_BRANCH_ID.to_string())
     }
 
     // ---------------- admission (§Security) ----------------
@@ -1302,6 +1595,226 @@ mod tests {
         assert!(db.path().join("g.md").exists());
         assert_eq!(fs::read(da.path().join("g.md")).unwrap(), b"line1\nline2\nline3\n");
         assert!(!db.path().join("f.md").exists());
+    }
+
+    #[test]
+    fn edit_in_past_forks_a_branch_and_isolates_from_main() {
+        // §2.5 + §2.2 isolation: fork the current state onto a new branch, edit on
+        // it, and main must be untouched; switching back and forth shows each
+        // branch's own state.
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        e.record_write("a.md", b"main-v1\n").unwrap().unwrap();
+        assert_eq!(e.current_branch(), MAIN_BRANCH_ID);
+
+        // Fork capturing everything up to now (t = MAX → fork_vv = full main vv).
+        let b = e.fork_from_time("feature", i64::MAX).unwrap();
+        assert_eq!(e.current_branch(), b, "HEAD followed the new branch");
+        assert_eq!(fs::read(d.path().join("a.md")).unwrap(), b"main-v1\n", "branch starts from the forked state");
+
+        // Edit on the branch + add a branch-only file.
+        e.record_write("a.md", b"branch-v2\n").unwrap().unwrap();
+        e.record_write("only-on-branch.md", b"x\n").unwrap().unwrap();
+        assert_eq!(fs::read(d.path().join("a.md")).unwrap(), b"branch-v2\n");
+
+        // Back to main: original content, and the branch-only file is gone.
+        e.checkout(MAIN_BRANCH_ID).unwrap();
+        assert_eq!(fs::read(d.path().join("a.md")).unwrap(), b"main-v1\n", "main is isolated from branch edits");
+        assert!(!d.path().join("only-on-branch.md").exists(), "branch-only file not visible on main");
+
+        // Back to the branch: its edits are intact.
+        e.checkout(&b).unwrap();
+        assert_eq!(fs::read(d.path().join("a.md")).unwrap(), b"branch-v2\n");
+        assert!(d.path().join("only-on-branch.md").exists());
+    }
+
+    #[test]
+    fn time_travel_is_branch_scoped() {
+        // §4.6 regression: state_as_of / file_at must fold only the checked-out
+        // branch's visible rows. With a divergent post-fork edit on main, a scrub
+        // on the branch must show the BRANCH's content — not a merge of the two.
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        e.record_write("a.md", b"m1\n").unwrap().unwrap();
+        let b = e.fork_from_time("feature", i64::MAX).unwrap();
+        e.record_write("a.md", b"b2\n").unwrap().unwrap(); // edit on the branch
+        e.checkout(MAIN_BRANCH_ID).unwrap();
+        e.record_write("a.md", b"m2\n").unwrap().unwrap(); // divergent edit on main
+
+        // On main, the slider sees main's line.
+        assert_eq!(e.file_at("a.md", i64::MAX).unwrap().as_deref(), Some(&b"m2\n"[..]));
+        // On the branch, it sees ONLY the branch's line — main's post-fork edit is
+        // invisible (pre-fix this folded both → a 3-way merge, not "b2").
+        e.checkout(&b).unwrap();
+        assert_eq!(e.file_at("a.md", i64::MAX).unwrap().as_deref(), Some(&b"b2\n"[..]));
+        let st = e.state_as_of(i64::MAX).unwrap();
+        assert_eq!(st.get("a.md").map(|v| v.as_slice()), Some(&b"b2\n"[..]));
+    }
+
+    #[test]
+    fn delete_branch_rules() {
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        e.record_write("a.md", b"v1\n").unwrap().unwrap();
+        let b = e.fork_from_time("feature", i64::MAX).unwrap();
+        assert_eq!(e.current_branch(), b);
+        // Deleting the checked-out branch auto-checks-out main.
+        e.delete_branch(&b).unwrap();
+        assert_eq!(e.current_branch(), MAIN_BRANCH_ID);
+        assert!(e.branches().unwrap().iter().all(|x| x.branch_id != b), "deleted branch dropped from the live list");
+        // main can never be deleted.
+        assert!(e.delete_branch(MAIN_BRANCH_ID).is_err());
+        // Checking out a non-existent branch errors.
+        assert!(e.checkout("nope").is_err());
+    }
+
+    #[test]
+    fn delete_head_lands_on_nearest_live_ancestor_not_a_tombstone() {
+        // main <- a <- b, checked out on b. Delete a (not HEAD), then delete b
+        // (HEAD): HEAD must skip the tombstoned parent a and land on a LIVE branch
+        // (main). Landing on deleted a would strand the user on a branch absent
+        // from the switcher.
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        e.record_write("f.md", b"m\n").unwrap().unwrap();
+        let a = e.fork_from_time("a", i64::MAX).unwrap(); // forks main, checks out a
+        assert_eq!(e.current_branch(), a);
+        let b = e.fork_from_time("b", i64::MAX).unwrap(); // forks a, checks out b
+        assert_eq!(e.current_branch(), b);
+        // Delete the mid branch while sitting on b (a is not HEAD → HEAD unmoved).
+        e.delete_branch(&a).unwrap();
+        assert_eq!(e.current_branch(), b, "deleting a non-HEAD branch must not move HEAD");
+        // Delete HEAD: must skip tombstoned parent a and land on main.
+        e.delete_branch(&b).unwrap();
+        assert_eq!(e.current_branch(), MAIN_BRANCH_ID, "must not be stranded on the deleted ancestor a");
+    }
+
+    #[test]
+    fn create_branch_validates_name_and_parent() {
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        e.record_write("a.md", b"v1\n").unwrap().unwrap();
+        let head = e.head_branch();
+        let vv = crate::branch::version_vector_of(&e.store.all_rows().unwrap());
+        // Empty / whitespace-only names are rejected (would be unaddressable by name).
+        assert!(e.create_branch_here("").is_err(), "empty name rejected");
+        assert!(e.create_branch_here("   ").is_err(), "whitespace-only name rejected");
+        assert!(e.create_branch("", &head, vv.clone()).is_err());
+        // Forking off a non-existent parent is rejected (no orphan branch).
+        assert!(e.create_branch("x", "no-such-parent", vv.clone()).is_err(), "unknown parent rejected");
+        // A valid create still works, and the count reflects exactly one new branch.
+        assert!(e.create_branch("ok", &head, vv).is_ok());
+        assert_eq!(e.branches().unwrap().len(), 2, "only the valid branch was created");
+    }
+
+    #[test]
+    fn create_branch_checkout_and_scoped_tip() {
+        // create_branch (explicit fork_vv) + checkout + authoring on a non-main
+        // branch exercises the branch-scoped tip path and isolation.
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        e.record_write("a.md", b"m1\n").unwrap().unwrap();
+        let head = e.head_branch();
+        let vv = crate::branch::version_vector_of(&e.store.all_rows().unwrap());
+        let bid = e.create_branch("topic", &head, vv).unwrap();
+        assert_ne!(bid, MAIN_BRANCH_ID);
+        assert_eq!(e.branches().unwrap().len(), 2, "main + topic");
+        e.checkout(&bid).unwrap();
+        assert_eq!(e.current_branch(), bid);
+        // Two edits on the branch chain through the branch-scoped tip.
+        e.record_write("a.md", b"m1\nb2\n").unwrap().unwrap();
+        e.record_write("a.md", b"m1\nb2\nb3\n").unwrap().unwrap();
+        assert_eq!(fs::read(d.path().join("a.md")).unwrap(), b"m1\nb2\nb3\n");
+        e.checkout(MAIN_BRANCH_ID).unwrap();
+        assert_eq!(fs::read(d.path().join("a.md")).unwrap(), b"m1\n", "main untouched by branch edits");
+        // Deleting a non-existent branch is an error (not a panic).
+        assert!(e.delete_branch("does-not-exist").is_err());
+    }
+
+    #[test]
+    fn branches_sync_to_peers_not_just_the_checked_out_one() {
+        // The user's requirement: every branch syncs, not only HEAD. A forks a
+        // branch, edits on it, then edits main; B catches up ALL of A's rows and
+        // must (1) learn the branch record, (2) hold main's state, and (3) be able
+        // to check out the branch and see its isolated state.
+        let da = tempdir().unwrap();
+        let db = tempdir().unwrap();
+        let a = eng(da.path(), 1);
+        let b = eng(db.path(), 2);
+
+        a.record_write("a.md", b"m1\n").unwrap().unwrap();
+        let bid = a.fork_from_time("feature", i64::MAX).unwrap();
+        a.record_write("a.md", b"branch2\n").unwrap().unwrap();
+        a.record_write("feat-only.md", b"x\n").unwrap().unwrap();
+        a.checkout(MAIN_BRANCH_ID).unwrap();
+        a.record_write("a.md", b"m2\n").unwrap().unwrap(); // divergent edit on main
+
+        // Full catch-up: ship every one of A's rows (content + branch records) to B.
+        let all: Vec<WireRow> = a.store.all_rows().unwrap().into_iter().map(|r| a.wire(r).unwrap()).collect();
+        b.integrate_many(&all).unwrap();
+
+        // B is on main and converges to main's state.
+        assert_eq!(fs::read(db.path().join("a.md")).unwrap(), b"m2\n");
+        assert!(!db.path().join("feat-only.md").exists(), "branch-only file not on main");
+
+        // B learned the branch record purely from sync.
+        assert!(
+            b.branches().unwrap().iter().any(|x| x.branch_id == bid && x.name == "feature" && !x.deleted),
+            "the feature branch synced to B"
+        );
+
+        // B can check out the synced branch and see its isolated state.
+        b.checkout(&bid).unwrap();
+        assert_eq!(fs::read(db.path().join("a.md")).unwrap(), b"branch2\n", "branch state on B");
+        assert!(db.path().join("feat-only.md").exists());
+
+        // A delete on A also converges (tombstone syncs).
+        a.delete_branch(&bid).unwrap();
+        let more: Vec<WireRow> = a.store.all_rows().unwrap().into_iter().map(|r| a.wire(r).unwrap()).collect();
+        // B is currently on the branch being deleted on A; integrate the tombstone.
+        b.checkout(MAIN_BRANCH_ID).unwrap();
+        b.integrate_many(&more).unwrap();
+        assert!(b.branches().unwrap().iter().all(|x| x.branch_id != bid), "branch deletion synced to B");
+    }
+
+    #[test]
+    fn branch_records_sync_native_to_wasm_memengine() {
+        // Cross-surface: a native (CLI/desktop) node's branches must converge on a
+        // wasm (web/Obsidian) MemEngine node — same branch set, same per-branch
+        // scoped state — purely from the synced rows.
+        use crate::memengine::MemEngine;
+        let da = tempdir().unwrap();
+        let a = eng(da.path(), 1);
+        a.record_write("a.md", b"m1\n").unwrap().unwrap();
+        let bid = a.fork_from_time("feature", i64::MAX).unwrap();
+        a.record_write("a.md", b"branch2\n").unwrap().unwrap();
+        a.checkout(MAIN_BRANCH_ID).unwrap();
+        a.record_write("a.md", b"m2\n").unwrap().unwrap();
+
+        let mem = MemEngine::create(Identity::from_seed(&[5; 32]), "v");
+        let all: Vec<WireRow> = a.store.all_rows().unwrap().into_iter().map(|r| a.wire(r).unwrap()).collect();
+        mem.integrate_many(&all).unwrap();
+
+        // wasm node converged main and learned the branch from sync alone.
+        assert_eq!(mem.read_file("a.md").unwrap().as_deref(), Some(&b"m2\n"[..]));
+        assert!(mem.branches().iter().any(|x| x.branch_id == bid && x.name == "feature"));
+        // and can check it out to its isolated state.
+        mem.checkout(&bid).unwrap();
+        assert_eq!(mem.read_file("a.md").unwrap().as_deref(), Some(&b"branch2\n"[..]));
+    }
+
+    #[test]
+    fn single_branch_vault_is_byte_identical_back_compat() {
+        // §2.2 back-compat: with no branch ever created, HEAD=main and every row is
+        // visible, so the materialized tree matches a plain whole-log fold.
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        e.record_write("a.md", b"hello\n").unwrap().unwrap();
+        e.record_write("dir/b.md", b"world\n").unwrap().unwrap();
+        let scoped = e.store.live_files().unwrap();
+        let full = compute_files(&e.store, &e.store.all_rows().unwrap()).unwrap();
+        let live: Vec<_> = full.into_iter().filter(|f| !f.deleted).collect();
+        assert_eq!(scoped.len(), live.len());
     }
 
     #[test]

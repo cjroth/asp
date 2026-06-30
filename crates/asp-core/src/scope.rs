@@ -138,13 +138,30 @@ impl Pattern {
 fn glob_match(pat: &str, text: &str) -> bool {
     let p: Vec<char> = pat.chars().collect();
     let t: Vec<char> = text.chars().collect();
-    gm(&p, 0, &t, 0)
+    // Memoize states already proven non-matching. Without this, a pattern with
+    // several `*` against a long near-matching text (e.g. `*a*a*a*…*b` vs
+    // `aaaa…`) backtracks exponentially — a CPU DoS reachable through a hostile
+    // `.aspignore` synced from a peer. Memoizing failed (pi, ti) states bounds the
+    // matcher to O(|pat| · |text|) while preserving exact semantics.
+    let mut failed: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    gm(&p, 0, &t, 0, &mut failed)
 }
 
-fn gm(p: &[char], pi: usize, t: &[char], ti: usize) -> bool {
+fn gm(p: &[char], pi: usize, t: &[char], ti: usize, failed: &mut std::collections::HashSet<(usize, usize)>) -> bool {
     if pi == p.len() {
         return ti == t.len();
     }
+    if failed.contains(&(pi, ti)) {
+        return false;
+    }
+    let matched = gm_inner(p, pi, t, ti, failed);
+    if !matched {
+        failed.insert((pi, ti));
+    }
+    matched
+}
+
+fn gm_inner(p: &[char], pi: usize, t: &[char], ti: usize, failed: &mut std::collections::HashSet<(usize, usize)>) -> bool {
     if p[pi] == '*' {
         // `**` — any chars including '/'.
         if pi + 1 < p.len() && p[pi + 1] == '*' {
@@ -154,16 +171,16 @@ fn gm(p: &[char], pi: usize, t: &[char], ti: usize) -> bool {
             }
             // try consuming 0..=len chars
             for k in ti..=t.len() {
-                if gm(p, npi, t, k) {
+                if gm(p, npi, t, k, failed) {
                     return true;
                 }
             }
-            return gm(p, npi, t, ti);
+            return gm(p, npi, t, ti, failed);
         }
         // single `*` — any chars except '/'.
         let mut k = ti;
         loop {
-            if gm(p, pi + 1, t, k) {
+            if gm(p, pi + 1, t, k, failed) {
                 return true;
             }
             if k == t.len() || t[k] == '/' {
@@ -174,12 +191,12 @@ fn gm(p: &[char], pi: usize, t: &[char], ti: usize) -> bool {
     }
     if p[pi] == '?' {
         if ti < t.len() && t[ti] != '/' {
-            return gm(p, pi + 1, t, ti + 1);
+            return gm(p, pi + 1, t, ti + 1, failed);
         }
         return false;
     }
     if ti < t.len() && p[pi] == t[ti] {
-        return gm(p, pi + 1, t, ti + 1);
+        return gm(p, pi + 1, t, ti + 1, failed);
     }
     false
 }
@@ -244,5 +261,33 @@ mod tests {
         let s = Scope::parse("docs/**/tmp\n");
         assert!(s.ignored("docs/a/b/tmp"));
         assert!(s.ignored("docs/tmp"));
+    }
+
+    #[test]
+    fn pathological_glob_does_not_backtrack_exponentially() {
+        // A hostile `.aspignore` (synced from a peer) with many `*` against a long
+        // near-matching path used to blow up to O(2^n). The matcher is memoized to
+        // O(|pat|·|text|); this many-`*` pattern over a long non-matching text must
+        // resolve effectively instantly. Completion *is* the assertion — without the
+        // memo this test would hang. We also pin the (correct) negative result.
+        let pat = "*a".repeat(24); // 24 alternations of `*a`
+        let text = "a".repeat(200); // matches the a's but the pattern needs more → false
+        let s = Scope::parse(&format!("{pat}b\n"));
+        let start = std::time::Instant::now();
+        let hit = s.ignored(&text);
+        assert!(!hit, "pattern requires a trailing 'b' the text lacks");
+        assert!(start.elapsed().as_secs() < 2, "glob matcher backtracked (took {:?})", start.elapsed());
+    }
+
+    #[test]
+    fn memoized_matcher_preserves_semantics() {
+        // The memo only caches *failures*; matching behaviour is unchanged.
+        let s = Scope::parse("src/**/*.rs\n");
+        assert!(s.ignored("src/a/b/c.rs"));
+        assert!(s.ignored("src/x.rs"));
+        assert!(!s.ignored("src/x.md"));
+        let s2 = Scope::parse("a*b*c\n");
+        assert!(s2.ignored("axxbyyc"));
+        assert!(!s2.ignored("axxbyy"));
     }
 }

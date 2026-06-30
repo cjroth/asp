@@ -10,6 +10,7 @@
 //! construction and need no side counter.
 
 use crate::authkeys::AuthKey;
+use crate::branch::Branch;
 use crate::error::AspResult;
 use crate::log::{Kind, LogRow, MergeClass};
 use crate::store::{BlobStore, FileRow};
@@ -22,11 +23,27 @@ CREATE TABLE IF NOT EXISTS blobs(content_hash TEXT PRIMARY KEY, bytes BLOB NOT N
 CREATE TABLE IF NOT EXISTS log(
   id TEXT PRIMARY KEY, site_id TEXT NOT NULL, lamport INTEGER NOT NULL, seq INTEGER NOT NULL,
   ts INTEGER NOT NULL, file_id TEXT NOT NULL, kind TEXT NOT NULL, merge_class TEXT NOT NULL,
-  parent TEXT, base_hash TEXT, result_hash TEXT, path TEXT, sig BLOB,
+  parent TEXT, base_hash TEXT, result_hash TEXT, path TEXT,
+  branch_id TEXT NOT NULL DEFAULT 'main', merge_parent TEXT, sig BLOB,
   UNIQUE(site_id, seq)
 );
 CREATE INDEX IF NOT EXISTS log_file ON log(file_id);
 CREATE INDEX IF NOT EXISTS log_site ON log(site_id, seq);
+-- NOTE: the `log_branch` index on log(branch_id) is created in `migrate_branching`,
+-- NOT here. On a pre-branching DB the `log` table already exists (so the CREATE
+-- TABLE above is a no-op) and still lacks `branch_id`; indexing it before the
+-- migration's ALTER adds the column fails the whole batch with "no such column".
+-- Branch records (§2.1). `fork_vv` is JSON (site_id -> max seq at the fork).
+-- Synced as Kind::Branch rows in P4; for now node-local + replicated by checkout/
+-- merge broadcasts. `main` is implicit (BranchSet injects it) so the table may be
+-- empty on a single-branch vault — byte-identical to today.
+CREATE TABLE IF NOT EXISTS branches(
+  branch_id TEXT PRIMARY KEY, name TEXT NOT NULL, parent TEXT,
+  fork_vv TEXT NOT NULL DEFAULT '{}', created_lamport INTEGER NOT NULL DEFAULT 0,
+  created_ts INTEGER NOT NULL DEFAULT 0, deleted INTEGER NOT NULL DEFAULT 0
+);
+-- The checked-out branch (HEAD). Per-device, never synced (§7).
+CREATE TABLE IF NOT EXISTS head(singleton INTEGER PRIMARY KEY CHECK(singleton=0), branch_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS files(
   file_id TEXT PRIMARY KEY, path TEXT, result_hash TEXT, merge_class TEXT,
   deleted INTEGER NOT NULL DEFAULT 0, lamport INTEGER, site_id TEXT, conflict INTEGER NOT NULL DEFAULT 0
@@ -73,7 +90,38 @@ impl SqliteStore {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
         )?;
         conn.execute_batch(SCHEMA)?;
-        Ok(SqliteStore { conn })
+        let store = SqliteStore { conn };
+        store.migrate_branching()?;
+        Ok(store)
+    }
+
+    /// Idempotent migration to the branching schema (§9): add the `branch_id`/
+    /// `merge_parent` columns to a `log` table created before branching. New DBs
+    /// already have them (the `CREATE TABLE` above), so the `ALTER`s are guarded by
+    /// a column-existence check and skipped. Existing rows take the `'main'`
+    /// default, reading back byte-identical to today.
+    fn migrate_branching(&self) -> AspResult<()> {
+        let have: std::collections::HashSet<String> = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(log)")?;
+            let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            cols.collect::<Result<_, _>>()?
+        };
+        if !have.contains("branch_id") {
+            self.conn.execute_batch("ALTER TABLE log ADD COLUMN branch_id TEXT NOT NULL DEFAULT 'main'")?;
+        }
+        if !have.contains("merge_parent") {
+            self.conn.execute_batch("ALTER TABLE log ADD COLUMN merge_parent TEXT")?;
+        }
+        // Index on branch_id — created here (not in SCHEMA) so it runs only once the
+        // column is guaranteed to exist, on both fresh and migrated DBs. Idempotent.
+        self.conn.execute_batch("CREATE INDEX IF NOT EXISTS log_branch ON log(branch_id)")?;
+        // Partial index over just the (few) `Kind::Branch` records, so
+        // `branch_rows()`'s `WHERE kind='branch'` — re-run on every branch authoring
+        // and remote integration by `reconcile_branches` — is a tiny index probe
+        // instead of a full `log` scan. `kind` predates branching, so this is safe
+        // on pre-branching DBs too. Idempotent.
+        self.conn.execute_batch("CREATE INDEX IF NOT EXISTS log_kind_branch ON log(kind) WHERE kind='branch'")?;
+        Ok(())
     }
 
     pub fn conn(&self) -> &Connection {
@@ -85,12 +133,13 @@ impl SqliteStore {
     /// Append a row idempotently (dedup by Merkle id). Returns true if newly added.
     pub fn append_row(&self, row: &LogRow) -> AspResult<bool> {
         let n = self.conn.execute(
-            "INSERT OR IGNORE INTO log(id, site_id, lamport, seq, ts, file_id, kind, merge_class, parent, base_hash, result_hash, path, sig)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            "INSERT OR IGNORE INTO log(id, site_id, lamport, seq, ts, file_id, kind, merge_class, parent, base_hash, result_hash, path, branch_id, merge_parent, sig)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             params![
                 row.id, row.site_id, row.lamport, row.seq, row.ts, row.file_id,
                 row.kind.as_str(), row.merge_class.as_str(), row.parent, row.base_hash,
-                row.result_hash, row.path, if row.sig.is_empty() { None } else { Some(&row.sig) }
+                row.result_hash, row.path, row.branch_id, row.merge_parent,
+                if row.sig.is_empty() { None } else { Some(&row.sig) }
             ],
         )?;
         Ok(n > 0)
@@ -119,6 +168,8 @@ impl SqliteStore {
             base_hash: r.get("base_hash")?,
             result_hash: r.get("result_hash")?,
             path: r.get("path")?,
+            branch_id: r.get("branch_id")?,
+            merge_parent: r.get("merge_parent")?,
             sig: sig.unwrap_or_default(),
         })
     }
@@ -127,6 +178,15 @@ impl SqliteStore {
         let mut stmt = self.conn.prepare(
             "SELECT * FROM log ORDER BY lamport, site_id, id",
         )?;
+        let rows = stmt.query_map([], Self::row_from)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Every `Kind::Branch` record row (§7) — the synced branch metadata, which
+    /// `reconcile_branches` folds (LWW) into the branch set. Cheap: branch records
+    /// are few relative to content rows.
+    pub fn branch_rows(&self) -> AspResult<Vec<LogRow>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM log WHERE kind='branch'")?;
         let rows = stmt.query_map([], Self::row_from)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -486,6 +546,77 @@ impl SqliteStore {
             .optional()?)
     }
 
+    // ----- branches / head (§2, §3.2) -----
+
+    /// All branch records (excludes the implicit `main`, which the [`BranchSet`]
+    /// injects). Soft-deleted branches are included — their rows still exist for
+    /// sync/history; callers filter on `deleted` for the live set.
+    pub fn branches(&self) -> AspResult<Vec<Branch>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT branch_id, name, parent, fork_vv, created_lamport, created_ts, deleted FROM branches ORDER BY created_lamport, branch_id",
+        )?;
+        let rows = stmt.query_map([], Self::branch_from)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn branch_from(r: &rusqlite::Row) -> rusqlite::Result<Branch> {
+        let fork_vv: String = r.get("fork_vv")?;
+        Ok(Branch {
+            branch_id: r.get("branch_id")?,
+            name: r.get("name")?,
+            parent: r.get("parent")?,
+            fork_vv: serde_json::from_str(&fork_vv).unwrap_or_default(),
+            created_lamport: r.get::<_, i64>("created_lamport")? as u64,
+            created_ts: r.get("created_ts")?,
+            deleted: r.get::<_, i64>("deleted")? != 0,
+        })
+    }
+
+    /// Upsert a branch record (last-writer-wins on name/deleted is resolved by the
+    /// caller in P4; here it just persists the latest known state).
+    pub fn put_branch(&self, b: &Branch) -> AspResult<()> {
+        let fork_vv = serde_json::to_string(&b.fork_vv).unwrap_or_else(|_| "{}".into());
+        self.conn.execute(
+            "INSERT INTO branches(branch_id, name, parent, fork_vv, created_lamport, created_ts, deleted)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(branch_id) DO UPDATE SET name=?2, parent=?3, fork_vv=?4, created_lamport=?5, created_ts=?6, deleted=?7",
+            params![b.branch_id, b.name, b.parent, fork_vv, b.created_lamport as i64, b.created_ts, b.deleted as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn branch(&self, id: &str) -> AspResult<Option<Branch>> {
+        if id == crate::log::MAIN_BRANCH_ID {
+            return Ok(Some(Branch::main()));
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT branch_id, name, parent, fork_vv, created_lamport, created_ts, deleted FROM branches WHERE branch_id=?1",
+                params![id],
+                Self::branch_from,
+            )
+            .optional()?)
+    }
+
+    /// The checked-out branch (HEAD). Defaults to `main` when unset (a fresh or
+    /// pre-branching vault), so a single-branch vault folds `main` exactly as today.
+    pub fn head(&self) -> AspResult<String> {
+        Ok(self
+            .conn
+            .query_row("SELECT branch_id FROM head WHERE singleton=0", [], |r| r.get::<_, String>(0))
+            .optional()?
+            .unwrap_or_else(|| crate::log::MAIN_BRANCH_ID.to_string()))
+    }
+
+    pub fn set_head(&self, branch_id: &str) -> AspResult<()> {
+        self.conn.execute(
+            "INSERT INTO head(singleton, branch_id) VALUES(0, ?1) ON CONFLICT(singleton) DO UPDATE SET branch_id=?1",
+            params![branch_id],
+        )?;
+        Ok(())
+    }
+
     // ----- config -----
 
     pub fn set_config(&self, key: &str, value: &str) -> AspResult<()> {
@@ -689,6 +820,43 @@ mod tests {
     }
 
     #[test]
+    fn branches_and_head_roundtrip() {
+        let s = SqliteStore::open_memory().unwrap();
+        // Fresh vault: no records, HEAD defaults to main.
+        assert!(s.branches().unwrap().is_empty());
+        assert_eq!(s.head().unwrap(), crate::log::MAIN_BRANCH_ID);
+        assert_eq!(s.branch(crate::log::MAIN_BRANCH_ID).unwrap().unwrap().name, "main");
+        assert!(s.branch("ghost").unwrap().is_none());
+
+        let mut b = Branch {
+            branch_id: "b1".into(),
+            name: "feature".into(),
+            parent: Some(crate::log::MAIN_BRANCH_ID.into()),
+            fork_vv: [("aa".to_string(), 3i64)].into_iter().collect(),
+            created_lamport: 7,
+            created_ts: 11,
+            deleted: false,
+        };
+        s.put_branch(&b).unwrap();
+        let got = s.branch("b1").unwrap().unwrap();
+        assert_eq!(got, b, "branch record round-trips incl. fork_vv JSON");
+        assert_eq!(s.branches().unwrap().len(), 1);
+
+        // Upsert (rename + soft-delete) is reflected.
+        b.name = "renamed".into();
+        b.deleted = true;
+        s.put_branch(&b).unwrap();
+        assert_eq!(s.branch("b1").unwrap().unwrap().name, "renamed");
+        assert!(s.branch("b1").unwrap().unwrap().deleted);
+
+        // HEAD set/get.
+        s.set_head("b1").unwrap();
+        assert_eq!(s.head().unwrap(), "b1");
+        s.set_head(crate::log::MAIN_BRANCH_ID).unwrap();
+        assert_eq!(s.head().unwrap(), crate::log::MAIN_BRANCH_ID);
+    }
+
+    #[test]
     fn embeddings_api_roundtrip_and_model_versioned() {
         // §Embeddings: v1 ships the *substrate* (table + API), never populated by
         // the engine. The storage shape is content-addressed and model-versioned
@@ -704,5 +872,77 @@ mod tests {
         s.put_embedding(&ch, "m1", &[5, 6]).unwrap();
         assert_eq!(s.get_embedding(&ch, "m1").unwrap().as_deref(), Some(&[5, 6][..]));
         assert_eq!(s.row_count().unwrap(), 0, "embeddings never write the log");
+    }
+
+    // Regression: opening a vault created *before* branching must not fail. The
+    // pre-branching `log` table has no `branch_id` column; the `log_branch` index
+    // must therefore be created only after `migrate_branching` ALTERs the column in,
+    // not eagerly in SCHEMA (which would fail the whole batch with "no such column:
+    // branch_id" and abort the open — the bug behind "create vault failed").
+    #[test]
+    fn opens_pre_branching_db_and_migrates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asp.db");
+
+        // Author a pre-branching DB: just the old `log` table (no branch_id /
+        // merge_parent, no log_branch index) with one row, exactly as an older
+        // build would have left it on disk.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE log(
+                   id TEXT PRIMARY KEY, site_id TEXT NOT NULL, lamport INTEGER NOT NULL, seq INTEGER NOT NULL,
+                   ts INTEGER NOT NULL, file_id TEXT NOT NULL, kind TEXT NOT NULL, merge_class TEXT NOT NULL,
+                   parent TEXT, base_hash TEXT, result_hash TEXT, path TEXT, sig BLOB,
+                   UNIQUE(site_id, seq)
+                 );
+                 INSERT INTO log(id, site_id, lamport, seq, ts, file_id, kind, merge_class)
+                 VALUES('r1','aa',1,0,0,'f1','create','text');",
+            )
+            .unwrap();
+        }
+
+        // Opening must succeed (previously errored before the migration could run).
+        let s = SqliteStore::open(&path).unwrap();
+
+        // The column was added and the index now exists.
+        let have: std::collections::HashSet<String> = {
+            let mut stmt = s.conn.prepare("PRAGMA table_info(log)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1)).unwrap().collect::<Result<_, _>>().unwrap()
+        };
+        assert!(have.contains("branch_id") && have.contains("merge_parent"));
+        let has_index: bool = s
+            .conn
+            .query_row("SELECT 1 FROM sqlite_master WHERE type='index' AND name='log_branch'", [], |_| Ok(()))
+            .optional()
+            .unwrap()
+            .is_some();
+        assert!(has_index, "log_branch index created after the migration");
+
+        // The pre-existing row reads back on the implicit `main` branch, and a
+        // re-open is idempotent (no error from re-running the migration/index).
+        assert_eq!(s.head().unwrap(), crate::log::MAIN_BRANCH_ID);
+        let branch: String = s.conn.query_row("SELECT branch_id FROM log WHERE id='r1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(branch, "main");
+        drop(s);
+        SqliteStore::open(&path).unwrap(); // idempotent second open
+    }
+
+    #[test]
+    fn branch_rows_query_uses_the_partial_index_not_a_full_scan() {
+        // reconcile_branches runs branch_rows() on every branch authoring and remote
+        // integration; without the partial index it is an O(log) full table scan.
+        // Assert the planner uses the index so a large content log can't make every
+        // reconcile O(N).
+        let s = SqliteStore::open_memory().unwrap();
+        let plan: String = s
+            .conn
+            .query_row("EXPLAIN QUERY PLAN SELECT * FROM log WHERE kind='branch'", [], |r| r.get::<_, String>(3))
+            .unwrap();
+        assert!(
+            plan.contains("log_kind_branch"),
+            "branch_rows must hit the partial index, got plan: {plan}"
+        );
+        assert!(!plan.contains("SCAN log"), "branch_rows must not full-scan the log, got: {plan}");
     }
 }

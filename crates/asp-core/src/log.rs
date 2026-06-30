@@ -10,6 +10,11 @@
 use crate::oid::merkle_id;
 use serde::{Deserialize, Serialize};
 
+/// The stable id of the root branch every vault starts on. A fixed sentinel (not a
+/// content hash) so a pre-branching vault — whose rows carry no `branch_id` — reads
+/// back as `main` via the column/serde default, byte-identical to today (§9 migration).
+pub const MAIN_BRANCH_ID: &str = "main";
+
 /// What a row does to its `file_id`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -19,6 +24,15 @@ pub enum Kind {
     Rename,
     Delete,
     Reclass,
+    /// A 2-parent merge marker authored by `merge_branch` (§2.6): `parent` is the
+    /// destination branch tip, `merge_parent` the source tip. Carries no content of
+    /// its own (the per-file merge edits are separate rows); it exists so the graph
+    /// and the derived git history show an explicit merge node.
+    Merge,
+    /// A synced **branch record** (§7): creation/rename/delete of a branch rides the
+    /// same anti-entropy path as content rows. The branch metadata is carried in the
+    /// row's `path`/`base_hash`/`result_hash` fields (see `sqlite::Branch`).
+    Branch,
 }
 
 impl Kind {
@@ -29,6 +43,8 @@ impl Kind {
             Kind::Rename => "rename",
             Kind::Delete => "delete",
             Kind::Reclass => "reclass",
+            Kind::Merge => "merge",
+            Kind::Branch => "branch",
         }
     }
     pub fn parse(s: &str) -> Option<Kind> {
@@ -38,6 +54,8 @@ impl Kind {
             "rename" => Kind::Rename,
             "delete" => Kind::Delete,
             "reclass" => Kind::Reclass,
+            "merge" => Kind::Merge,
+            "branch" => Kind::Branch,
             _ => return None,
         })
     }
@@ -124,9 +142,46 @@ pub struct LogRow {
     pub result_hash: Option<String>,
     /// Set by create/rename: the file's path as of this row.
     pub path: Option<String>,
+    /// The branch this row was authored on (§2). A row is only visible to folds
+    /// scoped to this branch or its descendants (up to their fork point). Pre-
+    /// branching rows default to [`MAIN_BRANCH_ID`].
+    #[serde(default = "default_branch_id")]
+    pub branch_id: String,
+    /// Second parent — set only on [`Kind::Merge`] (§2.6); the source branch tip.
+    #[serde(default)]
+    pub merge_parent: Option<String>,
     /// Optional ed25519 author signature over the row (off by default).
     #[serde(with = "serde_bytes", default)]
     pub sig: Vec<u8>,
+}
+
+fn default_branch_id() -> String {
+    MAIN_BRANCH_ID.to_string()
+}
+
+impl Default for LogRow {
+    /// A blank, `main`-branch row — every field empty/None. Construction sites fill
+    /// in what they need with `..LogRow::default()`, so adding a field doesn't
+    /// require touching every literal.
+    fn default() -> LogRow {
+        LogRow {
+            id: String::new(),
+            site_id: String::new(),
+            lamport: 0,
+            seq: 0,
+            ts: 0,
+            file_id: String::new(),
+            kind: Kind::Edit,
+            merge_class: MergeClass::Text,
+            parent: None,
+            base_hash: None,
+            result_hash: None,
+            path: None,
+            branch_id: MAIN_BRANCH_ID.to_string(),
+            merge_parent: None,
+            sig: vec![],
+        }
+    }
 }
 
 impl LogRow {
@@ -145,6 +200,8 @@ impl LogRow {
             self.base_hash.clone().unwrap_or_default().into_bytes(),
             self.result_hash.clone().unwrap_or_default().into_bytes(),
             self.path.clone().unwrap_or_default().into_bytes(),
+            self.branch_id.clone().into_bytes(),
+            self.merge_parent.clone().unwrap_or_default().into_bytes(),
         ]
     }
 
@@ -182,19 +239,14 @@ mod tests {
 
     fn row() -> LogRow {
         LogRow {
-            id: String::new(),
             site_id: "aa".into(),
             lamport: 1,
-            seq: 0,
             ts: 100,
             file_id: "f1".into(),
             kind: Kind::Create,
-            merge_class: MergeClass::Text,
-            parent: None,
-            base_hash: None,
             result_hash: Some("deadbeef".into()),
             path: Some("a.md".into()),
-            sig: vec![],
+            ..LogRow::default()
         }
     }
 
@@ -210,6 +262,33 @@ mod tests {
         let mut tampered = r.clone();
         tampered.path = Some("b.md".into());
         assert!(!tampered.id_valid());
+    }
+
+    #[test]
+    fn branch_fields_are_covered_by_the_id() {
+        // §3.1: branch_id and merge_parent are part of the Merkle id, so a row
+        // re-tagged onto another branch (or given a second parent) is a distinct row.
+        let r = row().seal();
+        let mut on_b = r.clone();
+        on_b.branch_id = "b-xyz".into();
+        assert!(!on_b.id_valid(), "branch_id must change the id");
+        let resealed = on_b.clone().seal();
+        assert_ne!(resealed.id, r.id);
+
+        let mut merged = r.clone();
+        merged.kind = Kind::Merge;
+        merged.merge_parent = Some("other-tip".into());
+        let merged = merged.seal();
+        let mut tampered = merged.clone();
+        tampered.merge_parent = Some("forged".into());
+        assert!(!tampered.id_valid(), "merge_parent must change the id");
+    }
+
+    #[test]
+    fn kind_branch_and_merge_round_trip() {
+        for k in [Kind::Merge, Kind::Branch] {
+            assert_eq!(Kind::parse(k.as_str()), Some(k));
+        }
     }
 
     #[test]

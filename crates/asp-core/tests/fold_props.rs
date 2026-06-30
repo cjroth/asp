@@ -54,7 +54,7 @@ fn generate(seed: u64, n_files: usize, ops_per_file: usize) -> (MemBlobStore, Ve
     let mut rows: Vec<LogRow> = Vec::new();
     let mut lamport: u64 = 1;
 
-    let mut put = |s: &MemBlobStore, r: &mut Rng| -> String {
+    let put = |s: &MemBlobStore, r: &mut Rng| -> String {
         // A handful of distinct contents so forks sometimes collide on bytes.
         s.put_blob(format!("content-{}", r.below(8)).as_bytes()).unwrap()
     };
@@ -77,6 +77,8 @@ fn generate(seed: u64, n_files: usize, ops_per_file: usize) -> (MemBlobStore, Ve
             base_hash: None,
             result_hash: Some(put(&store, &mut rng)),
             path: Some(create_path),
+            branch_id: asp_core::MAIN_BRANCH_ID.to_string(),
+            merge_parent: None,
             sig: vec![],
         }
         .seal();
@@ -106,6 +108,8 @@ fn generate(seed: u64, n_files: usize, ops_per_file: usize) -> (MemBlobStore, Ve
                         base_hash: None,
                         result_hash: Some(put(&store, &mut rng)),
                         path: Some(p),
+                        branch_id: asp_core::MAIN_BRANCH_ID.to_string(),
+                        merge_parent: None,
                         sig: vec![],
                     }
                     .seal();
@@ -136,6 +140,8 @@ fn generate(seed: u64, n_files: usize, ops_per_file: usize) -> (MemBlobStore, Ve
                     base_hash: pbase,
                     result_hash: Some(put(&store, &mut rng)),
                     path: None,
+                    branch_id: asp_core::MAIN_BRANCH_ID.to_string(),
+                    merge_parent: None,
                     sig: vec![],
                 }
                 .seal()
@@ -162,6 +168,8 @@ fn generate(seed: u64, n_files: usize, ops_per_file: usize) -> (MemBlobStore, Ve
                     base_hash: pbase.clone(),
                     result_hash: pbase,
                     path: None,
+                    branch_id: asp_core::MAIN_BRANCH_ID.to_string(),
+                    merge_parent: None,
                     sig: vec![],
                 }
                 .seal()
@@ -180,6 +188,8 @@ fn generate(seed: u64, n_files: usize, ops_per_file: usize) -> (MemBlobStore, Ve
                     base_hash: pbase,
                     result_hash: None,
                     path: Some(PATHS[rng.below(PATHS.len())].to_string()),
+                    branch_id: asp_core::MAIN_BRANCH_ID.to_string(),
+                    merge_parent: None,
                     sig: vec![],
                 }
                 .seal()
@@ -199,6 +209,8 @@ fn generate(seed: u64, n_files: usize, ops_per_file: usize) -> (MemBlobStore, Ve
                     base_hash: pbase,
                     result_hash: None,
                     path: None,
+                    branch_id: asp_core::MAIN_BRANCH_ID.to_string(),
+                    merge_parent: None,
                     sig: vec![],
                 }
                 .seal()
@@ -247,6 +259,96 @@ fn fold_is_permutation_invariant_over_random_histories() {
             let got = compute_files(&store, &shuffled).unwrap();
             assert_eq!(norm(&base), norm(&got), "seed {seed} shuffle {k}: fold not order-invariant");
         }
+    }
+}
+
+#[test]
+fn branch_scoped_fold_is_deterministic_and_isolated() {
+    // §8.2: branches are a scoped VIEW over the shared log. Tag a suffix of a random
+    // concurrent history onto a child branch B (forked at the vv of the prefix), and
+    // assert the three branch invariants:
+    //   - Determinism: compute_files(visible(B)) is permutation-invariant.
+    //   - Scoped == filtered: visible(main) folds identically to the main-tagged
+    //     subset (main never sees B's rows → ISOLATION).
+    //   - Back-compat: with no branch, the scoped main fold == the whole-log fold.
+    use asp_core::{version_vector_of, visible_rows, Branch, BranchSet, MAIN_BRANCH_ID};
+    for seed in 0..250u64 {
+        let (store, rows) = generate(seed, 5, 6);
+        if rows.len() < 4 {
+            continue;
+        }
+        // Back-compat: a single-branch history (all rows main) scopes to itself.
+        let bs0 = BranchSet::new([]);
+        let whole = compute_files(&store, &rows).unwrap();
+        let scoped_main0 = compute_files(&store, &visible_rows(&rows, &bs0, MAIN_BRANCH_ID)).unwrap();
+        assert_eq!(norm(&whole), norm(&scoped_main0), "seed {seed}: single-branch scope must equal whole-log fold");
+
+        // Fork B at the version vector of the first half; retag the second half onto
+        // B IN PLACE (keep each row's id so parent linkage + fold tiebreak are intact
+        // — the fold reads ids, not branch_id, for ordering, and never re-validates).
+        let split = rows.len() / 2;
+        let fork_vv = version_vector_of(&rows[..split]);
+        let mut tagged = rows.clone();
+        let mut rng = Rng::new(seed ^ 0xB14C);
+        for r in tagged[split..].iter_mut() {
+            if rng.chance(70) {
+                r.branch_id = "B".to_string();
+            }
+        }
+        let bs = BranchSet::new([Branch {
+            branch_id: "B".into(),
+            name: "B".into(),
+            parent: Some(MAIN_BRANCH_ID.into()),
+            fork_vv,
+            created_lamport: 0,
+            created_ts: 0,
+            deleted: false,
+        }]);
+
+        // Determinism of the scoped fold under arrival permutation.
+        let vis_b = visible_rows(&tagged, &bs, "B");
+        let base_b = compute_files(&store, &vis_b).unwrap();
+        for k in 0..3 {
+            let mut shuffled = vis_b.clone();
+            let mut r2 = Rng::new(seed.wrapping_mul(31) + k);
+            shuffle(&mut r2, &mut shuffled);
+            let got = compute_files(&store, &shuffled).unwrap();
+            assert_eq!(norm(&base_b), norm(&got), "seed {seed}: scoped fold not order-invariant");
+        }
+
+        // Branch-scoped INCREMENTAL fold == from-scratch scoped fold, after every
+        // row, in random arrival order — exactly what the engine does: filter rows
+        // to visible(B), then refold only the touched file. This is the §8.2 primary
+        // gate extended to a scoped view.
+        {
+            let mut arrival = vis_b.clone();
+            let mut r3 = Rng::new(seed.wrapping_mul(7901) + 3);
+            shuffle(&mut r3, &mut arrival);
+            let mut by_file: BTreeMap<String, Vec<LogRow>> = BTreeMap::new();
+            let mut seen: Vec<LogRow> = Vec::new();
+            let mut fold = FoldState::from_rows(&store, &[]).unwrap();
+            for r in arrival {
+                by_file.entry(r.file_id.clone()).or_default().push(r.clone());
+                seen.push(r.clone());
+                let fid = r.file_id.clone();
+                fold.refold_files(&store, std::slice::from_ref(&fid), |f| Ok(by_file.get(f).cloned().unwrap_or_default()))
+                    .unwrap();
+                assert_eq!(
+                    norm(&fold.files()),
+                    norm(&compute_files(&store, &seen).unwrap()),
+                    "seed {seed}: scoped incremental fold diverged after a row for {fid}"
+                );
+            }
+        }
+
+        // Isolation: state(main) sees only main-tagged rows, regardless of B's rows.
+        let main_subset: Vec<LogRow> = tagged.iter().filter(|r| r.branch_id == MAIN_BRANCH_ID).cloned().collect();
+        let vis_main = visible_rows(&tagged, &bs, MAIN_BRANCH_ID);
+        assert_eq!(
+            norm(&compute_files(&store, &main_subset).unwrap()),
+            norm(&compute_files(&store, &vis_main).unwrap()),
+            "seed {seed}: main must be isolated from branch B's rows"
+        );
     }
 }
 

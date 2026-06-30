@@ -15,9 +15,11 @@ use anyhow::{anyhow, Context, Result};
 use asp_core::iroh_net;
 use asp_core::net::{AuthOpts, EngineRef};
 use asp_core::{Engine, Identity, Msg, VaultConfig, WireRow};
+pub use asp_core::Graph;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -68,6 +70,16 @@ pub struct HistEvent {
     /// Path the row applies to (resolved from the file_id's latest path for
     /// rows that don't carry one, e.g. edits/deletes).
     pub path: String,
+}
+
+/// One branch for the switcher UI (a thin projection of an `asp-core` `Branch`).
+#[derive(Clone, Serialize)]
+pub struct BranchDto {
+    pub branch_id: String,
+    pub name: String,
+    pub parent: Option<String>,
+    /// True for the checked-out branch (HEAD).
+    pub current: bool,
 }
 
 /// Content of a file as of a point in time (for read-only time travel).
@@ -126,6 +138,12 @@ pub struct DesktopEngine {
     relay_override: Mutex<Option<String>>,
     /// The co-hosted relay task (abort to stop it).
     relay_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Set once `reopen_saved` (the background startup rehydrate) has finished, so
+    /// the UI can deterministically clear its "Loading your vaults…" gate by
+    /// querying instead of having to catch the one-shot `vaults-ready` event — which
+    /// it misses if the webview's listener isn't attached before the (often instant,
+    /// e.g. empty-config) reopen emits it.
+    ready: AtomicBool,
 }
 
 fn random_id() -> String {
@@ -145,6 +163,7 @@ impl DesktopEngine {
             change_listener: Arc::new(Mutex::new(None)),
             relay_override: Mutex::new(None),
             relay_task: Mutex::new(None),
+            ready: AtomicBool::new(false),
         };
         // Restore the persisted "faster local syncing" preference: co-host the
         // relay up front (before any folder binds) so reopened vaults' tickets
@@ -234,6 +253,12 @@ impl DesktopEngine {
     /// any managed folder. The Tauri shell uses it to emit a realtime UI event.
     pub fn set_change_listener(&self, cb: impl Fn(String) + Send + Sync + 'static) {
         *self.change_listener.lock().unwrap() = Some(Arc::new(cb));
+    }
+
+    /// Whether `reopen_saved` has completed. The UI polls this once on mount as a
+    /// race-proof fallback to the `vaults-ready` event (see the `ready` field).
+    pub fn vaults_ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
     }
 
     pub fn identity_ssh(&self) -> String {
@@ -520,6 +545,9 @@ impl DesktopEngine {
         });
         let keep: Vec<FolderCfg> = opened.iter().map(|(c, _)| c.clone()).collect();
         Self::write_saved_folders(&keep);
+        // Startup rehydrate is done — let the UI clear its loading gate (querying
+        // `vaults_ready`) even if it missed the one-shot `vaults-ready` event.
+        self.ready.store(true, Ordering::SeqCst);
         opened.into_iter().map(|(_, i)| i).collect()
     }
 
@@ -828,6 +856,93 @@ impl DesktopEngine {
             });
         }
         Ok(out)
+    }
+
+    // ---- Branches (§2, §7): scoped views over the shared log ----
+
+    /// All live branches for the switcher (`main` first; HEAD flagged).
+    pub fn list_branches(&self, id: &str) -> Result<Vec<BranchDto>> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let eng = f.engine.lock().unwrap();
+        let head = eng.current_branch();
+        Ok(eng
+            .branches()?
+            .into_iter()
+            .map(|b| BranchDto { current: b.branch_id == head, branch_id: b.branch_id, name: b.name, parent: b.parent })
+            .collect())
+    }
+
+    /// The checked-out branch id (HEAD).
+    pub fn current_branch(&self, id: &str) -> Result<String> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let head = f.engine.lock().unwrap().current_branch();
+        Ok(head)
+    }
+
+    /// The branch/commit DAG (GitHub-network-style), bounded to `cap` per lane.
+    pub fn graph(&self, id: &str, cap: usize) -> Result<asp_core::Graph> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let g = f.engine.lock().unwrap().graph(cap)?;
+        Ok(g)
+    }
+
+    /// Create a branch off HEAD at the current point (does not switch). The branch
+    /// record is pushed live to peers so every node learns it.
+    pub fn create_branch(&self, id: &str, name: &str) -> Result<String> {
+        let (conns, branch_id, wr) = {
+            let folders = self.folders.lock().unwrap();
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            let eng = f.engine.lock().unwrap();
+            let (bid, wr) = eng.create_branch_here_wire(name)?;
+            (f.conns.clone(), bid, wr)
+        };
+        self.broadcast(&conns, wr);
+        Ok(branch_id)
+    }
+
+    /// Switch HEAD to a branch and re-materialize its scoped state to disk. HEAD is
+    /// per-device (never synced), so nothing is broadcast; the caller re-reads the
+    /// now-switched working tree.
+    pub fn checkout_branch(&self, id: &str, branch_id: &str) -> Result<()> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        f.engine.lock().unwrap().checkout(branch_id)?;
+        Ok(())
+    }
+
+    /// Edit-in-the-past ⇒ branch (§2.5): fork HEAD at wall-clock `ts` and switch to
+    /// the new branch. The record is pushed live to peers.
+    pub fn fork_branch_at(&self, id: &str, name: &str, ts: i64) -> Result<String> {
+        let (conns, branch_id, wr) = {
+            let folders = self.folders.lock().unwrap();
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            let eng = f.engine.lock().unwrap();
+            // Fork at the point in time, then read back the authored branch record to
+            // broadcast (it's this site's latest Kind::Branch row).
+            let bid = eng.fork_from_time(name, ts)?;
+            let wr = eng
+                .branch_record_wire(&bid)
+                .ok_or_else(|| anyhow!("forked branch record missing"))?;
+            (f.conns.clone(), bid, wr)
+        };
+        self.broadcast(&conns, wr);
+        Ok(branch_id)
+    }
+
+    /// Soft-delete a branch; the tombstone is pushed live to peers.
+    pub fn delete_branch(&self, id: &str, branch_id: &str) -> Result<()> {
+        let (conns, wr) = {
+            let folders = self.folders.lock().unwrap();
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            let eng = f.engine.lock().unwrap();
+            let wr = eng.delete_branch(branch_id)?;
+            (f.conns.clone(), wr)
+        };
+        self.broadcast(&conns, wr);
+        Ok(())
     }
 
     /// Content of a file as the vault was at wall-clock `ts` (read-only; folds

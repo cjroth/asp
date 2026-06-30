@@ -35,6 +35,8 @@ fn row(
         base_hash: base.map(String::from),
         result_hash: result.map(String::from),
         path: path.map(String::from),
+        branch_id: asp_core::MAIN_BRANCH_ID.to_string(),
+        merge_parent: None,
         sig: vec![],
     }
     .seal()

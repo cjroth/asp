@@ -11,6 +11,7 @@ import { api, type ClonePhase, type FileEntry, type HistEvent, type VaultInfo, t
 import CustomizeModal, { type CustomizeInit } from './vault/CustomizeModal';
 import FileTree from './vault/FileTree';
 import HistoryBar from './vault/HistoryBar';
+import BranchControls from './vault/BranchControls';
 import { buildEvents, createTsByPath, defaultView, type TrackEvent, type View, viewForNow } from './vault/history';
 import * as Icon from './vault/icons';
 import LiveEditor from './vault/LiveEditor';
@@ -290,6 +291,18 @@ export default function App() {
       // cold start — drop the loading hint. The `vaults-changed` event below also
       // clears it as each background-reopened vault lands.
       if (vs.length) setVaultsLoading(false);
+      // Race-proof fallback: the `vaults-ready` event is one-shot and fires from
+      // the shell's startup thread, often before our listener attaches (e.g. an
+      // empty config reopens instantly), so it can be missed entirely. Querying
+      // readiness here clears the gate deterministically once reopen has finished,
+      // regardless of whether we caught the event.
+      else if (desktop) {
+        try {
+          if (await api.vaultsReady()) setVaultsLoading(false);
+        } catch {
+          /* not the desktop shell, or command unavailable — leave it to the event */
+        }
+      }
       // Refresh-restore: on the first mount after a real page load, if the URL
       // hash names a known vault, open it (openVault then picks the hashed file).
       // Works identically on desktop and web — the hash is read the same way.
@@ -1565,6 +1578,10 @@ export default function App() {
                 </>
               )}
             </div>
+
+            {activeId && (
+              <BranchControls vaultId={activeId} accent={accent} onChanged={() => { if (activeId) void openVault(activeId); }} />
+            )}
 
             <div style={{ display: 'flex', alignItems: 'center', gap: 1, padding: '9px 9px 7px', position: 'relative' }}>
               <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--faint2)', flex: 1, paddingLeft: 3 }}>Files</span>

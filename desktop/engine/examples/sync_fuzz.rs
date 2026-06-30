@@ -635,8 +635,8 @@ fn apply_scenario(
             // Every side writes the SAME path near-simultaneously → must converge to one.
             let path = "shared/contended.md".to_string();
             write_cli(&hub.dir, &path, format!("# shared\n\nCLI {}\n", rng.next_u64()).as_bytes());
-            for i in 0..np {
-                let _ = peers[i].de.write_file(&peers[i].id, &path, &format!("# shared\n\nENG{i} {}\n", rng.next_u64()));
+            for (i, peer) in peers.iter().enumerate().take(np) {
+                let _ = peer.de.write_file(&peer.id, &path, &format!("# shared\n\nENG{i} {}\n", rng.next_u64()));
             }
             if !live.contains(&path) { live.push(path); }
             "concurrent-same-file".into()
