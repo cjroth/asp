@@ -1423,12 +1423,36 @@ impl Engine {
             return Err(AspError::NotFound(format!("no such branch: {branch_id}")));
         };
         if self.head_branch() == branch_id {
-            let parent = b.parent.clone().unwrap_or_else(|| MAIN_BRANCH_ID.to_string());
-            self.checkout(&parent)?;
+            // Land on the nearest *live* ancestor — never another tombstone, which
+            // would strand HEAD on a branch absent from the switcher.
+            let target = self.nearest_live_ancestor(&b)?;
+            self.checkout(&target)?;
         }
         b.deleted = true;
         // Author a synced deletion record so the tombstone converges everywhere.
         self.author_branch_record(&b)
+    }
+
+    /// The nearest ancestor of `start` that is still live (not tombstoned),
+    /// defaulting to `main`. Walks the parent chain; cycle- and dangling-safe.
+    fn nearest_live_ancestor(&self, start: &Branch) -> AspResult<String> {
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(start.branch_id.clone());
+        let mut cur = start.parent.clone();
+        while let Some(id) = cur {
+            if !seen.insert(id.clone()) {
+                break; // cycle
+            }
+            if id == MAIN_BRANCH_ID {
+                return Ok(id); // main is always live
+            }
+            match self.store.branch(&id)? {
+                Some(p) if !p.deleted => return Ok(p.branch_id),
+                Some(p) => cur = p.parent.clone(),
+                None => break, // dangling parent
+            }
+        }
+        Ok(MAIN_BRANCH_ID.to_string())
     }
 
     // ---------------- admission (§Security) ----------------
@@ -1637,6 +1661,27 @@ mod tests {
         assert!(e.delete_branch(MAIN_BRANCH_ID).is_err());
         // Checking out a non-existent branch errors.
         assert!(e.checkout("nope").is_err());
+    }
+
+    #[test]
+    fn delete_head_lands_on_nearest_live_ancestor_not_a_tombstone() {
+        // main <- a <- b, checked out on b. Delete a (not HEAD), then delete b
+        // (HEAD): HEAD must skip the tombstoned parent a and land on a LIVE branch
+        // (main). Landing on deleted a would strand the user on a branch absent
+        // from the switcher.
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        e.record_write("f.md", b"m\n").unwrap().unwrap();
+        let a = e.fork_from_time("a", i64::MAX).unwrap(); // forks main, checks out a
+        assert_eq!(e.current_branch(), a);
+        let b = e.fork_from_time("b", i64::MAX).unwrap(); // forks a, checks out b
+        assert_eq!(e.current_branch(), b);
+        // Delete the mid branch while sitting on b (a is not HEAD → HEAD unmoved).
+        e.delete_branch(&a).unwrap();
+        assert_eq!(e.current_branch(), b, "deleting a non-HEAD branch must not move HEAD");
+        // Delete HEAD: must skip tombstoned parent a and land on main.
+        e.delete_branch(&b).unwrap();
+        assert_eq!(e.current_branch(), MAIN_BRANCH_ID, "must not be stranded on the deleted ancestor a");
     }
 
     #[test]

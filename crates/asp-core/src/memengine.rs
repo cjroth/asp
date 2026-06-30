@@ -274,12 +274,37 @@ impl MemEngine {
             return Err(AspError::NotFound(format!("no such branch: {branch_id}")));
         };
         if self.head_branch() == branch_id {
-            let parent = b.parent.clone().unwrap_or_else(|| MAIN_BRANCH_ID.to_string());
-            self.checkout(&parent)?;
+            // Land on the nearest *live* ancestor — never another tombstone (parity
+            // with the native engine, §7).
+            let target = self.nearest_live_ancestor(&b);
+            self.checkout(&target)?;
         }
         b.deleted = true;
         self.author_branch_record(&b)?;
         Ok(())
+    }
+
+    /// The nearest ancestor of `start` that is still live (not tombstoned),
+    /// defaulting to `main`. Cycle- and dangling-safe.
+    fn nearest_live_ancestor(&self, start: &crate::branch::Branch) -> String {
+        let bs = self.branch_set();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(start.branch_id.clone());
+        let mut cur = start.parent.clone();
+        while let Some(id) = cur {
+            if !seen.insert(id.clone()) {
+                break; // cycle
+            }
+            if id == MAIN_BRANCH_ID {
+                return id; // main is always live
+            }
+            match bs.get(&id) {
+                Some(p) if !p.deleted => return p.branch_id.clone(),
+                Some(p) => cur = p.parent.clone(),
+                None => break, // dangling parent
+            }
+        }
+        MAIN_BRANCH_ID.to_string()
     }
 
     fn current_for_path(&self, rel: &str) -> Option<FileRow> {
@@ -813,6 +838,21 @@ mod tests {
         e.delete_branch(&b).unwrap();
         assert_eq!(e.current_branch(), MAIN_BRANCH_ID);
         assert!(e.branches().iter().all(|x| x.branch_id != b));
+    }
+
+    #[test]
+    fn mem_delete_head_lands_on_nearest_live_ancestor() {
+        // Parity with the native engine: main <- a <- b on b; delete a then b →
+        // HEAD skips the tombstoned a and lands on main, not on a deleted branch.
+        let e = MemEngine::create(Identity::from_seed(&[7; 32]), "v");
+        e.record_write("f.md", b"m\n").unwrap().unwrap();
+        let a = e.fork_from_time("a", i64::MAX).unwrap();
+        let b = e.fork_from_time("b", i64::MAX).unwrap();
+        assert_eq!(e.current_branch(), b);
+        e.delete_branch(&a).unwrap();
+        assert_eq!(e.current_branch(), b, "deleting a non-HEAD branch must not move HEAD");
+        e.delete_branch(&b).unwrap();
+        assert_eq!(e.current_branch(), MAIN_BRANCH_ID, "must not be stranded on the deleted ancestor a");
     }
 
     #[test]
