@@ -121,7 +121,7 @@ fn generate(seed: u64, n_files: usize, ops_per_file: usize) -> (MemBlobStore, Ve
             let (ptip, pbase) = tips[rng.below(tips.len())].clone();
             let site = SITES[rng.below(SITES.len())].to_string();
             let kind_roll = rng.below(10);
-            let r = if kind_roll < 6 {
+            let r = if kind_roll < 5 {
                 // edit
                 LogRow {
                     id: String::new(),
@@ -135,6 +135,32 @@ fn generate(seed: u64, n_files: usize, ops_per_file: usize) -> (MemBlobStore, Ve
                     parent: Some(ptip),
                     base_hash: pbase,
                     result_hash: Some(put(&store, &mut rng)),
+                    path: None,
+                    sig: vec![],
+                }
+                .seal()
+            } else if kind_roll < 6 {
+                // reclass: change the file's merge class (exercises the fold's
+                // Reclass branch + the merge-class routing of later concurrent
+                // edits). Content is unchanged, so carry the current hash forward.
+                let newc = match rng.below(3) {
+                    0 => MergeClass::Text,
+                    1 => MergeClass::Code,
+                    _ => MergeClass::Binary,
+                };
+                class = newc;
+                LogRow {
+                    id: String::new(),
+                    site_id: site,
+                    lamport,
+                    seq: 0,
+                    ts: lamport as i64,
+                    file_id: file_id.clone(),
+                    kind: Kind::Reclass,
+                    merge_class: newc,
+                    parent: Some(ptip),
+                    base_hash: pbase.clone(),
+                    result_hash: pbase,
                     path: None,
                     sig: vec![],
                 }

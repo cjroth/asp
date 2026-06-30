@@ -463,6 +463,7 @@ enum Scenario {
     BinaryFile,
     HugeFile,
     CodeFile,
+    TimeTravelRestore,
 }
 
 fn pick_scenario(rng: &mut Rng, round: usize) -> Scenario {
@@ -474,7 +475,7 @@ fn pick_scenario(rng: &mut Rng, round: usize) -> Scenario {
             EditExisting, NewFile, Rename, Delete, DeleteRecreate, RapidBurst,
             LargeFile, ManyFiles, ConcurrentSameFile, EmptyFile, DeepNesting,
             TruncateToEmpty, SwapNames, RenameOntoExisting, CaseOnlyRename, RenameThenEdit,
-            ExternalRescan, BinaryFile, HugeFile, CodeFile,
+            ExternalRescan, BinaryFile, HugeFile, CodeFile, TimeTravelRestore,
         ]
     };
     rng.pick(&menu).clone()
@@ -753,6 +754,24 @@ fn apply_scenario(
                 do_write(other, hub, peers, &path, &rand_code(rng, "concurrent code edit"), lat);
             }
             format!("code/{side:?} {path}")
+        }
+        TimeTravelRestore => {
+            // Revert a file to its content as of a moment ago via restore_file_at,
+            // which authors an edit (the historical bytes) and broadcasts it — all
+            // surfaces must still converge. Exercises time-travel restore racing a
+            // live, concurrently-mutating sync (a flagged blind spot). Engine-side
+            // (the CLI has no equivalent one-file restore primitive here).
+            if live.is_empty() {
+                return "tt-restore(skip)".into();
+            }
+            let path = live[rng.below(live.len())].clone();
+            let i = rng.below(np);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+            let ts = now - (rng.below(3) as i64); // a second or two back
+            let t = Instant::now();
+            let _ = peers[i].de.restore_file_at(&peers[i].id, &path, ts);
+            lat.push(t.elapsed().as_millis());
+            format!("tt-restore/Engine({i}) {path}@-{}s", now - ts)
         }
     }
 }
