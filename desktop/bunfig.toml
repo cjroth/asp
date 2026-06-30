@@ -1,0 +1,5 @@
+# Test config for `bun test` (the suite runs on bun's native runner — see
+# src/test-shim.ts for why). The preload registers a jsdom DOM + the project's
+# test setup before any test file loads.
+[test]
+preload = ["./src/bun-test-preload.ts"]

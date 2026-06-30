@@ -185,6 +185,27 @@ pub async fn run_relay(http_bind: SocketAddr) -> Result<()> {
     Ok(())
 }
 
+/// Spawn a co-hosted relay and return its `http://addr` URL plus a task that owns
+/// it (aborting the task stops the relay). Used by the desktop "faster local
+/// syncing" toggle to route peers through this machine instead of the public n0
+/// relays. Bind `127.0.0.1:0` for a free localhost port.
+pub async fn spawn_relay(http_bind: SocketAddr) -> Result<(String, tokio::task::JoinHandle<()>)> {
+    use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+    let mut config = ServerConfig::default();
+    config.relay = Some(RelayConfig::new(http_bind));
+    config.quic = None;
+    let server = Server::spawn(config).await.map_err(|e| anyhow!("starting relay: {e}"))?;
+    let addr = server.http_addr().ok_or_else(|| anyhow!("relay bound no http address"))?;
+    let url = format!("http://{addr}");
+    tracing::info!(%addr, "co-hosted relay up");
+    // The spawned task owns `server`, keeping it alive until the task is aborted.
+    let handle = tokio::spawn(async move {
+        std::future::pending::<()>().await;
+        drop(server);
+    });
+    Ok((url, handle))
+}
+
 // ---------------- framing ----------------
 
 /// Write one length-delimited frame: a `u32` big-endian length, then the bytes.
@@ -367,16 +388,26 @@ async fn drive(
 
 /// Stream the listener's catch-up to a connector in bounded pages, then a final
 /// `Synced` so the connector finishes promptly (no idle wait).
+///
+/// Blobs are deduplicated across the whole catch-up: a row bundles its content
+/// blob, but a vault with lots of repeated content (e.g. 28k files sharing 3k
+/// unique blobs) would otherwise ship each blob once per referencing row — ~5x
+/// its real size, which the receiver then has to parse and hash. We send each
+/// blob only on its first occurrence (causal/seq order guarantees that's at or
+/// before any later reference); the receiver accumulates blobs in its content
+/// store, so a later row referencing an already-sent hash folds fine without the
+/// bytes. Convergence is unchanged — the receiver's state is byte-identical.
 async fn stream_catchup(
     send: &mut SendStream,
     engine: &EngineRef,
     peer_vv: &std::collections::BTreeMap<String, i64>,
 ) -> Result<()> {
     let our_vv = { engine.lock().unwrap().store.version_vector()? };
+    let mut sent_blobs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (site, _max) in our_vv {
         let mut cursor = peer_vv.get(&site).copied().unwrap_or(-1);
         loop {
-            let page = {
+            let mut page = {
                 let eng = engine.lock().unwrap();
                 eng.rows_after_wire_page(&site, cursor, CATCHUP_PAGE_ROWS)?
             };
@@ -384,6 +415,10 @@ async fn stream_catchup(
                 break;
             }
             cursor = page.last().map(|w| w.row.seq as i64).unwrap_or(cursor);
+            // Keep each blob only on its first occurrence across the catch-up.
+            for wr in &mut page {
+                wr.blobs.retain(|b| sent_blobs.insert(b.hash.clone()));
+            }
             let mut sends = Vec::new();
             crate::session::push_rows_chunked(&mut sends, page);
             for s in sends {

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from '../test-shim';
 import { isDesktop } from './platform';
 
 const w = window as unknown as Record<string, unknown>;

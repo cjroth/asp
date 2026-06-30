@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from '../test-shim';
 import { avatarStyle, glyphOf, hash, hueForId, loadVaultMeta, resolveMeta, saveVaultMeta } from './vaultMeta';
 
 afterEach(() => localStorage.clear());

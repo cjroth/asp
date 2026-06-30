@@ -1,6 +1,6 @@
 // FileTree virtualization + scroll behavior.
 import { cleanup, fireEvent, render } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from '../test-shim';
 import type { FileEntry } from '../lib/api';
 import FileTree from './FileTree';
 import { buildTree, flatten } from './tree';

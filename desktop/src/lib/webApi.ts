@@ -9,8 +9,9 @@ import init, { WasmEngine } from 'asp-wasm';
 // `new URL('…', import.meta.url)` breaks under Vite dev: for a linked package it
 // resolves to a `file://` URL the browser refuses to fetch.
 import wasmUrl from 'asp-wasm/asp_wasm_bg.wasm?url';
-import type { Api, FileAt, FileEntry, HistEvent, VaultInfo, VaultStatus } from './api';
+import type { Api, CloneProgress, FileAt, FileEntry, HistEvent, VaultInfo, VaultStatus } from './api';
 import { WELCOME_MD } from '../vault/welcome';
+import { makeCoalescer } from './coalesce';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -19,9 +20,11 @@ const randHex = (n: number) => Array.from(crypto.getRandomValues(new Uint8Array(
 interface RegEntry {
   id: string;
   vault_id: string;
-  // For vaults cloned from a peer: the ticket+authKey to keep syncing against.
-  // Browsers can't listen, so the app's poll uses these to call syncNow.
-  upstream?: { ticket: string; authKey?: string };
+  // The upstream this vault was cloned from. Browsers can't open a listening
+  // socket, so a web node stays in sync by holding a live connection to this
+  // ticket open (`startLiveSync`), reconnecting if it drops.
+  ticket?: string;
+  authKey?: string | null;
 }
 
 // ---- byte store: OPFS when available, in-memory fallback otherwise ----
@@ -116,6 +119,10 @@ export function createWebApi(): Api {
 
   const registry = () => readJson<RegEntry[]>('registry.json', []);
   const engines = new Map<string, WasmEngine>();
+  // Live connections, one per vault id. A browser can't accept inbound
+  // connections, but once it dials the upstream it holds the link open and rows
+  // stream both ways in realtime — no polling.
+  const live = new Map<string, { stop: boolean }>();
 
   async function engineFor(id: string): Promise<WasmEngine> {
     const cached = engines.get(id);
@@ -130,6 +137,18 @@ export function createWebApi(): Api {
     return eng;
   }
   const persist = (id: string, eng: WasmEngine) => writeBytes(stateName(id), eng.dump_state());
+  // `dump_state` re-serializes the WHOLE engine (every row + blob) to OPFS, so on
+  // a big vault doing it on every keystroke-save / synced row is the dominant
+  // cost. Coalesce it: edits return immediately and the state is written at most
+  // once per quiet window. Durability is the live peer sync; OPFS is a cache that
+  // a reload re-syncs — and we flush on page-hide so nothing pending is lost.
+  const persistQueue = makeCoalescer<WasmEngine>((id, eng) => void persist(id, eng).catch(() => {}), 700);
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') persistQueue.flush();
+    });
+    window.addEventListener('pagehide', () => persistQueue.flush());
+  }
 
   const fileList = (eng: WasmEngine): FileEntry[] => {
     const detail = JSON.parse(eng.files_detail_json()) as { file_id: string; path: string; merge_class: string; deleted: boolean }[];
@@ -139,6 +158,13 @@ export function createWebApi(): Api {
   };
 
   const info = (e: RegEntry): VaultInfo => ({ id: e.id, path: '', vault_id: e.vault_id, enabled: true, listening_ticket: null });
+
+  // Look up the upstream a vault was cloned from, so the poll-driven `syncNow`
+  // (called without an explicit ticket) can re-dial it.
+  const upstreamOf = async (id: string): Promise<{ ticket: string; authKey?: string | null } | null> => {
+    const entry = (await registry()).find((r) => r.id === id);
+    return entry?.ticket ? { ticket: entry.ticket, authKey: entry.authKey ?? null } : null;
+  };
 
   return {
     listVaults: async () => (await registry()).map(info),
@@ -163,29 +189,89 @@ export function createWebApi(): Api {
       return info({ id, vault_id });
     },
 
-    cloneRemote: async (_dest: string, ticket: string, authKey?: string): Promise<VaultInfo> => {
+    cloneRemote: async (_dest: string, ticket: string, authKey?: string, onProgress?: CloneProgress): Promise<VaultInfo> => {
       await ensureWasm();
       const id = 'w_' + randHex(8);
       const eng = new WasmEngine(await deviceSeed(), ''); // empty → adopt the peer's vault
-      await eng.sync(ticket, authKey ?? null, null);
+      let lastDone = 0;
+      let lastTotal = 0;
+      // Stream catch-up progress to the UI, then flip to the 'saving' phase for the
+      // (one) OPFS write — on a big vault that final write is itself a few seconds.
+      const cb = onProgress
+        ? (done: number, total: number) => {
+            lastDone = done;
+            lastTotal = total;
+            onProgress(done, total, 'receiving');
+          }
+        : undefined;
+      await eng.sync(ticket, authKey ?? null, null, cb);
       const vault_id = eng.vault_id();
       engines.set(id, eng);
+      onProgress?.(lastDone, lastTotal || lastDone, 'saving');
       await persist(id, eng);
       const reg = await registry();
-      reg.unshift({ id, vault_id, upstream: { ticket, authKey } });
+      // Remember the upstream so the live connection can re-dial it — a browser
+      // node has no other way to pull a peer's later pushes.
+      reg.unshift({ id, vault_id, ticket, authKey: authKey ?? null });
       await writeJson('registry.json', reg);
       return info({ id, vault_id });
     },
 
-    webUpstreams: async () =>
-      (await registry())
-        .filter((r) => r.upstream?.ticket)
-        .map((r) => ({ id: r.id, ticket: r.upstream!.ticket, authKey: r.upstream!.authKey })),
+    // Hold a live connection to the upstream open, reconnecting if it drops. The
+    // engine integrates remote pushes in realtime and fires `onChange` so the UI
+    // refreshes; locally-authored rows push out over the same connection. A vault
+    // with no upstream (created locally) has nothing to connect to.
+    startLiveSync: async (id, onChange) => {
+      if (live.has(id)) return;
+      const up = await upstreamOf(id);
+      if (!up) return;
+      const eng = await engineFor(id);
+      const handle = { stop: false };
+      live.set(id, handle);
+      void (async () => {
+        while (!handle.stop) {
+          try {
+            // Resolves when the connection closes; on_change fires per remote push.
+            await eng.connect_live(up.ticket, up.authKey ?? undefined, null, () => {
+              persistQueue.schedule(id, eng);
+              try {
+                onChange();
+              } catch {
+                /* listener threw — ignore */
+              }
+            });
+          } catch {
+            /* connect/dial failed — back off and retry below */
+          }
+          if (handle.stop) break;
+          await new Promise((r) => setTimeout(r, 1500)); // reconnect backoff
+        }
+        live.delete(id);
+      })();
+    },
+
+    stopLiveSync: async (id) => {
+      const h = live.get(id);
+      if (h) h.stop = true;
+      live.delete(id);
+      persistQueue.flushKey(id); // leaving the vault — write its latest state now
+    },
 
     syncNow: async (id, ticket, authKey) => {
+      // Called from the editor poll with no ticket: fall back to the upstream we
+      // cloned from. A vault created locally (no upstream) simply has nothing to
+      // sync against, so this is a no-op.
+      let t = ticket;
+      let k = authKey;
+      if (!t) {
+        const up = await upstreamOf(id);
+        if (!up) return;
+        t = up.ticket;
+        k = up.authKey ?? undefined;
+      }
       const eng = await engineFor(id);
-      await eng.sync(ticket, authKey ?? null, null);
-      await persist(id, eng);
+      await eng.sync(t, k ?? null, null);
+      persistQueue.schedule(id, eng);
     },
 
     getStatus: async (id): Promise<VaultStatus> => {
@@ -203,19 +289,19 @@ export function createWebApi(): Api {
     writeFile: async (id, path, content) => {
       const eng = await engineFor(id);
       eng.record_write(path, enc.encode(content));
-      await persist(id, eng);
+      persistQueue.schedule(id, eng);
     },
 
     renameFile: async (id, oldPath, newPath) => {
       const eng = await engineFor(id);
       eng.record_rename(oldPath, newPath);
-      await persist(id, eng);
+      persistQueue.schedule(id, eng);
     },
 
     deleteFile: async (id, path) => {
       const eng = await engineFor(id);
       eng.record_remove(path);
-      await persist(id, eng);
+      persistQueue.schedule(id, eng);
     },
 
     // Empty directories aren't first-class in the thin (wasm) engine — the folder
@@ -232,6 +318,7 @@ export function createWebApi(): Api {
     rescan: async () => {},
 
     removeVault: async (id) => {
+      persistQueue.cancel(id); // don't let a debounced write resurrect the state file
       engines.delete(id);
       await removeFile(stateName(id));
       const reg = (await registry()).filter((r) => r.id !== id);
@@ -242,6 +329,9 @@ export function createWebApi(): Api {
     // FROM a web node isn't available; these are no-ops on web.
     addLocalFolder: () => Promise.reject(new Error('addLocalFolder is desktop-only')),
     setAllowConnections: async () => null,
+    // A browser can't co-host a relay (no listening socket); always off on web.
+    setLocalRelay: async () => false,
+    getLocalRelay: async () => false,
     authorize: async () => {},
     createSnapshot: async () => '',
     restore: async () => {},

@@ -18,8 +18,8 @@ use crate::order::NodeId;
 use crate::session::SessionVault;
 use crate::store::{BlobStore, FileRow, MemBlobStore};
 use crate::wire::{WireBlob, WireRow};
-use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashSet};
 
 fn now_unix() -> i64 {
     #[cfg(not(target_arch = "wasm32"))]
@@ -63,9 +63,18 @@ pub struct MemEngine {
     site: String,
     blobs: MemBlobStore,
     rows: RefCell<Vec<LogRow>>,
+    /// Every row id we hold — kept in lockstep with `rows` (append-only, so it
+    /// only grows). Lets integrate dedup in O(1) instead of rescanning the whole
+    /// log per row/page (a paged clone was O(N·pages) just on the dedup).
+    row_ids: RefCell<HashSet<String>>,
     files: RefCell<Vec<FileRow>>,
     config: RefCell<BTreeMap<String, String>>,
     authorized: RefCell<Vec<AuthKey>>,
+    /// When set, `integrate_many` appends rows but defers the fold — the clone
+    /// driver turns it on across the paged catch-up so the whole history folds
+    /// ONCE at the end instead of re-folding the growing log on every page
+    /// (O(N·pages) → O(N)). The driver folds + clears it on `Synced`.
+    batch: Cell<bool>,
 }
 
 impl MemEngine {
@@ -85,10 +94,18 @@ impl MemEngine {
             },
             blobs: MemBlobStore::new(),
             rows: RefCell::new(Vec::new()),
+            row_ids: RefCell::new(HashSet::new()),
             files: RefCell::new(Vec::new()),
             config: RefCell::new(cfg),
             authorized: RefCell::new(Vec::new()),
+            batch: Cell::new(false),
         }
+    }
+
+    /// Defer the fold during a bulk integrate (clone catch-up): append rows
+    /// without re-folding; the caller folds once via `materialize` when done.
+    pub fn set_batch(&self, on: bool) {
+        self.batch.set(on);
     }
 
     /// The device connection key seed — used to bind this node's iroh endpoint
@@ -181,6 +198,7 @@ impl MemEngine {
             .seal(),
         };
         self.rows.borrow_mut().push(row.clone());
+        self.row_ids.borrow_mut().insert(row.id.clone());
         Ok(Some(row))
     }
 
@@ -205,16 +223,37 @@ impl MemEngine {
         }
         .seal();
         self.rows.borrow_mut().push(row.clone());
+        self.row_ids.borrow_mut().insert(row.id.clone());
         Ok(Some(row))
     }
 
     pub fn record_write(&self, rel: &str, bytes: &[u8]) -> AspResult<Option<WireRow>> {
         match self.write_row(rel, bytes)? {
             Some(row) => {
-                self.materialize()?;
+                // Fast path: a linear local edit folds to exactly the new bytes for
+                // this one file_id with no cross-file effect, so update just its
+                // FileRow instead of re-folding the whole log. (Creates fall to the
+                // full fold below, which resolves any path collision.)
+                if row.kind == Kind::Edit {
+                    self.apply_one_edit(&row);
+                } else {
+                    self.materialize()?;
+                }
                 Ok(Some(self.wire(row)?))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Update a single file's materialized row for a linear edit — byte-identical
+    /// to what a full fold would produce for it (the edit was authored on the tip,
+    /// so it's a linear apply: new hash + lamport + author, nothing else changes).
+    fn apply_one_edit(&self, row: &LogRow) {
+        if let Some(f) = self.files.borrow_mut().iter_mut().find(|f| f.file_id == row.file_id) {
+            f.result_hash = row.result_hash.clone();
+            f.lamport = row.lamport;
+            f.site_id = row.site_id.clone();
+            f.deleted = false;
         }
     }
 
@@ -282,6 +321,7 @@ impl MemEngine {
         }
         .seal();
         self.rows.borrow_mut().push(row.clone());
+        self.row_ids.borrow_mut().insert(row.id.clone());
         self.materialize()?;
         Ok(Some(self.wire(row)?))
     }
@@ -336,9 +376,8 @@ impl MemEngine {
                 return Err(AspError::Protocol("blob hash mismatch".into()));
             }
         }
-        let exists = self.rows.borrow().iter().any(|r| r.id == wr.row.id);
-        if exists {
-            return Ok(false);
+        if !self.row_ids.borrow_mut().insert(wr.row.id.clone()) {
+            return Ok(false); // already held
         }
         self.rows.borrow_mut().push(wr.row.clone());
         self.materialize()?;
@@ -363,17 +402,16 @@ impl MemEngine {
                 }
             }
         }
-        // Dedup against rows we already hold and against repeats within the
-        // batch — a HashSet membership test, not the O(rows) linear scan the
-        // per-row path does for each row.
-        let mut seen: std::collections::HashSet<String> =
-            self.rows.borrow().iter().map(|r| r.id.clone()).collect();
+        // Dedup against the maintained id-set (and repeats within the batch) in
+        // O(1) per row — the old code rebuilt the set from the whole log on every
+        // call, which over a paged catch-up was O(N·pages).
         let mut flags = Vec::with_capacity(wrs.len());
         let mut added = 0usize;
         {
+            let mut ids = self.row_ids.borrow_mut();
             let mut store = self.rows.borrow_mut();
             for wr in wrs {
-                let is_new = seen.insert(wr.row.id.clone());
+                let is_new = ids.insert(wr.row.id.clone());
                 if is_new {
                     store.push(wr.row.clone());
                     added += 1;
@@ -381,7 +419,7 @@ impl MemEngine {
                 flags.push(is_new);
             }
         }
-        if added > 0 {
+        if added > 0 && !self.batch.get() {
             self.materialize()?;
         }
         Ok(flags)
@@ -452,13 +490,12 @@ impl MemEngine {
                 return Err(AspError::Protocol("state snapshot is for a different vault".into()));
             }
         }
-        let mut seen: std::collections::HashSet<String> =
-            self.rows.borrow().iter().map(|r| r.id.clone()).collect();
         let mut added = 0usize;
         {
+            let mut ids = self.row_ids.borrow_mut();
             let mut store = self.rows.borrow_mut();
             for r in snap.rows {
-                if seen.insert(r.id.clone()) {
+                if ids.insert(r.id.clone()) {
                     store.push(r);
                     added += 1;
                 }
@@ -728,5 +765,136 @@ mod tests {
         a.integrate(&rb).unwrap();
         assert_eq!(a.files_map().unwrap(), b.files_map().unwrap(), "mem engines converge");
         assert_eq!(a.read_file("doc.md").unwrap().as_deref(), Some(&b"L1\nl2\nL3\n"[..]));
+    }
+
+    /// Guards the perf rewrite: integrating a catch-up in PAGES under batch mode
+    /// (fold once at the end) must produce byte-identical state to a single
+    /// integrate, to the source's own fold, and be fully idempotent — and the
+    /// linear-edit fast-path must match a full re-fold.
+    #[test]
+    fn paged_batch_equals_single_fold_and_dedups() {
+        // A source with creates, a linear edit (exercises the fast-path), a rename
+        // and a delete — then collect every authored row in order.
+        let src = MemEngine::create(Identity::from_seed(&[9; 32]), "v1");
+        let mut all: Vec<WireRow> = Vec::new();
+        for i in 0..40 {
+            all.push(src.record_write(&format!("dir{}/f{i}.md", i % 5), format!("body {i}\n").as_bytes()).unwrap().unwrap());
+        }
+        all.push(src.record_write("dir0/f0.md", b"edited via fast-path\n").unwrap().unwrap());
+        all.push(src.record_rename("dir1/f1.md", "dir1/renamed.md").unwrap().unwrap());
+        all.push(src.record_remove("dir2/f2.md").unwrap().unwrap());
+
+        // A: one batch.
+        let a = MemEngine::create(Identity::from_seed(&[1; 32]), "v1");
+        assert_eq!(a.integrate_many(&all).unwrap().iter().filter(|f| **f).count(), all.len());
+
+        // B: paged under batch mode, fold once at the end (the clone path).
+        let b = MemEngine::create(Identity::from_seed(&[2; 32]), "v1");
+        b.set_batch(true);
+        for page in all.chunks(7) {
+            b.integrate_many(page).unwrap();
+        }
+        b.set_batch(false);
+        b.materialize().unwrap();
+
+        assert_eq!(a.files_map().unwrap(), b.files_map().unwrap(), "paged batch == single batch");
+        assert_eq!(a.files_map().unwrap(), src.files_map().unwrap(), "== source's own fold (fast-path correct)");
+        assert!(a.read_file("dir0/f0.md").unwrap().as_deref() == Some(&b"edited via fast-path\n"[..]));
+        assert!(a.read_file("dir1/renamed.md").unwrap().is_some() && a.read_file("dir1/f1.md").unwrap().is_none());
+        assert!(a.read_file("dir2/f2.md").unwrap().is_none());
+
+        // Idempotency: re-integrating everything is a no-op (dedup via the id-set),
+        // single + batch, in or out of batch mode.
+        assert!(a.integrate_many(&all).unwrap().iter().all(|f| !*f), "batch re-integration adds nothing");
+        assert!(!a.integrate(&all[0]).unwrap(), "single re-integration dedups");
+        b.set_batch(true);
+        assert!(b.integrate_many(&all).unwrap().iter().all(|f| !*f), "batch dedup holds in batch mode");
+        b.set_batch(false);
+        assert_eq!(a.files_map().unwrap(), src.files_map().unwrap(), "state unchanged after redundant integrates");
+    }
+
+    /// Fuzz the perf paths: random op sequences (create/edit/delete/rename, hitting
+    /// the linear-edit fast-path) integrated in random-sized pages under batch mode
+    /// must converge byte-identically to a single integrate and to the source's own
+    /// fold, and stay idempotent. Seeded → deterministic.
+    #[test]
+    fn fuzz_random_ops_paged_batch_converges() {
+        use rand::{Rng, SeedableRng};
+        for seed in 0..16u64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let src = MemEngine::create(Identity::from_seed(&[7; 32]), "v1");
+            let mut paths: Vec<String> = Vec::new();
+            let mut all: Vec<WireRow> = Vec::new();
+            for _ in 0..70 {
+                match rng.gen_range(0..5) {
+                    // create-or-edit a (maybe new) path
+                    0 | 1 => {
+                        let p = if !paths.is_empty() && rng.gen_bool(0.5) {
+                            paths[rng.gen_range(0..paths.len())].clone()
+                        } else {
+                            format!("d{}/f{}.md", rng.gen_range(0..4), rng.gen_range(0..40))
+                        };
+                        if let Some(r) = src.record_write(&p, format!("v{}", rng.gen_range(0..10_000)).as_bytes()).unwrap() {
+                            all.push(r);
+                            if !paths.contains(&p) {
+                                paths.push(p);
+                            }
+                        }
+                    }
+                    // edit an existing path (linear fast-path)
+                    2 => {
+                        if !paths.is_empty() {
+                            let p = paths[rng.gen_range(0..paths.len())].clone();
+                            if let Some(r) = src.record_write(&p, format!("e{}", rng.gen_range(0..10_000)).as_bytes()).unwrap() {
+                                all.push(r);
+                            }
+                        }
+                    }
+                    // delete
+                    3 => {
+                        if !paths.is_empty() {
+                            let p = paths.remove(rng.gen_range(0..paths.len()));
+                            if let Some(r) = src.record_remove(&p).unwrap() {
+                                all.push(r);
+                            }
+                        }
+                    }
+                    // rename
+                    _ => {
+                        if !paths.is_empty() {
+                            let i = rng.gen_range(0..paths.len());
+                            let old = paths[i].clone();
+                            let new = format!("d{}/r{}.md", rng.gen_range(0..4), rng.gen_range(0..40));
+                            if !paths.contains(&new) {
+                                if let Some(r) = src.record_rename(&old, &new).unwrap() {
+                                    all.push(r);
+                                    paths[i] = new;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let single = MemEngine::create(Identity::from_seed(&[1; 32]), "v1");
+            single.integrate_many(&all).unwrap();
+
+            let paged = MemEngine::create(Identity::from_seed(&[2; 32]), "v1");
+            paged.set_batch(true);
+            let mut i = 0;
+            while i < all.len() {
+                let n = rng.gen_range(1..9).min(all.len() - i);
+                paged.integrate_many(&all[i..i + n]).unwrap();
+                i += n;
+            }
+            paged.set_batch(false);
+            paged.materialize().unwrap();
+
+            let want = src.files_map().unwrap();
+            assert_eq!(single.files_map().unwrap(), want, "seed {seed}: single integrate == source fold");
+            assert_eq!(paged.files_map().unwrap(), want, "seed {seed}: paged batch == source fold");
+            assert!(single.integrate_many(&all).unwrap().iter().all(|f| !*f), "seed {seed}: idempotent");
+            assert_eq!(single.files_map().unwrap(), want, "seed {seed}: unchanged after redundant integrate");
+        }
     }
 }

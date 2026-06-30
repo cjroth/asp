@@ -219,7 +219,6 @@ fn git_head(dir: &Path) -> Option<String> {
 /// of the converged tree — a mismatch means a stale/incorrect git export).
 fn wait_converged(hub: &Hub, peers: &[Peer], timeout: Duration) -> (bool, Vec<String>) {
     let start = Instant::now();
-    let mut last = Vec::new();
     loop {
         let cli = snapshot_dir(&hub.dir);
         let cli_head = git_head(&hub.dir);
@@ -250,9 +249,8 @@ fn wait_converged(hub: &Hub, peers: &[Peer], timeout: Duration) -> (bool, Vec<St
         if problems.is_empty() {
             return (true, Vec::new());
         }
-        last = problems;
         if start.elapsed() >= timeout {
-            return (false, last);
+            return (false, problems);
         }
         std::thread::sleep(Duration::from_millis(120));
     }

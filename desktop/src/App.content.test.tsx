@@ -1,10 +1,11 @@
+import { mock } from 'bun:test';
 // Editor content-integrity tests on a SMALL flat vault (every row stably
 // rendered — no virtualization/scroll fragility), with a deliberately SLOW
 // backend. These reproduce the "random stuff / stale content" class that the
 // happy-path harness missed: the editor must reflect the in-memory working copy,
 // never a stale/empty backend read while a write is still draining.
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from './test-shim';
 
 let CONTENT: Record<string, string>;
 const reset = () => { CONTENT = { 'a.md': '# A\n\naaa', 'b.md': '# B\n\nbbb', 'c.md': '# C\n\nccc' }; };
@@ -14,9 +15,10 @@ const slow = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const writeFile = vi.fn(async (_id: string, p: string, c: string) => { await slow(120); CONTENT[p] = c; });
 const readFile = vi.fn(async (_id: string, p: string) => { await slow(10); return CONTENT[p] ?? ''; });
 
-vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/v') }));
-vi.mock('./lib/api', () => ({
+mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/v') }));
+mock.module('./lib/api', () => ({
   api: {
+    startLiveSync: vi.fn(), stopLiveSync: vi.fn(), setLocalRelay: vi.fn(async () => false), getLocalRelay: vi.fn(async () => false),
     listVaults: async () => [{ id: 'v1', path: '/v', vault_id: 'vid', enabled: false, listening_ticket: null }],
     getStatus: async (id: string) => ({ id, vault_id: 'vid', rows: 3, files: 3, head: 'h', listening_ticket: null, peers: [], last_ts: 1 }),
     getIdentity: async () => 'k',
@@ -83,3 +85,5 @@ describe('editor content integrity (small vault, slow backend)', () => {
     expect(editor.textContent || '').not.toContain('bbb');
   });
 });
+import { afterAll as __aa, mock as __mk } from 'bun:test';
+__aa(() => __mk.restore());

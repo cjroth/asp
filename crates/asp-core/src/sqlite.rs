@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS files(
   file_id TEXT PRIMARY KEY, path TEXT, result_hash TEXT, merge_class TEXT,
   deleted INTEGER NOT NULL DEFAULT 0, lamport INTEGER, site_id TEXT, conflict INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS files_path ON files(path);
 CREATE TABLE IF NOT EXISTS fold_cache(step_key TEXT PRIMARY KEY, output_hash TEXT);
 CREATE TABLE IF NOT EXISTS snapshots(
   snapshot_id TEXT PRIMARY KEY, created_lamport INTEGER, label TEXT, tree_hash TEXT,
@@ -45,6 +46,11 @@ CREATE TABLE IF NOT EXISTS authorized_keys(
 );
 CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS git_blobs(content_hash TEXT PRIMARY KEY, git_oid TEXT NOT NULL);
+-- Per-file (mtime, size) -> content hash cache, so the startup reconcile can skip
+-- reading + hashing files whose stat is unchanged (the dominant cost on a big
+-- working tree). Purely a local performance cache: never synced, and a miss only
+-- costs a re-read, so it can be dropped at any time without affecting correctness.
+CREATE TABLE IF NOT EXISTS fs_stat(path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL, hash TEXT NOT NULL);
 "#;
 
 pub struct SqliteStore {
@@ -186,10 +192,33 @@ impl SqliteStore {
             .query_row("SELECT MAX(ts) FROM log", [], |r| r.get::<_, Option<i64>>(0))?)
     }
 
-    /// Count of live (non-deleted) materialized files — a single aggregate, so
-    /// the status poll never materializes every `FileRow` just to count them.
-    pub fn live_file_count(&self) -> AspResult<u64> {
-        Ok(self.conn.query_row("SELECT COUNT(*) FROM files WHERE deleted=0", [], |r| r.get::<_, i64>(0))? as u64)
+    /// Count of live (non-tombstone) materialized files — a single aggregate, so
+    /// the status poll never materializes every `FileRow` just to count them
+    /// (must stay O(1) on a big vault).
+    pub fn live_file_count(&self) -> AspResult<usize> {
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM files WHERE deleted=0", [], |r| r.get::<_, i64>(0))? as usize)
+    }
+
+    /// The live (non-tombstone) file at `path`, if any — an indexed lookup, not a
+    /// load of every file row (record_* run it on every edit).
+    pub fn live_file_by_path(&self, path: &str) -> AspResult<Option<FileRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, path, result_hash, merge_class, deleted, lamport, site_id, conflict
+             FROM files WHERE path=?1 AND deleted=0 LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![path], |r| {
+            Ok(FileRow {
+                file_id: r.get(0)?,
+                path: r.get(1)?,
+                result_hash: r.get(2)?,
+                merge_class: MergeClass::parse(&r.get::<_, String>(3)?).unwrap_or(MergeClass::Text),
+                deleted: r.get::<_, i64>(4)? != 0,
+                lamport: r.get::<_, i64>(5)? as u64,
+                site_id: r.get(6)?,
+                conflict: r.get::<_, i64>(7)? != 0,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
     }
 
     /// Derived-git blob-object id for a content hash, if already exported. The git
@@ -330,6 +359,98 @@ impl SqliteStore {
             "UPDATE files SET result_hash=?2, lamport=?3, site_id=?4 WHERE file_id=?1",
             params![file_id, result_hash, lamport as i64, site_id],
         )?;
+        Ok(())
+    }
+
+    /// Every file row, tombstones included — the prior fold result, for diffing a
+    /// fresh fold so materialize only touches what changed (vs `replace_files`,
+    /// which rewrites the whole table on every edit — O(N) per keystroke).
+    pub fn all_files(&self) -> AspResult<Vec<FileRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, path, result_hash, merge_class, deleted, lamport, site_id, conflict FROM files",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(FileRow {
+                    file_id: r.get(0)?,
+                    path: r.get(1)?,
+                    result_hash: r.get(2)?,
+                    merge_class: MergeClass::parse(&r.get::<_, String>(3)?).unwrap_or(MergeClass::Text),
+                    deleted: r.get::<_, i64>(4)? != 0,
+                    lamport: r.get::<_, i64>(5)? as u64,
+                    site_id: r.get(6)?,
+                    conflict: r.get::<_, i64>(7)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Delete specific file rows by `file_id` — for fold outputs that drop a row
+    /// entirely (a deleted directory entity gets no tombstone, unlike a content
+    /// file), which `replace_files` used to handle by rewriting the whole table.
+    pub fn delete_file_rows(&self, file_ids: &[String]) -> AspResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for id in file_ids {
+            tx.execute("DELETE FROM files WHERE file_id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load the (mtime_ns, size, content_hash) reconcile cache: path -> stat+hash.
+    pub fn load_fs_stat(&self) -> AspResult<std::collections::HashMap<String, (i64, i64, String)>> {
+        let mut stmt = self.conn.prepare("SELECT path, mtime_ns, size, hash FROM fs_stat")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?)))
+        })?;
+        Ok(rows.collect::<Result<std::collections::HashMap<_, _>, _>>()?)
+    }
+
+    /// Record the stat+hash for files (re)read during a scan (one txn = one fsync).
+    pub fn upsert_fs_stat(&self, entries: &[(String, i64, i64, String)]) -> AspResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for (path, mtime_ns, size, hash) in entries {
+            tx.execute(
+                "INSERT OR REPLACE INTO fs_stat(path, mtime_ns, size, hash) VALUES (?1,?2,?3,?4)",
+                params![path, mtime_ns, size, hash],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop reconcile-cache entries for paths no longer on disk (kept in sync).
+    pub fn delete_fs_stat(&self, paths: &[String]) -> AspResult<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for p in paths {
+            tx.execute("DELETE FROM fs_stat WHERE path = ?1", params![p])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Insert-or-replace specific file rows by `file_id` (the PK) — the
+    /// incremental counterpart to `replace_files`. One transaction = one fsync.
+    pub fn upsert_files(&self, files: &[FileRow]) -> AspResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for f in files {
+            tx.execute(
+                "INSERT OR REPLACE INTO files(file_id, path, result_hash, merge_class, deleted, lamport, site_id, conflict)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    f.file_id, f.path, f.result_hash, f.merge_class.as_str(),
+                    f.deleted as i64, f.lamport as i64, f.site_id, f.conflict as i64
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

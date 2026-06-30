@@ -42,17 +42,29 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState { engine })
         .setup(|app| {
-            // Re-open previously-managed folders OFF the startup critical path.
-            // Each reopen runs capture_rescan (O(files) hashing), so doing it
-            // synchronously before the window is built froze first paint on a large
-            // saved vault. Spawn it on a background thread (the engine guards its own
-            // state with a mutex, so commands that arrive meanwhile are safe), and
-            // emit `vaults-ready` so the UI refreshes its list the moment the
-            // reopened folders are live instead of waiting for the next poll.
+            // Push a `vault-changed` event to the webview the instant a peer's
+            // change integrates, so the desktop UI updates in realtime (the
+            // in-process analogue of the web node's live on_change callback)
+            // instead of waiting for its periodic re-read.
             let handle = app.handle().clone();
+            app.state::<AppState>().engine.set_change_listener(move |vault_id| {
+                let _ = handle.emit("vault-changed", vault_id);
+            });
+            // Re-open saved folders in the BACKGROUND so the window opens instantly.
+            // A folder's open includes a startup reconcile that reads every file on
+            // disk — ~tens of seconds for a 28k-file vault — which used to block the
+            // whole app from appearing. Folders reopen concurrently and emit a
+            // realtime `vaults-changed` the instant each lands (no polling), so the
+            // UI surfaces each vault as it's ready. A vault becomes shareable only
+            // after its reconcile, so a clone can never contend with one mid-scan.
+            let h2 = app.handle().clone();
             std::thread::spawn(move || {
-                let _ = handle.state::<AppState>().engine.reopen_saved();
-                let _ = handle.emit("vaults-ready", ());
+                let emit_handle = h2.clone();
+                h2.state::<AppState>()
+                    .engine
+                    .reopen_saved_streaming(move |_info| {
+                        let _ = emit_handle.emit("vaults-changed", ());
+                    });
             });
             Ok(())
         })
@@ -61,6 +73,8 @@ pub fn run() {
             commands::add_local_folder,
             commands::clone_remote,
             commands::set_allow_connections,
+            commands::set_local_relay,
+            commands::get_local_relay,
             commands::set_enabled,
             commands::sync_now,
             commands::get_status,
