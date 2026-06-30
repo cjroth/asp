@@ -283,4 +283,74 @@ mod tests {
         let ghost = row("aa", 0, "no-such-branch");
         assert!(!bs.visibility(MAIN_BRANCH_ID).sees(&ghost));
     }
+
+    #[test]
+    fn adversarial_lineage_and_branch_ids_never_panic_and_stay_deterministic() {
+        // §8.3: arbitrary/garbage branch_ids, cyclic + dangling branch lineage, and
+        // huge/odd fork_vvs must never panic the visibility fold and must stay
+        // permutation-invariant (deterministic) — exactly the guarantees fold_order
+        // gives for malformed causal DAGs, now for malformed branch DAGs.
+        use crate::fold::compute_files;
+        use crate::store::{BlobStore, MemBlobStore};
+        let store = MemBlobStore::new();
+        let h = store.put_blob(b"x\n").unwrap();
+        // A few branch_ids: real lineage members + pure garbage.
+        let labels = ["main", "a", "b", "cyc1", "cyc2", "dangling", "🗑\0garbage", ""];
+        // Adversarial branch set: a<-b (ok), a self-parent, cyc1<->cyc2 cycle,
+        // dangling -> unknown, plus huge fork seqs.
+        let mut branches = vec![
+            Branch { branch_id: "a".into(), name: "a".into(), parent: Some(MAIN_BRANCH_ID.into()), fork_vv: vv(&[("s0", 2)]), created_lamport: 1, created_ts: 0, deleted: false },
+            Branch { branch_id: "b".into(), name: "b".into(), parent: Some("a".into()), fork_vv: vv(&[("s0", i64::MAX), ("ghost", 9)]), created_lamport: 2, created_ts: 0, deleted: false },
+            Branch { branch_id: "cyc1".into(), name: "c1".into(), parent: Some("cyc2".into()), fork_vv: vv(&[("s1", -5)]), created_lamport: 3, created_ts: 0, deleted: false },
+            Branch { branch_id: "cyc2".into(), name: "c2".into(), parent: Some("cyc1".into()), fork_vv: vv(&[]), created_lamport: 3, created_ts: 0, deleted: false },
+            Branch { branch_id: "dangling".into(), name: "d".into(), parent: Some("no-such".into()), fork_vv: vv(&[("s2", 0)]), created_lamport: 4, created_ts: 0, deleted: false },
+        ];
+        branches.push(Branch { branch_id: "selfp".into(), name: "self".into(), parent: Some("selfp".into()), fork_vv: vv(&[]), created_lamport: 5, created_ts: 0, deleted: false });
+        let bs = BranchSet::new(branches);
+
+        // Deterministic LCG (no Math.random in this env).
+        let mut state: u64 = 0xDEAD_BEEF;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let mut rows = Vec::new();
+        for i in 0..60u64 {
+            let site = format!("s{}", next() % 4);
+            let branch = labels[(next() as usize) % labels.len()];
+            let seq = next() % 6;
+            rows.push(
+                LogRow {
+                    site_id: site,
+                    lamport: i + 1,
+                    seq,
+                    file_id: format!("f{}", next() % 8),
+                    kind: Kind::Create,
+                    merge_class: MergeClass::Text,
+                    result_hash: Some(h.clone()),
+                    path: Some(format!("p{}.md", next() % 5)),
+                    branch_id: branch.into(),
+                    ..LogRow::default()
+                }
+                .seal(),
+            );
+        }
+
+        for target in ["main", "a", "b", "cyc1", "dangling", "selfp", "ghost-target"] {
+            // Never panics; permutation-invariant.
+            let v1 = compute_files(&store, &visible_rows(&rows, &bs, target)).unwrap();
+            let mut shuffled = rows.clone();
+            // simple reverse + rotate shuffle
+            shuffled.reverse();
+            let rot = (next() as usize) % shuffled.len().max(1);
+            shuffled.rotate_left(rot);
+            let v2 = compute_files(&store, &visible_rows(&shuffled, &bs, target)).unwrap();
+            let norm = |fs: &[crate::store::FileRow]| {
+                let mut x: Vec<_> = fs.iter().map(|f| (f.path.clone(), f.deleted, f.result_hash.clone())).collect();
+                x.sort();
+                x
+            };
+            assert_eq!(norm(&v1), norm(&v2), "target {target}: scoped fold not deterministic on adversarial input");
+        }
+    }
 }

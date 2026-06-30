@@ -316,6 +316,31 @@ fn branch_scoped_fold_is_deterministic_and_isolated() {
             assert_eq!(norm(&base_b), norm(&got), "seed {seed}: scoped fold not order-invariant");
         }
 
+        // Branch-scoped INCREMENTAL fold == from-scratch scoped fold, after every
+        // row, in random arrival order — exactly what the engine does: filter rows
+        // to visible(B), then refold only the touched file. This is the §8.2 primary
+        // gate extended to a scoped view.
+        {
+            let mut arrival = vis_b.clone();
+            let mut r3 = Rng::new(seed.wrapping_mul(7901) + 3);
+            shuffle(&mut r3, &mut arrival);
+            let mut by_file: BTreeMap<String, Vec<LogRow>> = BTreeMap::new();
+            let mut seen: Vec<LogRow> = Vec::new();
+            let mut fold = FoldState::from_rows(&store, &[]).unwrap();
+            for r in arrival {
+                by_file.entry(r.file_id.clone()).or_default().push(r.clone());
+                seen.push(r.clone());
+                let fid = r.file_id.clone();
+                fold.refold_files(&store, std::slice::from_ref(&fid), |f| Ok(by_file.get(f).cloned().unwrap_or_default()))
+                    .unwrap();
+                assert_eq!(
+                    norm(&fold.files()),
+                    norm(&compute_files(&store, &seen).unwrap()),
+                    "seed {seed}: scoped incremental fold diverged after a row for {fid}"
+                );
+            }
+        }
+
         // Isolation: state(main) sees only main-tagged rows, regardless of B's rows.
         let main_subset: Vec<LogRow> = tagged.iter().filter(|r| r.branch_id == MAIN_BRANCH_ID).cloned().collect();
         let vis_main = visible_rows(&tagged, &bs, MAIN_BRANCH_ID);

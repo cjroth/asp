@@ -984,9 +984,13 @@ impl Engine {
         self.apply_target(&desired)
     }
 
-    /// Materialized state at wall-clock T (best-effort): fold rows with ts ≤ T.
+    /// Materialized state at wall-clock T (best-effort): fold the checked-out
+    /// branch's visible rows with ts ≤ T (§4.6 — time-travel is branch-scoped, so a
+    /// scrub on a branch never mixes in sibling/parent-after-fork history).
     pub fn state_as_of(&self, t: i64) -> AspResult<BTreeMap<String, Vec<u8>>> {
-        let rows: Vec<LogRow> = self.store.all_rows()?.into_iter().filter(|r| r.ts <= t).collect();
+        let bs = self.branch_set()?;
+        let vis = bs.visibility(&self.head_branch());
+        let rows: Vec<LogRow> = self.store.all_rows()?.into_iter().filter(|r| vis.sees(r) && r.ts <= t).collect();
         let files = compute_files(&self.store, &rows)?;
         let mut m = BTreeMap::new();
         for f in files {
@@ -1007,7 +1011,9 @@ impl Engine {
     /// file's blob like `state_as_of`. On a large vault that is the difference
     /// between a snappy scrub and reading the whole vault on every tick.
     pub fn file_at(&self, path: &str, t: i64) -> AspResult<Option<Vec<u8>>> {
-        let rows: Vec<LogRow> = self.store.all_rows()?.into_iter().filter(|r| r.ts <= t).collect();
+        let bs = self.branch_set()?;
+        let vis = bs.visibility(&self.head_branch());
+        let rows: Vec<LogRow> = self.store.all_rows()?.into_iter().filter(|r| vis.sees(r) && r.ts <= t).collect();
         let files = compute_files(&self.store, &rows)?;
         for f in files {
             if !f.deleted && f.path == path {
@@ -1301,6 +1307,29 @@ mod tests {
         e.checkout(&b).unwrap();
         assert_eq!(fs::read(d.path().join("a.md")).unwrap(), b"branch-v2\n");
         assert!(d.path().join("only-on-branch.md").exists());
+    }
+
+    #[test]
+    fn time_travel_is_branch_scoped() {
+        // §4.6 regression: state_as_of / file_at must fold only the checked-out
+        // branch's visible rows. With a divergent post-fork edit on main, a scrub
+        // on the branch must show the BRANCH's content — not a merge of the two.
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        e.record_write("a.md", b"m1\n").unwrap().unwrap();
+        let b = e.fork_from_time("feature", i64::MAX).unwrap();
+        e.record_write("a.md", b"b2\n").unwrap().unwrap(); // edit on the branch
+        e.checkout(MAIN_BRANCH_ID).unwrap();
+        e.record_write("a.md", b"m2\n").unwrap().unwrap(); // divergent edit on main
+
+        // On main, the slider sees main's line.
+        assert_eq!(e.file_at("a.md", i64::MAX).unwrap().as_deref(), Some(&b"m2\n"[..]));
+        // On the branch, it sees ONLY the branch's line — main's post-fork edit is
+        // invisible (pre-fix this folded both → a 3-way merge, not "b2").
+        e.checkout(&b).unwrap();
+        assert_eq!(e.file_at("a.md", i64::MAX).unwrap().as_deref(), Some(&b"b2\n"[..]));
+        let st = e.state_as_of(i64::MAX).unwrap();
+        assert_eq!(st.get("a.md").map(|v| v.as_slice()), Some(&b"b2\n"[..]));
     }
 
     #[test]
