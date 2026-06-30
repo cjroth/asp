@@ -50,6 +50,12 @@ pub struct Engine {
     /// file_ids whose log changed since the cache was last reconciled — drained
     /// and re-folded by `materialize`. Every row append records its file_id here.
     dirty: std::cell::RefCell<std::collections::HashSet<String>>,
+    /// In-memory memo of content_hash → derived-git blob oid. The git oid is a
+    /// pure function of the bytes, so this is a safe cache; it spares the git
+    /// export a SQLite lookup per file on every settle (the dominant per-op cost
+    /// at scale was ~3000 `git_oid_for` queries per export). Backed by the durable
+    /// `git_blobs` table for cross-session reuse.
+    git_oids: std::cell::RefCell<std::collections::HashMap<String, [u8; 20]>>,
 }
 
 fn now_unix() -> u64 {
@@ -108,6 +114,7 @@ impl Engine {
             batch: std::cell::Cell::new(false),
             fold: std::cell::RefCell::new(None),
             dirty: std::cell::RefCell::new(std::collections::HashSet::new()),
+            git_oids: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
         Ok(eng)
     }
@@ -512,19 +519,34 @@ impl Engine {
     fn export_git(&self, entries: &BTreeMap<String, String>, derived_time: u64) {
         let git_dir = &self.git_dir;
         let store = &self.store;
+        let cache = &self.git_oids;
         let _ = gitexport::export(git_dir, entries, derived_time, |content_hash: &str| -> AspResult<[u8; 20]> {
-            if let Some(oid_hex) = store.git_oid_for(content_hash)? {
-                if let Ok(bytes) = hex::decode(&oid_hex) {
-                    if bytes.len() == 20 {
-                        let mut oid = [0u8; 20];
-                        oid.copy_from_slice(&bytes);
-                        return Ok(oid);
-                    }
-                }
+            // In-memory memo first (deterministic fn of content), so a settle does
+            // not issue a SQLite lookup per file.
+            if let Some(oid) = cache.borrow().get(content_hash).copied() {
+                return Ok(oid);
             }
-            let bytes = store.get_blob(content_hash)?.unwrap_or_default();
-            let oid = gitexport::write_blob_object(git_dir, &bytes)?;
-            store.put_git_oid(content_hash, &hex::encode(oid))?;
+            // Then the durable git_blobs cache (cross-session), else compute + persist.
+            let oid = match store.git_oid_for(content_hash)? {
+                Some(oid_hex) => match hex::decode(&oid_hex) {
+                    Ok(b) if b.len() == 20 => {
+                        let mut o = [0u8; 20];
+                        o.copy_from_slice(&b);
+                        o
+                    }
+                    _ => {
+                        let bytes = store.get_blob(content_hash)?.unwrap_or_default();
+                        gitexport::write_blob_object(git_dir, &bytes)?
+                    }
+                },
+                None => {
+                    let bytes = store.get_blob(content_hash)?.unwrap_or_default();
+                    let o = gitexport::write_blob_object(git_dir, &bytes)?;
+                    store.put_git_oid(content_hash, &hex::encode(o))?;
+                    o
+                }
+            };
+            cache.borrow_mut().insert(content_hash.to_string(), oid);
             Ok(oid)
         });
     }
