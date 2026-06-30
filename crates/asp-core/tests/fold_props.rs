@@ -7,7 +7,8 @@
 //! every arrival order.
 
 use asp_core::store::MemBlobStore;
-use asp_core::{compute_files, fold_order, BlobStore, FileRow, Kind, LogRow, MergeClass};
+use asp_core::{compute_files, fold_order, BlobStore, FileRow, FoldState, Kind, LogRow, MergeClass};
+use std::collections::BTreeMap;
 
 // ---- tiny deterministic PRNG (xorshift) ----
 struct Rng(u64);
@@ -219,6 +220,41 @@ fn fold_is_permutation_invariant_over_random_histories() {
             shuffle(&mut rng, &mut shuffled);
             let got = compute_files(&store, &shuffled).unwrap();
             assert_eq!(norm(&base), norm(&got), "seed {seed} shuffle {k}: fold not order-invariant");
+        }
+    }
+}
+
+#[test]
+fn incremental_foldstate_matches_full_fold_after_every_row() {
+    // THE gate for the incremental fold: feed a random concurrent history to a
+    // FoldState ONE ROW AT A TIME in a random arrival order (re-folding only the
+    // touched file each step), and assert it equals compute_files over the rows
+    // seen so far — after EVERY row. Out-of-order arrival, concurrent forks,
+    // renames creating/breaking path collisions, delete+recreate: all must keep
+    // the incremental state identical to a from-scratch fold.
+    for seed in 0..300u64 {
+        let (store, rows) = generate(seed, 6, 8);
+        let mut arrival = rows.clone();
+        let mut rng = Rng::new(seed.wrapping_mul(7919) + 1);
+        shuffle(&mut rng, &mut arrival);
+
+        // rows seen so far, indexed by file_id, so refold_files can hand the
+        // incremental fold ALL rows for a touched file.
+        let mut by_file: BTreeMap<String, Vec<LogRow>> = BTreeMap::new();
+        let mut seen: Vec<LogRow> = Vec::new();
+        let mut fold = FoldState::from_rows(&store, &[]).unwrap();
+
+        for r in arrival {
+            by_file.entry(r.file_id.clone()).or_default().push(r.clone());
+            seen.push(r.clone());
+            let fid = r.file_id.clone();
+            fold
+                .refold_files(&store, std::slice::from_ref(&fid), |f| Ok(by_file.get(f).cloned().unwrap_or_default()))
+                .unwrap();
+
+            let incremental = norm(&fold.files());
+            let full = norm(&compute_files(&store, &seen).unwrap());
+            assert_eq!(incremental, full, "seed {seed}: incremental fold diverged after a row for {fid}");
         }
     }
 }

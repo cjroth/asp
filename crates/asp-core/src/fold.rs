@@ -106,24 +106,20 @@ fn order_key(r: &LogRow) -> OrderKey {
     OrderKey { lamport: r.lamport, site_id: r.site_id.clone(), id: r.id.clone() }
 }
 
-/// Fold the whole log into the materialized `files` set, writing any merged
-/// blobs back to the store. Pure function of the rows + blobs.
-pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::AspResult<Vec<FileRow>> {
-    let ordered = fold_order(rows);
-    let mut states: HashMap<String, FileState> = HashMap::new();
-
-    // Read a blob by hash. Only the genuine 3-way-merge path reads content; the
-    // common linear-edit path just tracks `content_hash` (cheap, no blob I/O) —
-    // so a fold over a vault with no concurrent conflicts is O(rows), not
-    // O(blob bytes). `blob(content_hash)` is byte-identical to the eagerly
-    // materialized content, so the resulting FileRows are unchanged.
+/// Run the per-file fold state machine over `ordered` (already in fold order),
+/// updating `states`. Each `file_id`'s state is a pure function of ITS OWN rows
+/// (the only cross-file interaction is path-collision resolution, done later in
+/// `resolve_paths`), so feeding one file's rows here yields exactly the state it
+/// would have inside a whole-log fold — the property the incremental `FoldState`
+/// relies on. Only a genuine 3-way merge reads blobs; linear edits just track the
+/// content hash.
+fn apply_rows(store: &dyn BlobStore, ordered: &[LogRow], states: &mut HashMap<String, FileState>) -> crate::error::AspResult<()> {
     let blob = |h: &Option<String>| -> Vec<u8> {
         match h {
             Some(h) => store.get_blob(h).ok().flatten().unwrap_or_default(),
             None => Vec::new(),
         }
     };
-
     for r in ordered.iter() {
         match r.kind {
             Kind::Create => {
@@ -192,14 +188,70 @@ pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::As
             }
         }
     }
+    Ok(())
+}
 
-    Ok(resolve_paths(states))
+/// Fold the whole log into the materialized `files` set, writing any merged
+/// blobs back to the store. Pure function of the rows + blobs.
+pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::AspResult<Vec<FileRow>> {
+    let ordered = fold_order(rows);
+    let mut states: HashMap<String, FileState> = HashMap::new();
+    apply_rows(store, &ordered, &mut states)?;
+    Ok(resolve_paths(&states))
+}
+
+/// An incrementally-maintained fold: the per-`file_id` states plus a way to
+/// re-fold only the files a new batch of rows touched, instead of re-folding the
+/// whole log. Because each file's state is independent (above), re-folding just
+/// the touched files from their own rows yields the same states a full fold would
+/// — `FoldState::files()` then resolves paths over ALL cached states. The
+/// `fold_props` differential test pins this equal to `compute_files` for every
+/// random history and arrival order; the sync fuzzer validates it end to end.
+pub struct FoldState {
+    states: HashMap<String, FileState>,
+}
+
+impl FoldState {
+    /// Build from scratch by folding the whole log (used once, e.g. at open).
+    pub fn from_rows(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::AspResult<FoldState> {
+        let ordered = fold_order(rows);
+        let mut states = HashMap::new();
+        apply_rows(store, &ordered, &mut states)?;
+        Ok(FoldState { states })
+    }
+
+    /// Re-fold exactly `file_ids`, replacing their cached state. `rows_for(fid)`
+    /// must return ALL rows for `fid` (a new row can be concurrent with / precede
+    /// cached rows, so the file is re-folded from scratch — but only that file).
+    /// A file whose rows vanished (none returned) is dropped.
+    pub fn refold_files(
+        &mut self,
+        store: &dyn BlobStore,
+        file_ids: &[String],
+        rows_for: impl Fn(&str) -> crate::error::AspResult<Vec<LogRow>>,
+    ) -> crate::error::AspResult<()> {
+        for fid in file_ids {
+            self.states.remove(fid);
+            let frows = rows_for(fid)?;
+            if frows.is_empty() {
+                continue;
+            }
+            let ordered = fold_order(&frows);
+            apply_rows(store, &ordered, &mut self.states)?;
+        }
+        Ok(())
+    }
+
+    /// The materialized file set (resolves path collisions across all files).
+    pub fn files(&self) -> Vec<FileRow> {
+        resolve_paths(&self.states)
+    }
 }
 
 /// Resolve live-path collisions: among files claiming the same path, the lowest
 /// fold-order claim keeps it; others get a deterministic ` (n)` suffix. Tombstones
 /// are emitted too (deleted=1) so deletes are explicit, ordered rows.
-fn resolve_paths(states: HashMap<String, FileState>) -> Vec<FileRow> {
+fn resolve_paths(states: &HashMap<String, FileState>) -> Vec<FileRow> {
     // Stable ordering of all states by (path_claim, file_id).
     let mut all: Vec<(&String, &FileState)> = states.iter().collect();
     all.sort_by(|a, b| {
