@@ -89,10 +89,21 @@ struct FileState {
     lamport: u64,
     site_id: String,
     conflict: bool,
-    /// Fold-order index of the row that last set this file's path (create/rename)
-    /// — the deterministic key for resolving live-path collisions.
-    path_claim: usize,
+    /// Order key `(lamport, site_id, id)` of the row that last set this file's
+    /// path (create/rename) — the deterministic key for resolving live-path
+    /// collisions. Intrinsic to that row (not a global fold-order index), so it
+    /// is identical whether the file is folded in isolation or with the whole
+    /// log — exactly what an incremental fold needs. Two files can only collide
+    /// on a path if their claim rows are concurrent (different file_ids → no
+    /// causal edge), and concurrent rows order by this same key in `fold_order`,
+    /// so collision resolution is unchanged from the previous index-based key.
+    path_claim: OrderKey,
     created: bool,
+}
+
+/// The order key of a row — its concurrent-tiebreak identity.
+fn order_key(r: &LogRow) -> OrderKey {
+    OrderKey { lamport: r.lamport, site_id: r.site_id.clone(), id: r.id.clone() }
 }
 
 /// Fold the whole log into the materialized `files` set, writing any merged
@@ -113,7 +124,7 @@ pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::As
         }
     };
 
-    for (idx, r) in ordered.iter().enumerate() {
+    for r in ordered.iter() {
         match r.kind {
             Kind::Create => {
                 states.insert(
@@ -126,7 +137,7 @@ pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::As
                         lamport: r.lamport,
                         site_id: r.site_id.clone(),
                         conflict: false,
-                        path_claim: idx,
+                        path_claim: order_key(r),
                         created: true,
                     },
                 );
@@ -159,7 +170,7 @@ pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::As
                     continue;
                 }
                 st.path = r.path.clone();
-                st.path_claim = idx; // last rename wins by fold order
+                st.path_claim = order_key(r); // last rename wins by fold order
                 st.lamport = r.lamport;
                 st.site_id = r.site_id.clone();
             }
