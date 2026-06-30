@@ -66,6 +66,11 @@ pub struct MemEngine {
     files: RefCell<Vec<FileRow>>,
     config: RefCell<BTreeMap<String, String>>,
     authorized: RefCell<Vec<AuthKey>>,
+    /// Synced branch records (§7), reconciled LWW from the Kind::Branch rows — the
+    /// same set every peer converges to. The implicit `main` is not stored here.
+    branches: RefCell<Vec<crate::branch::Branch>>,
+    /// The checked-out branch (HEAD) — per-device, never synced (§7).
+    head: RefCell<String>,
 }
 
 impl MemEngine {
@@ -88,6 +93,8 @@ impl MemEngine {
             files: RefCell::new(Vec::new()),
             config: RefCell::new(cfg),
             authorized: RefCell::new(Vec::new()),
+            branches: RefCell::new(Vec::new()),
+            head: RefCell::new(MAIN_BRANCH_ID.to_string()),
         }
     }
 
@@ -114,14 +121,130 @@ impl MemEngine {
     }
 
     fn tip(&self, file_id: &str) -> Option<String> {
+        let bs = self.branch_set();
+        let vis = bs.visibility(&self.head_branch());
         self.rows
             .borrow()
             .iter()
-            .filter(|r| r.file_id == file_id)
+            .filter(|r| r.file_id == file_id && vis.sees(r))
             .max_by(|a, b| {
                 a.lamport.cmp(&b.lamport).then_with(|| a.site_id.cmp(&b.site_id)).then_with(|| a.id.cmp(&b.id))
             })
             .map(|r| r.id.clone())
+    }
+
+    // ----- branches (§2, §7) — parity with the native Engine -----
+
+    /// The checked-out branch (HEAD).
+    pub fn head_branch(&self) -> String {
+        self.head.borrow().clone()
+    }
+
+    /// The checked-out branch id (alias used by hosts/bindings).
+    pub fn current_branch(&self) -> String {
+        self.head_branch()
+    }
+
+    fn branch_set(&self) -> crate::branch::BranchSet {
+        crate::branch::BranchSet::new(self.branches.borrow().clone())
+    }
+
+    /// All live branches, `main` first.
+    pub fn branches(&self) -> Vec<crate::branch::Branch> {
+        let mut out = vec![crate::branch::Branch::main()];
+        for b in self.branches.borrow().iter() {
+            if !b.deleted {
+                out.push(b.clone());
+            }
+        }
+        out
+    }
+
+    /// Rebuild the branch set from the synced Kind::Branch records (LWW).
+    fn reconcile_branches(&self) {
+        let recs = crate::branch::reconcile_branches(&self.rows.borrow(), |h| self.blobs.get_blob(h).ok().flatten());
+        *self.branches.borrow_mut() = recs;
+    }
+
+    /// Author a synced branch record (§7) — the wasm-side mirror of the native
+    /// engine: a Kind::Branch row whose result blob is the JSON-encoded Branch.
+    pub fn author_branch_record(&self, b: &crate::branch::Branch) -> AspResult<WireRow> {
+        let blob = crate::branch::encode_branch_record(b);
+        let h = self.blobs.put_blob(&blob)?;
+        let row = LogRow {
+            site_id: self.site_id(),
+            lamport: self.next_lamport(),
+            seq: self.next_seq(),
+            ts: now_unix(),
+            file_id: b.branch_id.clone(),
+            kind: Kind::Branch,
+            result_hash: Some(h),
+            path: Some(b.name.clone()),
+            ..LogRow::default()
+        }
+        .seal();
+        self.rows.borrow_mut().push(row.clone());
+        self.reconcile_branches();
+        self.wire(row)
+    }
+
+    /// Create a branch off `parent` capturing `fork_vv`. Returns its id.
+    pub fn create_branch(&self, name: &str, parent: &str, fork_vv: crate::branch::VersionVector) -> AspResult<String> {
+        let created_lamport = self.next_lamport();
+        let branch_id = crate::branch::Branch::derive_id(name, parent, &fork_vv, created_lamport, &self.site_id());
+        let b = crate::branch::Branch {
+            branch_id: branch_id.clone(),
+            name: name.to_string(),
+            parent: Some(parent.to_string()),
+            fork_vv,
+            created_lamport,
+            created_ts: now_unix(),
+            deleted: false,
+        };
+        self.author_branch_record(&b)?;
+        Ok(branch_id)
+    }
+
+    /// Switch HEAD and re-materialize the branch's scoped state.
+    pub fn checkout(&self, branch_id: &str) -> AspResult<()> {
+        if self.branch_set().get(branch_id).is_none() {
+            return Err(AspError::NotFound(format!("no such branch: {branch_id}")));
+        }
+        *self.head.borrow_mut() = branch_id.to_string();
+        self.materialize()
+    }
+
+    /// Edit-in-the-past ⇒ branch (§2.5): fork HEAD at wall-clock `t`, switch to it.
+    pub fn fork_from_time(&self, name: &str, t: i64) -> AspResult<String> {
+        let fork_vv = {
+            let bs = self.branch_set();
+            let vis = bs.visibility(&self.head_branch());
+            let rows = self.rows.borrow();
+            let scoped: Vec<LogRow> = rows.iter().filter(|r| vis.sees(r) && r.ts <= t).cloned().collect();
+            crate::branch::version_vector_of(&scoped)
+        };
+        let head = self.head_branch();
+        let id = self.create_branch(name, &head, fork_vv)?;
+        self.checkout(&id)?;
+        Ok(id)
+    }
+
+    /// Soft-delete a branch (§4.2); main cannot be deleted, deleting HEAD checks
+    /// out the parent.
+    pub fn delete_branch(&self, branch_id: &str) -> AspResult<()> {
+        if branch_id == MAIN_BRANCH_ID {
+            return Err(AspError::Invalid("cannot delete the main branch".into()));
+        }
+        let Some(mut b) = self.branch_set().get(branch_id).cloned() else {
+            return Err(AspError::NotFound(format!("no such branch: {branch_id}")));
+        };
+        if self.head_branch() == branch_id {
+            let parent = b.parent.clone().unwrap_or_else(|| MAIN_BRANCH_ID.to_string());
+            self.checkout(&parent)?;
+        }
+        b.deleted = true;
+        self.author_branch_record(&b)?;
+        Ok(())
     }
 
     fn current_for_path(&self, rel: &str) -> Option<FileRow> {
@@ -159,7 +282,7 @@ impl MemEngine {
                     base_hash: cur.result_hash.clone(),
                     result_hash: Some(result_hash),
                     path: None,
-                    branch_id: MAIN_BRANCH_ID.to_string(),
+                    branch_id: self.head_branch(),
                     merge_parent: None,
                     sig: vec![],
                 }
@@ -178,7 +301,7 @@ impl MemEngine {
                 base_hash: None,
                 result_hash: Some(result_hash),
                 path: Some(rel.to_string()),
-                branch_id: MAIN_BRANCH_ID.to_string(),
+                branch_id: self.head_branch(),
                 merge_parent: None,
                 sig: vec![],
             }
@@ -205,7 +328,7 @@ impl MemEngine {
             base_hash: cur.result_hash.clone(),
             result_hash: None,
             path: None,
-            branch_id: MAIN_BRANCH_ID.to_string(),
+            branch_id: self.head_branch(),
             merge_parent: None,
             sig: vec![],
         }
@@ -284,7 +407,7 @@ impl MemEngine {
             base_hash: cur.result_hash.clone(),
             result_hash: cur.result_hash.clone(),
             path: Some(new.to_string()),
-            branch_id: MAIN_BRANCH_ID.to_string(),
+            branch_id: self.head_branch(),
             merge_parent: None,
             sig: vec![],
         }
@@ -349,6 +472,9 @@ impl MemEngine {
             return Ok(false);
         }
         self.rows.borrow_mut().push(wr.row.clone());
+        if wr.row.kind == Kind::Branch {
+            self.reconcile_branches();
+        }
         self.materialize()?;
         Ok(true)
     }
@@ -378,6 +504,7 @@ impl MemEngine {
             self.rows.borrow().iter().map(|r| r.id.clone()).collect();
         let mut flags = Vec::with_capacity(wrs.len());
         let mut added = 0usize;
+        let mut any_branch = false;
         {
             let mut store = self.rows.borrow_mut();
             for wr in wrs {
@@ -385,9 +512,13 @@ impl MemEngine {
                 if is_new {
                     store.push(wr.row.clone());
                     added += 1;
+                    any_branch |= wr.row.kind == Kind::Branch;
                 }
                 flags.push(is_new);
             }
+        }
+        if any_branch {
+            self.reconcile_branches();
         }
         if added > 0 {
             self.materialize()?;
@@ -473,15 +604,20 @@ impl MemEngine {
             }
         }
         if added > 0 {
+            self.reconcile_branches();
             self.materialize()?;
         }
         Ok(added)
     }
 
     pub fn materialize(&self) -> AspResult<()> {
-        // Fold directly off the borrowed log — cloning the whole Vec<LogRow> on
-        // every write/integrate was pure waste (this is the wasm/Obsidian path).
-        let files = compute_files(&self.blobs, &self.rows.borrow())?;
+        // Fold the checked-out branch's visible rows (§2.3). On a single-branch
+        // vault visible(main) is every row — byte-identical to before.
+        let bs = self.branch_set();
+        let vis = bs.visibility(&self.head_branch());
+        let rows = self.rows.borrow();
+        let scoped: Vec<LogRow> = rows.iter().filter(|r| vis.sees(r)).cloned().collect();
+        let files = compute_files(&self.blobs, &scoped)?;
         *self.files.borrow_mut() = files;
         Ok(())
     }
@@ -595,6 +731,34 @@ impl SessionVault for MemEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mem_engine_branch_ops_and_isolation() {
+        // SDK-surface parity: the wasm node creates/forks/checks-out/deletes
+        // branches with the same isolation guarantees as the native engine.
+        let e = MemEngine::create(Identity::from_seed(&[3; 32]), "v");
+        e.record_write("a.md", b"m1\n").unwrap().unwrap();
+        assert_eq!(e.current_branch(), MAIN_BRANCH_ID);
+        let b = e.fork_from_time("feature", i64::MAX).unwrap();
+        assert_eq!(e.current_branch(), b);
+        assert_eq!(e.read_file("a.md").unwrap().as_deref(), Some(&b"m1\n"[..]));
+        e.record_write("a.md", b"b2\n").unwrap().unwrap();
+        e.record_write("only-branch.md", b"x\n").unwrap().unwrap();
+
+        // main is isolated.
+        e.checkout(MAIN_BRANCH_ID).unwrap();
+        assert_eq!(e.read_file("a.md").unwrap().as_deref(), Some(&b"m1\n"[..]));
+        assert!(e.read_file("only-branch.md").unwrap().is_none());
+        // back to the branch.
+        e.checkout(&b).unwrap();
+        assert_eq!(e.read_file("a.md").unwrap().as_deref(), Some(&b"b2\n"[..]));
+
+        // delete rules: main protected; deleting HEAD auto-checks-out main.
+        assert!(e.delete_branch(MAIN_BRANCH_ID).is_err());
+        e.delete_branch(&b).unwrap();
+        assert_eq!(e.current_branch(), MAIN_BRANCH_ID);
+        assert!(e.branches().iter().all(|x| x.branch_id != b));
+    }
 
     #[test]
     fn mem_engine_authors_folds_and_reads() {

@@ -1475,6 +1475,32 @@ mod tests {
     }
 
     #[test]
+    fn branch_records_sync_native_to_wasm_memengine() {
+        // Cross-surface: a native (CLI/desktop) node's branches must converge on a
+        // wasm (web/Obsidian) MemEngine node — same branch set, same per-branch
+        // scoped state — purely from the synced rows.
+        use crate::memengine::MemEngine;
+        let da = tempdir().unwrap();
+        let a = eng(da.path(), 1);
+        a.record_write("a.md", b"m1\n").unwrap().unwrap();
+        let bid = a.fork_from_time("feature", i64::MAX).unwrap();
+        a.record_write("a.md", b"branch2\n").unwrap().unwrap();
+        a.checkout(MAIN_BRANCH_ID).unwrap();
+        a.record_write("a.md", b"m2\n").unwrap().unwrap();
+
+        let mem = MemEngine::create(Identity::from_seed(&[5; 32]), "v");
+        let all: Vec<WireRow> = a.store.all_rows().unwrap().into_iter().map(|r| a.wire(r).unwrap()).collect();
+        mem.integrate_many(&all).unwrap();
+
+        // wasm node converged main and learned the branch from sync alone.
+        assert_eq!(mem.read_file("a.md").unwrap().as_deref(), Some(&b"m2\n"[..]));
+        assert!(mem.branches().iter().any(|x| x.branch_id == bid && x.name == "feature"));
+        // and can check it out to its isolated state.
+        mem.checkout(&bid).unwrap();
+        assert_eq!(mem.read_file("a.md").unwrap().as_deref(), Some(&b"branch2\n"[..]));
+    }
+
+    #[test]
     fn single_branch_vault_is_byte_identical_back_compat() {
         // §2.2 back-compat: with no branch ever created, HEAD=main and every row is
         // visible, so the materialized tree matches a plain whole-log fold.
