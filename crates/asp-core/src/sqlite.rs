@@ -125,6 +125,21 @@ impl SqliteStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Every row for one `file_id` (uses the `log_file` index) — the incremental
+    /// fold re-folds a touched file from exactly these. Order is irrelevant;
+    /// `fold_order` re-sorts.
+    pub fn rows_for_file(&self, file_id: &str) -> AspResult<Vec<LogRow>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM log WHERE file_id=?1")?;
+        let rows = stmt.query_map(params![file_id], Self::row_from)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Max Lamport across the log (0 if empty) — the derived-git commit time.
+    pub fn max_lamport(&self) -> AspResult<u64> {
+        let m: i64 = self.conn.query_row("SELECT COALESCE(MAX(lamport),0) FROM log", [], |r| r.get(0))?;
+        Ok(m as u64)
+    }
+
     /// Rows authored by `site` with `seq > after`, ascending — what a peer is
     /// missing per the version vector.
     pub fn rows_after(&self, site: &str, after: i64) -> AspResult<Vec<LogRow>> {

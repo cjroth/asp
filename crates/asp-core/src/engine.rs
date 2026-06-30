@@ -41,6 +41,15 @@ pub struct Engine {
     /// (`Engine` is `!Sync` and only ever touched behind a `Mutex`, so a `Cell`
     /// is safe here.)
     batch: std::cell::Cell<bool>,
+    /// Incremental fold cache: the per-file_id states, so `materialize` re-folds
+    /// only the files a change touched instead of the whole log. `None` until the
+    /// first materialize builds it (and after anything that can't name what it
+    /// touched, forcing a safe full rebuild). Authoritative EXCEPT for file_ids in
+    /// `dirty`, which `materialize` re-folds before reading the cache.
+    fold: std::cell::RefCell<Option<crate::FoldState>>,
+    /// file_ids whose log changed since the cache was last reconciled — drained
+    /// and re-folded by `materialize`. Every row append records its file_id here.
+    dirty: std::cell::RefCell<std::collections::HashSet<String>>,
 }
 
 fn now_unix() -> u64 {
@@ -97,6 +106,8 @@ impl Engine {
             scope: std::cell::RefCell::new(scope),
             site,
             batch: std::cell::Cell::new(false),
+            fold: std::cell::RefCell::new(None),
+            dirty: std::cell::RefCell::new(std::collections::HashSet::new()),
         };
         Ok(eng)
     }
@@ -206,10 +217,13 @@ impl Engine {
             }
         };
         self.store.append_row(&row)?;
+        self.note_dirty(&row.file_id);
         // Fast path: a local linear edit on the tip changed exactly one file's
         // content (no merge, no path change). Reflect it incrementally instead of
         // re-folding the whole log. Skipped in a capture batch (one flush at the
         // end) and for Create / anything structural, which take the full fold.
+        // (note_dirty above still records it, so a later full materialize re-folds
+        // it into the cache — the fast path's files-table write is idempotent.)
         if !self.batch.get() && matches!(row.kind, Kind::Edit) {
             self.materialize_local_edit(&row.file_id, rel, &result_hash, bytes, row.lamport, &row.site_id)?;
         } else {
@@ -239,6 +253,7 @@ impl Engine {
         }
         .seal();
         self.store.append_row(&row)?;
+        self.note_dirty(&row.file_id);
         self.materialize_unless_batched()?;
         Ok(Some(self.wire(row)?))
     }
@@ -264,6 +279,7 @@ impl Engine {
         }
         .seal();
         self.store.append_row(&row)?;
+        self.note_dirty(&row.file_id);
         self.materialize_unless_batched()?;
         Ok(Some(self.wire(row)?))
     }
@@ -296,6 +312,7 @@ impl Engine {
         }
         let added = self.store.append_row(&wr.row)?;
         if added {
+            self.note_dirty(&wr.row.file_id);
             self.materialize()?;
         }
         Ok(added)
@@ -323,6 +340,7 @@ impl Engine {
             let added = self.store.append_row(&wr.row)?;
             if added {
                 any = true;
+                self.note_dirty(&wr.row.file_id);
             }
             flags.push(added);
         }
@@ -351,6 +369,13 @@ impl Engine {
         self.materialize().map(|_| ())
     }
 
+    /// Mark a file_id's log as changed since the fold cache was last reconciled.
+    /// Called at every row append; `materialize` drains this and re-folds only
+    /// these files.
+    fn note_dirty(&self, file_id: &str) {
+        self.dirty.borrow_mut().insert(file_id.to_string());
+    }
+
     /// Returns the materialized path → content-hash map (for echo suppression).
     ///
     /// Reconciles disk + the derived git store to the folded log. Both are kept
@@ -363,7 +388,6 @@ impl Engine {
     /// materialize the previous table is empty, so everything is "changed" and the
     /// full initial reconcile still happens.)
     pub fn materialize(&self) -> AspResult<BTreeMap<String, String>> {
-        let rows = self.store.all_rows()?;
         // Previous materialized live state: path -> content_hash, and the set of
         // all previously-live paths (content + dir) for stale removal.
         let prev = self.store.live_files()?;
@@ -377,7 +401,29 @@ impl Engine {
             prev_hash.insert(f.path.clone(), f.result_hash.clone());
         }
 
-        let files = compute_files(&self.store, &rows)?;
+        // Fold incrementally: re-fold only the file_ids touched since the cache was
+        // last reconciled (`dirty`), reusing every other file's cached state, then
+        // resolve paths across all of them. Falls back to a full fold the first
+        // time (or whenever the cache is absent). `resolve_paths` runs over ALL
+        // files, so a path-collision side effect (e.g. a delete promoting a
+        // suffixed file) is handled even though only the deleted file was dirty —
+        // the differential test pins this equal to a from-scratch fold.
+        let files = {
+            let mut fg = self.fold.borrow_mut();
+            let dirty: Vec<String> = self.dirty.borrow_mut().drain().collect();
+            match fg.as_mut() {
+                Some(fs) => {
+                    fs.refold_files(&self.store, &dirty, |fid| self.store.rows_for_file(fid))?;
+                    fs.files()
+                }
+                None => {
+                    let fs = crate::FoldState::from_rows(&self.store, &self.store.all_rows()?)?;
+                    let f = fs.files();
+                    *fg = Some(fs);
+                    f
+                }
+            }
+        };
         self.store.replace_files(&files)?;
 
         // New desired set, built WITHOUT reading blobs: content files (path ->
@@ -453,7 +499,7 @@ impl Engine {
         }
 
         // Derived git export at the settle boundary.
-        let derived_time = rows.iter().map(|r| r.lamport).max().unwrap_or(0);
+        let derived_time = self.store.max_lamport()?;
         self.export_git(&hashes, derived_time);
 
         Ok(hashes)
@@ -749,6 +795,7 @@ impl Engine {
         }
         .seal();
         self.store.append_row(&row)?;
+        self.note_dirty(&row.file_id);
         self.materialize_unless_batched()?;
         Ok(Some(self.wire(row)?))
     }
@@ -772,6 +819,7 @@ impl Engine {
         }
         .seal();
         self.store.append_row(&row)?;
+        self.note_dirty(&row.file_id);
         self.materialize_unless_batched()?;
         Ok(Some(self.wire(row)?))
     }
