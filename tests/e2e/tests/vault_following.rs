@@ -3,7 +3,8 @@
 //! Works), while a folder that already has its own content is a separate vault and
 //! must not silently merge — the mismatch is a clear, actionable error.
 
-use asp_e2e::{temp_root, Hub, Node};
+use asp_e2e::{admin_cmd, temp_root, wait_until, Hub, Node};
+use std::time::Duration;
 
 const SECRET: &str = "k";
 
@@ -37,6 +38,19 @@ fn separate_populated_vaults_do_not_silently_merge() {
     a.init();
     a.write("a.md", b"from A\n");
     a.sync(&url, Some(SECRET)); // the hub adopts A's vault
+
+    // The hub adopts A's vault asynchronously; wait until it has, so a
+    // still-pristine hub doesn't race-adopt C instead (an intra-test race that
+    // flakes under parallel CI load — the negative case can't trigger then).
+    let a_vault = a.status_json()["vault_id"].as_str().unwrap_or("").to_string();
+    let adopted = wait_until(Duration::from_secs(15), || {
+        let (ok, out, _) = admin_cmd(root.path(), "hub", &["status", "--json"]);
+        ok && serde_json::from_str::<serde_json::Value>(&out)
+            .ok()
+            .and_then(|v| v["vault_id"].as_str().map(|s| !s.is_empty() && s == a_vault))
+            .unwrap_or(false)
+    });
+    assert!(adopted, "hub did not adopt A's vault in time");
 
     // C is an independent, *populated* vault — different vault id. Syncing must
     // fail loudly (not silently no-op), guiding the user to clone.

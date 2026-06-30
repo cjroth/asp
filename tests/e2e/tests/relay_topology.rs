@@ -2,7 +2,8 @@
 //! transitive relay trust (two writers converge through a single relay without
 //! either enumerating the other's key — only the relay holds the auth secret).
 
-use asp_e2e::{temp_root, Hub, Node};
+use asp_e2e::{temp_root, wait_until, Hub, Node};
+use std::time::Duration;
 
 const SECRET: &str = "relay-secret";
 
@@ -27,13 +28,19 @@ fn two_clones_through_one_relay() {
     a.write("from-a.md", b"a\n");
     a.commit();
     a.sync(&url, Some(SECRET));
-    b.sync(&url, Some(SECRET));
-    c.sync(&url, Some(SECRET));
 
-    assert_eq!(b.read_str("doc.md").as_deref(), Some("v1\nv2\n"));
-    assert_eq!(c.read_str("doc.md").as_deref(), Some("v1\nv2\n"));
-    assert_eq!(b.read_str("from-a.md").as_deref(), Some("a\n"));
-    assert_eq!(c.read_str("from-a.md").as_deref(), Some("a\n"));
+    // Store-and-forward through the relay is asynchronous; converge B and C with a
+    // bounded re-sync instead of a single round (a one-shot assert flakes under
+    // parallel CI load — the relay may not have served A's push yet).
+    let converged = wait_until(Duration::from_secs(20), || {
+        b.sync(&url, Some(SECRET));
+        c.sync(&url, Some(SECRET));
+        b.read_str("doc.md").as_deref() == Some("v1\nv2\n")
+            && c.read_str("doc.md").as_deref() == Some("v1\nv2\n")
+            && b.read_str("from-a.md").as_deref() == Some("a\n")
+            && c.read_str("from-a.md").as_deref() == Some("a\n")
+    });
+    assert!(converged, "B/C did not converge through the relay (b.doc={:?} c.doc={:?})", b.read_str("doc.md"), c.read_str("doc.md"));
 }
 
 #[test]

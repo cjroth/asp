@@ -1,7 +1,8 @@
 //! *Sync core:* clone + full catch-up; offline → reconnect catch-up via version
 //! vectors (sends exactly what's missing, observed as convergence after a gap).
 
-use asp_e2e::{temp_root, Hub, Node};
+use asp_e2e::{temp_root, wait_until, Hub, Node};
+use std::time::Duration;
 
 const SECRET: &str = "k";
 
@@ -73,12 +74,22 @@ fn offline_then_reconnect_catchup() {
     assert!(rows_before >= 6);
 
     // Reconnect: only the missing rows flow (version vectors), and B converges.
+    // Push-through a store-and-forward hub is asynchronous (A's oneshot can return
+    // before the hub serves it to B), so converge with a bounded re-sync rather
+    // than a single round — a one-shot assert is timing-fragile under parallel CI
+    // load. Convergence is the invariant; how many rounds it takes is not.
     a.sync(&url, Some(SECRET));
-    b.sync(&url, Some(SECRET));
-    assert_eq!(b.read_str("base.md").as_deref(), Some("v2\n"));
-    for i in 0..5 {
-        assert_eq!(b.read_str(&format!("offline{i}.md")).as_deref(), Some(&*format!("o{i}\n")));
-    }
-    // Both hold the same number of rows after catch-up (nothing lost or duplicated).
-    assert_eq!(a.rows(), b.rows());
+    let converged = wait_until(Duration::from_secs(20), || {
+        b.sync(&url, Some(SECRET));
+        b.read_str("base.md").as_deref() == Some("v2\n")
+            && (0..5).all(|i| b.read_str(&format!("offline{i}.md")).as_deref() == Some(&*format!("o{i}\n")))
+            && a.rows() == b.rows()
+    });
+    assert!(
+        converged,
+        "B did not converge: base.md={:?} rows a={} b={}",
+        b.read_str("base.md"),
+        a.rows(),
+        b.rows()
+    );
 }

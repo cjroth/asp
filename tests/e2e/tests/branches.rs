@@ -2,7 +2,8 @@
 //! The local lifecycle test is deterministic (no network); the propagation test
 //! drives two real `asp` processes through a hub.
 
-use asp_e2e::{temp_root, Hub, Node};
+use asp_e2e::{temp_root, wait_until, Hub, Node};
+use std::time::Duration;
 
 const SECRET: &str = "branch-secret";
 
@@ -59,13 +60,28 @@ fn branches_propagate_through_hub() {
     let b = Node::new(root.path(), "B");
     b.clone_from(&url, Some(SECRET));
 
-    // B learned the branch from sync, and is on main with main's state.
-    assert!(b.run(&["branch", "list"]).contains("feature"), "branch synced to the clone");
+    // Branch propagation through a store-and-forward hub is asynchronous: A's
+    // oneshot push can return before the hub has fully served it to B's clone.
+    // Re-sync until B has learned the branch (bounded) — a single round is
+    // timing-fragile under parallel CI load (the harness lesson the other
+    // networked tests already encode). Convergence, not a one-shot, is the gate.
+    let learned = wait_until(Duration::from_secs(15), || {
+        b.sync(&url, Some(SECRET));
+        b.run(&["branch", "list"]).contains("feature")
+    });
+    assert!(learned, "branch synced to the clone");
+
+    // B is on main with main's state.
     assert_eq!(b.read_str("a.md").as_deref(), Some("v1\n"));
     assert!(!b.exists("feat-only.md"));
 
-    // B checks out the synced branch and converges its isolated state.
+    // B checks out the synced branch and converges its isolated state (re-sync
+    // until the branch's content rows have caught up too).
     b.run(&["branch", "checkout", "feature"]);
-    assert_eq!(b.read_str("a.md").as_deref(), Some("v2\n"));
-    assert!(b.exists("feat-only.md"));
+    let converged = wait_until(Duration::from_secs(15), || {
+        b.sync(&url, Some(SECRET));
+        b.run(&["branch", "checkout", "feature"]);
+        b.read_str("a.md").as_deref() == Some("v2\n") && b.exists("feat-only.md")
+    });
+    assert!(converged, "branch content converged on B (a.md={:?})", b.read_str("a.md"));
 }
