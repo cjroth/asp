@@ -69,6 +69,16 @@ export interface Api {
   removeVault(id: string, trash: boolean): Promise<void>;
   // Reveal a folder/file in the OS file manager (Finder/Explorer). Desktop-only.
   revealPath(path: string): Promise<void>;
+  // Web-only: vaults cloned from a peer, with the ticket+authKey to sync against.
+  // Browsers have no standing connector, so the app's poll drives catch-up by
+  // calling syncNow for each of these. Empty on desktop (it live-syncs natively).
+  webUpstreams(): Promise<WebUpstream[]>;
+}
+
+export interface WebUpstream {
+  id: string;
+  ticket: string;
+  authKey?: string;
 }
 
 // ---- desktop backend: Tauri commands (a thin pass-through) ----
@@ -96,6 +106,8 @@ const tauriApi: Api = {
   rescan: (id) => invoke<void>('rescan', { id }),
   removeVault: (id, trash) => invoke<void>('remove_vault', { id, trash }),
   revealPath: (path) => invoke<void>('reveal_path', { path }),
+  // Desktop syncs continuously via its persistent connector — no poll-driven catch-up.
+  webUpstreams: async () => [],
 };
 
 // The web backend (wasm + OPFS) is heavy, so it's loaded lazily only when we're

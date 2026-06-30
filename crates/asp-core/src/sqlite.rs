@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS authorized_keys(
   added_at INTEGER, source TEXT
 );
 CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS git_blobs(content_hash TEXT PRIMARY KEY, git_oid TEXT NOT NULL);
 "#;
 
 pub struct SqliteStore {
@@ -124,6 +125,21 @@ impl SqliteStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Every row for one `file_id` (uses the `log_file` index) — the incremental
+    /// fold re-folds a touched file from exactly these. Order is irrelevant;
+    /// `fold_order` re-sorts.
+    pub fn rows_for_file(&self, file_id: &str) -> AspResult<Vec<LogRow>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM log WHERE file_id=?1")?;
+        let rows = stmt.query_map(params![file_id], Self::row_from)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Max Lamport across the log (0 if empty) — the derived-git commit time.
+    pub fn max_lamport(&self) -> AspResult<u64> {
+        let m: i64 = self.conn.query_row("SELECT COALESCE(MAX(lamport),0) FROM log", [], |r| r.get(0))?;
+        Ok(m as u64)
+    }
+
     /// Rows authored by `site` with `seq > after`, ascending — what a peer is
     /// missing per the version vector.
     pub fn rows_after(&self, site: &str, after: i64) -> AspResult<Vec<LogRow>> {
@@ -161,6 +177,40 @@ impl SqliteStore {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM log", [], |r| r.get::<_, i64>(0))? as u64)
     }
 
+    /// Wall-clock timestamp of the most recent log row (for "last synced"), or
+    /// `None` for an empty log. A single aggregate — never load every row just
+    /// to take a max (the status poll runs periodically on the active vault).
+    pub fn max_ts(&self) -> AspResult<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(ts) FROM log", [], |r| r.get::<_, Option<i64>>(0))?)
+    }
+
+    /// Count of live (non-deleted) materialized files — a single aggregate, so
+    /// the status poll never materializes every `FileRow` just to count them.
+    pub fn live_file_count(&self) -> AspResult<u64> {
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM files WHERE deleted=0", [], |r| r.get::<_, i64>(0))? as u64)
+    }
+
+    /// Derived-git blob-object id for a content hash, if already exported. The git
+    /// object id is a pure function of the bytes, so this cache lets `materialize`
+    /// skip re-reading and re-hashing every blob into the git store on every
+    /// settle — only content first seen this session is read + written.
+    pub fn git_oid_for(&self, content_hash: &str) -> AspResult<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT git_oid FROM git_blobs WHERE content_hash=?1", params![content_hash], |r| r.get::<_, String>(0))
+            .optional()?)
+    }
+
+    pub fn put_git_oid(&self, content_hash: &str, git_oid: &str) -> AspResult<()> {
+        self.conn.execute(
+            "INSERT INTO git_blobs(content_hash, git_oid) VALUES(?1,?2) ON CONFLICT(content_hash) DO NOTHING",
+            params![content_hash, git_oid],
+        )?;
+        Ok(())
+    }
+
     /// Next Lamport tick = max(observed) + 1, derived from the durable log.
     pub fn next_lamport(&self, observed: u64) -> AspResult<u64> {
         let max_log: i64 = self
@@ -184,18 +234,102 @@ impl SqliteStore {
 
     // ----- materialized files -----
 
-    pub fn replace_files(&self, files: &[FileRow]) -> AspResult<()> {
-        self.conn.execute("DELETE FROM files", [])?;
-        for f in files {
-            self.conn.execute(
+    /// Reconcile the `files` table to `files` by DELTA: read the current rows,
+    /// upsert only the file_ids whose row actually changed, and delete any that
+    /// disappeared. Same end state as `replace_files`, but a single-file change
+    /// writes one row instead of rewriting the whole table — turning the per-op
+    /// files-table cost from O(vault) writes (DELETE all + reinsert all, which
+    /// also churns the WAL) into O(changed) writes + one O(vault) read. The reads
+    /// are far cheaper than the writes/fsync they replace.
+    pub fn sync_files(&self, files: &[FileRow]) -> AspResult<()> {
+        // Current table state keyed by file_id (includes tombstones).
+        let mut old: std::collections::HashMap<String, FileRow> = std::collections::HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT file_id, path, result_hash, merge_class, deleted, lamport, site_id, conflict FROM files",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(FileRow {
+                    file_id: r.get(0)?,
+                    path: r.get(1)?,
+                    result_hash: r.get(2)?,
+                    merge_class: MergeClass::parse(&r.get::<_, String>(3)?).unwrap_or(MergeClass::Text),
+                    deleted: r.get::<_, i64>(4)? != 0,
+                    lamport: r.get::<_, i64>(5)? as u64,
+                    site_id: r.get(6)?,
+                    conflict: r.get::<_, i64>(7)? != 0,
+                })
+            })?;
+            for r in rows {
+                let f = r?;
+                old.insert(f.file_id.clone(), f);
+            }
+        }
+        let new_ids: std::collections::HashSet<&str> = files.iter().map(|f| f.file_id.as_str()).collect();
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut up = tx.prepare_cached(
                 "INSERT INTO files(file_id, path, result_hash, merge_class, deleted, lamport, site_id, conflict)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                 ON CONFLICT(file_id) DO UPDATE SET
+                   path=?2, result_hash=?3, merge_class=?4, deleted=?5, lamport=?6, site_id=?7, conflict=?8",
+            )?;
+            for f in files {
+                if old.get(&f.file_id) == Some(f) {
+                    continue; // row unchanged — no write
+                }
+                up.execute(params![
                     f.file_id, f.path, f.result_hash, f.merge_class.as_str(),
                     f.deleted as i64, f.lamport as i64, f.site_id, f.conflict as i64
-                ],
-            )?;
+                ])?;
+            }
+            let mut del = tx.prepare_cached("DELETE FROM files WHERE file_id=?1")?;
+            for id in old.keys() {
+                if !new_ids.contains(id.as_str()) {
+                    del.execute(params![id])?;
+                }
+            }
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn replace_files(&self, files: &[FileRow]) -> AspResult<()> {
+        // ONE transaction for the whole rewrite. Without it, every INSERT
+        // auto-commits its own WAL transaction — at 10k+ files that per-row
+        // commit overhead dominated `materialize` (≈585ms of an 824ms write at
+        // 10k files), making every save O(vault) in commits. A single
+        // transaction + a cached prepared statement collapses that to one
+        // commit. `unchecked_transaction` is safe here: `replace_files` is only
+        // called inside `materialize`, which holds the engine lock, so there is
+        // never a nested/concurrent transaction on this connection.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM files", [])?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO files(file_id, path, result_hash, merge_class, deleted, lamport, site_id, conflict)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            )?;
+            for f in files {
+                stmt.execute(params![
+                    f.file_id, f.path, f.result_hash, f.merge_class.as_str(),
+                    f.deleted as i64, f.lamport as i64, f.site_id, f.conflict as i64
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Update just one file's content hash (+ the authoring clock) in place — the
+    /// incremental-materialize fast path for a local linear edit, which changes
+    /// exactly one file's content and nothing structural (path/class/deleted/
+    /// conflict are untouched, matching what a full fold would leave them).
+    pub fn update_file_hash(&self, file_id: &str, result_hash: &str, lamport: u64, site_id: &str) -> AspResult<()> {
+        self.conn.execute(
+            "UPDATE files SET result_hash=?2, lamport=?3, site_id=?4 WHERE file_id=?1",
+            params![file_id, result_hash, lamport as i64, site_id],
+        )?;
         Ok(())
     }
 

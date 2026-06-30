@@ -43,6 +43,8 @@ fn main() {
     time("read_file (1)", &mut || { de.read_file(&v.id, "dir00/note-00000.md").unwrap(); });
     time("history (fold whole log)", &mut || { de.history(&v.id).unwrap(); });
     time("get_status", &mut || { de.status(&v.id).unwrap(); });
+    let now_ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 + 1;
+    time("read_file_at (history slider tick)", &mut || { de.read_file_at(&v.id, "dir00/note-00000.md", now_ts).unwrap(); });
     time("write_file edit (materialize)", &mut || { de.write_file(&v.id, "dir00/note-00000.md", "# edited\n\nnew body\n").unwrap(); });
     time("write_file new (create+materialize)", &mut || { de.write_file(&v.id, "zz-new.md", "# new\n").unwrap(); });
     time("delete_file (materialize)", &mut || { de.delete_file(&v.id, "zz-new.md").unwrap(); });

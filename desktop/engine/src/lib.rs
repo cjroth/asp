@@ -519,10 +519,14 @@ impl DesktopEngine {
         let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
         let eng = f.engine.lock().unwrap();
         let vault_id = VaultConfig::new(&eng.store).vault_id().ok().flatten().unwrap_or_default();
-        let files = eng.store.live_files()?.into_iter().filter(|f| !f.deleted).count();
+        // Cheap aggregates only — the status poll runs periodically on the active
+        // vault, so it must never load every row/file (O(N)) just to take a count
+        // or a max. `live_file_count` matches the previous `live_files().count()`
+        // (both include dir entities; files are stored with deleted=0).
+        let files = eng.store.live_file_count()? as usize;
         let head = std::fs::read_to_string(eng.git_dir.join("refs/heads/main")).map(|s| s.trim().to_string()).unwrap_or_default();
         let peers = eng.store.peers()?.into_iter().map(|(u, _)| u).collect();
-        let last_ts = eng.store.all_rows()?.iter().map(|r| r.ts).max();
+        let last_ts = eng.store.max_ts()?;
         Ok(VaultStatus {
             id: id.to_string(),
             vault_id,
@@ -666,8 +670,10 @@ impl DesktopEngine {
         let folders = self.folders.lock().unwrap();
         let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
         let eng = f.engine.lock().unwrap();
-        match eng.state_as_of(ts)?.get(path) {
-            Some(bytes) => Ok(FileAt { exists: true, content: String::from_utf8_lossy(bytes).into_owned() }),
+        // Reads exactly the one requested blob (not the whole vault) — see
+        // `Engine::file_at`. Keeps the history slider snappy on large vaults.
+        match eng.file_at(path, ts)? {
+            Some(bytes) => Ok(FileAt { exists: true, content: String::from_utf8_lossy(&bytes).into_owned() }),
             None => Ok(FileAt { exists: false, content: String::new() }),
         }
     }
@@ -679,8 +685,8 @@ impl DesktopEngine {
             let folders = self.folders.lock().unwrap();
             let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
             let eng = f.engine.lock().unwrap();
-            let wr = match eng.state_as_of(ts)?.get(path) {
-                Some(bytes) => eng.record_write(path, bytes)?,
+            let wr = match eng.file_at(path, ts)? {
+                Some(bytes) => eng.record_write(path, &bytes)?,
                 None => None,
             };
             (f.conns.clone(), wr)

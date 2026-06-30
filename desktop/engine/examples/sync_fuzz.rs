@@ -207,18 +207,45 @@ fn diff_keys(
     problems
 }
 
-/// Cross-surface convergence: CLI disk == every engine disk == every engine API.
+/// The derived-git commit on `main` for a vault dir (None if not yet written).
+/// Converged nodes hold the same log → same max-lamport + same tree → the SAME
+/// deterministic commit SHA, so this must agree across every surface.
+fn git_head(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join(".asp/git/refs/heads/main")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Cross-surface convergence: CLI disk == every engine disk == every engine API,
+/// AND the derived git head agrees across all surfaces (a deterministic function
+/// of the converged tree — a mismatch means a stale/incorrect git export).
 fn wait_converged(hub: &Hub, peers: &[Peer], timeout: Duration) -> (bool, Vec<String>) {
     let start = Instant::now();
     let mut last = Vec::new();
     loop {
         let cli = snapshot_dir(&hub.dir);
+        let cli_head = git_head(&hub.dir);
         let mut problems = Vec::new();
         for (i, p) in peers.iter().enumerate() {
             let eng = snapshot_dir(&p.dir);
             let api = engine_api_snapshot(&p.de, &p.id);
             problems.extend(diff_keys(&cli, &eng, "cli-disk", &format!("eng{i}-disk")));
-            problems.extend(diff_keys(&eng, &api, &format!("eng{i}-disk"), &format!("eng{i}-api")));
+            // Derived git head must match the CLI's once both have written one.
+            let eng_head = git_head(&p.dir);
+            if let (Some(c), Some(e)) = (&cli_head, &eng_head) {
+                if c != e {
+                    problems.push(format!("GIT HEAD MISMATCH eng{i}: cli={c} eng{e}", e = e));
+                }
+            }
+            // The engine's read_file API is utf8-LOSSY by design (the editor
+            // renders text), so a binary file's API view is the lossy view of
+            // its bytes — not byte-identical to disk. Compare the API against the
+            // engine disk passed through the SAME lossy transform: identity for
+            // valid utf8 (text/code), the correct lossy view for binary. This
+            // keeps the invariant honest for binary instead of excluding it.
+            let eng_lossy: BTreeMap<String, Vec<u8>> = eng
+                .iter()
+                .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned().into_bytes()))
+                .collect();
+            problems.extend(diff_keys(&eng_lossy, &api, &format!("eng{i}-disk(lossy)"), &format!("eng{i}-api")));
         }
         if problems.is_empty() {
             return (true, Vec::new());
@@ -253,6 +280,34 @@ fn rand_content(rng: &mut Rng, tag: &str) -> String {
     s
 }
 
+/// Non-utf8, null-containing bytes (classified `Binary`; whole-file LWW). Shaped
+/// like a small binary blob: a fake header, embedded NULs, and high bytes that
+/// are invalid utf8 — so it exercises the binary merge class and the engine's
+/// utf8-lossy API view, not just the text path.
+fn rand_binary(rng: &mut Rng, n: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(n + 8);
+    v.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x00, 0x1a]);
+    for _ in 0..n {
+        v.push((rng.next_u64() & 0xff) as u8); // full 0..=255 range incl. NUL/high
+    }
+    v
+}
+
+/// A realistic code file (classified `Code` — surface-aware merge, distinct from
+/// prose `Text`). Varying the body lets concurrent edits land in different code
+/// regions.
+fn rand_code(rng: &mut Rng, tag: &str) -> String {
+    let mut s = format!("// {tag}\nuse std::collections::HashMap;\n\n");
+    let fns = 1 + rng.below(4);
+    for i in 0..fns {
+        s.push_str(&format!(
+            "pub fn f{i}(x: u64) -> u64 {{\n    let k = {};\n    x.wrapping_mul(k).wrapping_add({i})\n}}\n\n",
+            rng.next_u64()
+        ));
+    }
+    s
+}
+
 // ----------------------------- main loop ------------------------------------
 fn main() {
     std::env::set_var("ASP_NO_RELAY", "1");
@@ -263,6 +318,7 @@ fn main() {
     let mut conv_timeout = Duration::from_secs(20);
     let mut debounce_ms = 60u64;
     let mut npeers = 1usize;
+    let mut prefill = 0usize;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -273,6 +329,10 @@ fn main() {
             "--timeout" => { conv_timeout = Duration::from_secs(args[i + 1].parse().unwrap()); i += 2; }
             "--debounce" => { debounce_ms = args[i + 1].parse().unwrap(); i += 2; }
             "--peers" => { npeers = args[i + 1].parse::<usize>().unwrap().max(1); i += 2; }
+            // Pre-seed N files into the CLI vault before the engines clone, so the
+            // fuzz starts at scale (large clone catch-up + per-op convergence on a
+            // big vault) instead of growing there slowly via ManyFiles rounds.
+            "--prefill" => { prefill = args[i + 1].parse().unwrap(); i += 2; }
             _ => { i += 1; }
         }
     }
@@ -284,6 +344,26 @@ fn main() {
     eprintln!("[setup] starting CLI vault (asp watch --listen, debounce={debounce_ms}ms)…");
     let hub = Hub::start(root.path(), auth, debounce_ms);
     eprintln!("[setup] CLI ticket: {}…", &hub.ticket[..hub.ticket.len().min(40)]);
+
+    // Pre-seed N files on the CLI disk; the watcher captures them, then the
+    // engines clone the whole set. Lets a run start at real scale.
+    let prefill_paths: Vec<String> = (0..prefill).map(|k| format!("seed/{:02}/f{:06}.md", k % 50, k)).collect();
+    if prefill > 0 {
+        eprintln!("[setup] prefilling {prefill} files into the CLI vault…");
+        for (k, p) in prefill_paths.iter().enumerate() {
+            let abs = hub.dir.join(p);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&abs, format!("# seed {k}\n\nbody {k}\n")).unwrap();
+        }
+        // Let the CLI watcher capture the batch before the engines clone.
+        std::thread::sleep(Duration::from_millis(1000 + prefill as u64));
+    }
+
+    // A generous initial-convergence budget — a large prefill means a big clone
+    // catch-up on first connect.
+    let initial_timeout = conv_timeout.max(Duration::from_secs(30 + prefill as u64 / 50));
 
     let mut peers: Vec<Peer> = Vec::new();
     for n in 0..npeers {
@@ -300,15 +380,19 @@ fn main() {
         peers.push(Peer { de, id: v.id, dir });
     }
 
-    let (ok, problems) = wait_converged(&hub, &peers, conv_timeout);
+    let (ok, problems) = wait_converged(&hub, &peers, initial_timeout);
     if !ok {
         eprintln!("[FAIL] initial convergence failed:\n{}", problems.join("\n"));
         std::process::exit(1);
     }
-    eprintln!("[setup] initial convergence OK across {npeers} engine(s)\n");
+    eprintln!(
+        "[setup] initial convergence OK across {npeers} engine(s) ({} files)\n",
+        snapshot_dir(&peers[0].dir).len()
+    );
 
     let mut rng = Rng::new(seed);
     let mut live: Vec<String> = vec!["README.md".into()];
+    live.extend(prefill_paths.iter().cloned());
     let mut streak = 0usize;
     let mut conv_latencies: Vec<u128> = Vec::new();
     let mut op_latencies: Vec<u128> = Vec::new();
@@ -405,6 +489,11 @@ enum Scenario {
     CaseOnlyRename,
     RenameThenEdit,
     ExternalRescan,
+    BinaryFile,
+    HugeFile,
+    CodeFile,
+    TimeTravelRestore,
+    VaultRestore,
 }
 
 fn pick_scenario(rng: &mut Rng, round: usize) -> Scenario {
@@ -416,7 +505,7 @@ fn pick_scenario(rng: &mut Rng, round: usize) -> Scenario {
             EditExisting, NewFile, Rename, Delete, DeleteRecreate, RapidBurst,
             LargeFile, ManyFiles, ConcurrentSameFile, EmptyFile, DeepNesting,
             TruncateToEmpty, SwapNames, RenameOntoExisting, CaseOnlyRename, RenameThenEdit,
-            ExternalRescan,
+            ExternalRescan, BinaryFile, HugeFile, CodeFile, TimeTravelRestore, VaultRestore,
         ]
     };
     rng.pick(&menu).clone()
@@ -637,6 +726,96 @@ fn apply_scenario(
                 live.push(name.clone());
             }
             format!("external-rescan/Engine({i}) {name}")
+        }
+        BinaryFile => {
+            // A binary blob (non-utf8, embedded NULs) — classified Binary, synced
+            // whole-file LWW. The engine API can't author non-utf8 (write_file is
+            // &str), so binary originates on a disk side: either the CLI hub, or
+            // written behind an engine + captured via rescan (engine-origin). Both
+            // must converge byte-exact on every disk; the lossy API view is checked
+            // against the lossy disk in wait_converged.
+            let name = format!("assets/{:04}.bin", rng.next_u64() % 10000);
+            let nbytes = 200 + rng.below(2000);
+            let bytes = rand_binary(rng, nbytes);
+            if rng.below(2) == 0 || np == 0 {
+                write_cli(&hub.dir, &name, &bytes);
+                if !live.contains(&name) { live.push(name.clone()); }
+                format!("binary/Cli {name} ({}B)", bytes.len())
+            } else {
+                let i = rng.below(np);
+                let full = peers[i].dir.join(&name);
+                if let Some(parent) = full.parent() { let _ = std::fs::create_dir_all(parent); }
+                let _ = std::fs::write(&full, &bytes);
+                let t = Instant::now();
+                let _ = peers[i].de.rescan(&peers[i].id);
+                lat.push(t.elapsed().as_millis());
+                if !live.contains(&name) { live.push(name.clone()); }
+                format!("binary/Engine({i})+rescan {name} ({}B)", bytes.len())
+            }
+        }
+        HugeFile => {
+            // A large file up to ~4MB — the upper end the app must stay correct on.
+            // Exercises blob storage, materialize, and convergence of multi-MB
+            // content across surfaces.
+            let path = format!("huge/{}.md", rng.next_u64() % 20);
+            let target = 1_000_000 + rng.below(3_200_000); // ~1–4.2 MB
+            let mut big = String::with_capacity(target + 64);
+            big.push_str("# Huge\n\n");
+            let mut n = 0u64;
+            while big.len() < target {
+                big.push_str(&format!("line {n} :: lorem ipsum dolor sit amet :: {}\n", rng.next_u64()));
+                n += 1;
+            }
+            let side = pick_side(rng, np);
+            do_write(side, hub, peers, &path, &big, lat);
+            if !live.contains(&path) { live.push(path.clone()); }
+            format!("huge(~{}MB)/{side:?}", big.len() / 1_000_000)
+        }
+        CodeFile => {
+            // A code file (Code merge class). Two sides may edit different fns of
+            // the same file → a 3-way code merge that must converge identically.
+            let path = format!("src/mod_{:03}.rs", rng.next_u64() % 200);
+            let side = pick_side(rng, np);
+            do_write(side, hub, peers, &path, &rand_code(rng, "code file"), lat);
+            if !live.contains(&path) { live.push(path.clone()); }
+            // Occasionally a concurrent edit from another side for a real code merge.
+            if np > 0 && rng.below(2) == 0 {
+                let other = pick_side(rng, np);
+                do_write(other, hub, peers, &path, &rand_code(rng, "concurrent code edit"), lat);
+            }
+            format!("code/{side:?} {path}")
+        }
+        TimeTravelRestore => {
+            // Revert a file to its content as of a moment ago via restore_file_at,
+            // which authors an edit (the historical bytes) and broadcasts it — all
+            // surfaces must still converge. Exercises time-travel restore racing a
+            // live, concurrently-mutating sync (a flagged blind spot). Engine-side
+            // (the CLI has no equivalent one-file restore primitive here).
+            if live.is_empty() {
+                return "tt-restore(skip)".into();
+            }
+            let path = live[rng.below(live.len())].clone();
+            let i = rng.below(np);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+            let ts = now - (rng.below(3) as i64); // a second or two back
+            let t = Instant::now();
+            let _ = peers[i].de.restore_file_at(&peers[i].id, &path, ts);
+            lat.push(t.elapsed().as_millis());
+            format!("tt-restore/Engine({i}) {path}@-{}s", now - ts)
+        }
+        VaultRestore => {
+            // Revert the WHOLE vault to a recent past instant (engine.restore with
+            // a unix-ts target), which authors revert rows for every file changed
+            // since and broadcasts them. Far heavier than a one-file restore: it
+            // races a live, concurrently-mutating sync and must still converge
+            // across all surfaces (the revert rows are normal latest-wins edits).
+            let i = rng.below(np);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+            let target = (now - 1 - (rng.below(3) as i64)).to_string();
+            let t = Instant::now();
+            let _ = peers[i].de.restore(&peers[i].id, &target);
+            lat.push(t.elapsed().as_millis());
+            format!("vault-restore/Engine({i}) @-{}s", now - target.parse::<i64>().unwrap_or(now))
         }
     }
 }

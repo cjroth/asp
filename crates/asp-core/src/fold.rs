@@ -82,7 +82,6 @@ pub fn fold_order(rows: &[LogRow]) -> Vec<LogRow> {
 
 /// Per-`file_id` fold state.
 struct FileState {
-    content: Option<Vec<u8>>,
     content_hash: Option<String>,
     path: Option<String>,
     merge_class: MergeClass,
@@ -90,33 +89,43 @@ struct FileState {
     lamport: u64,
     site_id: String,
     conflict: bool,
-    /// Fold-order index of the row that last set this file's path (create/rename)
-    /// — the deterministic key for resolving live-path collisions.
-    path_claim: usize,
+    /// Order key `(lamport, site_id, id)` of the row that last set this file's
+    /// path (create/rename) — the deterministic key for resolving live-path
+    /// collisions. Intrinsic to that row (not a global fold-order index), so it
+    /// is identical whether the file is folded in isolation or with the whole
+    /// log — exactly what an incremental fold needs. Two files can only collide
+    /// on a path if their claim rows are concurrent (different file_ids → no
+    /// causal edge), and concurrent rows order by this same key in `fold_order`,
+    /// so collision resolution is unchanged from the previous index-based key.
+    path_claim: OrderKey,
     created: bool,
 }
 
-/// Fold the whole log into the materialized `files` set, writing any merged
-/// blobs back to the store. Pure function of the rows + blobs.
-pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::AspResult<Vec<FileRow>> {
-    let ordered = fold_order(rows);
-    let mut states: HashMap<String, FileState> = HashMap::new();
+/// The order key of a row — its concurrent-tiebreak identity.
+fn order_key(r: &LogRow) -> OrderKey {
+    OrderKey { lamport: r.lamport, site_id: r.site_id.clone(), id: r.id.clone() }
+}
 
+/// Run the per-file fold state machine over `ordered` (already in fold order),
+/// updating `states`. Each `file_id`'s state is a pure function of ITS OWN rows
+/// (the only cross-file interaction is path-collision resolution, done later in
+/// `resolve_paths`), so feeding one file's rows here yields exactly the state it
+/// would have inside a whole-log fold — the property the incremental `FoldState`
+/// relies on. Only a genuine 3-way merge reads blobs; linear edits just track the
+/// content hash.
+fn apply_rows(store: &dyn BlobStore, ordered: &[LogRow], states: &mut HashMap<String, FileState>) -> crate::error::AspResult<()> {
     let blob = |h: &Option<String>| -> Vec<u8> {
         match h {
             Some(h) => store.get_blob(h).ok().flatten().unwrap_or_default(),
             None => Vec::new(),
         }
     };
-
-    for (idx, r) in ordered.iter().enumerate() {
+    for r in ordered.iter() {
         match r.kind {
             Kind::Create => {
-                let content = blob(&r.result_hash);
                 states.insert(
                     r.file_id.clone(),
                     FileState {
-                        content: Some(content),
                         content_hash: r.result_hash.clone(),
                         path: r.path.clone(),
                         merge_class: r.merge_class,
@@ -124,7 +133,7 @@ pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::As
                         lamport: r.lamport,
                         site_id: r.site_id.clone(),
                         conflict: false,
-                        path_claim: idx,
+                        path_claim: order_key(r),
                         created: true,
                     },
                 );
@@ -134,18 +143,18 @@ pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::As
                 if st.deleted {
                     continue; // remove-wins: a concurrent edit does not resurrect
                 }
-                let theirs = blob(&r.result_hash);
-                let ours = st.content.clone().unwrap_or_default();
                 if st.content_hash == r.base_hash {
-                    // Authored on the current tip — linear apply.
-                    st.content = Some(theirs);
+                    // Authored on the current tip — linear apply, just swap the
+                    // hash (no blob read needed).
                     st.content_hash = r.result_hash.clone();
                 } else {
+                    // Genuine 3-way merge — read the three sides now (rare path).
+                    let theirs = blob(&r.result_hash);
+                    let ours = blob(&st.content_hash);
                     let base = blob(&r.base_hash);
                     let m = merge3(st.merge_class, &base, &ours, &theirs);
                     let h = store.put_blob(&m.bytes)?;
                     st.conflict |= m.conflict;
-                    st.content = Some(m.bytes);
                     st.content_hash = Some(h);
                 }
                 st.lamport = r.lamport;
@@ -157,14 +166,13 @@ pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::As
                     continue;
                 }
                 st.path = r.path.clone();
-                st.path_claim = idx; // last rename wins by fold order
+                st.path_claim = order_key(r); // last rename wins by fold order
                 st.lamport = r.lamport;
                 st.site_id = r.site_id.clone();
             }
             Kind::Delete => {
                 if let Some(st) = states.get_mut(&r.file_id) {
                     st.deleted = true;
-                    st.content = None;
                     st.lamport = r.lamport;
                     st.site_id = r.site_id.clone();
                 }
@@ -180,14 +188,70 @@ pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::As
             }
         }
     }
+    Ok(())
+}
 
-    Ok(resolve_paths(states))
+/// Fold the whole log into the materialized `files` set, writing any merged
+/// blobs back to the store. Pure function of the rows + blobs.
+pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::AspResult<Vec<FileRow>> {
+    let ordered = fold_order(rows);
+    let mut states: HashMap<String, FileState> = HashMap::new();
+    apply_rows(store, &ordered, &mut states)?;
+    Ok(resolve_paths(&states))
+}
+
+/// An incrementally-maintained fold: the per-`file_id` states plus a way to
+/// re-fold only the files a new batch of rows touched, instead of re-folding the
+/// whole log. Because each file's state is independent (above), re-folding just
+/// the touched files from their own rows yields the same states a full fold would
+/// — `FoldState::files()` then resolves paths over ALL cached states. The
+/// `fold_props` differential test pins this equal to `compute_files` for every
+/// random history and arrival order; the sync fuzzer validates it end to end.
+pub struct FoldState {
+    states: HashMap<String, FileState>,
+}
+
+impl FoldState {
+    /// Build from scratch by folding the whole log (used once, e.g. at open).
+    pub fn from_rows(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::AspResult<FoldState> {
+        let ordered = fold_order(rows);
+        let mut states = HashMap::new();
+        apply_rows(store, &ordered, &mut states)?;
+        Ok(FoldState { states })
+    }
+
+    /// Re-fold exactly `file_ids`, replacing their cached state. `rows_for(fid)`
+    /// must return ALL rows for `fid` (a new row can be concurrent with / precede
+    /// cached rows, so the file is re-folded from scratch — but only that file).
+    /// A file whose rows vanished (none returned) is dropped.
+    pub fn refold_files(
+        &mut self,
+        store: &dyn BlobStore,
+        file_ids: &[String],
+        rows_for: impl Fn(&str) -> crate::error::AspResult<Vec<LogRow>>,
+    ) -> crate::error::AspResult<()> {
+        for fid in file_ids {
+            self.states.remove(fid);
+            let frows = rows_for(fid)?;
+            if frows.is_empty() {
+                continue;
+            }
+            let ordered = fold_order(&frows);
+            apply_rows(store, &ordered, &mut self.states)?;
+        }
+        Ok(())
+    }
+
+    /// The materialized file set (resolves path collisions across all files).
+    pub fn files(&self) -> Vec<FileRow> {
+        resolve_paths(&self.states)
+    }
 }
 
 /// Resolve live-path collisions: among files claiming the same path, the lowest
 /// fold-order claim keeps it; others get a deterministic ` (n)` suffix. Tombstones
 /// are emitted too (deleted=1) so deletes are explicit, ordered rows.
-fn resolve_paths(states: HashMap<String, FileState>) -> Vec<FileRow> {
+fn resolve_paths(states: &HashMap<String, FileState>) -> Vec<FileRow> {
     // Stable ordering of all states by (path_claim, file_id).
     let mut all: Vec<(&String, &FileState)> = states.iter().collect();
     all.sort_by(|a, b| {
@@ -374,6 +438,30 @@ mod tests {
         let rev = compute_files(&s, &[e2, e1, create]).unwrap();
         assert_eq!(fwd, rev, "equal-counter same-site rows fold deterministically");
         assert_eq!(fwd.iter().filter(|f| !f.deleted).count(), 1);
+    }
+
+    #[test]
+    fn concurrent_disjoint_edits_both_survive_in_the_fold() {
+        // Two devices edit the SAME file from the SAME base, in NON-overlapping
+        // regions, while partitioned (both rows carry base_hash = the base). The
+        // fold's 3-way merge must keep BOTH edits — not pick one wholesale. This
+        // guards the lazy-content fold path (the merge reads `ours` from
+        // content_hash, not an eagerly-stored buffer).
+        let s = crate::store::MemBlobStore::new();
+        let base = "header\nalpha\nbeta\ngamma\ndelta\nfooter\n";
+        let h0 = s.put_blob(base.as_bytes()).unwrap();
+        let create = mkrow("aa", 1, 0, "f1", Kind::Create, None, None, Some(&h0), Some("doc.md"));
+        let ha = s.put_blob(b"header\nalpha-A\nbeta\ngamma\ndelta\nfooter\n").unwrap();
+        let hb = s.put_blob(b"header\nalpha\nbeta\ngamma\ndelta\nfooter-B\n").unwrap();
+        let ea = mkrow("aa", 2, 1, "f1", Kind::Edit, Some(&create.id), Some(&h0), Some(&ha), None);
+        let eb = mkrow("bb", 2, 0, "f1", Kind::Edit, Some(&create.id), Some(&h0), Some(&hb), None);
+        let fwd = compute_files(&s, &[create.clone(), ea.clone(), eb.clone()]).unwrap();
+        let rev = compute_files(&s, &[eb, ea, create]).unwrap();
+        assert_eq!(fwd, rev, "disjoint concurrent edits fold deterministically (order-independent)");
+        let f = fwd.iter().find(|f| f.file_id == "f1" && !f.deleted).unwrap();
+        let merged = String::from_utf8(s.get_blob(f.result_hash.as_ref().unwrap()).unwrap().unwrap()).unwrap();
+        assert!(merged.contains("alpha-A"), "A's edit survived the fold merge: {merged:?}");
+        assert!(merged.contains("footer-B"), "B's edit survived the fold merge: {merged:?}");
     }
 
     #[test]

@@ -76,3 +76,68 @@ The closing moves: a **slow** mock (`App.content.test.tsx`, 120ms writes),
 **content/scroll assertions** (`FileTree.test.tsx`, harness "editor shows content
 after create"), and **rapid/overlapping actions** (rapid-multi-delete, file
 bouncing). Each new test fails on the pre-fix code.
+
+## Round 2 — the backend WAS the freeze at 10k–50k files
+
+The first round proved the backend was fine at 1k files. At 10k–50k it is not —
+`bench_ops.rs 50000 0` exposed O(vault)-per-op costs that scale right past the
+point a real vault hits. Same loop (measure one op, find the layer, fix the
+smallest thing, re-measure), backend edition.
+
+| # | Problem (at scale) | Fix | Result |
+|---|---|---|---|
+| 13 | every `write_file` was O(vault): `materialize` rewrote the whole `files` table with a per-row INSERT and **no transaction**, so SQLite auto-committed once per row | wrap the rewrite in ONE `unchecked_transaction` + a cached prepared statement | `replace_files` **585ms → 17ms**, `write_file` **824ms → 265ms** @ 10k (3.1×) |
+| 14 | `get_status` (10s poll) loaded **every** log row for `max(ts)` and materialized every `FileRow` to count them | `Store::max_ts()` (`SELECT MAX(ts)`) + `Store::live_file_count()` (`SELECT COUNT`) | `get_status` **220ms → 2.8ms** @ 10k |
+| 15 | the fold read **every** content blob, even on linear edits, to keep an in-memory `content` it only used for merges | lazy content in `compute_files`: track `content_hash`; read `ours/base/theirs` only when a real 3-way merge fires (byte-identical FileRows) | speeds up every materialize + every history fold |
+| 16 | history slider: `read_file_at` rebuilt the **whole-vault** snapshot (read all blobs) to extract one file, fired on every pointermove | `Engine::file_at(path,t)` reads exactly one blob; debounce the time-travel read 60ms in `App.tsx` | `read_file_at` **137ms → 48ms** @ 10k; a scrub is one read, not one-per-pixel |
+
+Each fix is locked by a test that asserts the *behavior*, not the speed:
+`store_and_config` (max_ts/live_file_count match the scan), `engine_snapshot`
+(`file_at` ≡ `state_as_of` across edits/renames/deletes/merges),
+`fold::concurrent_disjoint_edits_both_survive_in_the_fold` (the lazy fold still
+merges), and the full `sync_fuzz` battery (the transaction + fold changes don't
+break convergence: 4 seeds × 3 peers × 300 rounds, 0 divergences).
+
+Frontend companion: a **loading overlay** while opening/adding a large folder
+(`withOpening` in `App.tsx`, 140ms threshold so a quick switch never flashes) —
+the open path is genuinely slow at 50k files (first capture hashes + git-exports
+every file), so it gets the same progress affordance cloning already had.
+
+Cold start: `reopen_saved()` ran synchronously before the Tauri window was
+built, so a large saved vault froze first paint — fixed by moving it to a
+background thread in `.setup()` + a `vaults-ready` event the UI listens for, with
+a "Loading your vaults…" hint until it fires.
+
+**Still O(vault):** the *first* `add_local_folder` capture at 50k files (hash
+every file + store every blob + git-export every file) — inherent one-time
+ingest cost, covered by the loading overlay.
+
+## Round 3 — kill the whole-log re-fold (merges were O(N))
+
+Even after Round 2, every state change re-folded the ENTIRE log: `materialize`
+did `compute_files(all_rows)` on each local save AND each peer row integrated.
+The data model is incremental-friendly (per-`file_id` independence; concurrent
+rows order by an intrinsic `(lamport,site_id,id)` key) but the engine recomputed
+from scratch for trivial correctness. Round 3 makes it incremental.
+
+| # | Problem | Fix | Result |
+|---|---|---|---|
+| 17 | a local save still re-folded the whole log inside `materialize` | fast path in `record_write` for a linear edit on the tip: update one files-table row + write one file + refresh git, no fold | `write_file` edit **1061ms → 485ms** @50k |
+| 18 | path-collision resolution keyed on the global fold-order index (only valid in a whole-log fold) | key it on the path-setting row's intrinsic `OrderKey` (behavior-preserving; collisions are always cross-file ⇒ concurrent ⇒ same order) | enables folding a file in isolation |
+| 19 | peer-row integration and concurrent merges still O(total log) | `FoldState`: per-`file_id` state cache; the engine keeps it in memory + a `dirty` set fed by every append (local & peer), and `materialize` re-folds ONLY dirty files, then resolves paths over all | integration **O(total log) → O(touched files' rows + file count)** |
+
+Deep-history payoff (`bench_ops 100 50000` — 100 files, 50k rows, previously an
+O(n²) seed that had to be killed): it now completes, and `write_file` edit is
+**12.9ms**, `delete_file` **16ms** — versus the old whole-log fold of 50k rows on
+every op. (A structural op right after a long burst of fast-path-only edits pays
+a one-time catch-up to reconcile all the deferred `dirty` files; in real use
+materializes interleave, so `dirty` stays tiny.)
+
+The correctness gate is generative, not a spot check (`tests/fold_props.rs`):
+across 300 random concurrent histories, feed a `FoldState` one row at a time in
+a random arrival order and assert it equals `compute_files` over the rows seen so
+far **after every row** — covering out-of-order arrival, concurrent forks/merges,
+renames that create/break path collisions, and delete+recreate. Plus
+`compute_files` permutation-invariance over 400 histories, and the full
+`sync_fuzz` battery now also asserts the derived **git head** converges across
+every surface (seeds 1/7/13/23/99 × 1/2/3 peers + 240-round runs, 0 divergences).

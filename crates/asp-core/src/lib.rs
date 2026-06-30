@@ -43,7 +43,7 @@ pub mod sqlite;
 
 pub use authkeys::{AdmitCtx, AuthKey};
 pub use error::{AspError, AspResult};
-pub use fold::{compute_files, fold_order};
+pub use fold::{compute_files, fold_order, FoldState};
 pub use identity::Identity;
 pub use log::{Kind, LogRow, MergeClass};
 pub use memengine::MemEngine;

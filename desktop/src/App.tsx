@@ -140,6 +140,17 @@ export default function App() {
   const [authKey, setAuthKey] = useState('');
   const [connecting, setConnecting] = useState(false);
   const [connectDest, setConnectDest] = useState<string | null>(null);
+  // Non-dismissable "working…" overlay shown while a folder is being added
+  // (capture_rescan hashes every file) or a vault is being opened
+  // (list_files + tree build). Both scale with vault size, so on a large
+  // folder they take long enough that the UI would otherwise look frozen.
+  // The string is the label to show; null hides the overlay.
+  const [opening, setOpening] = useState<string | null>(null);
+  // True while the desktop shell is still reopening previously-saved vaults in
+  // the background (see the `vaults-ready` Tauri event). Lets the connect screen
+  // show "Loading your vaults…" instead of a bare empty state on cold start.
+  // Web loads its registry synchronously, so it never enters this state.
+  const [vaultsLoading, setVaultsLoading] = useState(isDesktop());
 
   const [share, setShare] = useState<{ id: string; code: string; requireKey: boolean; accessKey: string; copied: boolean; unavailable?: boolean } | null>(null);
   const [vaultCtx, setVaultCtx] = useState<{ x: number; y: number; id: string; vaultId: string; name: string } | null>(null);
@@ -265,6 +276,11 @@ export default function App() {
     void api.getIdentity().then(setIdentity).catch(() => {});
     void (async () => {
       const vs = await refreshVaults();
+      // Any vaults already available (web registry, or folders the desktop shell
+      // finished reopening before we mounted) means we're not waiting on an empty
+      // cold start — drop the loading hint. The `vaults-ready` event below also
+      // clears it once the background reopen completes.
+      if (vs.length) setVaultsLoading(false);
       // Refresh-restore: on the first mount after a real page load, if the URL
       // hash names a known vault, open it (openVault then picks the hashed file).
       // Works identically on desktop and web — the hash is read the same way.
@@ -286,6 +302,32 @@ export default function App() {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshVaults, refreshStatuses]);
+
+  // The desktop shell reopens previously-saved folders on a background thread and
+  // emits `vaults-ready` when done (so a large saved vault doesn't block first
+  // paint). Refresh the list the moment it fires. Desktop-only; on web the import
+  // resolves but `listen` has no transport, so we swallow it.
+  useEffect(() => {
+    if (!desktop) return;
+    let un: (() => void) | undefined;
+    let cancelled = false;
+    void import('@tauri-apps/api/event')
+      .then(({ listen }) =>
+        listen('vaults-ready', () => {
+          setVaultsLoading(false);
+          void refreshVaults().then(refreshStatuses);
+        }),
+      )
+      .then((u) => {
+        if (cancelled) u();
+        else un = u;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      un?.();
+    };
+  }, [desktop, refreshVaults, refreshStatuses]);
 
   // Persist the active vault's open tabs whenever they change.
   useEffect(() => {
@@ -314,6 +356,14 @@ export default function App() {
 
   useEffect(() => {
     const t = setInterval(() => {
+      // Web (wasm/OPFS) vaults have no standing connector, so they can't catch up
+      // on their own after the initial clone. Drive it from the poll: for each
+      // vault cloned from a peer, sync against its stored upstream ticket. The
+      // downstream refreshFiles/refreshActiveContent below then surfaces the
+      // pulled-in changes. No-op on desktop (webUpstreams is empty there).
+      void Promise.resolve(api.webUpstreams?.())
+        .then((ups) => Promise.all((ups ?? []).map((u) => api.syncNow(u.id, u.ticket, u.authKey).catch(() => {}))))
+        .catch(() => {});
       if (screen === 'editor' && activeIdRef.current) {
         const id = activeIdRef.current;
         void api.getStatus(id).then((st) => setStatuses((p) => ({ ...p, [id]: st }))).catch(() => {});
@@ -396,9 +446,10 @@ export default function App() {
     }
 
     let cancelled = false;
-    void (async () => {
-      try {
-        if (live) {
+    let ttTimer: ReturnType<typeof setTimeout> | undefined;
+    if (live) {
+      void (async () => {
+        try {
           const content = await api.readFile(id, path);
           if (cancelled || seq !== paintSeq.current) return;
           contentRef.current[key] = content;
@@ -406,18 +457,32 @@ export default function App() {
           dirtyRef.current = false;
           setDocText(content);
           setPaint({ source: content, readOnly: false, notExist: false, key: `${path}#live#${seq}` });
-        } else {
-          const at = await api.readFileAt(id, path, Math.floor(ph / 1000));
-          if (cancelled || seq !== paintSeq.current) return;
-          setDocText(at.exists ? at.content : '');
-          setPaint({ source: at.content, readOnly: true, notExist: !at.exists, key: `${path}#tt${ph}#${seq}` });
+        } catch {
+          if (!cancelled) setPaint(null);
         }
-      } catch {
-        if (!cancelled) setPaint(null);
-      }
-    })();
+      })();
+    } else {
+      // Debounce time-travel reads: dragging the history-slider handle fires a
+      // playhead update on every pointermove, and each read_file_at folds the
+      // log as-of that instant. Coalesce a drag into one read after a short
+      // settle (a discrete tick-jump still feels instant at 60ms) so a scrub
+      // never queues dozens of backend reads on a large vault.
+      ttTimer = setTimeout(() => {
+        void (async () => {
+          try {
+            const at = await api.readFileAt(id, path, Math.floor(ph / 1000));
+            if (cancelled || seq !== paintSeq.current) return;
+            setDocText(at.exists ? at.content : '');
+            setPaint({ source: at.content, readOnly: true, notExist: !at.exists, key: `${path}#tt${ph}#${seq}` });
+          } catch {
+            if (!cancelled) setPaint(null);
+          }
+        })();
+      }, 60);
+    }
     return () => {
       cancelled = true;
+      if (ttTimer) clearTimeout(ttTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId, selectedPath, playhead]);
@@ -448,8 +513,25 @@ export default function App() {
   );
 
   // ---------- vault open / switch ----------
+  // Run a potentially-slow open/add operation, showing a non-dismissable
+  // "working…" overlay only if it runs longer than a short threshold — so a
+  // quick vault switch never flashes a spinner, but a large folder (where
+  // capture_rescan / list_files / tree-build take seconds) shows progress
+  // instead of looking frozen. Nesting is safe: the inner call clears the
+  // overlay when its work is done, and the outer's finally is a harmless no-op.
+  const withOpening = useCallback(async (label: string, fn: () => Promise<void>) => {
+    const timer = setTimeout(() => setOpening(label), 140);
+    try {
+      await fn();
+    } finally {
+      clearTimeout(timer);
+      setOpening(null);
+    }
+  }, []);
+
   const openVault = useCallback(
-    async (id: string) => {
+    (id: string) =>
+      withOpening('Opening vault…', async () => {
       await flushSave();
       const fs = await refreshFiles(id);
       const tree = buildTree(fs);
@@ -486,8 +568,8 @@ export default function App() {
       setSelectedPaths(active ? new Set([active]) : new Set());
       setAnchorPath(active);
       scheduleHistory(id);
-    },
-    [flushSave, refreshFiles, scheduleHistory],
+      }),
+    [withOpening, flushSave, refreshFiles, scheduleHistory],
   );
   openVaultRef.current = openVault;
 
@@ -975,15 +1057,20 @@ export default function App() {
     try {
       const dir = await open({ directory: true });
       if (typeof dir === 'string') {
-        const info = await api.addLocalFolder(dir);
-        await refreshVaults();
-        await openVault(info.id);
+        // addLocalFolder runs capture_rescan (hashes every file on disk), which
+        // scales with folder size — show the overlay so a large folder doesn't
+        // look frozen. openVault then shows its own (for the list_files step).
+        await withOpening('Opening folder…', async () => {
+          const info = await api.addLocalFolder(dir);
+          await refreshVaults();
+          await openVault(info.id);
+        });
       }
     } catch (err) {
       console.error('open folder failed', err);
       alert('Could not open that folder: ' + String((err as Error)?.message ?? err));
     }
-  }, [openVault, refreshVaults]);
+  }, [openVault, refreshVaults, withOpening]);
 
   const onChooseDest = useCallback(async () => {
     const dir = await open({ directory: true });
@@ -1312,6 +1399,13 @@ export default function App() {
               <span>Connect Vault</span>
             </button>
           </div>
+
+          {desktop && vaultsLoading && saved.length === 0 && (
+            <div data-testid="vaults-loading" style={{ marginTop: 26, display: 'flex', alignItems: 'center', gap: 10, padding: '14px 15px', border: '1px solid var(--line)', borderRadius: 14, background: 'var(--bg)', color: 'var(--text3)', fontSize: 13 }}>
+              <span style={{ width: 15, height: 15, border: '2px solid var(--faint2)', borderTopColor: 'var(--text2)', borderRadius: '50%', display: 'inline-block', animation: 'aspSpin 0.7s linear infinite', flex: 'none' }} />
+              <span>Loading your vaults…</span>
+            </div>
+          )}
 
           {saved.length > 0 && (
             <>
@@ -1677,6 +1771,17 @@ export default function App() {
   return (
     <>
       {screen === 'connect' ? renderConnect() : renderEditor()}
+
+      {/* open/add progress overlay — non-dismissable; shown only when an open
+          runs long enough to look frozen (see withOpening). Above every modal. */}
+      {opening && (
+        <div data-testid="opening-overlay" style={{ position: 'fixed', inset: 0, zIndex: 95, background: 'var(--overlay)', backdropFilter: 'blur(2px)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14, background: 'var(--bg)', borderRadius: 16, boxShadow: '0 24px 60px rgba(28,25,23,0.28)', padding: '26px 34px' }}>
+            <span style={{ width: 26, height: 26, border: '3px solid var(--faint2)', borderTopColor: 'var(--text)', borderRadius: '50%', display: 'inline-block', animation: 'aspSpin 0.7s linear infinite' }} />
+            <div style={{ fontSize: 13.5, fontWeight: 500, color: 'var(--text2)' }}>{opening}</div>
+          </div>
+        </div>
+      )}
 
       {/* vault-row context menu (connect screen) */}
       {vaultCtx && (

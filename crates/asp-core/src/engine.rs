@@ -41,6 +41,21 @@ pub struct Engine {
     /// (`Engine` is `!Sync` and only ever touched behind a `Mutex`, so a `Cell`
     /// is safe here.)
     batch: std::cell::Cell<bool>,
+    /// Incremental fold cache: the per-file_id states, so `materialize` re-folds
+    /// only the files a change touched instead of the whole log. `None` until the
+    /// first materialize builds it (and after anything that can't name what it
+    /// touched, forcing a safe full rebuild). Authoritative EXCEPT for file_ids in
+    /// `dirty`, which `materialize` re-folds before reading the cache.
+    fold: std::cell::RefCell<Option<crate::FoldState>>,
+    /// file_ids whose log changed since the cache was last reconciled — drained
+    /// and re-folded by `materialize`. Every row append records its file_id here.
+    dirty: std::cell::RefCell<std::collections::HashSet<String>>,
+    /// In-memory memo of content_hash → derived-git blob oid. The git oid is a
+    /// pure function of the bytes, so this is a safe cache; it spares the git
+    /// export a SQLite lookup per file on every settle (the dominant per-op cost
+    /// at scale was ~3000 `git_oid_for` queries per export). Backed by the durable
+    /// `git_blobs` table for cross-session reuse.
+    git_oids: std::cell::RefCell<std::collections::HashMap<String, [u8; 20]>>,
 }
 
 fn now_unix() -> u64 {
@@ -97,6 +112,9 @@ impl Engine {
             scope: std::cell::RefCell::new(scope),
             site,
             batch: std::cell::Cell::new(false),
+            fold: std::cell::RefCell::new(None),
+            dirty: std::cell::RefCell::new(std::collections::HashSet::new()),
+            git_oids: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
         Ok(eng)
     }
@@ -206,7 +224,18 @@ impl Engine {
             }
         };
         self.store.append_row(&row)?;
-        self.materialize_unless_batched()?;
+        self.note_dirty(&row.file_id);
+        // Fast path: a local linear edit on the tip changed exactly one file's
+        // content (no merge, no path change). Reflect it incrementally instead of
+        // re-folding the whole log. Skipped in a capture batch (one flush at the
+        // end) and for Create / anything structural, which take the full fold.
+        // (note_dirty above still records it, so a later full materialize re-folds
+        // it into the cache — the fast path's files-table write is idempotent.)
+        if !self.batch.get() && matches!(row.kind, Kind::Edit) {
+            self.materialize_local_edit(&row.file_id, rel, &result_hash, bytes, row.lamport, &row.site_id)?;
+        } else {
+            self.materialize_unless_batched()?;
+        }
         Ok(Some(self.wire(row)?))
     }
 
@@ -231,6 +260,7 @@ impl Engine {
         }
         .seal();
         self.store.append_row(&row)?;
+        self.note_dirty(&row.file_id);
         self.materialize_unless_batched()?;
         Ok(Some(self.wire(row)?))
     }
@@ -256,6 +286,7 @@ impl Engine {
         }
         .seal();
         self.store.append_row(&row)?;
+        self.note_dirty(&row.file_id);
         self.materialize_unless_batched()?;
         Ok(Some(self.wire(row)?))
     }
@@ -288,6 +319,7 @@ impl Engine {
         }
         let added = self.store.append_row(&wr.row)?;
         if added {
+            self.note_dirty(&wr.row.file_id);
             self.materialize()?;
         }
         Ok(added)
@@ -315,6 +347,7 @@ impl Engine {
             let added = self.store.append_row(&wr.row)?;
             if added {
                 any = true;
+                self.note_dirty(&wr.row.file_id);
             }
             flags.push(added);
         }
@@ -343,18 +376,67 @@ impl Engine {
         self.materialize().map(|_| ())
     }
 
-    /// Returns the materialized path → content-hash map (for echo suppression).
-    pub fn materialize(&self) -> AspResult<BTreeMap<String, String>> {
-        let rows = self.store.all_rows()?;
-        let old_live: Vec<String> = self.store.live_files()?.into_iter().map(|f| f.path).collect();
-        let files = compute_files(&self.store, &rows)?;
-        self.store.replace_files(&files)?;
+    /// Mark a file_id's log as changed since the fold cache was last reconciled.
+    /// Called at every row append; `materialize` drains this and re-folds only
+    /// these files.
+    fn note_dirty(&self, file_id: &str) {
+        self.dirty.borrow_mut().insert(file_id.to_string());
+    }
 
-        // Desired on-disk set: content files (path -> bytes) and directory
-        // entities (paths to `mkdir`).
-        let mut desired: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        let mut desired_dirs: Vec<String> = Vec::new();
+    /// Returns the materialized path → content-hash map (for echo suppression).
+    ///
+    /// Reconciles disk + the derived git store to the folded log. Both are kept
+    /// O(changed) rather than O(vault): the previous materialized `files` table is
+    /// the record of what's already on disk, so a content file is only (re)written
+    /// when its hash changed (or it's new, or it went missing from disk); and the
+    /// git export resolves blob oids through a `content_hash → git_oid` cache so an
+    /// unchanged file is never re-read/re-hashed. A single edit on a 50k-file vault
+    /// therefore touches one file's bytes, not all of them. (On the first
+    /// materialize the previous table is empty, so everything is "changed" and the
+    /// full initial reconcile still happens.)
+    pub fn materialize(&self) -> AspResult<BTreeMap<String, String>> {
+        // Previous materialized live state: path -> content_hash, and the set of
+        // all previously-live paths (content + dir) for stale removal.
+        let prev = self.store.live_files()?;
+        let mut prev_hash: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+        let mut old_live: Vec<String> = Vec::with_capacity(prev.len());
+        for f in &prev {
+            if f.deleted {
+                continue;
+            }
+            old_live.push(f.path.clone());
+            prev_hash.insert(f.path.clone(), f.result_hash.clone());
+        }
+
+        // Fold incrementally: re-fold only the file_ids touched since the cache was
+        // last reconciled (`dirty`), reusing every other file's cached state, then
+        // resolve paths across all of them. Falls back to a full fold the first
+        // time (or whenever the cache is absent). `resolve_paths` runs over ALL
+        // files, so a path-collision side effect (e.g. a delete promoting a
+        // suffixed file) is handled even though only the deleted file was dirty —
+        // the differential test pins this equal to a from-scratch fold.
+        let files = {
+            let mut fg = self.fold.borrow_mut();
+            let dirty: Vec<String> = self.dirty.borrow_mut().drain().collect();
+            match fg.as_mut() {
+                Some(fs) => {
+                    fs.refold_files(&self.store, &dirty, |fid| self.store.rows_for_file(fid))?;
+                    fs.files()
+                }
+                None => {
+                    let fs = crate::FoldState::from_rows(&self.store, &self.store.all_rows()?)?;
+                    let f = fs.files();
+                    *fg = Some(fs);
+                    f
+                }
+            }
+        };
+        self.store.sync_files(&files)?;
+
+        // New desired set, built WITHOUT reading blobs: content files (path ->
+        // content_hash, also the returned echo-suppression map) and dir entities.
         let mut hashes: BTreeMap<String, String> = BTreeMap::new();
+        let mut desired_dirs: Vec<String> = Vec::new();
         for f in &files {
             if f.deleted {
                 continue;
@@ -362,20 +444,26 @@ impl Engine {
             if f.merge_class == MergeClass::Dir {
                 desired_dirs.push(f.path.clone());
             } else if let Some(h) = &f.result_hash {
-                let bytes = self.store.get_blob(h)?.unwrap_or_default();
-                desired.insert(f.path.clone(), bytes);
                 hashes.insert(f.path.clone(), h.clone());
             }
         }
 
-        // Write/overwrite desired files atomically (only when content differs).
-        // Track whether `.aspignore` is (re)written this pass so we can refresh
-        // the live scope below without a stat on every materialize.
+        // Write content files whose hash CHANGED vs the previous materialize (or
+        // are new / went missing from disk). An unchanged file present on disk is
+        // skipped with a cheap `exists` stat — no content read, no write. (External
+        // edits are reconciled through `rescan`/`capture_rescan`, not here; this
+        // pass reflects the log to disk.) `.aspignore` (re)writes/removals still
+        // trigger a scope reload below.
         let mut aspignore_changed = false;
-        for (path, bytes) in &desired {
+        for (path, h) in &hashes {
             let abs = self.root.join(path);
+            let unchanged = prev_hash.get(path).map(|ph| ph.as_deref() == Some(h.as_str())).unwrap_or(false);
+            if unchanged && abs.exists() {
+                continue;
+            }
+            let bytes = self.store.get_blob(h)?.unwrap_or_default();
             let differs = match fs::read(&abs) {
-                Ok(cur) => &cur != bytes,
+                Ok(cur) => cur != bytes,
                 Err(_) => true,
             };
             if differs {
@@ -385,11 +473,8 @@ impl Engine {
                 if let Some(parent) = abs.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                let tmp = abs.with_extension(format!(
-                    "asp-tmp-{}",
-                    now_unix()
-                ));
-                fs::write(&tmp, bytes)?;
+                let tmp = abs.with_extension(format!("asp-tmp-{}", now_unix()));
+                fs::write(&tmp, &bytes)?;
                 fs::rename(&tmp, &abs)?;
             }
         }
@@ -402,7 +487,7 @@ impl Engine {
         // Remove files/dirs that were live before but no longer are.
         let desired_dir_set: std::collections::HashSet<&String> = desired_dirs.iter().collect();
         for path in old_live {
-            if !desired.contains_key(&path) && !desired_dir_set.contains(&path) {
+            if !hashes.contains_key(&path) && !desired_dir_set.contains(&path) {
                 if path == ".aspignore" {
                     aspignore_changed = true; // an ignore file was removed
                 }
@@ -421,10 +506,93 @@ impl Engine {
         }
 
         // Derived git export at the settle boundary.
-        let derived_time = rows.iter().map(|r| r.lamport).max().unwrap_or(0);
-        let _ = gitexport::export(&self.git_dir, &desired, derived_time);
+        let derived_time = self.store.max_lamport()?;
+        self.export_git(&hashes, derived_time);
 
         Ok(hashes)
+    }
+
+    /// Export the derived git tree from `entries` (path → content_hash for every
+    /// live content file). Blob oids resolve through the content_hash → git_oid
+    /// cache, so an unchanged file is never re-read/re-hashed into the git store.
+    /// Best-effort: a git-store hiccup never fails a write.
+    fn export_git(&self, entries: &BTreeMap<String, String>, derived_time: u64) {
+        let git_dir = &self.git_dir;
+        let store = &self.store;
+        let cache = &self.git_oids;
+        let _ = gitexport::export(git_dir, entries, derived_time, |content_hash: &str| -> AspResult<[u8; 20]> {
+            // In-memory memo first (deterministic fn of content), so a settle does
+            // not issue a SQLite lookup per file.
+            if let Some(oid) = cache.borrow().get(content_hash).copied() {
+                return Ok(oid);
+            }
+            // Then the durable git_blobs cache (cross-session), else compute + persist.
+            let oid = match store.git_oid_for(content_hash)? {
+                Some(oid_hex) => match hex::decode(&oid_hex) {
+                    Ok(b) if b.len() == 20 => {
+                        let mut o = [0u8; 20];
+                        o.copy_from_slice(&b);
+                        o
+                    }
+                    _ => {
+                        let bytes = store.get_blob(content_hash)?.unwrap_or_default();
+                        gitexport::write_blob_object(git_dir, &bytes)?
+                    }
+                },
+                None => {
+                    let bytes = store.get_blob(content_hash)?.unwrap_or_default();
+                    let o = gitexport::write_blob_object(git_dir, &bytes)?;
+                    store.put_git_oid(content_hash, &hex::encode(o))?;
+                    o
+                }
+            };
+            cache.borrow_mut().insert(content_hash.to_string(), oid);
+            Ok(oid)
+        });
+    }
+
+    /// Incremental-materialize fast path for a LOCAL LINEAR EDIT: an `Edit` row
+    /// authored on the current tip (so `result_hash` is the new content outright —
+    /// no merge — and the path/class/liveness are unchanged). Such a write changes
+    /// exactly one file, so we reflect it in place (one files-table row, one disk
+    /// write) and refresh the derived git tree, instead of re-folding the whole log
+    /// like `materialize`. The full fold stays the source of truth and the path for
+    /// everything else (create/rename/delete, peer pushes, conflicts, capture
+    /// batches); a later full materialize re-derives the identical state, so the
+    /// two never disagree (the sync fuzzer asserts this every round).
+    fn materialize_local_edit(&self, file_id: &str, rel: &str, result_hash: &str, bytes: &[u8], lamport: u64, site: &str) -> AspResult<()> {
+        self.store.update_file_hash(file_id, result_hash, lamport, site)?;
+
+        let abs = self.root.join(rel);
+        let differs = match fs::read(&abs) {
+            Ok(cur) => cur != bytes,
+            Err(_) => true,
+        };
+        if differs {
+            if let Some(parent) = abs.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let tmp = abs.with_extension(format!("asp-tmp-{}", now_unix()));
+            fs::write(&tmp, bytes)?;
+            fs::rename(&tmp, &abs)?;
+        }
+        if rel == ".aspignore" {
+            self.reload_scope();
+        }
+
+        // Refresh the derived git tree from the now-updated files table. The new
+        // local row carries the highest lamport, so it is the derived time.
+        let mut entries: BTreeMap<String, String> = BTreeMap::new();
+        for f in self.store.live_files()? {
+            if f.deleted || f.merge_class == MergeClass::Dir {
+                continue;
+            }
+            if let Some(h) = f.result_hash {
+                entries.insert(f.path, h);
+            }
+        }
+        self.export_git(&entries, lamport);
+        Ok(())
     }
 
     fn prune_empty_dirs(&self, mut dir: Option<&Path>) {
@@ -649,6 +817,7 @@ impl Engine {
         }
         .seal();
         self.store.append_row(&row)?;
+        self.note_dirty(&row.file_id);
         self.materialize_unless_batched()?;
         Ok(Some(self.wire(row)?))
     }
@@ -672,6 +841,7 @@ impl Engine {
         }
         .seal();
         self.store.append_row(&row)?;
+        self.note_dirty(&row.file_id);
         self.materialize_unless_batched()?;
         Ok(Some(self.wire(row)?))
     }
@@ -770,6 +940,27 @@ impl Engine {
             }
         }
         Ok(m)
+    }
+
+    /// Content of a single `path` as the vault was at wall-clock `t` — `None` if
+    /// it didn't exist (non-deleted) then. The history-slider read: it still
+    /// folds the log as-of `t` for correct path resolution (renames / ` (n)`
+    /// collisions), but reads exactly **one** blob (the target), not every live
+    /// file's blob like `state_as_of`. On a large vault that is the difference
+    /// between a snappy scrub and reading the whole vault on every tick.
+    pub fn file_at(&self, path: &str, t: i64) -> AspResult<Option<Vec<u8>>> {
+        let rows: Vec<LogRow> = self.store.all_rows()?.into_iter().filter(|r| r.ts <= t).collect();
+        let files = compute_files(&self.store, &rows)?;
+        for f in files {
+            if !f.deleted && f.path == path {
+                let bytes = match f.result_hash {
+                    Some(h) => self.store.get_blob(&h)?.unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
     }
 
     /// Bring the working set to `desired` by recording the necessary edits.
