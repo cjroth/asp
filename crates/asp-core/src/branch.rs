@@ -252,8 +252,16 @@ pub fn build_graph(rows: &[LogRow], live_branches: &[Branch], head: &str, cap: u
     // branch_id -> its commit ids in order (for parent chaining + fork lookup).
     let mut chain: HashMap<String, Vec<(u64, String)>> = HashMap::new();
 
+    // Group rows by branch in a single pass (was a full-log filter per lane,
+    // i.e. O(lanes × rows); now O(rows)). Lanes are distinct branch ids, so each
+    // group is consumed by exactly one lane.
+    let mut by_branch: HashMap<&str, Vec<&LogRow>> = HashMap::new();
+    for r in rows.iter().filter(|r| r.kind != Kind::Branch) {
+        by_branch.entry(r.branch_id.as_str()).or_default().push(r);
+    }
+
     for (lane, b) in lanes.iter().enumerate() {
-        let mut mine: Vec<&LogRow> = rows.iter().filter(|r| r.branch_id == b.branch_id && r.kind != Kind::Branch).collect();
+        let mut mine: Vec<&LogRow> = by_branch.remove(b.branch_id.as_str()).unwrap_or_default();
         mine.sort_by(|x, y| {
             x.lamport.cmp(&y.lamport).then_with(|| x.site_id.cmp(&y.site_id)).then_with(|| x.id.cmp(&y.id))
         });

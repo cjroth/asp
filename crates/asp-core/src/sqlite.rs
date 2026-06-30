@@ -115,6 +115,12 @@ impl SqliteStore {
         // Index on branch_id — created here (not in SCHEMA) so it runs only once the
         // column is guaranteed to exist, on both fresh and migrated DBs. Idempotent.
         self.conn.execute_batch("CREATE INDEX IF NOT EXISTS log_branch ON log(branch_id)")?;
+        // Partial index over just the (few) `Kind::Branch` records, so
+        // `branch_rows()`'s `WHERE kind='branch'` — re-run on every branch authoring
+        // and remote integration by `reconcile_branches` — is a tiny index probe
+        // instead of a full `log` scan. `kind` predates branching, so this is safe
+        // on pre-branching DBs too. Idempotent.
+        self.conn.execute_batch("CREATE INDEX IF NOT EXISTS log_kind_branch ON log(kind) WHERE kind='branch'")?;
         Ok(())
     }
 
@@ -920,5 +926,23 @@ mod tests {
         assert_eq!(branch, "main");
         drop(s);
         SqliteStore::open(&path).unwrap(); // idempotent second open
+    }
+
+    #[test]
+    fn branch_rows_query_uses_the_partial_index_not_a_full_scan() {
+        // reconcile_branches runs branch_rows() on every branch authoring and remote
+        // integration; without the partial index it is an O(log) full table scan.
+        // Assert the planner uses the index so a large content log can't make every
+        // reconcile O(N).
+        let s = SqliteStore::open_memory().unwrap();
+        let plan: String = s
+            .conn
+            .query_row("EXPLAIN QUERY PLAN SELECT * FROM log WHERE kind='branch'", [], |r| r.get::<_, String>(3))
+            .unwrap();
+        assert!(
+            plan.contains("log_kind_branch"),
+            "branch_rows must hit the partial index, got plan: {plan}"
+        );
+        assert!(!plan.contains("SCAN log"), "branch_rows must not full-scan the log, got: {plan}");
     }
 }
