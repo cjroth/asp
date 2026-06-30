@@ -207,17 +207,34 @@ fn diff_keys(
     problems
 }
 
-/// Cross-surface convergence: CLI disk == every engine disk == every engine API.
+/// The derived-git commit on `main` for a vault dir (None if not yet written).
+/// Converged nodes hold the same log → same max-lamport + same tree → the SAME
+/// deterministic commit SHA, so this must agree across every surface.
+fn git_head(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join(".asp/git/refs/heads/main")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Cross-surface convergence: CLI disk == every engine disk == every engine API,
+/// AND the derived git head agrees across all surfaces (a deterministic function
+/// of the converged tree — a mismatch means a stale/incorrect git export).
 fn wait_converged(hub: &Hub, peers: &[Peer], timeout: Duration) -> (bool, Vec<String>) {
     let start = Instant::now();
     let mut last = Vec::new();
     loop {
         let cli = snapshot_dir(&hub.dir);
+        let cli_head = git_head(&hub.dir);
         let mut problems = Vec::new();
         for (i, p) in peers.iter().enumerate() {
             let eng = snapshot_dir(&p.dir);
             let api = engine_api_snapshot(&p.de, &p.id);
             problems.extend(diff_keys(&cli, &eng, "cli-disk", &format!("eng{i}-disk")));
+            // Derived git head must match the CLI's once both have written one.
+            let eng_head = git_head(&p.dir);
+            if let (Some(c), Some(e)) = (&cli_head, &eng_head) {
+                if c != e {
+                    problems.push(format!("GIT HEAD MISMATCH eng{i}: cli={c} eng{e}", e = e));
+                }
+            }
             // The engine's read_file API is utf8-LOSSY by design (the editor
             // renders text), so a binary file's API view is the lossy view of
             // its bytes — not byte-identical to disk. Compare the API against the
