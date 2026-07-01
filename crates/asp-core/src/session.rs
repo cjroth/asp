@@ -102,8 +102,13 @@ pub struct Session {
 /// serialized frame at a time. A single row whose blobs exceed the budget
 /// still ships alone (never split a row from its blobs — the fold needs them
 /// together).
-const CATCHUP_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-const CATCHUP_CHUNK_ROWS: usize = 512;
+// Smaller frames (1 MiB / 256 rows) than a bulk transfer would want, deliberately:
+// the browser can only reach a listener over a RELAY (no direct UDP), where one
+// large frame streams slowly and stalls the "Receiving notes…" bar. Smaller frames
+// keep bytes flowing, advance progress smoothly, and stay under the connector's
+// per-frame idle timeout on a big clone.
+const CATCHUP_CHUNK_BYTES: usize = 1024 * 1024;
+const CATCHUP_CHUNK_ROWS: usize = 256;
 
 /// Every row the peer (`peer_vv`) is missing, built up front. Used by the
 /// connector (small push-back) and by non-streaming drivers (the in-process
