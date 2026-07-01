@@ -70,6 +70,10 @@ pub struct MemEngine {
     /// log per row/page (a paged clone was O(N·pages) just on the dedup).
     row_ids: RefCell<HashSet<String>>,
     files: RefCell<Vec<FileRow>>,
+    /// Per-branch materialized-files LRU: `checkout` parks the outgoing branch's
+    /// computed `files` and restores the target's if cached, so switching among a
+    /// few branches skips the full recompute. Cleared on any remote integrate.
+    files_cache: RefCell<Vec<(String, Vec<FileRow>)>>,
     config: RefCell<BTreeMap<String, String>>,
     authorized: RefCell<Vec<AuthKey>>,
     /// Synced branch records (§7), reconciled LWW from the Kind::Branch rows — the
@@ -103,6 +107,7 @@ impl MemEngine {
             rows: RefCell::new(Vec::new()),
             row_ids: RefCell::new(HashSet::new()),
             files: RefCell::new(Vec::new()),
+            files_cache: RefCell::new(Vec::new()),
             config: RefCell::new(cfg),
             authorized: RefCell::new(Vec::new()),
             branches: RefCell::new(Vec::new()),
@@ -325,13 +330,40 @@ impl MemEngine {
         Ok(branch_id)
     }
 
-    /// Switch HEAD and re-materialize the branch's scoped state.
+    /// Switch HEAD and re-materialize the branch's scoped state. Parks the outgoing
+    /// branch's computed files and restores the target's if cached (near-instant),
+    /// else recomputes — parity with the native engine's checkout LRU.
     pub fn checkout(&self, branch_id: &str) -> AspResult<()> {
         if self.branch_set().get(branch_id).is_none() {
             return Err(AspError::NotFound(format!("no such branch: {branch_id}")));
         }
+        let old = self.head_branch();
+        if old == branch_id {
+            return Ok(());
+        }
+        // Park the current branch's files (self.files is kept current by materialize).
+        {
+            let files = self.files.borrow().clone();
+            let mut cache = self.files_cache.borrow_mut();
+            cache.retain(|(b, _)| b != &old);
+            cache.push((old, files));
+            while cache.len() > 4 {
+                cache.remove(0);
+            }
+        }
         *self.head.borrow_mut() = branch_id.to_string();
-        self.materialize()
+        // Restore the target's parked files if present; else recompute.
+        let restored = {
+            let mut cache = self.files_cache.borrow_mut();
+            cache.iter().position(|(b, _)| b == branch_id).map(|pos| cache.remove(pos).1)
+        };
+        match restored {
+            Some(f) => {
+                *self.files.borrow_mut() = f;
+                Ok(())
+            }
+            None => self.materialize(),
+        }
     }
 
     /// Edit-in-the-past ⇒ branch (§2.5): fork HEAD at wall-clock `t`, switch to it.
@@ -686,8 +718,13 @@ impl MemEngine {
         if any_branch {
             self.reconcile_branches();
         }
-        if added > 0 && !self.batch.get() {
-            self.materialize()?;
+        if added > 0 {
+            // A remote row may affect a parked branch's state — drop the checkout
+            // LRU so the next switch recomputes (parity with the native engine).
+            self.files_cache.borrow_mut().clear();
+            if !self.batch.get() {
+                self.materialize()?;
+            }
         }
         Ok(flags)
     }

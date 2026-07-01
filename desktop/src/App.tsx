@@ -167,6 +167,9 @@ export default function App() {
   const [authKey, setAuthKey] = useState('');
   const [connecting, setConnecting] = useState(false);
   const [cloneProg, setCloneProg] = useState<{ done: number; total: number; phase: ClonePhase } | null>(null);
+  // Surfaced clone/connect failure (e.g. a stalled transfer) so the connect dialog
+  // shows what went wrong instead of silently resetting.
+  const [connectError, setConnectError] = useState<string | null>(null);
   const [connectDest, setConnectDest] = useState<string | null>(null);
   // Non-dismissable "working…" overlay shown while a folder is being added
   // (capture_rescan hashes every file) or a vault is being opened
@@ -706,6 +709,10 @@ export default function App() {
       setSelectedPaths(active ? new Set([active]) : new Set());
       setAnchorPath(active);
       scheduleHistory(id);
+      // Fetch this vault's status (file count, peers, head) so the status bar is
+      // populated immediately — desktop refreshes it on events, but a freshly
+      // opened/created vault (esp. web) otherwise has none until something changes.
+      void api.getStatus(id).then((st) => setStatuses((p) => ({ ...p, [id]: st }))).catch(() => {});
       }),
     [withOpening, flushSave, refreshFiles, scheduleHistory],
   );
@@ -1156,6 +1163,33 @@ export default function App() {
     }
   }, []);
 
+  // Load the before/after content for a history event → the timeline's diff popup.
+  // "After" is the file as of that event's instant; "before" is as of the previous
+  // event that touched the same path (empty if this was its creation).
+  const loadDiff = useCallback(
+    async (ev: TrackEvent): Promise<{ path: string; kind: string; before: string; after: string } | null> => {
+      const id = activeIdRef.current;
+      if (!id) return null;
+      const sec = Math.floor(ev.ts / 1000);
+      const prev = events
+        .filter((e) => e.path === ev.path && e.ts < ev.ts)
+        .sort((a, b) => b.ts - a.ts)[0];
+      try {
+        const after = await api.readFileAt(id, ev.path, sec);
+        const before = prev ? await api.readFileAt(id, ev.path, Math.floor(prev.ts / 1000)) : { exists: false, content: '' };
+        return {
+          path: ev.path,
+          kind: ev.kind,
+          before: before.exists ? before.content : '',
+          after: after.exists ? after.content : '',
+        };
+      } catch {
+        return null;
+      }
+    },
+    [events],
+  );
+
   const onTabHistory = useCallback(() => {
     setHistOpen((h) => {
       if (!h && activeIdRef.current) void refreshHistory(activeIdRef.current); // fetch on open
@@ -1279,6 +1313,7 @@ export default function App() {
       // Desktop needs a destination folder; web clones straight into OPFS.
       if (!t || (desktop && !connectDest)) return;
       setConnecting(true);
+      setConnectError(null);
       setCloneProg({ done: 0, total: 0, phase: 'receiving' });
       try {
         const info = await api.cloneRemote(connectDest || '', t, authKey || undefined, (done, total, phase) =>
@@ -1291,7 +1326,10 @@ export default function App() {
         await refreshVaults();
         await openVault(info.id);
       } catch (err) {
+        // Surface the failure in the dialog (a stalled transfer, bad ticket, …)
+        // instead of silently resetting — the user was left staring at a spinner.
         console.error('clone failed', err);
+        setConnectError(String((err as Error)?.message || err) || 'Connection failed. Please try again.');
       } finally {
         setConnecting(false);
         setCloneProg(null);
@@ -1935,6 +1973,7 @@ export default function App() {
           onCheckoutBranch={(b) => void onCheckoutBranch(b)}
           onCreateTag={(name, tsMs) => void onCreateTag(name, tsMs)}
           onDeleteTag={(t) => void onDeleteTag(t)}
+          loadDiff={loadDiff}
           onTabHistory={onTabHistory}
           onTabLog={onTabLog}
           onNow={onNow}
@@ -2109,6 +2148,11 @@ export default function App() {
                   <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: connectDest ? 'var(--text)' : 'var(--faint)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{connectDest || 'Choose a folder…'}</span>
                   <span style={{ fontSize: 12, color: 'var(--faint)' }}>Choose…</span>
                 </div>
+              </div>
+            )}
+            {connectError && (
+              <div data-testid="connect-error" style={{ fontSize: 12.5, color: '#c0392b', background: '#c0392b12', border: '1px solid #c0392b40', borderRadius: 9, padding: '9px 12px' }}>
+                {connectError}
               </div>
             )}
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 2 }}>

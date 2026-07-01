@@ -21,6 +21,7 @@ import {
   zoomKeepingFocus,
 } from './history';
 import { forkEdges, laneColor, laneForEvent, laneGeometry, laneIndex, lanesFromGraph, nodesToEvents } from './timeline';
+import { lineDiff } from './diffLines';
 import * as Icon from './icons';
 import { deriveLog, logColor, logText } from './log';
 
@@ -52,6 +53,8 @@ export interface HistoryBarProps {
   onCheckoutBranch: (branchId: string) => void;
   onCreateTag: (name: string, tsMs: number) => void;
   onDeleteTag: (tagId: string) => void;
+  // Load the before/after content for a history event, for the diff popup.
+  loadDiff: (ev: TrackEvent) => Promise<{ path: string; kind: string; before: string; after: string } | null>;
   onTabHistory: () => void;
   onTabLog: () => void;
   onNow: () => void;
@@ -86,6 +89,14 @@ export default function HistoryBar(props: HistoryBarProps) {
   const [tagName, setTagName] = useState('');
   // Measured track pixel size — lane y and SVG edge coords are in px.
   const [trackSize, setTrackSize] = useState({ w: 640, h: 96 });
+  // Layout mode: 'time' spaces dots by wall-clock time (default); 'seq' spaces them
+  // evenly by edit order (a cleaner, uniform view when edits cluster in time).
+  const [seqMode, setSeqMode] = useState(false);
+  // The "what changed" diff popup for a clicked dot, and its loading flag.
+  const [diff, setDiff] = useState<{ path: string; kind: string; before: string; after: string } | null>(null);
+  const [diffBusy, setDiffBusy] = useState(false);
+  // Pending tag deletion awaiting confirmation.
+  const [confirmTag, setConfirmTag] = useState<{ tag_id: string; name: string } | null>(null);
 
   // Location (desktop only): the folder ICON opens the OS file manager; a single
   // click on the path TEXT copies the full path (with brief feedback); a
@@ -111,8 +122,6 @@ export default function HistoryBar(props: HistoryBarProps) {
   const playT = playhead == null ? now : playhead;
   const filterTs = timeTravel ? playhead : null;
   const axisTicks = useMemo(() => axisTicksFor(view), [view]);
-  const playPct = Math.max(0, Math.min(100, toPct(playT, view)));
-  const nowPct = Math.max(0, Math.min(100, toPct(now, view)));
 
   // Lanes (branches) + per-event lane index + fork edges + tags.
   const lanes = useMemo(() => lanesFromGraph(graph), [graph]);
@@ -127,6 +136,41 @@ export default function HistoryBar(props: HistoryBarProps) {
   const sampled = inView.length > MAX_TICKS ? inView.filter((_, i) => i % Math.ceil(inView.length / MAX_TICKS) === 0) : inView;
   const visibleRows = filterTs == null ? events.length : events.filter((e) => e.ts <= filterTs).length;
 
+  // Rendered dots + an x-position function, per layout mode. In 'time' mode dots
+  // sit at their wall-clock position within the view (pan/zoom apply). In 'seq'
+  // mode all (sampled) events are spaced evenly by edit order — a uniform view.
+  const rendered = useMemo(() => {
+    if (!seqMode) return sampled.map((e) => ({ e, xPct: toPct(e.ts, view) }));
+    const list = events.length > MAX_TICKS ? events.filter((_, i) => i % Math.ceil(events.length / MAX_TICKS) === 0) : events;
+    const n = Math.max(1, list.length - 1);
+    return list.map((e, i) => ({ e, xPct: list.length <= 1 ? 50 : (i / n) * 100 }));
+  }, [seqMode, sampled, events, view]);
+
+  // Percent-x for an arbitrary wall-clock instant (playhead / now / tags / edges).
+  // In 'seq' mode it snaps to the nearest rendered edit's slot.
+  const xAt = (ts: number): number => {
+    if (!seqMode) return toPct(ts, view);
+    if (rendered.length === 0) return 100;
+    if (ts >= rendered[rendered.length - 1].e.ts) return 100;
+    let x = rendered[0].xPct;
+    for (const r of rendered) {
+      if (r.e.ts <= ts) x = r.xPct;
+      else break;
+    }
+    return x;
+  };
+
+  // Nearest rendered edit's ts to a percent-x — for click/scrub in 'seq' mode.
+  const tsAtPct = (pct: number): number => {
+    if (rendered.length === 0) return nowRef.current;
+    let best = rendered[0];
+    for (const r of rendered) if (Math.abs(r.xPct - pct) < Math.abs(best.xPct - pct)) best = r;
+    return best.e.ts;
+  };
+
+  const playPct = Math.max(0, Math.min(100, xAt(playT)));
+  const nowPct = Math.max(0, Math.min(100, xAt(now)));
+
   // Measure the track so lane y-positions and fork-edge coordinates are in px.
   useEffect(() => {
     const el = trackRef.current;
@@ -138,10 +182,31 @@ export default function HistoryBar(props: HistoryBarProps) {
     return () => ro.disconnect();
   }, [histOpen, props.barHeight]);
 
+  const seqModeRef = useRef(seqMode);
+  seqModeRef.current = seqMode;
+
   // ---- track interaction ----
   const onTrackDown = (e: React.PointerEvent) => {
     const el = trackRef.current;
     if (!el) return;
+    // In 'seq' mode there is no time axis to pan — a click just scrubs to the
+    // nearest edit; dragging does the same, live.
+    if (seqModeRef.current) {
+      const scrub = (ev: PointerEvent | React.PointerEvent) => {
+        const r = el.getBoundingClientRect();
+        const pct = ((ev.clientX - r.left) / r.width) * 100;
+        setPlayhead(Math.min(tsAtPct(pct), nowRef.current));
+      };
+      scrub(e);
+      const move = (ev: PointerEvent) => scrub(ev);
+      const up = () => {
+        document.removeEventListener('pointermove', move);
+        document.removeEventListener('pointerup', up);
+      };
+      document.addEventListener('pointermove', move);
+      document.addEventListener('pointerup', up);
+      return;
+    }
     const startX = e.clientX;
     const v0 = viewRef.current || defaultView(nowRef.current);
     const span0 = v0.end - v0.start;
@@ -173,8 +238,13 @@ export default function HistoryBar(props: HistoryBarProps) {
     const el = trackRef.current;
     if (!el) return;
     const move = (ev: PointerEvent) => {
-      const v = viewRef.current || defaultView(nowRef.current);
       const r = el.getBoundingClientRect();
+      if (seqModeRef.current) {
+        const pct = ((ev.clientX - r.left) / r.width) * 100;
+        setPlayhead(Math.min(tsAtPct(pct), nowRef.current));
+        return;
+      }
+      const v = viewRef.current || defaultView(nowRef.current);
       const t = v.start + ((ev.clientX - r.left) / r.width) * (v.end - v.start);
       setPlayhead(Math.max(nowRef.current - 90 * DAY, Math.min(t, nowRef.current)));
     };
@@ -186,9 +256,16 @@ export default function HistoryBar(props: HistoryBarProps) {
     document.addEventListener('pointerup', up);
   };
 
-  const onJump = (ts: number) => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    setPlayhead(Math.min(ts, nowRef.current));
+  // Click a dot → show the "what changed" diff popup (and scrub to that moment).
+  const openDiff = (ev: TrackEvent) => {
+    setPlayhead(Math.min(ev.ts, nowRef.current));
+    setDiffBusy(true);
+    setDiff({ path: ev.path, kind: ev.kind, before: '', after: '' });
+    void props
+      .loadDiff(ev)
+      .then((d) => setDiff(d))
+      .catch(() => setDiff(null))
+      .finally(() => setDiffBusy(false));
   };
 
   // Non-passive wheel listener so we can preventDefault and zoom.
@@ -253,8 +330,28 @@ export default function HistoryBar(props: HistoryBarProps) {
   const tabActive: React.CSSProperties = { ...tabBase, background: 'var(--bg)', color: 'var(--text)', boxShadow: '0 1px 2px rgba(0,0,0,0.08)' };
   const barHeight = props.barHeight;
 
-  const pxX = (ts: number) => (toPct(ts, view) / 100) * trackSize.w;
+  const pxX = (ts: number) => (xAt(ts) / 100) * trackSize.w;
   const multiLane = lanes.length > 1;
+
+  // Per-lane connecting polylines (so a lane reads as one continuous history) and
+  // the x of each lane's most-recent dot (to anchor the branch label on the right).
+  const perLane = useMemo(() => {
+    const byLane = new Map<number, { xPct: number; ts: number }[]>();
+    for (const r of rendered) {
+      const lane = laneForEvent(r.e, laneIdx);
+      if (!byLane.has(lane)) byLane.set(lane, []);
+      byLane.get(lane)!.push({ xPct: r.xPct, ts: r.e.ts });
+    }
+    const polylines = new Map<number, string>();
+    const lastX = new Map<number, number>();
+    for (const [lane, pts] of byLane) {
+      const sorted = [...pts].sort((a, b) => a.xPct - b.xPct);
+      const y = geom.y(lane);
+      polylines.set(lane, sorted.map((p) => `${(p.xPct / 100) * trackSize.w},${y}`).join(' '));
+      lastX.set(lane, (Math.max(...sorted.map((p) => p.xPct)) / 100) * trackSize.w);
+    }
+    return { polylines, lastX };
+  }, [rendered, laneIdx, geom, trackSize.w]);
 
   return (
     <div style={{ flex: 'none', height: barHeight, background: 'var(--bg-sub)', borderTop: '1px solid var(--line)', display: 'flex', flexDirection: 'column', userSelect: 'none', transition: props.animate ? 'height .16s ease' : 'none' }}>
@@ -274,6 +371,9 @@ export default function HistoryBar(props: HistoryBarProps) {
           style={{ fontFamily: locationIsPath ? "'JetBrains Mono', monospace" : 'inherit', fontSize: 12, color: pathCopied ? accent : 'var(--text2)', maxWidth: 190, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: locationIsPath ? 'pointer' : 'default' }}
         >{locationIsPath && pathCopied ? 'Copied path' : location}</span>
         <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10.5, color: 'var(--faint2)', flex: 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{fingerprint}</span>
+        {status && (
+          <span data-testid="file-count" style={{ fontSize: 10.5, color: 'var(--faint2)', flex: 'none', whiteSpace: 'nowrap' }}>· {status.files.toLocaleString()} {status.files === 1 ? 'file' : 'files'}</span>
+        )}
         {/* Branch pill: shows the checked-out branch (replaces the old dropdown). */}
         {multiLane && (
           <span data-testid="current-branch-pill" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, fontFamily: "'JetBrains Mono', monospace", padding: '2px 9px', borderRadius: 20, flex: 'none', background: 'var(--line)', color: laneColor(laneIdx.get(currentBranch) ?? 0, accent), fontWeight: 600 }}>
@@ -302,11 +402,16 @@ export default function HistoryBar(props: HistoryBarProps) {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 14px 2px' }}>
             <span style={{ flex: 1 }} />
             <span style={{ fontSize: 11, color: 'var(--faint2)', fontVariantNumeric: 'tabular-nums', flex: 'none' }}>{filterTs == null ? `${events.length} rows` : `${visibleRows} / ${events.length} rows`}</span>
+            {/* Layout toggle: time-proportional vs even-by-edit spacing. */}
+            <div style={{ display: 'flex', flex: 'none', border: '1px solid var(--line)', borderRadius: 7, overflow: 'hidden' }}>
+              <button data-testid="mode-time" onClick={() => setSeqMode(false)} title="Space dots by time" style={{ height: 24, padding: '0 8px', border: 'none', borderRight: '1px solid var(--line)', background: seqMode ? 'var(--bg)' : 'var(--line)', color: seqMode ? 'var(--text3)' : 'var(--text)', cursor: 'pointer', fontFamily: 'inherit', fontSize: 11, fontWeight: 500 }}>Time</button>
+              <button data-testid="mode-seq" onClick={() => setSeqMode(true)} title="Space dots evenly by edit" style={{ height: 24, padding: '0 8px', border: 'none', background: seqMode ? 'var(--line)' : 'var(--bg)', color: seqMode ? 'var(--text)' : 'var(--text3)', cursor: 'pointer', fontFamily: 'inherit', fontSize: 11, fontWeight: 500 }}>Edits</button>
+            </div>
             <button data-testid="tag-here" onClick={beginTag} title="Tag this moment" style={{ display: 'flex', alignItems: 'center', gap: 5, fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: 'var(--text2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 7, padding: '4px 10px', cursor: 'pointer', flex: 'none' }}>
               <TagIcon color="var(--faint)" />
               <span>Tag</span>
             </button>
-            <div style={{ display: 'flex', flex: 'none', border: '1px solid var(--line)', borderRadius: 7, overflow: 'hidden' }}>
+            <div style={{ display: 'flex', flex: 'none', border: '1px solid var(--line)', borderRadius: 7, overflow: 'hidden', opacity: seqMode ? 0.4 : 1, pointerEvents: seqMode ? 'none' : 'auto' }}>
               <button className="asp-icon-btn" onClick={() => zoomBtn(1.8)} title="Zoom out" style={{ width: 26, height: 24, border: 'none', borderRight: '1px solid var(--line)', background: 'var(--bg)', color: 'var(--text3)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 }}>
                 <Icon.MinusIcon />
               </button>
@@ -318,10 +423,14 @@ export default function HistoryBar(props: HistoryBarProps) {
           </div>
 
           <div ref={trackRef} data-testid="history-track" onPointerDown={onTrackDown} style={{ position: 'relative', flex: 1, margin: '0 16px 11px', cursor: 'crosshair', touchAction: 'none' }}>
-            {/* SVG overlay: lane guides + fork edges + tag stems (px coords). */}
+            {/* SVG overlay: lane guides + per-lane connecting line + fork edges. */}
             <svg width={trackSize.w} height={trackSize.h} style={{ position: 'absolute', inset: 0, overflow: 'visible', pointerEvents: 'none' }}>
               {lanes.map((l) => (
                 <line key={l.branchId} x1={0} y1={geom.y(l.lane)} x2={trackSize.w} y2={geom.y(l.lane)} stroke="var(--line)" strokeWidth={1} />
+              ))}
+              {/* Connecting line through each lane's dots — history reads as continuous. */}
+              {[...perLane.polylines.entries()].map(([lane, pts]) => (
+                <polyline key={lane} data-testid="lane-line" points={pts} fill="none" stroke={laneColor(lane, accent)} strokeWidth={2} strokeLinecap="round" opacity={0.55} />
               ))}
               {edges.map((e) => {
                 const x = pxX(e.ts);
@@ -334,49 +443,54 @@ export default function HistoryBar(props: HistoryBarProps) {
               })}
             </svg>
 
-            {/* branch labels (click to check out) */}
-            {multiLane &&
-              lanes.map((l) => (
-                <div
-                  key={l.branchId}
-                  data-testid={`lane-label-${l.name}`}
-                  onPointerDown={(e) => { e.stopPropagation(); if (l.branchId !== currentBranch) props.onCheckoutBranch(l.branchId); }}
-                  title={l.branchId === currentBranch ? 'Current branch' : `Switch to ${l.name}`}
-                  style={{ position: 'absolute', left: 0, top: geom.y(l.lane) - 9, height: 18, display: 'flex', alignItems: 'center', gap: 4, padding: '0 6px', fontSize: 10.5, fontWeight: l.branchId === currentBranch ? 700 : 500, color: l.branchId === currentBranch ? laneColor(l.lane, accent) : 'var(--faint)', background: 'var(--bg-sub)', borderRadius: 5, cursor: l.branchId === currentBranch ? 'default' : 'pointer', zIndex: 4, maxWidth: 120, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
-                >
-                  <BranchDot color={laneColor(l.lane, accent)} />
-                  {l.name}
-                </div>
+            {!seqMode &&
+              axisTicks.map((a, i) => (
+                <React.Fragment key={i}>
+                  <div style={{ position: 'absolute', left: a.pct + '%', top: 0, bottom: 0, width: 1, background: 'var(--line)', opacity: 0.5 }} />
+                  <div style={{ position: 'absolute', left: a.pct + '%', bottom: -2, transform: 'translateX(4px)', fontSize: 9.5, color: 'var(--faint2)', fontFamily: "'JetBrains Mono', monospace", whiteSpace: 'nowrap' }}>{a.label}</div>
+                </React.Fragment>
               ))}
 
-            {axisTicks.map((a, i) => (
-              <React.Fragment key={i}>
-                <div style={{ position: 'absolute', left: a.pct + '%', top: 0, bottom: 0, width: 1, background: 'var(--line)', opacity: 0.5 }} />
-                <div style={{ position: 'absolute', left: a.pct + '%', bottom: -2, transform: 'translateX(4px)', fontSize: 9.5, color: 'var(--faint2)', fontFamily: "'JetBrains Mono', monospace", whiteSpace: 'nowrap' }}>{a.label}</div>
-              </React.Fragment>
-            ))}
-
-            {sampled.map((e, i) => {
-              const pct = toPct(e.ts, view);
+            {rendered.map((r, i) => {
+              const e = r.e;
               const past = e.ts <= playT;
               const c = colorForKind(e.kind, laneColor(laneForEvent(e, laneIdx), accent));
               const y = geom.y(laneForEvent(e, laneIdx));
               return (
                 <div
                   key={i}
-                  onPointerDown={onJump(e.ts)}
-                  title={`${e.kind} · ${e.path} · ${fmtFull(e.ts)}`}
-                  style={{ position: 'absolute', left: pct + '%', top: y, width: 18, height: 18, marginLeft: -9, marginTop: -9, borderRadius: '50%', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 3 }}
+                  onPointerDown={(ev) => { ev.stopPropagation(); openDiff(e); }}
+                  title={`${e.kind} · ${e.path} · ${fmtFull(e.ts)} — click to see the change`}
+                  style={{ position: 'absolute', left: r.xPct + '%', top: y, width: 18, height: 18, marginLeft: -9, marginTop: -9, borderRadius: '50%', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 3 }}
                 >
                   <span style={{ width: 9, height: 9, borderRadius: '50%', background: past ? c : 'var(--bg)', border: '1.5px solid ' + c, opacity: past ? 1 : 0.5 }} />
                 </div>
               );
             })}
 
+            {/* branch labels: on the RIGHT, next to each lane's most recent dot. */}
+            {multiLane &&
+              lanes.map((l) => {
+                const anchor = perLane.lastX.get(l.lane);
+                const left = anchor != null ? Math.min(anchor + 12, trackSize.w - 4) : trackSize.w - 4;
+                return (
+                  <div
+                    key={l.branchId}
+                    data-testid={`lane-label-${l.name}`}
+                    onPointerDown={(e) => { e.stopPropagation(); if (l.branchId !== currentBranch) props.onCheckoutBranch(l.branchId); }}
+                    title={l.branchId === currentBranch ? 'Current branch' : `Switch to ${l.name}`}
+                    style={{ position: 'absolute', left, top: geom.y(l.lane) - 9, height: 18, display: 'flex', alignItems: 'center', gap: 4, padding: '0 6px', fontSize: 10.5, fontWeight: l.branchId === currentBranch ? 700 : 500, color: l.branchId === currentBranch ? laneColor(l.lane, accent) : 'var(--faint)', background: 'var(--bg-sub)', borderRadius: 5, cursor: l.branchId === currentBranch ? 'default' : 'pointer', zIndex: 4, maxWidth: 140, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
+                  >
+                    <BranchDot color={laneColor(l.lane, accent)} />
+                    {l.name}
+                  </div>
+                );
+              })}
+
             {/* tag flags */}
             {tags.map((t) => {
               const tsMs = t.at_ts * 1000;
-              const pct = toPct(tsMs, view);
+              const pct = xAt(tsMs);
               if (pct < -2 || pct > 102) return null;
               return (
                 <div
@@ -392,7 +506,7 @@ export default function HistoryBar(props: HistoryBarProps) {
                     {t.name}
                     <span
                       data-testid={`tag-delete-${t.name}`}
-                      onPointerDown={(e) => { e.stopPropagation(); props.onDeleteTag(t.tag_id); }}
+                      onPointerDown={(e) => { e.stopPropagation(); setConfirmTag({ tag_id: t.tag_id, name: t.name }); }}
                       style={{ marginLeft: 1, opacity: 0.75, fontSize: 11, lineHeight: 1 }}
                     >×</span>
                   </span>
@@ -405,9 +519,16 @@ export default function HistoryBar(props: HistoryBarProps) {
               <div onPointerDown={onHandleDown} style={{ position: 'absolute', left: -11, top: '50%', width: 24, height: 28, marginTop: -14, borderRadius: 8, background: accent, border: '2px solid var(--bg)', boxShadow: '0 2px 6px rgba(28,25,23,0.22)', cursor: 'ew-resize' }} />
             </div>
 
-            {/* tag-name input, anchored at the playhead */}
+            {/* tag-name input, anchored at the playhead. A full-screen backdrop
+                closes it on any outside click. */}
             {tagging && (
-              <div style={{ position: 'absolute', left: `min(${Math.max(0, toPct(tagging.ts, view))}%, calc(100% - 190px))`, top: 2, zIndex: 8, display: 'flex', gap: 4, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 8, boxShadow: '0 8px 24px rgba(28,25,23,0.18)', padding: 4 }} onPointerDown={(e) => e.stopPropagation()}>
+              <>
+                <div
+                  data-testid="tag-backdrop"
+                  onPointerDown={(e) => { e.stopPropagation(); setTagging(null); setTagName(''); }}
+                  style={{ position: 'fixed', inset: 0, zIndex: 7 }}
+                />
+              <div style={{ position: 'absolute', left: `min(${Math.max(0, xAt(tagging.ts))}%, calc(100% - 190px))`, top: 2, zIndex: 8, display: 'flex', gap: 4, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 8, boxShadow: '0 8px 24px rgba(28,25,23,0.18)', padding: 4 }} onPointerDown={(e) => e.stopPropagation()}>
                 <input
                   data-testid="tag-name-input"
                   autoFocus
@@ -422,6 +543,7 @@ export default function HistoryBar(props: HistoryBarProps) {
                 />
                 <button data-testid="tag-confirm" onPointerDown={(e) => { e.stopPropagation(); commitTag(); }} style={{ fontSize: 12, padding: '0 10px', borderRadius: 6, border: 'none', background: accent, color: '#fff', cursor: 'pointer' }}>Tag</button>
               </div>
+              </>
             )}
           </div>
         </div>
@@ -446,6 +568,58 @@ export default function HistoryBar(props: HistoryBarProps) {
             ))}
           </div>
         </div>
+      )}
+
+      {/* Diff popup: what changed at the clicked history dot. */}
+      {diff && (
+        <>
+          <div onPointerDown={() => setDiff(null)} style={{ position: 'fixed', inset: 0, zIndex: 70, background: 'rgba(28,25,23,0.28)' }} />
+          <div data-testid="diff-popup" style={{ position: 'fixed', zIndex: 71, top: '16vh', left: '50%', transform: 'translateX(-50%)', width: 'min(720px, 92vw)', maxHeight: '64vh', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 14, boxShadow: '0 24px 64px rgba(28,25,23,0.22)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '11px 15px', borderBottom: '1px solid var(--line)' }}>
+              <span style={{ width: 7, height: 7, borderRadius: '50%', background: colorForKind(diff.kind, accent), flex: 'none' }} />
+              <span style={{ fontSize: 13, fontWeight: 600, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{diff.path}</span>
+              <span style={{ fontSize: 11, color: 'var(--faint)', textTransform: 'capitalize' }}>{diff.kind}</span>
+              <span onPointerDown={() => setDiff(null)} style={{ cursor: 'pointer', fontSize: 18, lineHeight: 1, color: 'var(--faint)', marginLeft: 4 }}>×</span>
+            </div>
+            <div className="asp-scroll" style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: '10px 14px', fontFamily: "'JetBrains Mono', monospace", fontSize: 12, lineHeight: 1.55 }}>
+              {diffBusy ? (
+                <div style={{ color: 'var(--faint)' }}>Loading…</div>
+              ) : (
+                (() => {
+                  const d = lineDiff(diff.before, diff.after);
+                  if (d.unchanged) return <div style={{ color: 'var(--faint)' }}>No textual change at this point (or the change is between edits within the same second).</div>;
+                  return (
+                    <>
+                      {d.context.map((l, i) => (
+                        <div key={`c${i}`} style={{ color: 'var(--faint2)', whiteSpace: 'pre-wrap' }}> {l}</div>
+                      ))}
+                      {d.removed.map((l, i) => (
+                        <div key={`r${i}`} data-testid="diff-removed" style={{ color: '#c0392b', background: '#c0392b14', whiteSpace: 'pre-wrap' }}>- {l}</div>
+                      ))}
+                      {d.added.map((l, i) => (
+                        <div key={`a${i}`} data-testid="diff-added" style={{ color: '#2f8f4e', background: '#2f8f4e14', whiteSpace: 'pre-wrap' }}>+ {l}</div>
+                      ))}
+                    </>
+                  );
+                })()
+              )}
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Confirm before deleting a tag. */}
+      {confirmTag && (
+        <>
+          <div onPointerDown={() => setConfirmTag(null)} style={{ position: 'fixed', inset: 0, zIndex: 72, background: 'rgba(28,25,23,0.28)' }} />
+          <div data-testid="tag-delete-confirm" style={{ position: 'fixed', zIndex: 73, top: '38vh', left: '50%', transform: 'translateX(-50%)', width: 'min(320px, 90vw)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 12, boxShadow: '0 24px 64px rgba(28,25,23,0.22)', padding: 16 }}>
+            <div style={{ fontSize: 13.5, color: 'var(--text)', marginBottom: 14 }}>Delete the tag <b>{confirmTag.name}</b>? This can't be undone.</div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button onPointerDown={() => setConfirmTag(null)} style={{ fontSize: 12.5, padding: '6px 12px', borderRadius: 7, border: '1px solid var(--line)', background: 'var(--bg)', color: 'var(--text2)', cursor: 'pointer' }}>Cancel</button>
+              <button data-testid="tag-delete-confirm-btn" onPointerDown={() => { props.onDeleteTag(confirmTag.tag_id); setConfirmTag(null); }} style={{ fontSize: 12.5, padding: '6px 12px', borderRadius: 7, border: 'none', background: '#d96a6a', color: '#fff', cursor: 'pointer' }}>Delete tag</button>
+            </div>
+          </div>
+        </>
       )}
 
       {locCtx && (

@@ -61,6 +61,37 @@ try {
   const dots = await page.locator(eventDot).count();
   if (dots > 0) ok('timeline-has-event-dots', { dots }); else bad('timeline-has-event-dots', { dots });
 
+  // Connecting line between dots (continuity).
+  const laneLine = await page.locator('[data-testid="lane-line"]').count();
+  if (laneLine > 0) ok('connecting-line-present'); else bad('connecting-line-present', { laneLine });
+
+  // File count shown after the fingerprint in the status bar.
+  const fc = await page.locator('[data-testid="file-count"]').innerText().catch(() => '');
+  if (/file/.test(fc)) ok('file-count-shown', { fc }); else bad('file-count-shown', { fc });
+
+  // Layout toggle: switch to even-by-edit spacing (dots spread evenly across the
+  // track — this also moves the earliest dot away from the playhead handle so it's
+  // reliably clickable for the diff below).
+  await page.getByTestId('mode-seq').click();
+  await sleep(400);
+  const seqDots = await page.locator(eventDot).count();
+  if (seqDots > 0) ok('layout-toggle-edits-mode', { seqDots }); else bad('layout-toggle-edits-mode', { seqDots });
+
+  // Click a dot → diff popup showing what changed.
+  await page.locator(eventDot).first().click();
+  const diffPopup = page.locator('[data-testid="diff-popup"]');
+  await diffPopup.waitFor({ timeout: 8000 });
+  await sleep(500);
+  await shot('03b-diff');
+  const diffText = await diffPopup.innerText();
+  if (diffText.length > 0) ok('dot-click-diff-popup', { sample: diffText.slice(0, 60).replace(/\n/g, ' ') });
+  else bad('dot-click-diff-popup');
+  // Close the diff popup (backdrop), and switch back to time mode.
+  await page.mouse.click(5, 5);
+  await sleep(200);
+  await page.getByTestId('mode-time').click();
+  await sleep(200);
+
   // Tag the current moment.
   await page.getByTestId('tag-here').click();
   await page.getByTestId('tag-name-input').fill('milestone');
@@ -112,6 +143,25 @@ try {
   } else {
     bad('branch-switch-via-lane', { reason: 'no main lane label' });
   }
+
+  // Tag input closes on an outside click (no tag created).
+  await page.getByTestId('tag-here').click();
+  await page.getByTestId('tag-name-input').waitFor({ timeout: 5000 });
+  await page.mouse.click(5, 5); // click outside
+  await sleep(300);
+  const inputGone = (await page.locator('[data-testid="tag-name-input"]').count()) === 0;
+  if (inputGone) ok('tag-input-closes-on-outside-click'); else bad('tag-input-closes-on-outside-click');
+
+  // Deleting a tag asks for confirmation first.
+  await page.locator('[data-testid="tag-delete-milestone"]').click();
+  const confirm = page.locator('[data-testid="tag-delete-confirm"]');
+  await confirm.waitFor({ timeout: 5000 });
+  ok('tag-delete-asks-confirmation');
+  await shot('09-tag-confirm');
+  await page.getByTestId('tag-delete-confirm-btn').click();
+  await sleep(600);
+  const tagGone = (await page.locator('[data-testid="tag-milestone"]').count()) === 0;
+  if (tagGone) ok('tag-deleted-after-confirm'); else bad('tag-deleted-after-confirm');
 } catch (e) {
   bad('exception', { error: String(e).slice(0, 300) });
   await shot('99-error');

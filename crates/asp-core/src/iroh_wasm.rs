@@ -33,15 +33,30 @@ async fn write_frame(send: &mut SendStream, bytes: &[u8]) -> Result<(), String> 
     Ok(())
 }
 
+/// Idle cap for a single catch-up frame. A large clone streams many frames, but no
+/// single frame should take this long to arrive over the relay — if one does, the
+/// transfer has stalled (dropped relay, dead listener), so fail loudly instead of
+/// hanging the "Receiving notes…" spinner forever. Generous so a slow-but-alive
+/// relay isn't killed mid-frame.
+const FRAME_IDLE_SECS: u64 = 45;
+
 async fn read_frame(recv: &mut RecvStream) -> Result<Option<Vec<u8>>, String> {
+    use n0_future::time::{timeout, Duration};
     let mut len = [0u8; 4];
+    // The gap BETWEEN frames is unbounded (the peer may pause), so a plain read on
+    // the length prefix is fine — a clean end-of-stream here just ends catch-up.
     if recv.read_exact(&mut len).await.is_err() {
         return Ok(None); // clean end-of-stream at a frame boundary
     }
     let n = u32::from_be_bytes(len) as usize;
     let mut buf = vec![0u8; n];
-    recv.read_exact(&mut buf).await.map_err(|e| format!("read body: {e}"))?;
-    Ok(Some(buf))
+    // Once a frame's length has arrived its body must follow promptly; bound it so a
+    // mid-frame stall surfaces as an error the UI can show rather than an infinite hang.
+    match timeout(Duration::from_secs(FRAME_IDLE_SECS), recv.read_exact(&mut buf)).await {
+        Ok(Ok(())) => Ok(Some(buf)),
+        Ok(Err(e)) => Err(format!("read body: {e}")),
+        Err(_) => Err(format!("clone stalled — no data for {FRAME_IDLE_SECS}s (relay or peer dropped)")),
+    }
 }
 
 /// Bind a browser iroh endpoint under the device key. With a `relay_url` it uses

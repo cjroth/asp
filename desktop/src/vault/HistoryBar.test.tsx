@@ -44,6 +44,7 @@ const props = (over: Partial<HistoryBarProps> = {}): HistoryBarProps => ({
   onCheckoutBranch: vi.fn(),
   onCreateTag: vi.fn(),
   onDeleteTag: vi.fn(),
+  loadDiff: vi.fn(async () => ({ path: 'README.md', kind: 'edit', before: 'a\n', after: 'a\nb\n' })),
   onTabHistory: vi.fn(),
   onTabLog: vi.fn(),
   onNow: vi.fn(),

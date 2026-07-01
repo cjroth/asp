@@ -48,6 +48,12 @@ pub struct Engine {
     /// touched, forcing a safe full rebuild). Authoritative EXCEPT for file_ids in
     /// `dirty`, which `materialize` re-folds before reading the cache.
     fold: std::cell::RefCell<Option<crate::FoldState>>,
+    /// A tiny per-branch `FoldState` LRU (§10). `checkout` parks the outgoing
+    /// branch's fold here and restores the target's if present, so switching among
+    /// a few branches skips the full O(all-rows) refold and is near-instant. Any
+    /// remote integrate clears it (a cached branch may have gained rows). Keyed by
+    /// branch_id, most-recently-parked last; capped at `FOLD_CACHE_CAP`.
+    fold_cache: std::cell::RefCell<Vec<(String, crate::FoldState)>>,
     /// file_ids whose log changed since the cache was last reconciled — drained
     /// and re-folded by `materialize`. Every row append records its file_id here.
     dirty: std::cell::RefCell<std::collections::HashSet<String>>,
@@ -73,6 +79,10 @@ pub struct Engine {
 fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
+
+/// How many parked per-branch folds the checkout LRU keeps (§10). Small: a person
+/// hops among a couple of branches, and each entry holds a whole fold.
+const FOLD_CACHE_CAP: usize = 4;
 
 fn random_id() -> String {
     use rand::RngCore;
@@ -187,6 +197,7 @@ impl Engine {
             site,
             batch: std::cell::Cell::new(false),
             fold: std::cell::RefCell::new(None),
+            fold_cache: std::cell::RefCell::new(Vec::new()),
             dirty: std::cell::RefCell::new(std::collections::HashSet::new()),
             git_oids: std::cell::RefCell::new(std::collections::HashMap::new()),
             change_listener: std::cell::RefCell::new(None),
@@ -494,6 +505,11 @@ impl Engine {
             self.reconcile_branches()?;
         }
         if any {
+            // A remote row may land on (or before the fork of) a branch whose fold
+            // we parked — invalidate the whole checkout LRU so the next switch to
+            // any parked branch rebuilds from the log. Cheap: the cache is tiny and
+            // integrate isn't the branch-switch hot path.
+            self.fold_cache.borrow_mut().clear();
             self.materialize()?;
             self.notify_change();
         }
@@ -1521,14 +1537,36 @@ impl Engine {
     }
 
     /// Switch HEAD to `branch_id` and re-materialize its scoped state to disk +
-    /// `files` table (§3.3). The one expensive user action (full re-materialize):
-    /// the fold cache is per-branch, so it is rebuilt from `visible(new HEAD)`.
+    /// `files` table (§3.3). Uses a per-branch `FoldState` LRU: the outgoing
+    /// branch's fold is parked and the target's restored if cached, so switching
+    /// among a few branches skips the full O(all-rows) refold and is near-instant.
+    /// A cold target still rebuilds from `visible(new HEAD)` exactly as before.
     pub fn checkout(&self, branch_id: &str) -> AspResult<()> {
         if self.store.branch(branch_id)?.is_none() {
             return Err(AspError::NotFound(format!("no such branch: {branch_id}")));
         }
+        let old = self.head_branch();
+        if old == branch_id {
+            return Ok(());
+        }
+        // Bring the current branch's fold fully up to date (drains `dirty`), then
+        // park it so a later switch back is a cache hit. Cheap when already clean.
+        self.materialize()?;
+        if let Some(fs) = self.fold.borrow_mut().take() {
+            let mut cache = self.fold_cache.borrow_mut();
+            cache.retain(|(b, _)| b != &old);
+            cache.push((old, fs));
+            while cache.len() > FOLD_CACHE_CAP {
+                cache.remove(0);
+            }
+        }
         self.store.set_head(branch_id)?;
-        *self.fold.borrow_mut() = None; // rebuild the scoped cache for the new HEAD
+        // Restore the target's parked fold if we have it; else force a full rebuild.
+        let restored = {
+            let mut cache = self.fold_cache.borrow_mut();
+            cache.iter().position(|(b, _)| b == branch_id).map(|pos| cache.remove(pos).1)
+        };
+        *self.fold.borrow_mut() = restored;
         self.dirty.borrow_mut().clear();
         self.materialize()?;
         Ok(())
@@ -1804,6 +1842,40 @@ mod tests {
         assert!(e.delete_branch(MAIN_BRANCH_ID).is_err());
         // Checking out a non-existent branch errors.
         assert!(e.checkout("nope").is_err());
+    }
+
+    #[test]
+    fn checkout_lru_roundtrip_matches_a_cold_fold() {
+        // Switching A→B→A must land byte-identical state whether the target's fold
+        // is restored from the LRU (warm) or rebuilt from scratch (cold) — the
+        // per-branch fold cache must never diverge from a full fold.
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        e.record_write("shared.md", b"base\n").unwrap().unwrap();
+        let b = e.fork_from_time("feature", i64::MAX).unwrap(); // checks out feature
+        e.record_write("only-b.md", b"b\n").unwrap().unwrap();
+        e.record_write("shared.md", b"b-edit\n").unwrap().unwrap();
+
+        // main: only shared.md=base, no only-b.md.
+        e.checkout(MAIN_BRANCH_ID).unwrap();
+        assert_eq!(e.file_at("shared.md", i64::MAX).unwrap().as_deref(), Some(&b"base\n"[..]));
+        assert!(e.file_at("only-b.md", i64::MAX).unwrap().is_none());
+
+        // Back to feature via the LRU (warm): must equal the branch's real state.
+        e.checkout(&b).unwrap();
+        assert_eq!(e.file_at("shared.md", i64::MAX).unwrap().as_deref(), Some(&b"b-edit\n"[..]));
+        assert_eq!(e.file_at("only-b.md", i64::MAX).unwrap().as_deref(), Some(&b"b\n"[..]));
+
+        // Cold reference: a freshly-opened engine (empty LRU) checked out to feature.
+        let cold = Engine::open(d.path(), Identity::from_seed(&[1; 32])).unwrap();
+        cold.checkout(&b).unwrap();
+        let norm = |e: &Engine| {
+            let mut v: Vec<(String, Option<String>, bool)> =
+                e.store.live_files().unwrap().into_iter().map(|f| (f.path, f.result_hash, f.deleted)).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(norm(&e), norm(&cold), "warm (LRU) checkout diverged from a cold full fold");
     }
 
     #[test]
