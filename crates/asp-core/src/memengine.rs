@@ -1015,6 +1015,41 @@ mod tests {
     }
 
     #[test]
+    fn mem_clone_receiver_scales_and_round_trips() {
+        // Reproduces the WEB clone receiver at scale (the desktop→browser "Receiving
+        // notes…" path): a source authors N files; a fresh engine integrates the
+        // catch-up in 256-row PAGES under batch (exactly what `iroh_wasm::drive`
+        // does), folds ONCE, then persists + reloads via export/import_state. Pins
+        // that the receiver is O(N) — not O(N²) — and that a large state round-trips
+        // (the OPFS save/load path) without corruption. N kept CI-friendly; the same
+        // code path was run at 28k locally.
+        const N: usize = 4000;
+        let src = MemEngine::create(Identity::from_seed(&[21; 32]), "vid-scale");
+        let files: BTreeMap<String, Vec<u8>> =
+            (0..N).map(|i| (format!("d{:02}/f{:06}.md", i % 50, i), format!("# note {i}\n\nbody {i}\n").into_bytes())).collect();
+        let wire = src.record_writes(&files).unwrap();
+        assert!(wire.len() >= N, "one create row per file");
+
+        // Fresh receiver: page the catch-up (256/page) under batch, fold once.
+        let dst = MemEngine::create(Identity::from_seed(&[22; 32]), "");
+        dst.set_batch(true);
+        for page in wire.chunks(256) {
+            dst.integrate_many(page).unwrap();
+        }
+        dst.set_batch(false);
+        dst.materialize().unwrap();
+        assert_eq!(dst.files_map().unwrap().len(), N, "receiver converged to the full vault");
+
+        // Persist (dump_state) + reload (load_state) — the OPFS save/restore path.
+        let blob = dst.export_state().unwrap();
+        let restored = MemEngine::create(Identity::from_seed(&[23; 32]), "");
+        let added = restored.import_state(&blob).unwrap();
+        assert!(added >= N);
+        restored.materialize().unwrap();
+        assert_eq!(restored.files_map().unwrap(), dst.files_map().unwrap(), "state survives save→load byte-identically");
+    }
+
+    #[test]
     fn mem_tags_history_and_time_travel_parity() {
         // Web parity: the wasm node tags moments, lists history, folds as-of a time,
         // and forks-on-edit-in-the-past exactly like the native engine.
