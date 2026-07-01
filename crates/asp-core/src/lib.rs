@@ -24,6 +24,7 @@ pub mod order;
 pub mod scope;
 pub mod session;
 pub mod store;
+pub mod tag;
 pub mod wire;
 
 // Native-only: on-disk SQLite, fs-backed engine + git export, TLS.
@@ -45,7 +46,7 @@ pub mod sqlite;
 pub use authkeys::{AdmitCtx, AuthKey};
 pub use branch::{
     build_graph, encode_branch_record, reconcile_branches, version_vector_of, visible_rows, Branch,
-    BranchSet, Graph, GraphBranch, GraphNode, VersionVector, Visibility,
+    BranchSet, Graph, GraphBranch, GraphNode, GraphTag, VersionVector, Visibility,
 };
 pub use error::{AspError, AspResult};
 pub use fold::{compute_files, fold_order, FoldState};
@@ -55,6 +56,7 @@ pub use memengine::MemEngine;
 pub use order::{NodeId, OrderKey};
 pub use session::{Role, Session, SessionVault, Step};
 pub use store::{BlobStore, FileRow, MemBlobStore};
+pub use tag::{encode_tag_record, reconcile_tags, Tag};
 pub use wire::{Msg, WireBlob, WireRow};
 
 #[cfg(not(target_arch = "wasm32"))]

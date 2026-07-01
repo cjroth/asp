@@ -28,7 +28,9 @@ fn now_unix() -> i64 {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        0
+        // Browser wall clock (ms → s). A wasm node must stamp real timestamps or the
+        // history timeline + point-in-time reads collapse to epoch 0.
+        (js_sys::Date::now() / 1000.0) as i64
     }
 }
 
@@ -181,7 +183,86 @@ impl MemEngine {
     /// per lane — same builder as native, so web and desktop render identically.
     pub fn graph(&self, cap: usize) -> crate::branch::Graph {
         let live: Vec<crate::branch::Branch> = self.branches.borrow().iter().filter(|b| !b.deleted).cloned().collect();
-        crate::branch::build_graph(&self.rows.borrow(), &live, &self.head_branch(), cap)
+        let mut g = crate::branch::build_graph(&self.rows.borrow(), &live, &self.head_branch(), cap);
+        let lane_of: std::collections::HashMap<String, usize> =
+            g.branches.iter().map(|b| (b.id.clone(), b.lane)).collect();
+        g.tags = self
+            .tags()
+            .into_iter()
+            .map(|t| crate::branch::GraphTag {
+                lane: *lane_of.get(&t.branch_id).unwrap_or(&0),
+                tag_id: t.tag_id,
+                name: t.name,
+                at_ts: t.at_ts,
+                branch_id: t.branch_id,
+            })
+            .collect();
+        g
+    }
+
+    /// Live (non-deleted) tags, reconciled LWW from the synced `Kind::Tag` records.
+    pub fn tags(&self) -> Vec<crate::tag::Tag> {
+        crate::tag::reconcile_tags(&self.rows.borrow(), |h| self.blobs.get_blob(h).ok().flatten())
+            .into_iter()
+            .filter(|t| !t.deleted)
+            .collect()
+    }
+
+    /// Author a synced tag record — the wasm-side mirror of the native engine.
+    pub fn author_tag_record(&self, t: &crate::tag::Tag) -> AspResult<WireRow> {
+        let blob = crate::tag::encode_tag_record(t);
+        let h = self.blobs.put_blob(&blob)?;
+        let row = LogRow {
+            site_id: self.site_id(),
+            lamport: self.next_lamport(),
+            seq: self.next_seq(),
+            ts: now_unix(),
+            file_id: t.tag_id.clone(),
+            kind: Kind::Tag,
+            result_hash: Some(h),
+            path: Some(t.name.clone()),
+            ..LogRow::default()
+        }
+        .seal();
+        self.row_ids.borrow_mut().insert(row.id.clone());
+        self.rows.borrow_mut().push(row.clone());
+        self.wire(row)
+    }
+
+    /// Tag the point at wall-clock `at_ts` on the current branch with `name`.
+    pub fn create_tag(&self, name: &str, at_ts: i64) -> AspResult<String> {
+        crate::tag::validate_tag_name(name)?;
+        let head = self.head_branch();
+        let at_lamport = {
+            let bs = self.branch_set();
+            let vis = bs.visibility(&head);
+            self.rows.borrow().iter().filter(|r| vis.sees(r) && r.ts <= at_ts).map(|r| r.lamport).max().unwrap_or(0)
+        };
+        let created_lamport = self.next_lamport();
+        let tag_id = crate::tag::Tag::derive_id(name, at_ts, &head, created_lamport, &self.site_id());
+        let t = crate::tag::Tag {
+            tag_id: tag_id.clone(),
+            name: name.to_string(),
+            at_ts,
+            at_lamport,
+            branch_id: head,
+            created_lamport,
+            created_ts: now_unix(),
+            deleted: false,
+        };
+        self.author_tag_record(&t)?;
+        Ok(tag_id)
+    }
+
+    /// Soft-delete a tag (its rows remain for history).
+    pub fn delete_tag(&self, tag_id: &str) -> AspResult<()> {
+        let existing = crate::tag::reconcile_tags(&self.rows.borrow(), |h| self.blobs.get_blob(h).ok().flatten())
+            .into_iter()
+            .find(|t| t.tag_id == tag_id)
+            .ok_or_else(|| AspError::NotFound(format!("no such tag: {tag_id}")))?;
+        let tomb = crate::tag::Tag { deleted: true, ..existing };
+        self.author_tag_record(&tomb)?;
+        Ok(())
     }
 
     /// The version vector visible on `branch` right now — the fork point a child
@@ -735,6 +816,58 @@ impl MemEngine {
         }
     }
 
+    // ----- time travel (branch-scoped PITR) — parity with the native engine so a
+    // web node can scrub history + fork-on-edit-in-the-past exactly like desktop -----
+
+    /// Content of `path` as the vault was at wall-clock `t` on the checked-out
+    /// branch (`None` if it didn't exist then). Folds visible rows with `ts <= t`.
+    pub fn file_at(&self, path: &str, t: i64) -> AspResult<Option<Vec<u8>>> {
+        let bs = self.branch_set();
+        let vis = bs.visibility(&self.head_branch());
+        let rows: Vec<LogRow> = self.rows.borrow().iter().filter(|r| vis.sees(r) && r.ts <= t).cloned().collect();
+        let files = crate::fold::compute_files(&self.blobs, &rows)?;
+        for f in files {
+            if !f.deleted && f.path == path {
+                let bytes = match f.result_hash {
+                    Some(h) => self.blobs.get_blob(&h)?.unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Restore `path` to its content as of `t` by recording it as a new edit on the
+    /// current branch (the log stays append-only). No-op if it didn't exist then.
+    pub fn restore_file_at(&self, path: &str, t: i64) -> AspResult<Option<WireRow>> {
+        match self.file_at(path, t)? {
+            Some(bytes) => self.record_write(path, &bytes),
+            None => Ok(None),
+        }
+    }
+
+    /// The append-only history as `(id, ts, lamport, kind, path, branch_id)`, path
+    /// resolved from each file_id's latest path (edits/deletes carry none). Branch
+    /// and tag records are metadata, not file-history events, so they're skipped.
+    pub fn history(&self) -> Vec<(String, i64, u64, String, String, String)> {
+        let mut latest: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut rows: Vec<LogRow> = self.rows.borrow().clone();
+        rows.sort_by(|a, b| a.lamport.cmp(&b.lamport).then_with(|| a.site_id.cmp(&b.site_id)).then_with(|| a.id.cmp(&b.id)));
+        let mut out = Vec::new();
+        for r in rows {
+            if let Some(p) = &r.path {
+                latest.insert(r.file_id.clone(), p.clone());
+            }
+            if matches!(r.kind, Kind::Branch | Kind::Tag) {
+                continue;
+            }
+            let path = r.path.clone().or_else(|| latest.get(&r.file_id).cloned()).unwrap_or_default();
+            out.push((r.id, r.ts, r.lamport, r.kind.as_str().to_string(), path, r.branch_id));
+        }
+        out
+    }
+
     pub fn row_count(&self) -> usize {
         self.rows.borrow().len()
     }
@@ -842,6 +975,44 @@ mod tests {
         e.delete_branch(&b).unwrap();
         assert_eq!(e.current_branch(), MAIN_BRANCH_ID);
         assert!(e.branches().iter().all(|x| x.branch_id != b));
+    }
+
+    #[test]
+    fn mem_tags_history_and_time_travel_parity() {
+        // Web parity: the wasm node tags moments, lists history, folds as-of a time,
+        // and forks-on-edit-in-the-past exactly like the native engine.
+        let e = MemEngine::create(Identity::from_seed(&[11; 32]), "v");
+        e.record_write("a.md", b"v1\n").unwrap().unwrap();
+        let t1 = e.history().last().unwrap().1; // ts of the create
+        e.record_write("a.md", b"v2\n").unwrap().unwrap();
+
+        // history() lists file events (no branch/tag rows), newest last.
+        let h = e.history();
+        assert!(h.iter().all(|(_, _, _, kind, _, _)| kind != "branch" && kind != "tag"));
+        assert!(h.iter().any(|(_, _, _, _, p, _)| p == "a.md"));
+
+        // Tag a moment; it's listed and does NOT appear as a history event.
+        let (tid, _) = { let id = e.create_tag("v1-point", t1).unwrap(); (id, ()) };
+        assert_eq!(e.tags().len(), 1);
+        assert!(e.history().iter().all(|(_, _, _, kind, _, _)| kind != "tag"));
+
+        // file_at folds as-of the timestamp. (Both writes land in the same wall-clock
+        // second in-test, so we assert existence boundaries, not sub-second ordering.)
+        assert!(e.file_at("a.md", t1 - 1).unwrap().is_none(), "file didn't exist before its create");
+        assert!(e.file_at("a.md", i64::MAX).unwrap().is_some(), "file exists at/after its history");
+        assert_eq!(e.file_at("a.md", i64::MAX).unwrap().as_deref(), Some(&b"v2\n"[..]));
+
+        // Fork-on-edit-in-the-past: fork at the tagged instant; edits on the branch
+        // don't touch main (the core isolation the auto-branch UX relies on).
+        let b = e.fork_from_time("from-v1", i64::MAX).unwrap();
+        e.record_write("a.md", b"branch-edit\n").unwrap().unwrap();
+        e.checkout(MAIN_BRANCH_ID).unwrap();
+        assert_eq!(e.read_file("a.md").unwrap().as_deref(), Some(&b"v2\n"[..]), "main untouched by the past-fork edit");
+        e.checkout(&b).unwrap();
+        assert_eq!(e.read_file("a.md").unwrap().as_deref(), Some(&b"branch-edit\n"[..]));
+
+        e.delete_tag(&tid).unwrap();
+        assert!(e.tags().is_empty());
     }
 
     #[test]

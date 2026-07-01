@@ -37,6 +37,8 @@ export interface HistEvent {
   lamport: number;
   kind: string; // create | edit | rename | delete | reclass
   path: string;
+  // The branch this event was authored on (for lane placement on the timeline).
+  branch_id?: string;
 }
 export interface FileAt {
   exists: boolean;
@@ -66,9 +68,24 @@ export interface GraphBranch {
   lane: number;
   current: boolean;
 }
+export interface GraphTag {
+  tag_id: string;
+  name: string;
+  at_ts: number;
+  branch_id: string;
+  lane: number;
+}
 export interface BranchGraphData {
   nodes: GraphNode[];
   branches: GraphBranch[];
+  tags?: GraphTag[];
+}
+// A user-named marker at a point in history (unix SECONDS in `at_ts`).
+export interface TagInfo {
+  tag_id: string;
+  name: string;
+  at_ts: number;
+  branch_id: string;
 }
 export type ClonePhase = 'receiving' | 'saving';
 export type CloneProgress = (done: number, total: number, phase: ClonePhase) => void;
@@ -119,6 +136,10 @@ export interface Api {
   checkoutBranch(id: string, branchId: string): Promise<void>;
   forkBranchAt(id: string, name: string, ts: number): Promise<string>;
   deleteBranch(id: string, branchId: string): Promise<void>;
+  // ---- tags: named markers at points in history ----
+  listTags(id: string): Promise<TagInfo[]>;
+  createTag(id: string, name: string, atTs: number): Promise<string>;
+  deleteTag(id: string, tagId: string): Promise<void>;
   readFileAt(id: string, path: string, ts: number): Promise<FileAt>;
   restoreFileAt(id: string, path: string, ts: number): Promise<void>;
   rescan(id: string): Promise<void>;
@@ -161,6 +182,9 @@ const tauriApi: Api = {
   checkoutBranch: (id, branchId) => invoke<void>('checkout_branch', { id, branchId }),
   forkBranchAt: (id, name, ts) => invoke<string>('fork_branch_at', { id, name, ts }),
   deleteBranch: (id, branchId) => invoke<void>('delete_branch', { id, branchId }),
+  listTags: (id) => invoke<TagInfo[]>('list_tags', { id }),
+  createTag: (id, name, atTs) => invoke<string>('create_tag', { id, name, atTs }),
+  deleteTag: (id, tagId) => invoke<void>('delete_tag', { id, tagId }),
   readFileAt: (id, path, ts) => invoke<FileAt>('read_file_at', { id, path, ts }),
   restoreFileAt: (id, path, ts) => invoke<void>('restore_file_at', { id, path, ts }),
   rescan: (id) => invoke<void>('rescan', { id }),

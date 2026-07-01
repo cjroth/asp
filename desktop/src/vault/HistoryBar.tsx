@@ -1,10 +1,13 @@
 // The bottom bar: a status row (location · fingerprint · live/time-travel pill)
-// with History / Log tabs that expand a panel. History shows the time-travel
-// track (pan, scrub, zoom, jump-to-event); Log shows real sync events derived
-// from history() + live status. All color is theme-driven via CSS variables.
+// with History / Log tabs that expand a panel. History is now the unified
+// time-travel + branch-network view: events are dots positioned by time (x) on
+// their branch's lane (y), fork edges curve where a branch diverged, and tags
+// flag named moments. Pan, scrub, zoom and the playhead work exactly as before —
+// branching is layered on top. Log shows real sync events. All color is
+// theme-driven via CSS variables.
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../lib/api';
-import type { HistEvent, VaultStatus } from '../lib/api';
+import type { BranchGraphData, HistEvent, VaultStatus } from '../lib/api';
 import {
   axisTicksFor,
   clampView,
@@ -17,6 +20,7 @@ import {
   zoomAround,
   zoomKeepingFocus,
 } from './history';
+import { forkEdges, laneColor, laneForEvent, laneGeometry, laneIndex, lanesFromGraph, nodesToEvents } from './timeline';
 import * as Icon from './icons';
 import { deriveLog, logColor, logText } from './log';
 
@@ -42,6 +46,12 @@ export interface HistoryBarProps {
   logOpen: boolean;
   barHeight: number;
   animate: boolean;
+  // Branch/tag graph (lanes + fork edges + tags). Null before it loads.
+  graph: BranchGraphData | null;
+  currentBranch: string;
+  onCheckoutBranch: (branchId: string) => void;
+  onCreateTag: (name: string, tsMs: number) => void;
+  onDeleteTag: (tagId: string) => void;
   onTabHistory: () => void;
   onTabLog: () => void;
   onNow: () => void;
@@ -51,8 +61,15 @@ const colorForKind = (kind: string, accent: string): string =>
   kind === 'create' ? '#3fa45a' : kind === 'edit' ? accent : kind === 'rename' ? '#d9a93d' : '#d96a6a';
 
 export default function HistoryBar(props: HistoryBarProps) {
-  const { events, histRaw, view, setView, playhead, setPlayhead, now, accent, accentSoft, timeTravel } = props;
-  const { location, locationIsPath, fingerprint, status, identity, histOpen, logOpen } = props;
+  const { histRaw, view, setView, playhead, setPlayhead, now, accent, accentSoft, timeTravel } = props;
+  // Per-event history drives the dots; where it's unavailable (web degrades
+  // history() to empty), fall back to the graph's coarsened commits so the
+  // timeline-as-network-graph is never blank.
+  const events = useMemo(
+    () => (props.events.length ? props.events : nodesToEvents(props.graph)),
+    [props.events, props.graph],
+  );
+  const { location, locationIsPath, fingerprint, status, identity, histOpen, logOpen, graph, currentBranch } = props;
 
   const trackRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef(view);
@@ -64,6 +81,11 @@ export default function HistoryBar(props: HistoryBarProps) {
 
   const [logCopied, setLogCopied] = useState(false);
   const [logCtx, setLogCtx] = useState<{ x: number; y: number; line: string } | null>(null);
+  // Inline "name this moment" input; null when not tagging. `ts` is the instant.
+  const [tagging, setTagging] = useState<{ ts: number } | null>(null);
+  const [tagName, setTagName] = useState('');
+  // Measured track pixel size — lane y and SVG edge coords are in px.
+  const [trackSize, setTrackSize] = useState({ w: 640, h: 96 });
 
   // Location (desktop only): the folder ICON opens the OS file manager; a single
   // click on the path TEXT copies the full path (with brief feedback); a
@@ -92,11 +114,29 @@ export default function HistoryBar(props: HistoryBarProps) {
   const playPct = Math.max(0, Math.min(100, toPct(playT, view)));
   const nowPct = Math.max(0, Math.min(100, toPct(now, view)));
 
+  // Lanes (branches) + per-event lane index + fork edges + tags.
+  const lanes = useMemo(() => lanesFromGraph(graph), [graph]);
+  const laneIdx = useMemo(() => laneIndex(lanes), [lanes]);
+  const edges = useMemo(() => forkEdges(lanes, events), [lanes, events]);
+  const geom = useMemo(() => laneGeometry(lanes.length, trackSize.h), [lanes.length, trackSize.h]);
+  const tags = graph?.tags ?? [];
+
   // Cap rendered tick nodes: a vault import clusters thousands of events at one
   // instant — rendering them all is a render bomb (they overlap to one pixel).
   const inView = events.filter((e) => e.ts >= view.start - span * 0.03 && e.ts <= view.end + span * 0.03);
   const sampled = inView.length > MAX_TICKS ? inView.filter((_, i) => i % Math.ceil(inView.length / MAX_TICKS) === 0) : inView;
   const visibleRows = filterTs == null ? events.length : events.filter((e) => e.ts <= filterTs).length;
+
+  // Measure the track so lane y-positions and fork-edge coordinates are in px.
+  useEffect(() => {
+    const el = trackRef.current;
+    if (!el || !histOpen) return;
+    const update = () => setTrackSize({ w: el.clientWidth, h: el.clientHeight });
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [histOpen, props.barHeight]);
 
   // ---- track interaction ----
   const onTrackDown = (e: React.PointerEvent) => {
@@ -173,6 +213,18 @@ export default function HistoryBar(props: HistoryBarProps) {
     setView(zoomAround(v, c, factor, nowRef.current));
   };
 
+  // ---- tags ----
+  const beginTag = () => {
+    setTagName('');
+    setTagging({ ts: playT });
+  };
+  const commitTag = () => {
+    const n = tagName.trim();
+    if (n && tagging) props.onCreateTag(n, tagging.ts);
+    setTagging(null);
+    setTagName('');
+  };
+
   // ---- log ----
   const logLines = useMemo(
     () => (logOpen ? deriveLog(histRaw, status, identity, { now }) : []),
@@ -201,6 +253,9 @@ export default function HistoryBar(props: HistoryBarProps) {
   const tabActive: React.CSSProperties = { ...tabBase, background: 'var(--bg)', color: 'var(--text)', boxShadow: '0 1px 2px rgba(0,0,0,0.08)' };
   const barHeight = props.barHeight;
 
+  const pxX = (ts: number) => (toPct(ts, view) / 100) * trackSize.w;
+  const multiLane = lanes.length > 1;
+
   return (
     <div style={{ flex: 'none', height: barHeight, background: 'var(--bg-sub)', borderTop: '1px solid var(--line)', display: 'flex', flexDirection: 'column', userSelect: 'none', transition: props.animate ? 'height .16s ease' : 'none' }}>
       <div style={{ display: 'flex', alignItems: 'center', height: 38, padding: '0 9px 0 15px', gap: 10, flex: 'none' }}>
@@ -219,6 +274,13 @@ export default function HistoryBar(props: HistoryBarProps) {
           style={{ fontFamily: locationIsPath ? "'JetBrains Mono', monospace" : 'inherit', fontSize: 12, color: pathCopied ? accent : 'var(--text2)', maxWidth: 190, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: locationIsPath ? 'pointer' : 'default' }}
         >{locationIsPath && pathCopied ? 'Copied path' : location}</span>
         <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10.5, color: 'var(--faint2)', flex: 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{fingerprint}</span>
+        {/* Branch pill: shows the checked-out branch (replaces the old dropdown). */}
+        {multiLane && (
+          <span data-testid="current-branch-pill" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, fontFamily: "'JetBrains Mono', monospace", padding: '2px 9px', borderRadius: 20, flex: 'none', background: 'var(--line)', color: laneColor(laneIdx.get(currentBranch) ?? 0, accent), fontWeight: 600 }}>
+            <BranchDot color={laneColor(laneIdx.get(currentBranch) ?? 0, accent)} />
+            {lanes.find((l) => l.branchId === currentBranch)?.name ?? 'main'}
+          </span>
+        )}
         {timeTravel && (
           <span style={{ fontSize: 11, fontFamily: "'JetBrains Mono', monospace", padding: '2px 9px', borderRadius: 20, flex: 'none', background: accentSoft, color: accent, fontWeight: 500 }}>{fmtFull(playT)}</span>
         )}
@@ -240,6 +302,10 @@ export default function HistoryBar(props: HistoryBarProps) {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 14px 2px' }}>
             <span style={{ flex: 1 }} />
             <span style={{ fontSize: 11, color: 'var(--faint2)', fontVariantNumeric: 'tabular-nums', flex: 'none' }}>{filterTs == null ? `${events.length} rows` : `${visibleRows} / ${events.length} rows`}</span>
+            <button data-testid="tag-here" onClick={beginTag} title="Tag this moment" style={{ display: 'flex', alignItems: 'center', gap: 5, fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: 'var(--text2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 7, padding: '4px 10px', cursor: 'pointer', flex: 'none' }}>
+              <TagIcon color="var(--faint)" />
+              <span>Tag</span>
+            </button>
             <div style={{ display: 'flex', flex: 'none', border: '1px solid var(--line)', borderRadius: 7, overflow: 'hidden' }}>
               <button className="asp-icon-btn" onClick={() => zoomBtn(1.8)} title="Zoom out" style={{ width: 26, height: 24, border: 'none', borderRight: '1px solid var(--line)', background: 'var(--bg)', color: 'var(--text3)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 }}>
                 <Icon.MinusIcon />
@@ -252,32 +318,111 @@ export default function HistoryBar(props: HistoryBarProps) {
           </div>
 
           <div ref={trackRef} data-testid="history-track" onPointerDown={onTrackDown} style={{ position: 'relative', flex: 1, margin: '0 16px 11px', cursor: 'crosshair', touchAction: 'none' }}>
-            <div style={{ position: 'absolute', left: 0, right: 0, top: '50%', height: 1, background: 'var(--line)' }} />
+            {/* SVG overlay: lane guides + fork edges + tag stems (px coords). */}
+            <svg width={trackSize.w} height={trackSize.h} style={{ position: 'absolute', inset: 0, overflow: 'visible', pointerEvents: 'none' }}>
+              {lanes.map((l) => (
+                <line key={l.branchId} x1={0} y1={geom.y(l.lane)} x2={trackSize.w} y2={geom.y(l.lane)} stroke="var(--line)" strokeWidth={1} />
+              ))}
+              {edges.map((e) => {
+                const x = pxX(e.ts);
+                const y1 = geom.y(e.fromLane);
+                const y2 = geom.y(e.toLane);
+                const color = laneColor(e.toLane, accent);
+                // Curve from the parent lane down to the branch lane at the fork time.
+                const d = `M ${x - 14} ${y1} C ${x} ${y1}, ${x} ${y2}, ${x + 6} ${y2}`;
+                return <path key={e.branchId} data-testid="fork-edge" d={d} fill="none" stroke={color} strokeWidth={1.6} opacity={0.85} />;
+              })}
+            </svg>
+
+            {/* branch labels (click to check out) */}
+            {multiLane &&
+              lanes.map((l) => (
+                <div
+                  key={l.branchId}
+                  data-testid={`lane-label-${l.name}`}
+                  onPointerDown={(e) => { e.stopPropagation(); if (l.branchId !== currentBranch) props.onCheckoutBranch(l.branchId); }}
+                  title={l.branchId === currentBranch ? 'Current branch' : `Switch to ${l.name}`}
+                  style={{ position: 'absolute', left: 0, top: geom.y(l.lane) - 9, height: 18, display: 'flex', alignItems: 'center', gap: 4, padding: '0 6px', fontSize: 10.5, fontWeight: l.branchId === currentBranch ? 700 : 500, color: l.branchId === currentBranch ? laneColor(l.lane, accent) : 'var(--faint)', background: 'var(--bg-sub)', borderRadius: 5, cursor: l.branchId === currentBranch ? 'default' : 'pointer', zIndex: 4, maxWidth: 120, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
+                >
+                  <BranchDot color={laneColor(l.lane, accent)} />
+                  {l.name}
+                </div>
+              ))}
+
             {axisTicks.map((a, i) => (
               <React.Fragment key={i}>
-                <div style={{ position: 'absolute', left: a.pct + '%', top: 0, bottom: 0, width: 1, background: 'var(--line)' }} />
+                <div style={{ position: 'absolute', left: a.pct + '%', top: 0, bottom: 0, width: 1, background: 'var(--line)', opacity: 0.5 }} />
                 <div style={{ position: 'absolute', left: a.pct + '%', bottom: -2, transform: 'translateX(4px)', fontSize: 9.5, color: 'var(--faint2)', fontFamily: "'JetBrains Mono', monospace", whiteSpace: 'nowrap' }}>{a.label}</div>
               </React.Fragment>
             ))}
+
             {sampled.map((e, i) => {
               const pct = toPct(e.ts, view);
               const past = e.ts <= playT;
-              const c = colorForKind(e.kind, accent);
+              const c = colorForKind(e.kind, laneColor(laneForEvent(e, laneIdx), accent));
+              const y = geom.y(laneForEvent(e, laneIdx));
               return (
                 <div
                   key={i}
                   onPointerDown={onJump(e.ts)}
                   title={`${e.kind} · ${e.path} · ${fmtFull(e.ts)}`}
-                  style={{ position: 'absolute', left: pct + '%', top: '50%', width: 18, height: 18, marginLeft: -9, marginTop: -9, borderRadius: '50%', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 3 }}
+                  style={{ position: 'absolute', left: pct + '%', top: y, width: 18, height: 18, marginLeft: -9, marginTop: -9, borderRadius: '50%', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 3 }}
                 >
                   <span style={{ width: 9, height: 9, borderRadius: '50%', background: past ? c : 'var(--bg)', border: '1.5px solid ' + c, opacity: past ? 1 : 0.5 }} />
                 </div>
               );
             })}
+
+            {/* tag flags */}
+            {tags.map((t) => {
+              const tsMs = t.at_ts * 1000;
+              const pct = toPct(tsMs, view);
+              if (pct < -2 || pct > 102) return null;
+              return (
+                <div
+                  key={t.tag_id}
+                  data-testid={`tag-${t.name}`}
+                  className="asp-tag-flag"
+                  onPointerDown={(e) => { e.stopPropagation(); setPlayhead(Math.min(tsMs, nowRef.current)); }}
+                  title={`${t.name} · ${fmtFull(tsMs)}`}
+                  style={{ position: 'absolute', left: pct + '%', top: 0, zIndex: 6, display: 'flex', alignItems: 'center', gap: 3, transform: 'translateX(-1px)', cursor: 'pointer' }}
+                >
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: accent, color: '#fff', fontSize: 10, fontWeight: 600, padding: '1px 6px 1px 5px', borderRadius: 5, whiteSpace: 'nowrap', boxShadow: '0 1px 3px rgba(28,25,23,0.25)' }}>
+                    <TagIcon color="#fff" size={9} />
+                    {t.name}
+                    <span
+                      data-testid={`tag-delete-${t.name}`}
+                      onPointerDown={(e) => { e.stopPropagation(); props.onDeleteTag(t.tag_id); }}
+                      style={{ marginLeft: 1, opacity: 0.75, fontSize: 11, lineHeight: 1 }}
+                    >×</span>
+                  </span>
+                </div>
+              );
+            })}
+
             <div style={{ position: 'absolute', left: nowPct + '%', top: 0, bottom: 0, width: 0, borderLeft: '1px dashed var(--faint2)' }} />
             <div style={{ position: 'absolute', left: playPct + '%', top: 3, bottom: 3, width: 2, marginLeft: -1, background: accent, borderRadius: 1, zIndex: 5 }}>
               <div onPointerDown={onHandleDown} style={{ position: 'absolute', left: -11, top: '50%', width: 24, height: 28, marginTop: -14, borderRadius: 8, background: accent, border: '2px solid var(--bg)', boxShadow: '0 2px 6px rgba(28,25,23,0.22)', cursor: 'ew-resize' }} />
             </div>
+
+            {/* tag-name input, anchored at the playhead */}
+            {tagging && (
+              <div style={{ position: 'absolute', left: `min(${Math.max(0, toPct(tagging.ts, view))}%, calc(100% - 190px))`, top: 2, zIndex: 8, display: 'flex', gap: 4, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 8, boxShadow: '0 8px 24px rgba(28,25,23,0.18)', padding: 4 }} onPointerDown={(e) => e.stopPropagation()}>
+                <input
+                  data-testid="tag-name-input"
+                  autoFocus
+                  value={tagName}
+                  placeholder="name this moment"
+                  onChange={(e) => setTagName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') commitTag();
+                    if (e.key === 'Escape') { setTagging(null); setTagName(''); }
+                  }}
+                  style={{ width: 130, fontSize: 12, padding: '5px 8px', borderRadius: 6, border: '1px solid var(--line)', background: 'var(--bg-sub)', color: 'var(--text)' }}
+                />
+                <button data-testid="tag-confirm" onPointerDown={(e) => { e.stopPropagation(); commitTag(); }} style={{ fontSize: 12, padding: '0 10px', borderRadius: 6, border: 'none', background: accent, color: '#fff', cursor: 'pointer' }}>Tag</button>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -331,5 +476,18 @@ export default function HistoryBar(props: HistoryBarProps) {
         </>
       )}
     </div>
+  );
+}
+
+function BranchDot({ color }: { color: string }) {
+  return <span style={{ width: 6, height: 6, borderRadius: '50%', background: color, flex: 'none' }} />;
+}
+
+function TagIcon({ color = 'currentColor', size = 11 }: { color?: string; size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" style={{ flex: 'none' }}>
+      <path d="M2.5 2.5h5.2c.3 0 .6.12.8.34l4.7 4.7a1.1 1.1 0 0 1 0 1.56l-4.06 4.06a1.1 1.1 0 0 1-1.56 0l-4.7-4.7a1.1 1.1 0 0 1-.34-.8V2.5Z" stroke={color} strokeWidth="1.1" strokeLinejoin="round" />
+      <circle cx="5.6" cy="5.6" r="1" fill={color} />
+    </svg>
   );
 }

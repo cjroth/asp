@@ -224,11 +224,26 @@ pub struct GraphBranch {
     pub current: bool,
 }
 
-/// The full network graph: lanes (branches) + the commit DAG over them.
+/// A user-named marker on the timeline (a tag). Placed by `at_ts` on its branch's
+/// lane so the UI can flag moments worth returning to.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GraphTag {
+    pub tag_id: String,
+    pub name: String,
+    pub at_ts: i64,
+    pub branch_id: String,
+    pub lane: usize,
+}
+
+/// The full network graph: lanes (branches) + the commit DAG over them + tags.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Graph {
     pub nodes: Vec<GraphNode>,
     pub branches: Vec<GraphBranch>,
+    /// User tags, placed on their branch lane. Filled by the engine (kept out of
+    /// `build_graph` so the pure DAG builder stays tag-agnostic).
+    #[serde(default)]
+    pub tags: Vec<GraphTag>,
 }
 
 /// Build the GitHub-network-style branch/commit DAG from the log + branch set
@@ -336,7 +351,7 @@ pub fn build_graph(rows: &[LogRow], live_branches: &[Branch], head: &str, cap: u
         })
         .collect();
 
-    Graph { nodes, branches }
+    Graph { nodes, branches, tags: Vec::new() }
 }
 
 /// A short human label for a coarsened commit: the file it touched (or "N changes").

@@ -8,7 +8,7 @@
 //! freeze rendering/input. `(async)` dispatches each to a worker thread.
 
 use asp_desktop_engine::{
-    BranchDto, DesktopEngine, FileAt, FileEntry, Graph, HistEvent, VaultInfo, VaultStatus,
+    BranchDto, DesktopEngine, FileAt, FileEntry, Graph, HistEvent, TagDto, VaultInfo, VaultStatus,
 };
 use std::path::PathBuf;
 use tauri::State;
@@ -172,6 +172,23 @@ pub fn fork_branch_at(state: State<AppState>, id: String, name: String, ts: i64)
 #[tauri::command(async)]
 pub fn delete_branch(state: State<AppState>, id: String, branch_id: String) -> R<()> {
     e(state.engine.delete_branch(&id, &branch_id))
+}
+
+// ---- Tags (thin pass-throughs to the engine) ----
+
+#[tauri::command(async)]
+pub fn list_tags(state: State<AppState>, id: String) -> R<Vec<TagDto>> {
+    e(state.engine.list_tags(&id))
+}
+
+#[tauri::command(async)]
+pub fn create_tag(state: State<AppState>, id: String, name: String, at_ts: i64) -> R<String> {
+    e(state.engine.create_tag(&id, &name, at_ts))
+}
+
+#[tauri::command(async)]
+pub fn delete_tag(state: State<AppState>, id: String, tag_id: String) -> R<()> {
+    e(state.engine.delete_tag(&id, &tag_id))
 }
 
 #[tauri::command(async)]

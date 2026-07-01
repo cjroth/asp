@@ -60,11 +60,21 @@ pub fn run() {
             let h2 = app.handle().clone();
             std::thread::spawn(move || {
                 let emit_handle = h2.clone();
-                h2.state::<AppState>()
-                    .engine
-                    .reopen_saved_streaming(move |_info| {
+                let prog_handle = h2.clone();
+                h2.state::<AppState>().engine.reopen_saved_streaming(
+                    move |_info| {
                         let _ = emit_handle.emit("vaults-changed", ());
-                    });
+                    },
+                    // Determinate startup progress: a big vault's reconcile emits
+                    // (path, done, total, phase) so the UI can show a real bar
+                    // instead of an indeterminate "Loading your vaults…" spinner.
+                    move |path, done, total, phase| {
+                        let _ = prog_handle.emit(
+                            "vault-scan-progress",
+                            serde_json::json!({ "path": path, "done": done, "total": total, "phase": phase }),
+                        );
+                    },
+                );
             });
             Ok(())
         })
@@ -103,6 +113,9 @@ pub fn run() {
             commands::checkout_branch,
             commands::fork_branch_at,
             commands::delete_branch,
+            commands::list_tags,
+            commands::create_tag,
+            commands::delete_tag,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Context Desktop");

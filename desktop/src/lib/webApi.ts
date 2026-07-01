@@ -345,13 +345,32 @@ export function createWebApi(): Api {
       persistQueue.schedule(id, eng);
     },
 
-    // Time-travel and on-disk rescan are desktop-only; degrade gracefully on web.
-    history: async () => [] as HistEvent[],
-    readFileAt: async (id, path): Promise<FileAt> => {
-      const bytes = (await engineFor(id)).read_file(path);
-      return bytes ? { exists: true, content: dec.decode(bytes) } : { exists: false, content: '' };
+    // ---- tags: named markers at points in history (synced like branch records) ----
+    listTags: async (id) =>
+      JSON.parse((await engineFor(id)).tags_json()) as { tag_id: string; name: string; at_ts: number; branch_id: string }[],
+    createTag: async (id, name, atTs) => {
+      const eng = await engineFor(id);
+      const tid = eng.create_tag(name, atTs);
+      persistQueue.schedule(id, eng);
+      return tid;
     },
-    restoreFileAt: async () => {},
+    deleteTag: async (id, tagId) => {
+      const eng = await engineFor(id);
+      eng.delete_tag(tagId);
+      persistQueue.schedule(id, eng);
+    },
+
+    // Time-travel now works on web too (the wasm engine folds as-of a timestamp,
+    // same as native) — so scrubbing history + editing-in-the-past auto-branch work
+    // in the browser, not just desktop.
+    history: async (id) => JSON.parse((await engineFor(id)).history_json()) as HistEvent[],
+    readFileAt: async (id, path, ts): Promise<FileAt> =>
+      JSON.parse((await engineFor(id)).file_at_json(path, ts)) as FileAt,
+    restoreFileAt: async (id, path, ts) => {
+      const eng = await engineFor(id);
+      eng.restore_file_at(path, ts);
+      persistQueue.schedule(id, eng);
+    },
     rescan: async () => {},
 
     removeVault: async (id) => {

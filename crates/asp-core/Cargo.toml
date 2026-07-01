@@ -47,6 +47,9 @@ tracing.workspace = true
 # RNG backend for handshake nonces + random file ids (one engine, §Implementation).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
+# The browser wall clock (Date.now, ms) — so a wasm node stamps real timestamps on
+# its log rows (native uses SystemTime). Without this the timeline / PITR see epoch 0.
+js-sys = "0.3"
 # iroh in the browser: relay-only transport (no UDP in the sandbox), no metrics.
 # Requires RUSTFLAGS=--cfg getrandom_backend="wasm_js" at build time.
 iroh = { version = "1", default-features = false, features = ["tls-ring"] }

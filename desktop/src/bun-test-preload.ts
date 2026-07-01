@@ -39,6 +39,21 @@ for (const k of [
 ]) {
   if (k in dom.window) g[k] = (dom.window as unknown as Record<string, unknown>)[k];
 }
+// jsdom has no ResizeObserver; the history timeline uses one to measure its track.
+// A no-op that fires one initial callback is enough for tests (they set explicit
+// getBoundingClientRect / clientWidth where size matters).
+if (!('ResizeObserver' in g)) {
+  class RO {
+    _cb: () => void;
+    constructor(cb: () => void) { this._cb = cb; }
+    observe() { try { this._cb(); } catch { /* ignore */ } }
+    unobserve() {}
+    disconnect() {}
+  }
+  g.ResizeObserver = RO as unknown;
+  (dom.window as unknown as Record<string, unknown>).ResizeObserver = RO;
+}
+
 // @testing-library/react needs this to silence the act(...) environment warning.
 g.IS_REACT_ACT_ENVIRONMENT = true;
 

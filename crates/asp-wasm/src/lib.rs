@@ -257,10 +257,91 @@ impl WasmEngine {
         self.eng.delete_branch(branch_id).map_err(to_err)
     }
 
-    /// The branch/commit DAG (GitHub-network-style) as JSON `{nodes, branches}`,
+    /// The branch/commit DAG (GitHub-network-style) as JSON `{nodes, branches, tags}`,
     /// bounded to `cap` commits per lane.
     pub fn graph_json(&self, cap: u32) -> Result<String, JsError> {
         serde_json::to_string(&self.eng.graph(cap as usize)).map_err(to_err)
+    }
+
+    // ---------------- tags ----------------
+
+    /// Live tags as JSON: `[{tag_id, name, at_ts, branch_id}]`.
+    pub fn tags_json(&self) -> Result<String, JsError> {
+        #[derive(serde::Serialize)]
+        struct T<'a> {
+            tag_id: &'a str,
+            name: &'a str,
+            at_ts: i64,
+            branch_id: &'a str,
+        }
+        let ts = self.eng.tags();
+        let out: Vec<T> = ts
+            .iter()
+            .map(|t| T { tag_id: &t.tag_id, name: &t.name, at_ts: t.at_ts, branch_id: &t.branch_id })
+            .collect();
+        serde_json::to_string(&out).map_err(to_err)
+    }
+
+    /// Tag the point at wall-clock `at_ts` (unix seconds) on the current branch.
+    pub fn create_tag(&self, name: &str, at_ts: f64) -> Result<String, JsError> {
+        if !at_ts.is_finite() {
+            return Err(JsError::new("tag timestamp must be a finite number"));
+        }
+        self.eng.create_tag(name, at_ts as i64).map_err(to_err)
+    }
+
+    /// Soft-delete a tag.
+    pub fn delete_tag(&self, tag_id: &str) -> Result<(), JsError> {
+        self.eng.delete_tag(tag_id).map_err(to_err)
+    }
+
+    // ---------------- history + time travel (PITR) ----------------
+
+    /// The append-only history as JSON `[{id, ts, lamport, kind, path, branch_id}]`
+    /// — drives the timeline. (Web parity with the native `history` command.)
+    pub fn history_json(&self) -> Result<String, JsError> {
+        #[derive(serde::Serialize)]
+        struct H {
+            id: String,
+            ts: i64,
+            lamport: u64,
+            kind: String,
+            path: String,
+            branch_id: String,
+        }
+        let out: Vec<H> = self
+            .eng
+            .history()
+            .into_iter()
+            .map(|(id, ts, lamport, kind, path, branch_id)| H { id, ts, lamport, kind, path, branch_id })
+            .collect();
+        serde_json::to_string(&out).map_err(to_err)
+    }
+
+    /// Content of `path` as of wall-clock `t` (unix seconds) as JSON `{exists, content}`.
+    pub fn file_at_json(&self, path: &str, t: f64) -> Result<String, JsError> {
+        if !t.is_finite() {
+            return Err(JsError::new("time must be a finite number"));
+        }
+        #[derive(serde::Serialize)]
+        struct FA {
+            exists: bool,
+            content: String,
+        }
+        let fa = match self.eng.file_at(path, t as i64).map_err(to_err)? {
+            Some(bytes) => FA { exists: true, content: String::from_utf8_lossy(&bytes).into_owned() },
+            None => FA { exists: false, content: String::new() },
+        };
+        serde_json::to_string(&fa).map_err(to_err)
+    }
+
+    /// Restore `path` to its content as of `t` (records it as a new edit).
+    pub fn restore_file_at(&self, path: &str, t: f64) -> Result<(), JsError> {
+        if !t.is_finite() {
+            return Err(JsError::new("time must be a finite number"));
+        }
+        self.eng.restore_file_at(path, t as i64).map_err(to_err)?;
+        Ok(())
     }
 
     /// The version vector visible on `branch` right now (the fork point a child

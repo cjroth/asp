@@ -124,18 +124,35 @@ struct FileStat {
     size: i64,
 }
 
+/// A scan-progress sink: `(done, total, phase)` where `phase` is "scanning" |
+/// "hashing" | "saving". Called (possibly from worker threads, so `Sync`) so a
+/// host can drive a determinate progress bar instead of an indeterminate spinner
+/// on a large vault's startup reconcile. A no-op by default (`|_, _, _| {}`).
+pub type ProgressFn<'a> = dyn Fn(u64, u64, &str) + Sync + 'a;
+
 /// Read + content-hash a set of files in parallel (the changed/new subset of a
 /// scan). Returns (rel, mtime_ns, size, bytes, hash) per successfully read file;
-/// unreadable files are dropped (treated as absent), as before.
-fn read_and_hash(files: &[FileStat]) -> Vec<(String, i64, i64, Vec<u8>, String)> {
+/// unreadable files are dropped (treated as absent), as before. `on` is called
+/// with the running hashed-file count so a large reconcile can show progress.
+fn read_and_hash(files: &[FileStat], on: &ProgressFn) -> Vec<(String, i64, i64, Vec<u8>, String)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let total = files.len() as u64;
+    let done = AtomicU64::new(0);
     let read_chunk = |chunk: &[FileStat]| {
         chunk
             .iter()
             .filter_map(|f| {
-                fs::read(&f.abs).ok().map(|b| {
+                let r = fs::read(&f.abs).ok().map(|b| {
                     let h = crate::oid::content_hash(&b);
                     (f.rel.clone(), f.mtime_ns, f.size, b, h)
-                })
+                });
+                // Report every 64 files (and cheaply) so the bar advances without
+                // flooding the host with a callback per file on a 28k-file vault.
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 64 == 0 || n == total {
+                    on(n, total, "hashing");
+                }
+                r
             })
             .collect::<Vec<_>>()
     };
@@ -803,6 +820,12 @@ impl Engine {
     /// §Renames). Returns authored rows to push. Used by the `watch` debounce
     /// flush and by startup reconciliation.
     pub fn capture_rescan(&self) -> AspResult<Vec<WireRow>> {
+        self.capture_rescan_progress(&|_, _, _| {})
+    }
+
+    /// Like [`capture_rescan`] but reports scan/hash/save progress to `on` so a host
+    /// can show a determinate progress bar during a large vault's startup reconcile.
+    pub fn capture_rescan_progress(&self, on: &ProgressFn) -> AspResult<Vec<WireRow>> {
         // Author the whole diff with per-row materialize deferred, then fold ONCE.
         // The diff below is computed from a single pre-pass snapshot, so deferring
         // is sound: each path is touched at most once, and `current_for_path`
@@ -817,7 +840,8 @@ impl Engine {
         // the change arrives as a written row rather than a pre-existing disk file.)
         self.reload_scope();
         self.batch.set(true);
-        let result = self.capture_rescan_inner(&self.scan_disk()?);
+        let scanned = self.scan_disk_progress(on)?;
+        let result = self.capture_rescan_inner(&scanned);
         self.batch.set(false);
         let authored = result?;
         // Nothing changed on disk → no new rows → the materialized files table and
@@ -825,7 +849,9 @@ impl Engine {
         // that `materialize` would otherwise redo every reopen — the dominant cost
         // of the startup reconcile on a big, unchanged vault.
         if !authored.is_empty() {
+            on(0, authored.len() as u64, "saving");
             self.materialize()?;
+            on(authored.len() as u64, authored.len() as u64, "saving");
         }
         Ok(authored)
     }
@@ -1049,6 +1075,10 @@ impl Engine {
 
     /// Walk the in-scope working tree into a `rel_path -> bytes` map.
     pub(crate) fn scan_disk(&self) -> AspResult<BTreeMap<String, DiskEntry>> {
+        self.scan_disk_progress(&|_, _, _| {})
+    }
+
+    pub(crate) fn scan_disk_progress(&self, on: &ProgressFn) -> AspResult<BTreeMap<String, DiskEntry>> {
         // Walk + stat every file (cheap), then read the body ONLY of files whose
         // (mtime, size) changed since we last hashed them. On a big working tree
         // that the user hasn't touched externally, the startup reconcile becomes
@@ -1058,6 +1088,7 @@ impl Engine {
         // correctness or convergence.
         let mut files: Vec<FileStat> = Vec::new();
         self.collect_files(&self.root, &mut files)?;
+        on(files.len() as u64, files.len() as u64, "scanning");
 
         let cache = self.store.load_fs_stat()?;
         let mut out: BTreeMap<String, DiskEntry> = BTreeMap::new();
@@ -1073,7 +1104,8 @@ impl Engine {
         }
 
         // Read (+ hash) the changed/new files in parallel — reads dominate.
-        let read = read_and_hash(&to_read);
+        on(0, to_read.len() as u64, "hashing");
+        let read = read_and_hash(&to_read, on);
         let mut updates: Vec<(String, i64, i64, String)> = Vec::with_capacity(read.len());
         for (rel, mtime_ns, size, bytes, hash) in read {
             updates.push((rel.clone(), mtime_ns, size, hash.clone()));
@@ -1274,7 +1306,117 @@ impl Engine {
     pub fn graph(&self, cap: usize) -> AspResult<crate::branch::Graph> {
         let rows = self.store.all_rows()?;
         let live: Vec<Branch> = self.store.branches()?.into_iter().filter(|b| !b.deleted).collect();
-        Ok(crate::branch::build_graph(&rows, &live, &self.head_branch(), cap))
+        let mut g = crate::branch::build_graph(&rows, &live, &self.head_branch(), cap);
+        // Place live tags on their branch's lane (unknown/deleted-branch tags land on
+        // lane 0 so they still show). Tag metadata rides the same log, reconciled LWW.
+        let lane_of: std::collections::HashMap<String, usize> =
+            g.branches.iter().map(|b| (b.id.clone(), b.lane)).collect();
+        g.tags = self
+            .tags()?
+            .into_iter()
+            .map(|t| crate::branch::GraphTag {
+                lane: *lane_of.get(&t.branch_id).unwrap_or(&0),
+                tag_id: t.tag_id,
+                name: t.name,
+                at_ts: t.at_ts,
+                branch_id: t.branch_id,
+            })
+            .collect();
+        Ok(g)
+    }
+
+    /// Live (non-deleted) tags, reconciled LWW from the synced `Kind::Tag` records.
+    pub fn tags(&self) -> AspResult<Vec<crate::tag::Tag>> {
+        let rows = self.store.tag_rows()?;
+        Ok(crate::tag::reconcile_tags(&rows, |h| self.store.get_blob(h).ok().flatten())
+            .into_iter()
+            .filter(|t| !t.deleted)
+            .collect())
+    }
+
+    /// Tag the point in history at wall-clock `at_ts` on the current branch with
+    /// `name`. Authored as a synced `Kind::Tag` row (like a branch record), so the
+    /// tag propagates to every peer. Returns the tag id + wire row for live push.
+    pub fn create_tag(&self, name: &str, at_ts: i64) -> AspResult<(String, WireRow)> {
+        crate::tag::validate_tag_name(name)?;
+        let head = self.head_branch();
+        // Lamport of the tagged instant: the max lamport of head-visible rows at or
+        // before `at_ts` (0 if none) — a stable ordering hint for the graph.
+        let bs = self.branch_set()?;
+        let vis = bs.visibility(&head);
+        let at_lamport = self
+            .store
+            .all_rows()?
+            .iter()
+            .filter(|r| vis.sees(r) && r.ts <= at_ts)
+            .map(|r| r.lamport)
+            .max()
+            .unwrap_or(0);
+        let created_lamport = self.store.next_lamport(0)?;
+        let created_ts = now_unix() as i64;
+        let tag_id = crate::tag::Tag::derive_id(name, at_ts, &head, created_lamport, &self.site_id());
+        let t = crate::tag::Tag {
+            tag_id: tag_id.clone(),
+            name: name.to_string(),
+            at_ts,
+            at_lamport,
+            branch_id: head,
+            created_lamport,
+            created_ts,
+            deleted: false,
+        };
+        let wr = self.author_tag_record(&t)?;
+        Ok((tag_id, wr))
+    }
+
+    /// Soft-delete a tag (its rows remain for history). Returns the tombstone wire
+    /// row for live push; it also converges via catch-up.
+    pub fn delete_tag(&self, tag_id: &str) -> AspResult<WireRow> {
+        let rows = self.store.tag_rows()?;
+        let existing = crate::tag::reconcile_tags(&rows, |h| self.store.get_blob(h).ok().flatten())
+            .into_iter()
+            .find(|t| t.tag_id == tag_id)
+            .ok_or_else(|| AspError::NotFound(format!("no such tag: {tag_id}")))?;
+        let tomb = crate::tag::Tag { deleted: true, ..existing };
+        self.author_tag_record(&tomb)
+    }
+
+    /// Author a synced tag record — a `Kind::Tag` row whose result blob is the
+    /// JSON-encoded `Tag`, keyed by `file_id = tag_id` so create → rename → delete
+    /// converge LWW. Mirrors `author_branch_record`.
+    fn author_tag_record(&self, t: &crate::tag::Tag) -> AspResult<WireRow> {
+        let blob = crate::tag::encode_tag_record(t);
+        let result_hash = self.store.put_blob(&blob)?;
+        let (lamport, seq) = self.next_counters()?;
+        let row = LogRow {
+            id: String::new(),
+            site_id: self.site_id(),
+            lamport,
+            seq,
+            ts: now_unix() as i64,
+            file_id: t.tag_id.clone(),
+            kind: Kind::Tag,
+            merge_class: MergeClass::Text,
+            parent: None,
+            base_hash: None,
+            result_hash: Some(result_hash),
+            path: Some(t.name.clone()),
+            branch_id: MAIN_BRANCH_ID.to_string(),
+            merge_parent: None,
+            sig: vec![],
+        }
+        .seal();
+        self.store.append_row(&row)?;
+        self.wire(row)
+    }
+
+    /// The latest `Kind::Tag` record row for `tag_id`, as a wire row — for a live
+    /// driver to push after a fork-time tag where the create path handed back the id.
+    pub fn tag_record_wire(&self, tag_id: &str) -> Option<WireRow> {
+        let rows = self.store.rows_for_file(tag_id).ok()?;
+        let key = |r: &LogRow| OrderKey { lamport: r.lamport, site_id: r.site_id.clone(), id: r.id.clone() };
+        let latest = rows.into_iter().filter(|r| r.kind == Kind::Tag).max_by(|a, b| key(a).cmp(&key(b)))?;
+        self.wire(latest).ok()
     }
 
     /// The version vector visible on `branch` right now — the fork point a child
@@ -1666,6 +1808,56 @@ mod tests {
         assert!(e.delete_branch(MAIN_BRANCH_ID).is_err());
         // Checking out a non-existent branch errors.
         assert!(e.checkout("nope").is_err());
+    }
+
+    #[test]
+    fn tags_create_list_delete_and_survive_reopen() {
+        let d = tempdir().unwrap();
+        {
+            let e = eng(d.path(), 1);
+            e.record_write("a.md", b"v1\n").unwrap().unwrap();
+            let (tid, _wr) = e.create_tag("release-1", 1_700_000_000).unwrap();
+            let tags = e.tags().unwrap();
+            assert_eq!(tags.len(), 1);
+            assert_eq!(tags[0].name, "release-1");
+            assert_eq!(tags[0].at_ts, 1_700_000_000);
+            assert_eq!(tags[0].branch_id, MAIN_BRANCH_ID, "tag records the branch it was taken on");
+            // Empty name rejected.
+            assert!(e.create_tag("  ", 1).is_err());
+            // Tags show up on the graph, placed on their branch lane.
+            let g = e.graph(100).unwrap();
+            assert_eq!(g.tags.len(), 1);
+            assert_eq!(g.tags[0].lane, 0);
+            // Soft-delete removes it from the live set.
+            e.delete_tag(&tid).unwrap();
+            assert!(e.tags().unwrap().is_empty());
+        }
+        // A fresh tag persists across reopen (it's a synced log row, not just memory).
+        {
+            let e = eng(d.path(), 1);
+            e.create_tag("keep", 1_700_000_500).unwrap();
+        }
+        let e = eng(d.path(), 1);
+        assert_eq!(e.tags().unwrap().iter().map(|t| t.name.clone()).collect::<Vec<_>>(), vec!["keep".to_string()]);
+    }
+
+    #[test]
+    fn capture_rescan_progress_reports_scan_and_hash() {
+        use std::sync::Mutex;
+        let d = tempdir().unwrap();
+        std::fs::write(d.path().join("a.md"), b"aaaa").unwrap();
+        std::fs::write(d.path().join("b.md"), b"bbbb").unwrap();
+        let e = eng(d.path(), 1);
+        let seen: Mutex<Vec<(u64, u64, String)>> = Mutex::new(Vec::new());
+        e.capture_rescan_progress(&|done, total, phase| {
+            seen.lock().unwrap().push((done, total, phase.to_string()));
+        })
+        .unwrap();
+        let seen = seen.into_inner().unwrap();
+        // We must have seen a "scanning" phase reporting the two files present.
+        assert!(seen.iter().any(|(_, t, p)| p == "scanning" && *t >= 2), "scanning phase reports the file total: {seen:?}");
+        // And a "hashing" phase (the two new files were read + hashed).
+        assert!(seen.iter().any(|(_, _, p)| p == "hashing"), "hashing phase reported: {seen:?}");
     }
 
     #[test]

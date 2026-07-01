@@ -27,6 +27,10 @@ const createDir = vi.fn(async (_i: string, p: string) => { FILES.push({ path: p,
 const renameFile = vi.fn(async () => {});
 const deleteFile = vi.fn(async () => {});
 const restoreFileAt = vi.fn(async () => {});
+const checkoutBranch = vi.fn(async () => {});
+const forkBranchAt = vi.fn(async () => 'edit-branch-id');
+const createTag = vi.fn(async () => 'tag-id');
+const deleteTag = vi.fn(async () => {});
 const removeVault = vi.fn(async () => {});
 const cloneRemote = vi.fn(async (dest: string) => ({ id: 'v3', path: dest, vault_id: 'vid3', enabled: false, listening_ticket: null }));
 const addLocalFolder = vi.fn(async (p: string) => ({ id: 'v3', path: p, vault_id: 'vid3', enabled: false, listening_ticket: null }));
@@ -60,6 +64,14 @@ mock.module('./lib/api', () => ({
     readFileAt: async (_i: string, p: string) => ({ exists: true, content: '# Readme\n\nOLD VERSION' }),
     restoreFileAt: (...a: unknown[]) => restoreFileAt(...(a as [])),
     removeVault: (...a: unknown[]) => removeVault(...(a as [])),
+    // Branch/tag surface (the timeline network graph + auto-branch + tags).
+    currentBranch: async () => 'main',
+    branchGraph: async () => ({ nodes: [], branches: [{ id: 'main', name: 'main', parent: null, head_commit: null, lane: 0, current: true }], tags: [] }),
+    checkoutBranch: (...a: unknown[]) => checkoutBranch(...(a as [])),
+    forkBranchAt: (...a: unknown[]) => forkBranchAt(...(a as [])),
+    listTags: async () => [],
+    createTag: (...a: unknown[]) => createTag(...(a as [])),
+    deleteTag: (...a: unknown[]) => deleteTag(...(a as [])),
   },
 }));
 
@@ -352,9 +364,36 @@ describe('App — editor', () => {
     (track.getBoundingClientRect as unknown) = () => ({ left: 0, top: 0, width: 100, height: 40, right: 100, bottom: 40, x: 0, y: 0, toJSON() {} });
     fireEvent(track, new MouseEvent('pointerdown', { clientX: 20, bubbles: true }));
     fireEvent(document, new MouseEvent('pointerup', { clientX: 20, bubbles: true }));
-    expect(await screen.findByText(/read-only/)).toBeTruthy();
-    fireEvent.click(screen.getByText('Restore this version'));
+    // Time travel is editable now — the banner invites branching, not "read-only".
+    expect(await screen.findByTestId('time-travel-banner')).toBeTruthy();
+    fireEvent.click(screen.getByText(/Restore onto/));
     await waitFor(() => expect(restoreFileAt).toHaveBeenCalled());
+  });
+
+  it('auto-branches when you edit while scrubbed into the past', async () => {
+    await screen.findByTestId('live-editor');
+    fireEvent.click(screen.getByText('History'));
+    const track = await screen.findByTestId('history-track');
+    (track.getBoundingClientRect as unknown) = () => ({ left: 0, top: 0, width: 100, height: 40, right: 100, bottom: 40, x: 0, y: 0, toJSON() {} });
+    fireEvent(track, new MouseEvent('pointerdown', { clientX: 20, bubbles: true }));
+    fireEvent(document, new MouseEvent('pointerup', { clientX: 20, bubbles: true }));
+    await screen.findByTestId('time-travel-banner');
+    // Editing in the past forks a branch at that instant instead of overwriting HEAD.
+    const editor = screen.getByTestId('live-editor');
+    fireEvent.input(editor, { target: { textContent: '# Readme\n\nEDIT IN THE PAST' } });
+    await waitFor(() => expect(forkBranchAt).toHaveBeenCalled());
+    expect(await screen.findByTestId('branch-created-banner')).toBeTruthy();
+  });
+
+  it('tags the current moment from the History track', async () => {
+    await screen.findByTestId('live-editor');
+    fireEvent.click(screen.getByText('History'));
+    await screen.findByTestId('history-track');
+    fireEvent.click(screen.getByTestId('tag-here'));
+    const input = await screen.findByTestId('tag-name-input');
+    fireEvent.change(input, { target: { value: 'release' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(createTag).toHaveBeenCalledWith('v1', 'release', expect.any(Number)));
   });
 
   it('opens the Log tab', async () => {
@@ -442,7 +481,7 @@ describe('App — editor', () => {
     fireEvent(track, new MouseEvent('pointerdown', { clientX: 20, bubbles: true }));
     fireEvent(document, new MouseEvent('pointerup', { clientX: 20, bubbles: true }));
     fireEvent.click(await screen.findByText('Return to now'));
-    await waitFor(() => expect(screen.queryByText(/read-only/)).toBeNull());
+    await waitFor(() => expect(screen.queryByTestId('time-travel-banner')).toBeNull());
   });
 });
 

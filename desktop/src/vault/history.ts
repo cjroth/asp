@@ -19,6 +19,8 @@ export interface TrackEvent {
   ts: number; // epoch ms
   kind: string;
   path: string;
+  /** The branch this event was authored on (lane placement). */
+  branchId: string;
 }
 
 export function defaultView(now: number): View {
@@ -119,10 +121,11 @@ export function colorOf(kind: string): string {
   return kind === 'create' ? '#3fa45a' : kind === 'edit' ? '#3d63dd' : kind === 'rename' ? '#d9a93d' : '#d96a6a';
 }
 
-// Convert backend history (unix SECONDS) into epoch-ms track events.
+// Convert backend history (unix SECONDS) into epoch-ms track events. `branch_id`
+// defaults to 'main' for a pre-branching backend that doesn't send it.
 export function buildEvents(hist: HistEvent[]): TrackEvent[] {
   return hist
-    .map((e) => ({ id: e.id, ts: e.ts * 1000, kind: e.kind, path: e.path }))
+    .map((e) => ({ id: e.id, ts: e.ts * 1000, kind: e.kind, path: e.path, branchId: e.branch_id ?? 'main' }))
     .sort((a, b) => a.ts - b.ts);
 }
 

@@ -70,6 +70,9 @@ pub struct HistEvent {
     /// Path the row applies to (resolved from the file_id's latest path for
     /// rows that don't carry one, e.g. edits/deletes).
     pub path: String,
+    /// The branch the row was authored on — lets the timeline place each event on
+    /// its branch lane (the network-graph view).
+    pub branch_id: String,
 }
 
 /// One branch for the switcher UI (a thin projection of an `asp-core` `Branch`).
@@ -80,6 +83,16 @@ pub struct BranchDto {
     pub parent: Option<String>,
     /// True for the checked-out branch (HEAD).
     pub current: bool,
+}
+
+/// One tag for the timeline UI (a thin projection of an `asp-core` `Tag`).
+#[derive(Clone, Serialize)]
+pub struct TagDto {
+    pub tag_id: String,
+    pub name: String,
+    /// Wall-clock unix seconds the tag marks.
+    pub at_ts: i64,
+    pub branch_id: String,
 }
 
 /// Content of a file as of a point in time (for read-only time travel).
@@ -355,12 +368,24 @@ impl DesktopEngine {
     /// touching the persisted list. Shared by `add_local_folder`/`reopen_saved`.
     /// `peer` is an optional upstream ticket to stay connected to.
     fn add_folder_inner(&self, path: &Path, peer: Option<String>) -> Result<VaultInfo> {
+        self.add_folder_inner_progress(path, peer, &|_, _, _| {})
+    }
+
+    /// Like [`add_folder_inner`] but reports the startup reconcile's scan/hash/save
+    /// progress to `on` — so the shell can show a determinate progress bar during a
+    /// large (e.g. 28k-file) vault's open instead of an indeterminate spinner.
+    fn add_folder_inner_progress(
+        &self,
+        path: &Path,
+        peer: Option<String>,
+        on: &(dyn Fn(u64, u64, &str) + Sync),
+    ) -> Result<VaultInfo> {
         let eng = if path.join(".asp/asp.db").exists() {
             Engine::open(path, self.identity.clone())?
         } else {
             Engine::init(path, self.identity.clone())?
         };
-        eng.capture_rescan()?;
+        eng.capture_rescan_progress(on)?;
         let id = random_id();
         let engine = self.handle(eng);
         let conns: Conns = Arc::new(AsyncMutex::new(HashMap::new()));
@@ -514,7 +539,7 @@ impl DesktopEngine {
     /// persisted upstream peers). Call once at startup. Folders that no longer
     /// exist on disk are skipped (and pruned).
     pub fn reopen_saved(&self) -> Result<Vec<VaultInfo>> {
-        Ok(self.reopen_saved_streaming(|_| {}))
+        Ok(self.reopen_saved_streaming(|_| {}, |_, _, _, _| {}))
     }
 
     /// Reopen saved folders **concurrently**, invoking `on_each` the moment each
@@ -524,7 +549,11 @@ impl DesktopEngine {
     /// them in parallel and streaming each as it lands means a big vault never
     /// blocks the small ones, and the shell can surface vaults the instant they're
     /// ready (a realtime `vaults-changed` event) rather than after the slowest.
-    pub fn reopen_saved_streaming(&self, on_each: impl Fn(&VaultInfo) + Send + Sync) -> Vec<VaultInfo> {
+    pub fn reopen_saved_streaming(
+        &self,
+        on_each: impl Fn(&VaultInfo) + Send + Sync,
+        on_progress: impl Fn(&str, u64, u64, &str) + Send + Sync,
+    ) -> Vec<VaultInfo> {
         let cfgs: Vec<FolderCfg> = Self::saved_folders()
             .into_iter()
             .filter(|c| PathBuf::from(&c.path).join(".asp/asp.db").exists())
@@ -534,8 +563,12 @@ impl DesktopEngine {
                 .iter()
                 .map(|cfg| {
                     let on_each = &on_each;
+                    let on_progress = &on_progress;
                     s.spawn(move || {
-                        let info = self.add_folder_inner(&PathBuf::from(&cfg.path), cfg.peer.clone()).ok()?;
+                        let prog = |d: u64, t: u64, ph: &str| on_progress(&cfg.path, d, t, ph);
+                        let info = self
+                            .add_folder_inner_progress(&PathBuf::from(&cfg.path), cfg.peer.clone(), &prog)
+                            .ok()?;
                         on_each(&info);
                         Some((cfg.clone(), info))
                     })
@@ -846,6 +879,11 @@ impl DesktopEngine {
             if let Some(p) = &r.path {
                 latest.insert(r.file_id.clone(), p.clone());
             }
+            // Branch/Tag records are metadata (they carry no file change), so they
+            // aren't history events on the timeline — skip them.
+            if matches!(r.kind, asp_core::Kind::Branch | asp_core::Kind::Tag) {
+                continue;
+            }
             let path = r.path.clone().or_else(|| latest.get(&r.file_id).cloned()).unwrap_or_default();
             out.push(HistEvent {
                 id: r.id,
@@ -853,6 +891,7 @@ impl DesktopEngine {
                 lamport: r.lamport,
                 kind: r.kind.as_str().to_string(),
                 path,
+                branch_id: r.branch_id,
             });
         }
         Ok(out)
@@ -939,6 +978,47 @@ impl DesktopEngine {
             let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
             let eng = f.engine.lock().unwrap();
             let wr = eng.delete_branch(branch_id)?;
+            (f.conns.clone(), wr)
+        };
+        self.broadcast(&conns, wr);
+        Ok(())
+    }
+
+    // ---- Tags: named markers at points in history ----
+
+    /// All live tags on the timeline.
+    pub fn list_tags(&self, id: &str) -> Result<Vec<TagDto>> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let eng = f.engine.lock().unwrap();
+        Ok(eng
+            .tags()?
+            .into_iter()
+            .map(|t| TagDto { tag_id: t.tag_id, name: t.name, at_ts: t.at_ts, branch_id: t.branch_id })
+            .collect())
+    }
+
+    /// Tag the point at wall-clock `at_ts` on the current branch. The record is
+    /// pushed live to peers so every node learns it.
+    pub fn create_tag(&self, id: &str, name: &str, at_ts: i64) -> Result<String> {
+        let (conns, tag_id, wr) = {
+            let folders = self.folders.lock().unwrap();
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            let eng = f.engine.lock().unwrap();
+            let (tid, wr) = eng.create_tag(name, at_ts)?;
+            (f.conns.clone(), tid, wr)
+        };
+        self.broadcast(&conns, wr);
+        Ok(tag_id)
+    }
+
+    /// Soft-delete a tag; the tombstone is pushed live to peers.
+    pub fn delete_tag(&self, id: &str, tag_id: &str) -> Result<()> {
+        let (conns, wr) = {
+            let folders = self.folders.lock().unwrap();
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            let eng = f.engine.lock().unwrap();
+            let wr = eng.delete_tag(tag_id)?;
             (f.conns.clone(), wr)
         };
         self.broadcast(&conns, wr);

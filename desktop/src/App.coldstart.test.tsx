@@ -78,6 +78,20 @@ describe('cold-start loading hint', () => {
     await waitFor(() => expect(screen.queryByTestId('vaults-loading')).toBeNull());
     expect(screen.getByText('Your vaults')).toBeTruthy();
   }, 10000);
+
+  it('shows a determinate progress bar while a large vault reconciles', async () => {
+    render(<App />);
+    expect(await screen.findByTestId('vaults-loading')).toBeTruthy();
+    // The shell streams scan progress for the (still-loading) vault.
+    await waitFor(() => expect(handlers['vault-scan-progress']).toBeTruthy());
+    handlers['vault-scan-progress']!({ payload: { done: 14000, total: 28000, phase: 'hashing' } });
+    // A determinate bar + a live count replace the indeterminate spinner text.
+    await waitFor(() => expect(screen.getByTestId('scan-bar')).toBeTruthy());
+    expect(screen.getByTestId('scan-count').textContent).toContain('14,000');
+    expect(screen.getByText(/Reading changed files/)).toBeTruthy();
+    const fill = screen.getByTestId('scan-bar').firstChild as HTMLElement;
+    expect(fill.style.width).toBe('50%');
+  }, 10000);
 });
 
 import { afterAll as __aa, mock as __mk } from 'bun:test';

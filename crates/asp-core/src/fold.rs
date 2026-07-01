@@ -188,9 +188,9 @@ fn apply_rows(store: &dyn BlobStore, ordered: &[LogRow], states: &mut HashMap<St
             }
             // A merge marker (§2.6) carries no content of its own — the per-file
             // merge results are separate Edit rows — so it is a no-op on file state;
-            // it exists for the graph / derived-git DAG. A branch record (§7) is
-            // metadata, never a file mutation. Neither touches the fold.
-            Kind::Merge | Kind::Branch => {}
+            // it exists for the graph / derived-git DAG. A branch record (§7) and a
+            // tag record are metadata, never a file mutation. None touches the fold.
+            Kind::Merge | Kind::Branch | Kind::Tag => {}
         }
     }
     Ok(())

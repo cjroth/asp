@@ -7,11 +7,10 @@
 import { open } from '@tauri-apps/plugin-dialog';
 import { listen } from '@tauri-apps/api/event';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type ClonePhase, type FileEntry, type HistEvent, type VaultInfo, type VaultStatus } from './lib/api';
+import { api, type BranchGraphData, type ClonePhase, type FileEntry, type HistEvent, type VaultInfo, type VaultStatus } from './lib/api';
 import CustomizeModal, { type CustomizeInit } from './vault/CustomizeModal';
 import FileTree from './vault/FileTree';
 import HistoryBar from './vault/HistoryBar';
-import BranchControls from './vault/BranchControls';
 import { buildEvents, createTsByPath, defaultView, type TrackEvent, type View, viewForNow } from './vault/history';
 import * as Icon from './vault/icons';
 import LiveEditor from './vault/LiveEditor';
@@ -63,6 +62,26 @@ export function __resetUrlRestore(): void {
 
 const currentHash = (): string => (typeof window !== 'undefined' && window.location ? window.location.hash : '');
 
+// A friendly default name for an auto-created branch, derived from the instant it
+// forked from (e.g. "edit-jun30-1405"). The backend content-hashes the id (incl.
+// site + lamport) so concurrent same-name forks still get distinct branches.
+const AUTO_MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+function autoBranchName(fromMs: number): string {
+  const d = new Date(fromMs);
+  const p2 = (n: number) => (n < 10 ? '0' : '') + n;
+  return `edit-${AUTO_MONTHS[d.getMonth()]}${d.getDate()}-${p2(d.getHours())}${p2(d.getMinutes())}`;
+}
+
+// Human label for a startup scan phase, shown next to the progress bar.
+function scanPhaseLabel(p: { phase: string }): string {
+  return p.phase === 'scanning' ? 'Scanning your vault…' : p.phase === 'hashing' ? 'Reading changed files…' : p.phase === 'saving' ? 'Saving…' : 'Loading your vaults…';
+}
+
+// Display name of the checked-out branch (for the "restore onto <branch>" button).
+function lanes0Name(graph: BranchGraphData | null, currentBranch: string): string {
+  return graph?.branches.find((b) => b.id === currentBranch)?.name ?? 'this branch';
+}
+
 export default function App() {
   const desktop = isDesktop();
   const [prefs, setPrefsState] = useState<Prefs>(loadPrefs);
@@ -113,6 +132,12 @@ export default function App() {
   const [saving, setSaving] = useState(false);
 
   const [histRaw, setHistRaw] = useState<HistEvent[]>([]);
+  // The branch/tag network graph that drives the timeline lanes + fork edges + tag
+  // flags. Loaded alongside history when the History panel is open.
+  const [graph, setGraph] = useState<BranchGraphData | null>(null);
+  const [currentBranch, setCurrentBranch] = useState<string>('main');
+  // Non-blocking "you're now on a new branch" banner after an edit-in-the-past fork.
+  const [branchBanner, setBranchBanner] = useState<{ name: string; from: number } | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [view, setView] = useState<View | null>(null);
   const [playhead, setPlayhead] = useState<number | null>(null);
@@ -154,6 +179,9 @@ export default function App() {
   // show "Loading your vaults…" instead of a bare empty state on cold start.
   // Web loads its registry synchronously, so it never enters this state.
   const [vaultsLoading, setVaultsLoading] = useState(isDesktop());
+  // Determinate startup progress from the shell's `vault-scan-progress` events, so
+  // a big vault's reconcile shows a real bar instead of an indeterminate spinner.
+  const [scanProgress, setScanProgress] = useState<{ done: number; total: number; phase: string } | null>(null);
 
   const [share, setShare] = useState<{ id: string; code: string; requireKey: boolean; accessKey: string; copied: boolean; unavailable?: boolean } | null>(null);
   const [localRelayOn, setLocalRelayOn] = useState(false);
@@ -232,6 +260,14 @@ export default function App() {
       setHistRaw(await api.history(id));
     } catch {
       setHistRaw([]);
+    }
+    // The timeline IS the network graph now: pull lanes/edges/tags + HEAD too.
+    try {
+      const [g, cur] = await Promise.all([api.branchGraph(id, 400), api.currentBranch(id)]);
+      setGraph(g);
+      setCurrentBranch(cur);
+    } catch {
+      setGraph(null);
     }
     setNow(Date.now());
   }, []);
@@ -418,6 +454,7 @@ export default function App() {
     let cancelled = false;
     void listen('vaults-changed', () => {
       setVaultsLoading(false);
+      setScanProgress(null); // a vault landed → reconcile of the scanned one is done
       void refreshVaults().then(refreshStatuses).catch(() => {});
     }).then((u) => (cancelled ? u() : (unlisten = u)));
     return () => {
@@ -425,6 +462,21 @@ export default function App() {
       unlisten?.();
     };
   }, [desktop, refreshVaults, refreshStatuses]);
+
+  // Determinate startup progress: the shell streams (done, total, phase) as it
+  // reconciles each saved vault on cold start. Drives the progress bar below.
+  useEffect(() => {
+    if (!desktop) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void listen<{ done: number; total: number; phase: string }>('vault-scan-progress', (e) => {
+      setScanProgress(e.payload);
+    }).then((u) => (cancelled ? u() : (unlisten = u)));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [desktop]);
 
   const metaOf = useCallback(
     (v: VaultInfo) => resolveMeta(metaMap, v.vault_id, basename(v.path)),
@@ -518,7 +570,9 @@ export default function App() {
             const at = await api.readFileAt(id, path, Math.floor(ph / 1000));
             if (cancelled || seq !== paintSeq.current) return;
             setDocText(at.exists ? at.content : '');
-            setPaint({ source: at.content, readOnly: true, notExist: !at.exists, key: `${path}#tt${ph}#${seq}` });
+            // Time travel is now EDITABLE: the first edit here auto-forks a branch
+            // at this instant (see onEditorChange), so we never overwrite the past.
+            setPaint({ source: at.content, readOnly: false, notExist: !at.exists, key: `${path}#tt${ph}#${seq}` });
           } catch {
             if (!cancelled) setPaint(null);
           }
@@ -532,10 +586,49 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId, selectedPath, playhead]);
 
+  // Edit-in-the-past ⇒ auto-branch (§2.5). Editing while scrubbed back forks a new
+  // branch AT the scrubbed instant, checks it out, and lands the edit there — main
+  // is never overwritten and no manual "create branch" step is needed. Guarded so
+  // only the first keystroke forks; subsequent keystrokes ride the new live branch.
+  const forkingRef = useRef(false);
+  const autoBranchFromEdit = useCallback(async () => {
+    if (forkingRef.current) return;
+    const id = activeIdRef.current;
+    const path = selectedRef.current;
+    const ph = playheadRef.current;
+    if (!id || !path || ph == null) return;
+    forkingRef.current = true;
+    setSaving(true);
+    try {
+      const name = autoBranchName(ph);
+      await api.forkBranchAt(id, name, Math.floor(ph / 1000)); // fork + checkout at that instant
+      // We're now live on the new branch (at the historical state). Land the edit.
+      await api.writeFile(id, path, bufferRef.current);
+      contentRef.current[`${id}::${path}`] = bufferRef.current;
+      dirtyRef.current = false;
+      setPlayhead(null); // return to live — on the new branch
+      setBranchBanner({ name, from: ph });
+      await refreshFiles(id);
+      void api.currentBranch(id).then(setCurrentBranch).catch(() => {});
+      void api.branchGraph(id, 400).then(setGraph).catch(() => {});
+      scheduleHistory(id);
+    } catch {
+      /* ignore — stays on current branch */
+    } finally {
+      forkingRef.current = false;
+      setSaving(false);
+    }
+  }, [refreshFiles, scheduleHistory]);
+
   const onEditorChange = useCallback(
     (src: string) => {
       bufferRef.current = src;
       if (activeIdRef.current && selectedRef.current) contentRef.current[`${activeIdRef.current}::${selectedRef.current}`] = src;
+      // Scrubbed into the past → the edit forks a branch instead of saving to HEAD.
+      if (playheadRef.current != null && playheadRef.current < nowRef.current) {
+        void autoBranchFromEdit();
+        return;
+      }
       dirtyRef.current = true;
       setSaving(true);
       if (saveTimer.current) clearTimeout(saveTimer.current);
@@ -554,7 +647,7 @@ export default function App() {
           .catch(() => setSaving(false));
       }, 650);
     },
-    [scheduleHistory],
+    [scheduleHistory, autoBranchFromEdit],
   );
 
   // ---------- vault open / switch ----------
@@ -1011,6 +1104,57 @@ export default function App() {
     await refreshFiles(id);
     scheduleHistory(id);
   }, [refreshFiles, scheduleHistory]);
+
+  // Switch branch from the timeline's lane label (replaces the old dropdown).
+  const onCheckoutBranch = useCallback(async (branchId: string) => {
+    const id = activeIdRef.current;
+    if (!id) return;
+    await withOpening('Switching branch…', async () => {
+      await flushSave();
+      await api.checkoutBranch(id, branchId);
+      contentRef.current = {}; // the working tree changed; drop cached file bodies
+      setPlayhead(null);
+      setCurrentBranch(branchId);
+      await refreshFiles(id);
+      const sel = selectedRef.current;
+      if (sel) {
+        try {
+          const content = await api.readFile(id, sel);
+          contentRef.current[`${id}::${sel}`] = content;
+          bufferRef.current = content;
+          setDocText(content);
+          setPaint({ source: content, readOnly: false, notExist: false, key: `${sel}#live#${++paintSeq.current}` });
+        } catch {
+          /* file may not exist on this branch */
+        }
+      }
+      void api.branchGraph(id, 400).then(setGraph).catch(() => {});
+      scheduleHistory(id);
+    });
+  }, [flushSave, refreshFiles, scheduleHistory, withOpening]);
+
+  // Tag the given instant (epoch ms) with a name — a marker on the timeline.
+  const onCreateTag = useCallback(async (name: string, tsMs: number) => {
+    const id = activeIdRef.current;
+    if (!id) return;
+    try {
+      await api.createTag(id, name, Math.floor(tsMs / 1000));
+      void api.branchGraph(id, 400).then(setGraph).catch(() => {});
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const onDeleteTag = useCallback(async (tagId: string) => {
+    const id = activeIdRef.current;
+    if (!id) return;
+    try {
+      await api.deleteTag(id, tagId);
+      void api.branchGraph(id, 400).then(setGraph).catch(() => {});
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   const onTabHistory = useCallback(() => {
     setHistOpen((h) => {
@@ -1476,9 +1620,21 @@ export default function App() {
           </div>
 
           {desktop && vaultsLoading && saved.length === 0 && (
-            <div data-testid="vaults-loading" style={{ marginTop: 26, display: 'flex', alignItems: 'center', gap: 10, padding: '14px 15px', border: '1px solid var(--line)', borderRadius: 14, background: 'var(--bg)', color: 'var(--text3)', fontSize: 13 }}>
-              <span style={{ width: 15, height: 15, border: '2px solid var(--faint2)', borderTopColor: 'var(--text2)', borderRadius: '50%', display: 'inline-block', animation: 'aspSpin 0.7s linear infinite', flex: 'none' }} />
-              <span>Loading your vaults…</span>
+            <div data-testid="vaults-loading" style={{ marginTop: 26, padding: '14px 15px', border: '1px solid var(--line)', borderRadius: 14, background: 'var(--bg)', color: 'var(--text3)', fontSize: 13 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <span style={{ width: 15, height: 15, border: '2px solid var(--faint2)', borderTopColor: 'var(--text2)', borderRadius: '50%', display: 'inline-block', animation: 'aspSpin 0.7s linear infinite', flex: 'none' }} />
+                <span style={{ flex: 1 }}>{scanProgress ? scanPhaseLabel(scanProgress) : 'Loading your vaults…'}</span>
+                {scanProgress && scanProgress.total > 0 && (
+                  <span data-testid="scan-count" style={{ fontVariantNumeric: 'tabular-nums', color: 'var(--faint2)', fontSize: 12 }}>
+                    {scanProgress.done.toLocaleString()} / {scanProgress.total.toLocaleString()}
+                  </span>
+                )}
+              </div>
+              {scanProgress && scanProgress.total > 0 && (
+                <div data-testid="scan-bar" style={{ marginTop: 10, height: 5, borderRadius: 3, background: 'var(--line)', overflow: 'hidden' }}>
+                  <div style={{ height: '100%', width: `${Math.min(100, Math.round((scanProgress.done / scanProgress.total) * 100))}%`, background: accent, borderRadius: 3, transition: 'width .2s ease' }} />
+                </div>
+              )}
             </div>
           )}
 
@@ -1578,10 +1734,6 @@ export default function App() {
                 </>
               )}
             </div>
-
-            {activeId && (
-              <BranchControls vaultId={activeId} accent={accent} onChanged={() => { if (activeId) void openVault(activeId); }} />
-            )}
 
             <div style={{ display: 'flex', alignItems: 'center', gap: 1, padding: '9px 9px 7px', position: 'relative' }}>
               <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--faint2)', flex: 1, paddingLeft: 3 }}>Files</span>
@@ -1707,13 +1859,22 @@ export default function App() {
                 </div>
 
                 {timeTravel && (
-                  <div style={{ flex: 'none', display: 'flex', alignItems: 'center', gap: 12, padding: '9px 18px', background: accentSoft, borderBottom: `1px solid ${accent}33` }}>
+                  <div data-testid="time-travel-banner" style={{ flex: 'none', display: 'flex', alignItems: 'center', gap: 12, padding: '9px 18px', background: accentSoft, borderBottom: `1px solid ${accent}33` }}>
                     <Icon.ClockIcon stroke={accent} style={{ flex: 'none' }} />
                     <div style={{ flex: 1, minWidth: 0, fontSize: 12.5, color: 'var(--text2)' }}>
-                      Viewing this vault as it was on <b style={{ fontWeight: 600, color: 'var(--text)' }}>{new Date(playT).toLocaleString()}</b> · read-only
+                      This vault as it was on <b style={{ fontWeight: 600, color: 'var(--text)' }}>{new Date(playT).toLocaleString()}</b> · start typing to branch from here
                     </div>
-                    <button onClick={() => void onRestoreHere()} style={{ fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: 'var(--bg)', background: accent, border: 'none', borderRadius: 7, padding: '6px 12px', cursor: 'pointer', flex: 'none' }}>Restore this version</button>
-                    <button onClick={onNow} style={{ fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: 'var(--text2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 7, padding: '6px 12px', cursor: 'pointer', flex: 'none' }}>Return to now</button>
+                    <button onClick={() => void onRestoreHere()} title="Bring this version forward onto the current branch" style={{ fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: 'var(--text2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 7, padding: '6px 12px', cursor: 'pointer', flex: 'none' }}>Restore onto {lanes0Name(graph, currentBranch)}</button>
+                    <button onClick={onNow} style={{ fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: 'var(--bg)', background: accent, border: 'none', borderRadius: 7, padding: '6px 12px', cursor: 'pointer', flex: 'none' }}>Return to now</button>
+                  </div>
+                )}
+                {branchBanner && !timeTravel && (
+                  <div data-testid="branch-created-banner" style={{ flex: 'none', display: 'flex', alignItems: 'center', gap: 12, padding: '9px 18px', background: accentSoft, borderBottom: `1px solid ${accent}33` }}>
+                    <Icon.ClockIcon stroke={accent} style={{ flex: 'none' }} />
+                    <div style={{ flex: 1, minWidth: 0, fontSize: 12.5, color: 'var(--text2)' }}>
+                      You're now on a new branch <b style={{ fontWeight: 600, color: 'var(--text)' }}>{branchBanner.name}</b> — forked from {new Date(branchBanner.from).toLocaleString()}. Edits here won't touch the original.
+                    </div>
+                    <button onClick={() => setBranchBanner(null)} style={{ fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: 'var(--text2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 7, padding: '6px 12px', cursor: 'pointer', flex: 'none' }}>Got it</button>
                   </div>
                 )}
 
@@ -1769,6 +1930,11 @@ export default function App() {
           logOpen={logOpen}
           barHeight={histOpen || logOpen ? histBarH : 38}
           animate={!resizingBar}
+          graph={graph}
+          currentBranch={currentBranch}
+          onCheckoutBranch={(b) => void onCheckoutBranch(b)}
+          onCreateTag={(name, tsMs) => void onCreateTag(name, tsMs)}
+          onDeleteTag={(t) => void onDeleteTag(t)}
           onTabHistory={onTabHistory}
           onTabLog={onTabLog}
           onNow={onNow}

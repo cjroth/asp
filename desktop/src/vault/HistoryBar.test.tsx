@@ -12,10 +12,10 @@ afterEach(() => { cleanup(); vi.useRealTimers(); });
 
 const NOW = 1_700_000_000_000;
 const rawEvents: HistEvent[] = [
-  { id: 'r1', ts: 1_699_999_000, lamport: 1, kind: 'create', path: 'README.md' },
-  { id: 'r2', ts: 1_699_999_500, lamport: 2, kind: 'edit', path: 'README.md' },
-  { id: 'r3', ts: 1_699_999_800, lamport: 3, kind: 'rename', path: 'a.md' },
-  { id: 'r4', ts: 1_699_999_900, lamport: 4, kind: 'delete', path: 'b.md' },
+  { id: 'r1', ts: 1_699_999_000, lamport: 1, kind: 'create', path: 'README.md', branch_id: 'main' },
+  { id: 'r2', ts: 1_699_999_500, lamport: 2, kind: 'edit', path: 'README.md', branch_id: 'main' },
+  { id: 'r3', ts: 1_699_999_800, lamport: 3, kind: 'rename', path: 'a.md', branch_id: 'main' },
+  { id: 'r4', ts: 1_699_999_900, lamport: 4, kind: 'delete', path: 'b.md', branch_id: 'main' },
 ];
 const status: VaultStatus = { id: 'v1', vault_id: 'vid', rows: 4, files: 2, head: 'h', listening_ticket: 'asp1abc', peers: ['ssh-ed25519 PEER x'], last_ts: 1 };
 
@@ -39,6 +39,11 @@ const props = (over: Partial<HistoryBarProps> = {}): HistoryBarProps => ({
   logOpen: false,
   barHeight: 150,
   animate: true,
+  graph: { nodes: [], branches: [{ id: 'main', name: 'main', parent: null, head_commit: null, lane: 0, current: true }], tags: [] },
+  currentBranch: 'main',
+  onCheckoutBranch: vi.fn(),
+  onCreateTag: vi.fn(),
+  onDeleteTag: vi.fn(),
   onTabHistory: vi.fn(),
   onTabLog: vi.fn(),
   onNow: vi.fn(),

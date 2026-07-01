@@ -121,6 +121,9 @@ impl SqliteStore {
         // instead of a full `log` scan. `kind` predates branching, so this is safe
         // on pre-branching DBs too. Idempotent.
         self.conn.execute_batch("CREATE INDEX IF NOT EXISTS log_kind_branch ON log(kind) WHERE kind='branch'")?;
+        // Same discipline for tag records: a partial index so `tag_rows()` is a tiny
+        // probe rather than a full `log` scan. Idempotent, safe on pre-tag DBs.
+        self.conn.execute_batch("CREATE INDEX IF NOT EXISTS log_kind_tag ON log(kind) WHERE kind='tag'")?;
         Ok(())
     }
 
@@ -187,6 +190,14 @@ impl SqliteStore {
     /// are few relative to content rows.
     pub fn branch_rows(&self) -> AspResult<Vec<LogRow>> {
         let mut stmt = self.conn.prepare("SELECT * FROM log WHERE kind='branch'")?;
+        let rows = stmt.query_map([], Self::row_from)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Every `Kind::Tag` record row — the synced tag metadata, which `reconcile_tags`
+    /// folds (LWW) into the tag set. Cheap: uses the `log_kind_tag` partial index.
+    pub fn tag_rows(&self) -> AspResult<Vec<LogRow>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM log WHERE kind='tag'")?;
         let rows = stmt.query_map([], Self::row_from)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }

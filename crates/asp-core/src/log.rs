@@ -33,6 +33,11 @@ pub enum Kind {
     /// same anti-entropy path as content rows. The branch metadata is carried in the
     /// row's `path`/`base_hash`/`result_hash` fields (see `sqlite::Branch`).
     Branch,
+    /// A synced **tag record**: a user-named marker at a point in history (a moment
+    /// worth returning to among thousands of edits). Like `Kind::Branch` it is
+    /// metadata — the JSON-encoded `Tag` rides in `result_hash`'s blob, keyed by
+    /// `file_id = tag_id`, and converges last-writer-wins. Never touches the fold.
+    Tag,
 }
 
 impl Kind {
@@ -45,6 +50,7 @@ impl Kind {
             Kind::Reclass => "reclass",
             Kind::Merge => "merge",
             Kind::Branch => "branch",
+            Kind::Tag => "tag",
         }
     }
     pub fn parse(s: &str) -> Option<Kind> {
@@ -56,6 +62,7 @@ impl Kind {
             "reclass" => Kind::Reclass,
             "merge" => Kind::Merge,
             "branch" => Kind::Branch,
+            "tag" => Kind::Tag,
             _ => return None,
         })
     }
