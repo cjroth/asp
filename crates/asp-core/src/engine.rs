@@ -1074,10 +1074,6 @@ impl Engine {
     }
 
     /// Walk the in-scope working tree into a `rel_path -> bytes` map.
-    pub(crate) fn scan_disk(&self) -> AspResult<BTreeMap<String, DiskEntry>> {
-        self.scan_disk_progress(&|_, _, _| {})
-    }
-
     pub(crate) fn scan_disk_progress(&self, on: &ProgressFn) -> AspResult<BTreeMap<String, DiskEntry>> {
         // Walk + stat every file (cheap), then read the body ONLY of files whose
         // (mtime, size) changed since we last hashed them. On a big working tree
