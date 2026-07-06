@@ -407,6 +407,158 @@ export function laneCountOf(lanes: Lane[]): number {
   return mx + 1;
 }
 
+// ---- wave C: collapsible prefix groups (accordion) -------------------------
+// Repos cloned with --all-branches carry branch-name farms:
+// `dependabot/npm_and_yarn/…`, `cursor/…`, `claude/…`. We group branches by their
+// FIRST path segment (text before the first `/`). A group with enough members can
+// COLLAPSE to a single display lane — its members' union activity window becomes
+// ONE span that packs (wave A) and magnifies (wave B) exactly like any branch —
+// then EXPAND back into individual spans on demand. `main` and the checked-out
+// branch are NEVER grouped: they keep their pinned lanes (0 / 1). Pure +
+// deterministic (sorts by prefix) so the render layer stays DOM-only.
+
+/** Default: a prefix needs at least this many members to become a group. */
+export const DEFAULT_MIN_GROUP_SIZE = 3;
+/** Default accordion policy: if the ungrouped packed-lane count exceeds this, the
+ *  groups start COLLAPSED (a branch-name farm is drowning the pane); at/below it
+ *  the whole graph is small enough that grouping would only add noise, so groups
+ *  default to all-expanded and the pane renders byte-identical to wave B. */
+export const GROUP_LANE_THRESHOLD = 12;
+
+/** The synthetic span/lane id a collapsed group packs under. Distinct from any real
+ *  branch id (which are content hashes) by the `group:` sentinel. */
+export function groupSpanId(prefix: string): string {
+  return `group:${prefix}`;
+}
+
+/** A prefix group: its members and the union activity window they collapse to. */
+export interface BranchGroup {
+  prefix: string;
+  branchIds: string[]; // members, sorted (deterministic)
+  span: LaneSpan; // union of member spans, keyed by groupSpanId(prefix)
+}
+
+/** Group branches by their first path segment. Only prefixes with >= minGroupSize
+ *  members (after excluding `main` and the current branch, which are never grouped)
+ *  become groups; branches without a `/`, or in a too-small prefix, stay individual.
+ *  The group's `span` is the union (min start … max end) of its members' activity
+ *  windows. Deterministic: groups sorted by prefix, members sorted by id. */
+export function groupBranches(graph: BranchGraphData | null, opts?: { minGroupSize?: number }): BranchGroup[] {
+  const branches = graph?.branches ?? [];
+  const minSize = opts?.minGroupSize ?? DEFAULT_MIN_GROUP_SIZE;
+  const spanById = new Map(branchSpans(graph).map((s) => [s.branchId, s]));
+  const buckets = new Map<string, string[]>();
+  for (const b of branches) {
+    if (b.id === MAIN_BRANCH_ID || b.current) continue; // pins are never grouped
+    const slash = b.name.indexOf('/');
+    if (slash <= 0) continue; // no prefix (or a leading slash) → singleton
+    const prefix = b.name.slice(0, slash);
+    const bucket = buckets.get(prefix);
+    if (bucket) bucket.push(b.id);
+    else buckets.set(prefix, [b.id]);
+  }
+  const out: BranchGroup[] = [];
+  for (const [prefix, ids] of buckets) {
+    if (ids.length < minSize) continue;
+    const branchIds = [...ids].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    let start = Infinity, end = -Infinity;
+    for (const id of branchIds) {
+      const s = spanById.get(id);
+      if (!s) continue;
+      if (s.start < start) start = s.start;
+      if (s.end > end) end = s.end;
+    }
+    if (!Number.isFinite(start)) { start = 0; end = 0; }
+    out.push({ prefix, branchIds, span: { branchId: groupSpanId(prefix), start, end, pinned: false } });
+  }
+  return out.sort((a, b) => (a.prefix < b.prefix ? -1 : a.prefix > b.prefix ? 1 : 0));
+}
+
+/** A collapsed group's display lane (its union span's packed lane + members). */
+export interface GroupLane {
+  prefix: string;
+  lane: number;
+  branchIds: string[];
+  span: LaneSpan;
+}
+
+/** The full grouped layout: what HistoryBar renders from. Collapsed groups fold
+ *  their members' spans into ONE union span before packing (wave-A re-pack
+ *  composability) so a 12-branch `dependabot/*` farm costs a single lane; expanded
+ *  groups contribute their members as ordinary individual spans (identical to the
+ *  ungrouped layout). Pins (main/current) are untouched either way — re-packing
+ *  with a different span list may legitimately reshuffle everything else. */
+export interface GroupedLayout {
+  /** Individual branch lanes (ungrouped branches + expanded-group members) — drives
+   *  polylines and per-branch labels, exactly like the pre-wave-C `lanes`. */
+  lanes: Lane[];
+  /** One entry per COLLAPSED group (chip + micro-dots + guide). */
+  groupLanes: GroupLane[];
+  /** EVERY branch id → its display lane (a collapsed member resolves to its group's
+   *  lane, so its events land there as micro-dots). Feeds laneForEvent/forkEdges. */
+  laneOfBranch: Map<string, number>;
+  /** Collapsed member branchId → its group prefix (micro-dot styling + expand click). */
+  memberGroup: Map<string, string>;
+  /** Distinct display-lane count (incl. group lanes) — what laneGeometry needs. */
+  laneCount: number;
+}
+
+/** Packed display lanes with the accordion applied. `expanded` holds the prefixes
+ *  currently expanded; every other group collapses to one lane. With no groups (or
+ *  every group expanded) the result is byte-identical to `packedLanes(graph)`. */
+export function packedLanesGrouped(
+  graph: BranchGraphData | null,
+  groups: BranchGroup[],
+  expanded: Set<string>,
+): GroupedLayout {
+  const branches = graph?.branches ?? [];
+  if (branches.length === 0) {
+    return {
+      lanes: [{ branchId: MAIN_BRANCH_ID, name: 'main', lane: 0, current: true, parent: null }],
+      groupLanes: [],
+      laneOfBranch: new Map([[MAIN_BRANCH_ID, 0]]),
+      memberGroup: new Map(),
+      laneCount: 1,
+    };
+  }
+
+  const collapsed = groups.filter((g) => !expanded.has(g.prefix));
+  const memberGroup = new Map<string, string>(); // branchId → prefix
+  const groupIdOf = new Map<string, string>(); // branchId → groupSpanId
+  for (const g of collapsed) {
+    for (const id of g.branchIds) { memberGroup.set(id, g.prefix); groupIdOf.set(id, groupSpanId(g.prefix)); }
+  }
+
+  // Span list to pack: one union span per collapsed group, plus every branch that
+  // isn't folded into a collapsed group.
+  const packSpans: LaneSpan[] = collapsed.map((g) => g.span);
+  for (const s of branchSpans(graph)) {
+    if (memberGroup.has(s.branchId)) continue;
+    packSpans.push(s);
+  }
+  const map = packLanes(packSpans);
+
+  const laneOfBranch = new Map<string, number>();
+  const lanes: Lane[] = [];
+  for (const b of branches) {
+    const gid = groupIdOf.get(b.id);
+    const lane = gid != null ? map.get(gid) ?? 0 : map.get(b.id) ?? 0;
+    laneOfBranch.set(b.id, lane);
+    if (!memberGroup.has(b.id)) {
+      lanes.push({ branchId: b.id, name: b.name, lane, current: b.current, parent: b.parent });
+    }
+  }
+  lanes.sort((a, b) => a.lane - b.lane || (a.branchId < b.branchId ? -1 : a.branchId > b.branchId ? 1 : 0));
+
+  const groupLanes: GroupLane[] = collapsed
+    .map((g) => ({ prefix: g.prefix, lane: map.get(groupSpanId(g.prefix)) ?? 0, branchIds: g.branchIds, span: g.span }))
+    .sort((a, b) => a.lane - b.lane || (a.prefix < b.prefix ? -1 : a.prefix > b.prefix ? 1 : 0));
+
+  let mx = 0;
+  for (const v of map.values()) if (v > mx) mx = v;
+  return { lanes, groupLanes, laneOfBranch, memberGroup, laneCount: mx + 1 };
+}
+
 // ---- label decluttering ----------------------------------------------------
 
 /** A candidate branch-name chip in pixel space. */

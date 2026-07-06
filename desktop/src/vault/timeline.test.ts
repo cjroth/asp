@@ -3,11 +3,14 @@ import type { BranchGraphData, GraphNode } from '../lib/api';
 import type { TrackEvent } from './history';
 import {
   branchSpans,
+  type BranchGroup,
   declutterLabels,
   FISHEYE_PIN_MIN,
   FISHEYE_THRESHOLD,
   fisheyeLaneYs,
   forkEdges,
+  groupBranches,
+  groupSpanId,
   IDEAL_ROW,
   type LaneSpan,
   laneColor,
@@ -18,6 +21,7 @@ import {
   lanesFromGraph,
   packLanes,
   packedLanes,
+  packedLanesGrouped,
 } from './timeline';
 
 const ev = (id: string, ts: number, branchId: string, kind = 'edit'): TrackEvent => ({ id, ts, kind, path: `${id}.md`, branchId });
@@ -287,6 +291,192 @@ describe('branchSpans — activity windows from graph nodes', () => {
     expect(byId.get('main')).toBe(0);
     expect(byId.get('a')).toBe(byId.get('b')); // packed onto the same display lane
     expect(laneCountOf(lanes)).toBe(2); // main + one shared feature lane (was 3)
+  });
+});
+
+describe('groupBranches — prefix accordion (wave C)', () => {
+  const gb = (id: string, name: string, current = false) =>
+    ({ id, name, parent: id === 'main' ? null : 'main', head_commit: `${id}-h`, lane: 0, current });
+  // A graph where each branch has ONE node (a zero-length span at its ts seconds).
+  const farm = (branches: BranchGraphData['branches'], ts: Record<string, number>): BranchGraphData => ({
+    branches,
+    nodes: Object.entries(ts).map(([bid, t]) => node(`${bid}-n`, bid, t)),
+    tags: [],
+  });
+
+  it('groups branches sharing a first path segment when >= minGroupSize (default 3)', () => {
+    const g = farm(
+      [gb('main', 'main', true), gb('da', 'dependabot/npm/a'), gb('db', 'dependabot/npm/b'), gb('dc', 'dependabot/pip/c')],
+      { main: 0, da: 10, db: 20, dc: 30 },
+    );
+    const groups = groupBranches(g);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].prefix).toBe('dependabot');
+    expect(groups[0].branchIds).toEqual(['da', 'db', 'dc']); // members sorted by id
+    // Union span = min start … max end over members (seconds → ms), keyed by group id.
+    expect(groups[0].span).toMatchObject({ branchId: groupSpanId('dependabot'), start: 10_000, end: 30_000, pinned: false });
+  });
+
+  it('honours minGroupSize: a below-threshold prefix stays individual', () => {
+    const g = farm([gb('main', 'main', true), gb('da', 'cursor/a'), gb('db', 'cursor/b')], { main: 0, da: 1, db: 2 });
+    expect(groupBranches(g)).toHaveLength(0); // 2 members < 3
+    expect(groupBranches(g, { minGroupSize: 2 })).toHaveLength(1); // opt-in lowers the bar
+  });
+
+  it('never groups main or the current branch (a pin removed can drop a group below threshold)', () => {
+    const g = farm(
+      [gb('main', 'main', false), gb('da', 'dependabot/a'), gb('db', 'dependabot/b'), gb('dc', 'dependabot/c', true)],
+      { main: 0, da: 10, db: 20, dc: 30 },
+    );
+    // dc is current → excluded → only da,db remain (2 < 3) → no group.
+    expect(groupBranches(g)).toHaveLength(0);
+    // main itself, even with a "main/…"-shaped id, is never a member.
+    const g2 = farm(
+      [gb('main', 'main', true), gb('da', 'dependabot/a'), gb('db', 'dependabot/b'), gb('dc', 'dependabot/c')],
+      { main: 0, da: 10, db: 20, dc: 30 },
+    );
+    expect(groupBranches(g2)[0].branchIds).toEqual(['da', 'db', 'dc']); // main absent
+  });
+
+  it('leaves slash-less branches as ungrouped singletons', () => {
+    const g = farm(
+      [gb('main', 'main', true), gb('a', 'cursor/a'), gb('b', 'cursor/b'), gb('c', 'cursor/c'), gb('r', 'readme')],
+      { main: 0, a: 1, b: 2, c: 3, r: 4 },
+    );
+    const groups = groupBranches(g);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].prefix).toBe('cursor');
+    expect(groups[0].branchIds).not.toContain('r'); // no '/' → singleton
+  });
+
+  it('is deterministic: groups sorted by prefix', () => {
+    const g = farm(
+      [
+        gb('main', 'main', true),
+        gb('c1', 'cursor/1'), gb('c2', 'cursor/2'), gb('c3', 'cursor/3'),
+        gb('d1', 'dependabot/1'), gb('d2', 'dependabot/2'), gb('d3', 'dependabot/3'),
+      ],
+      { main: 0, c1: 1, c2: 2, c3: 3, d1: 4, d2: 5, d3: 6 },
+    );
+    expect(groupBranches(g).map((x) => x.prefix)).toEqual(['cursor', 'dependabot']);
+  });
+});
+
+describe('packedLanesGrouped — accordion re-pack composition (wave C)', () => {
+  const gb = (id: string, name: string, current = false) =>
+    ({ id, name, parent: id === 'main' ? null : 'main', head_commit: `${id}-h`, lane: 0, current });
+  // Every branch active over the SAME window → nothing packs away (worst case).
+  const overlapGraph = (extra: { id: string; name: string }[]): BranchGraphData => {
+    const branches = [gb('main', 'main', true), ...extra.map((e) => gb(e.id, e.name))];
+    const nodes = branches.flatMap((b) => [node(`${b.id}-s`, b.id, 100), node(`${b.id}-e`, b.id, 200)]);
+    return { branches, nodes, tags: [] };
+  };
+  const g3 = () => overlapGraph([
+    { id: 'd1', name: 'dep/1' }, { id: 'd2', name: 'dep/2' }, { id: 'd3', name: 'dep/3' },
+    { id: 's1', name: 'solo1' }, { id: 's2', name: 'solo2' },
+  ]);
+
+  it('collapsed group costs ONE lane; members fold onto it (fewer lanes than ungrouped)', () => {
+    const g = g3();
+    const ungrouped = laneCountOf(packedLanes(g)); // main + 5 overlapping = 6
+    const groups = groupBranches(g);
+    const layout = packedLanesGrouped(g, groups, new Set()); // dep collapsed
+    // main + dep(1) + solo1 + solo2 = 4 lanes < 6.
+    expect(layout.laneCount).toBeLessThan(ungrouped);
+    // All three dep members share one display lane (the group's).
+    const dl = new Set(['d1', 'd2', 'd3'].map((id) => layout.laneOfBranch.get(id)));
+    expect(dl.size).toBe(1);
+    // They're folded out of the individually-rendered `lanes`, and marked as members.
+    expect(layout.lanes.map((l) => l.branchId)).not.toContain('d1');
+    expect(layout.memberGroup.get('d1')).toBe('dep');
+    expect(layout.groupLanes.map((gl) => gl.prefix)).toEqual(['dep']);
+  });
+
+  it('expanding a group restores its members as individual overlapping lanes', () => {
+    const g = g3();
+    const groups = groupBranches(g);
+    const expanded = packedLanesGrouped(g, groups, new Set(['dep']));
+    // dep expanded → its 3 members overlap → 3 distinct lanes again.
+    const dl = new Set(['d1', 'd2', 'd3'].map((id) => expanded.laneOfBranch.get(id)));
+    expect(dl.size).toBe(3);
+    expect(expanded.memberGroup.size).toBe(0); // nothing folded
+    expect(expanded.lanes.map((l) => l.branchId)).toEqual(
+      expect.arrayContaining(['d1', 'd2', 'd3']),
+    );
+  });
+
+  it('all-expanded (or no-group) layout is identical to packedLanes — regression guard', () => {
+    const g = g3();
+    const groups = groupBranches(g);
+    const allExpanded = packedLanesGrouped(g, groups, new Set(groups.map((x) => x.prefix)));
+    const base = packedLanes(g);
+    // Same lane per branch, same count, same individual lane list.
+    for (const l of base) expect(allExpanded.laneOfBranch.get(l.branchId)).toBe(l.lane);
+    expect(allExpanded.laneCount).toBe(laneCountOf(base));
+    expect(allExpanded.groupLanes).toHaveLength(0);
+    expect([...allExpanded.lanes].map((l) => [l.branchId, l.lane]).sort())
+      .toEqual(base.map((l) => [l.branchId, l.lane]).sort());
+  });
+
+  it('main and current keep their pins regardless of grouping', () => {
+    const branches = [
+      gb('main', 'main'),
+      gb('cur', 'feature/x', true),
+      gb('d1', 'dep/1'), gb('d2', 'dep/2'), gb('d3', 'dep/3'),
+    ];
+    const nodes = branches.flatMap((b) => [node(`${b.id}-s`, b.id, 100), node(`${b.id}-e`, b.id, 200)]);
+    const g: BranchGraphData = { branches, nodes, tags: [] };
+    const groups = groupBranches(g);
+    const layout = packedLanesGrouped(g, groups, new Set());
+    expect(layout.laneOfBranch.get('main')).toBe(0);
+    expect(layout.laneOfBranch.get('cur')).toBe(1);
+  });
+
+  it('fuzz (seeded LCG): random farms + random expansion never overlap on a lane; deterministic', () => {
+    let seed = 0x0c0f_fee1;
+    const rnd = () => ((seed = (seed * 1_103_515_245 + 12_345) & 0x7fff_ffff) / 0x7fff_ffff);
+    const ser = (m: Map<string, number>) => [...m.entries()].sort().map((e) => e.join(':')).join(',');
+    for (let iter = 0; iter < 150; iter++) {
+      const n = 2 + Math.floor(rnd() * 22);
+      const branches: BranchGraphData['branches'] = [gb('main', 'main', true)];
+      const nodes: GraphNode[] = [node('main-s', 'main', Math.floor(rnd() * 100)), node('main-e', 'main', 100 + Math.floor(rnd() * 100))];
+      for (let i = 0; i < n; i++) {
+        const id = `b${i}`;
+        // ~60% of branches join one of a few prefix farms; the rest are singletons.
+        const name = rnd() < 0.6 ? `farm${Math.floor(rnd() * 3)}/${i}` : `solo${i}`;
+        branches.push(gb(id, name));
+        const s = Math.floor(rnd() * 900);
+        nodes.push(node(`${id}-s`, id, s), node(`${id}-e`, id, s + Math.floor(rnd() * 150)));
+      }
+      const g: BranchGraphData = { branches, nodes, tags: [] };
+      const groups = groupBranches(g);
+      const expanded = new Set(groups.filter(() => rnd() < 0.5).map((x) => x.prefix));
+      const layout = packedLanesGrouped(g, groups, expanded);
+
+      // Reconstruct the effective span set the layout packed (collapsed union spans +
+      // every non-folded branch) and assert no two share a lane within epsilon.
+      const collapsed: BranchGroup[] = groups.filter((x) => !expanded.has(x.prefix));
+      const folded = new Set(collapsed.flatMap((x) => x.branchIds));
+      const effective: LaneSpan[] = [
+        ...collapsed.map((x) => x.span),
+        ...branchSpans(g).filter((s) => !folded.has(s.branchId)),
+      ];
+      const laneOf = (s: LaneSpan): number =>
+        s.branchId.startsWith('group:')
+          ? layout.laneOfBranch.get(collapsed.find((c) => c.span.branchId === s.branchId)!.branchIds[0])!
+          : layout.laneOfBranch.get(s.branchId)!;
+      const eps = epsOf(effective);
+      const byLane = new Map<number, LaneSpan[]>();
+      for (const s of effective) (byLane.get(laneOf(s)) ?? byLane.set(laneOf(s), []).get(laneOf(s))!).push(s);
+      for (const list of byLane.values()) {
+        list.sort((a, b) => a.start - b.start);
+        for (let i = 1; i < list.length; i++) {
+          expect(list[i - 1].end + eps).toBeLessThanOrEqual(list[i].start);
+        }
+      }
+      // Determinism: identical layout on a second call.
+      expect(ser(packedLanesGrouped(g, groups, expanded).laneOfBranch)).toBe(ser(layout.laneOfBranch));
+    }
   });
 });
 

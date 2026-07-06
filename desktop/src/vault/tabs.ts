@@ -60,6 +60,35 @@ export function saveOpenTabs(vaultId: string, tabs: string[]): void {
   }
 }
 
+// ---------- per-vault expanded-group persistence (wave C accordion) ----------
+// The set of history-graph prefix groups the user has EXPANDED, remembered per
+// vault (same localStorage try/catch idiom as the open-tabs list above). Absence
+// (null) means "no explicit choice yet" → the caller applies the size-based
+// default (collapse a branch-farm, leave a small graph expanded).
+
+const groupsKey = (vaultId: string): string => `asp.groups.${vaultId}`;
+
+/** Persisted expanded prefixes for a vault, or null if the user hasn't chosen. */
+export function loadExpandedGroups(vaultId: string): string[] | null {
+  try {
+    const raw = localStorage.getItem(groupsKey(vaultId));
+    if (raw == null) return null;
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed.filter((p): p is string => typeof p === 'string');
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveExpandedGroups(vaultId: string, prefixes: string[]): void {
+  try {
+    localStorage.setItem(groupsKey(vaultId), JSON.stringify(prefixes));
+  } catch {
+    /* ignore */
+  }
+}
+
 // ---------- tab-list transforms (pure) ----------
 
 // Append `path` if it isn't already open (focus is handled by the caller via the
