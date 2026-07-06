@@ -55,6 +55,16 @@ filenames. Add new edge cases as `Scenario` variants in `apply_scenario`.
   `kill -9 $(pgrep -x asp)` (match the exact `asp` comm — `pgrep -f asp` matches
   the repo path and lies).
 - It forces `ASP_NO_RELAY=1` (hermetic loopback dialing); no network needed.
+- **Rebuild the release binary first** — harnesses shell out to
+  `target/release/asp`, which goes stale silently (it once predated
+  `relay --git-proxy` entirely): `cargo build --release -p asp`.
+- **This VM (OrbStack, 11 GiB) is memory- and load-constrained**: cargo is
+  capped at `jobs=4` (`~/.cargo/config.toml` — leave it), run ONE build/test at
+  a time, and expect relay-path e2e (iroh QUIC) to flake under load with no code
+  change — `concurrent_merge` fails even on a clean HEAD here. Before treating
+  a soak/e2e failure as a regression, baseline the same test in a clean-HEAD
+  worktree (see the `verification-playbook` skill's flaky-environment protocol).
+  Long soaks belong on CI or a beefier box; short seeds are fine here.
 
 ## Layer 2 — UI live-update (where stale-UI bugs live)
 
@@ -120,6 +130,81 @@ change didn't regress"), spend most of the effort growing the surface:
 4. **Loop until a real streak.** Keep adding/attacking until the fuzzer clears
    ~10+ clean rounds in a row across the *expanded* surface — then report what new
    coverage was added, not just "tests pass."
+
+## Layer 3 — git bridge in the loop (git-bridge spec §10 "Soak")
+
+When the change touches the **git bridge** (`crates/asp-core/src/git*.rs`, the
+`asp git`/`asp clone` CLI, or the desktop/web git UI), a converging ASP mesh is
+only half the story: a git remote is bridged into that mesh, so the soak must also
+prove the **ASP fold and the git remote stay byte-consistent** while edits land on
+*both* sides. Model: the git remote is just another peer, so this is the same
+convergence bar with git as one more writer.
+
+### A — engine-level property soak (runnable now)
+
+The heavy lifting already ships as deterministic property/round-trip tests over the
+hermetic `git http-backend` fixture (`tests/e2e/src/gitfix.rs` — real wire bytes, no
+network). Run them under a clean-streak bar:
+
+```bash
+bash desktop/e2e/git-soak.sh          # loops the git-bridge battery ROUNDS times
+ROUNDS=10 bash desktop/e2e/git-soak.sh
+```
+
+What each covers (grep `tests/e2e/tests/git_*.rs`):
+
+- **`git_convergence_prop`** — the core soak: two bridge nodes, random interleaving
+  of local edits + plan authoring + upstream ingests → converged fold **and**
+  byte-identical synthesized commit SHAs. This is the "any node may bridge"
+  guarantee and the git analogue of the Layer-1 fuzzer.
+- **`git_push`** — clone → edit → plan → push → inspect with system `git`; then an
+  upstream commit → pull → push again → linear history (round-trip fidelity:
+  ancestry, modes, symlinks, renames).
+- **`git_ingest_race`** — two bridges ingest the same commit → content identical,
+  single collapsed marker (the §4.3 double-ingest race).
+- **`git_policy`** — `interval` auto-plan + duplicate-plan guard, and the
+  `asp git diff` / `asp git plan` LLM-hook primitives.
+- **`git_clone_pull`** / **`git_genesis`** — two independent clones of one repo
+  converge to identical rows + `vault_id` (the "paste the same URL on two machines"
+  property).
+
+Expand it the same way as Layer 1: add a fixture in `gitfix.rs` (criss-cross,
+foxtrot, octopus, merge-into-side, renames-across-merge, mid-history-root are there;
+add hostile real-world shapes) and a new op to the `git_convergence_prop` interleave
+(e.g. a `rebaseline` after a `force_rewrite_tip`, a rename racing an upstream edit).
+
+### B — live CLI-mesh follow (scenario; needs a git host)
+
+The full cross-surface scenario the sync-soak skill exists for — a real `asp watch`
+process bridging a git remote while a second ASP peer follows over iroh:
+
+1. **Remote:** a bare git repo with a few commits (the `git http-backend` shim, or a
+   throwaway private GitHub/Gitea repo for a real run).
+2. **Bridge:** `asp clone <git-url> ./bridge` then `asp watch --listen --dir ./bridge`
+   (pull tick + interval policy tick run inside the loop).
+3. **Follower:** `asp clone <bridge-ticket> ./follow` then `asp watch --peer …` — a
+   pure ASP peer that never speaks git; it must receive git updates purely over ASP
+   sync (bridges write everything into the log).
+4. **Fuzz both writers:** edits/renames/deletes on `./bridge` **and** `./follow`
+   (ASP side) interleaved with commits pushed to the remote by a third clone (git
+   side); periodically `asp git pull` + `asp git push -m …` on the bridge.
+5. **Assert convergence:** `./bridge` disk == `./follow` disk == the git remote's
+   HEAD tree (`git archive` the tip and diff), and `asp git status` shows
+   ahead/behind settling to 0 after a quiescent pull+push cycle. A racing upstream
+   `force_rewrite_tip` must freeze the bridge and clear via `asp git rebaseline`.
+
+**Why this layer isn't run in the hermetic loop yet:** the native git transport is
+**HTTPS/SSH-only** — a loopback plain-HTTP server is refused by design (SSRF
+hardening in `gitwire.rs`/`gitproxy.rs`). The engine-level tests in Layer A reach
+the fixture through the crate-internal `clone_from_git(spec, …)` API (which accepts
+the fixture's `http://127.0.0.1` base); the *CLI* path can't, so Layer B needs a
+reachable `https://` git host (a scratch private repo) or the crate-internal test
+transport. Wire it as a Rust example beside `desktop/engine/examples/sync_fuzz.rs`
+(reuse `gitfix::{GitHttpServer, advance_tip, force_rewrite_tip}` +
+`gitremote::{clone_from_git, pull_once}` + `gitpush::push`) rather than shell, so it
+can use that internal transport hermetically. The web follower variant (a web vault
+also connected to the native bridge, getting git updates with zero browser git
+traffic) rides on the existing Layer-2 UI harness.
 
 ## Where the bugs actually are
 
