@@ -41,8 +41,8 @@ pub fn add_local_folder(state: State<AppState>, path: String) -> R<VaultInfo> {
 }
 
 #[tauri::command(async)]
-pub fn clone_remote(state: State<AppState>, dest: String, url: String, auth_key: Option<String>) -> R<VaultInfo> {
-    e(state.engine.clone_remote(&PathBuf::from(dest), &url, auth_key.as_deref()))
+pub fn clone_remote(state: State<AppState>, dest: String, ticket: String, auth_key: Option<String>) -> R<VaultInfo> {
+    e(state.engine.clone_remote(&PathBuf::from(dest), &ticket, auth_key.as_deref()))
 }
 
 #[tauri::command(async)]
@@ -66,8 +66,8 @@ pub fn set_enabled(state: State<AppState>, id: String, on: bool) -> R<()> {
 }
 
 #[tauri::command(async)]
-pub fn sync_now(state: State<AppState>, id: String, url: String, auth_key: Option<String>) -> R<()> {
-    e(state.engine.sync(&id, &url, auth_key.as_deref()))
+pub fn sync_now(state: State<AppState>, id: String, ticket: String, auth_key: Option<String>) -> R<()> {
+    e(state.engine.sync(&id, &ticket, auth_key.as_deref()))
 }
 
 #[tauri::command(async)]
