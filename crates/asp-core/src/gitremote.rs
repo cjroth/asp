@@ -17,22 +17,23 @@
 //! native-only (it borrows the on-disk [`Engine`] + [`crate::sqlite::SqliteStore`]);
 //! the browser drives the same pure modules over a `fetch()` transport in `asp-wasm`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
 
+use crate::branch::{reconcile_branches, Branch};
 use crate::engine::Engine;
 use crate::error::{AspError, AspResult};
 use crate::gitbridge::{
     fetch_pack, ls_remote, remote_id, GitAuth, GitObjectKind, GitRemoteSpec, RemoteStore,
 };
 use crate::gitgenesis::{
-    git_file_id, git_site_id, synthesize_genesis, synthesize_ingest, DbBlobSource, ImportedFile,
-    IngestContext,
+    git_file_id, git_site_id, synthesize_genesis, synthesize_ingest_with_open_branches,
+    DbBlobSource, ImportedBranchSeed, ImportedFile, IngestContext,
 };
 use crate::gitimport::{
     no_base_lookup, plan_import, GitImportError, GitObjKind, GitObjectDb, ImportOptions,
-    ImportWarning, MAIN_LANE,
+    ImportWarning, LaneId, MAIN_LANE,
 };
 use crate::gitrecord::{build_commit_marker_row, build_ingest_row, GitCommitMarker, GitIngestRecord, GitRowIdentity};
 use crate::gitwire::{parse_git_url, GitUrl};
@@ -68,6 +69,10 @@ pub struct CloneOptions<'a> {
     /// Clone into a fresh random `vault_id` instead of the repo-derived one, for two
     /// intentionally-separate vaults (git-bridge §3.2 escape hatch).
     pub new_identity: bool,
+    /// Also import every open (unmerged) `refs/heads/*` branch as a **live** ASP
+    /// branch (`specs/git-open-branches.md` §1). `false` = default-branch history
+    /// only (byte-identical to the base spec).
+    pub all_branches: bool,
     /// Phase progress sink.
     pub on_progress: Option<ProgressFn<'a>>,
 }
@@ -85,6 +90,12 @@ pub struct GitCloneReport {
     pub warnings: Vec<String>,
     /// The imported tip sha.
     pub tip_sha: String,
+    /// Number of **live** open branches imported (`--all-branches`,
+    /// `specs/git-open-branches.md` §1). `0` for a plain clone.
+    pub open_branches: usize,
+    /// Number of open-branch refs skipped because their tip is already reachable from
+    /// HEAD (old release pointers / just-merged branches, §1). `0` for a plain clone.
+    pub refs_skipped: usize,
 }
 
 /// The outcome of a [`pull_once`].
@@ -228,9 +239,27 @@ pub async fn clone_from_git(
     let url = git_url_string(&spec.url);
     let rid = remote_id(&url);
 
+    // Open-branch candidates (`--all-branches`, git-open-branches §1/§6): every
+    // `refs/heads/*` except the default branch, fetched in the SAME pack (single
+    // negotiation). The planner decides which are unique vs skipped-reachable.
+    let mut wants: Vec<String> = vec![tip.clone()];
+    let mut open_candidates: Vec<(String, String)> = Vec::new();
+    if opts.all_branches {
+        for r in &refs.refs {
+            let Some(short) = r.name.strip_prefix("refs/heads/") else { continue };
+            if short == default_branch {
+                continue;
+            }
+            open_candidates.push((short.to_string(), r.oid.clone()));
+            if !wants.contains(&r.oid) {
+                wants.push(r.oid.clone());
+            }
+        }
+    }
+
     // 2/3. Fetch the pack (§3.4 size guard is best-effort: warn on a large pack).
     progress("fetching", 0, 0);
-    let outcome = fetch_pack(spec, std::slice::from_ref(&tip), &[], opts.depth, |_| {}).await?;
+    let outcome = fetch_pack(spec, &wants, &[], opts.depth, |_| {}).await?;
     if outcome.pack.len() as u64 > SIZE_WARN_BYTES {
         tracing::warn!(
             bytes = outcome.pack.len(),
@@ -244,7 +273,21 @@ pub async fn clone_from_git(
     // 4. Decode + plan.
     progress("replaying", 0, 0);
     let db = GitObjectDb::from_pack(&outcome.pack, no_base_lookup).map_err(imp)?;
-    let iopts = ImportOptions { depth: opts.depth, keep_imported_branches: false };
+    // Every candidate tip must be present in the fetched pack; a missing one (server
+    // pruned the ref between ls-remote and fetch) is a clear error, not a silent drop.
+    for (name, oid) in &open_candidates {
+        if db.get(oid).is_none() {
+            return Err(AspError::NotFound(format!(
+                "open branch '{name}' tip {oid} was not in the fetched pack (remote pruned it?)"
+            )));
+        }
+    }
+    // wave-2 plumbs open_branch_tips (the `--all-branches` clone path); default empty.
+    let iopts = ImportOptions {
+        depth: opts.depth,
+        keep_imported_branches: false,
+        open_branch_tips: open_candidates,
+    };
     let plan = plan_import(&db, &tip, &iopts).map_err(imp)?;
 
     // 5. Deterministic genesis → paged integrate under batch.
@@ -290,12 +333,16 @@ pub async fn clone_from_git(
         .filter(|l| l.id != MAIN_LANE)
         .map(|l| l.name.clone())
         .collect();
+    let open_branches = plan.lanes.iter().filter(|l| l.live).count();
+    let refs_skipped = plan.skipped_reachable.len();
     Ok(GitCloneReport {
         vault_id,
         commits: plan.commits.len(),
         branches,
         warnings: warning_strings(&plan.warnings),
         tip_sha: tip,
+        open_branches,
+        refs_skipped,
     })
 }
 
@@ -368,7 +415,17 @@ pub async fn pull_once(
     let plan = plan_import(&db, &new_tip, &ImportOptions::default()).map_err(imp)?;
 
     let site = git_site_id(&root_sha);
-    let ImportedMain { main_state, main_last_row, seen } = reconstruct_main_state(engine, &site)?;
+    let ImportedMain { main_state, main_last_row, mut seen } = reconstruct_main_state(engine, &site)?;
+
+    // Imported open branches (git-open-branches §4): every commit already in the vault
+    // as a `GitCommit` marker is in the assigned set (never re-imported), and a delta
+    // side lane that resolves to a live imported open branch is folded onto THAT branch
+    // (merge onto it + delete-after-merge) rather than a fresh duplicate.
+    let imported = reconstruct_imported_branches(engine, &site)?;
+    for sha in imported.markers.keys() {
+        seen.insert(sha.clone());
+    }
+    let imported_lanes = map_delta_lanes(&plan, &imported);
 
     // New commits + the side branches they introduce (for the report).
     let new_shas: HashSet<&str> = plan
@@ -380,7 +437,11 @@ pub async fn pull_once(
     let branches_added: Vec<String> = plan
         .lanes
         .iter()
-        .filter(|l| l.id != MAIN_LANE && new_shas.contains(l.created_at_commit.as_str()))
+        .filter(|l| {
+            l.id != MAIN_LANE
+                && !imported_lanes.contains_key(&l.id)
+                && new_shas.contains(l.created_at_commit.as_str())
+        })
         .map(|l| l.name.clone())
         .collect();
 
@@ -394,7 +455,13 @@ pub async fn pull_once(
         seen,
     };
     let scratch = MemBlobStore::new();
-    let out = synthesize_ingest(&plan, &ctx, &DbBlobSource::new(&db), &scratch)?;
+    let out = synthesize_ingest_with_open_branches(
+        &plan,
+        &ctx,
+        &imported_lanes,
+        &DbBlobSource::new(&db),
+        &scratch,
+    )?;
 
     if out.rows.is_empty() {
         // Everything the fetch revealed was already ingested (another bridge won).
@@ -865,6 +932,138 @@ fn reconstruct_main_state(engine: &Engine, site: &str) -> AspResult<ImportedMain
         })
         .collect();
     Ok(ImportedMain { main_state, main_last_row, seen })
+}
+
+/// Imported open branches reconstructed from the repo site's rows (git-open-branches
+/// §4): the sha→branch map of every imported commit + a replay seed per live open
+/// branch. Used by [`pull_once`] to fold a merged open branch's delta onto the
+/// EXISTING branch instead of a duplicate.
+struct ImportedBranches {
+    /// Imported commit sha → the `branch_id` its `GitCommit` marker rode.
+    markers: HashMap<String, String>,
+    /// Live (non-deleted, non-`main`) open branch id → its replay seed.
+    branches: HashMap<String, ImportedBranchSeed>,
+}
+
+/// A per-branch content-walk accumulator (mirrors [`reconstruct_main_state`]).
+#[derive(Default)]
+struct LaneWalk {
+    path_fid: BTreeMap<String, String>,
+    fid_path: BTreeMap<String, String>,
+    file_tip: BTreeMap<String, (String, Option<String>)>,
+    last_row: Option<String>,
+}
+
+/// Reconstruct the imported open branches (git-open-branches §4). Decodes the branch
+/// records (keeping the live, non-`main` ones) and walks each live branch's imported
+/// rows to recover its file tips + tip row — the seed [`synthesize_ingest_with_open_branches`]
+/// reuses so a merge-after-import lands on the existing branch.
+fn reconstruct_imported_branches(engine: &Engine, site: &str) -> AspResult<ImportedBranches> {
+    let rows = engine.store.rows_after(site, -1)?; // repo-site rows, seq order
+    let live: Vec<Branch> = reconcile_branches(&rows, |h| engine.store.get_blob(h).ok().flatten())
+        .into_iter()
+        .filter(|b| !b.deleted && b.branch_id != MAIN_BRANCH_ID)
+        .collect();
+    let live_ids: HashSet<String> = live.iter().map(|b| b.branch_id.clone()).collect();
+
+    let mut markers: HashMap<String, String> = HashMap::new();
+    let mut walks: HashMap<String, LaneWalk> = HashMap::new();
+    for r in &rows {
+        if r.kind == Kind::GitCommit {
+            if let Some(sha) = &r.path {
+                markers.insert(sha.clone(), r.branch_id.clone());
+            }
+        }
+        if r.kind == Kind::Branch || !live_ids.contains(&r.branch_id) {
+            continue;
+        }
+        let w = walks.entry(r.branch_id.clone()).or_default();
+        w.last_row = Some(r.id.clone());
+        match r.kind {
+            Kind::Create if r.merge_class != MergeClass::Dir => {
+                if let Some(p) = &r.path {
+                    w.path_fid.insert(p.clone(), r.file_id.clone());
+                    w.fid_path.insert(r.file_id.clone(), p.clone());
+                }
+                w.file_tip.insert(r.file_id.clone(), (r.id.clone(), r.result_hash.clone()));
+            }
+            Kind::Edit => {
+                w.file_tip.insert(r.file_id.clone(), (r.id.clone(), r.result_hash.clone()));
+            }
+            Kind::Rename => {
+                if let Some(old) = w.fid_path.get(&r.file_id).cloned() {
+                    w.path_fid.remove(&old);
+                }
+                if let Some(p) = &r.path {
+                    w.path_fid.insert(p.clone(), r.file_id.clone());
+                    w.fid_path.insert(r.file_id.clone(), p.clone());
+                }
+                w.file_tip.insert(r.file_id.clone(), (r.id.clone(), r.result_hash.clone()));
+            }
+            Kind::Delete => {
+                if let Some(old) = w.fid_path.remove(&r.file_id) {
+                    w.path_fid.remove(&old);
+                }
+                w.file_tip.insert(r.file_id.clone(), (r.id.clone(), None));
+            }
+            _ => {}
+        }
+    }
+
+    let mut branches: HashMap<String, ImportedBranchSeed> = HashMap::new();
+    for b in live {
+        let LaneWalk { path_fid, file_tip, last_row, .. } = walks.remove(&b.branch_id).unwrap_or_default();
+        let files: Vec<ImportedFile> = path_fid
+            .into_iter()
+            .filter_map(|(path, fid)| {
+                let (row_id, content_hash) = file_tip.get(&fid)?.clone();
+                Some(ImportedFile { path, file_id: fid, row_id, content_hash })
+            })
+            .collect();
+        branches.insert(
+            b.branch_id.clone(),
+            ImportedBranchSeed {
+                branch_id: b.branch_id,
+                name: b.name,
+                parent_branch: b.parent,
+                fork_vv: b.fork_vv,
+                created_lamport: b.created_lamport,
+                created_ts: b.created_ts,
+                tip_row: last_row,
+                files,
+            },
+        );
+    }
+    Ok(ImportedBranches { markers, branches })
+}
+
+/// Map each delta-plan side lane to the existing imported open branch it resolves to
+/// (git-open-branches §4). A lane maps to branch `B` iff its already-imported commits
+/// all belong to `B` (a live open branch now merging upstream). A genuinely-new merged
+/// PR (no imported commits on its lane) maps to nothing → base-spec fresh-branch path.
+fn map_delta_lanes(
+    plan: &crate::gitimport::ImportPlan,
+    imported: &ImportedBranches,
+) -> HashMap<LaneId, ImportedBranchSeed> {
+    let mut out = HashMap::new();
+    for lane in &plan.lanes {
+        if lane.id == MAIN_LANE {
+            continue;
+        }
+        let mut bids: HashSet<&str> = HashSet::new();
+        for c in plan.commits.iter().filter(|c| c.lane == lane.id) {
+            if let Some(b) = imported.markers.get(&c.sha) {
+                bids.insert(b.as_str());
+            }
+        }
+        if bids.len() == 1 {
+            let b = *bids.iter().next().unwrap();
+            if let Some(seed) = imported.branches.get(b) {
+                out.insert(lane.id, seed.clone());
+            }
+        }
+    }
+    out
 }
 
 /// Best-effort "ahead" count: content rows on `main` not authored by the repo site

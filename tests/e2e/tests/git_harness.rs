@@ -12,9 +12,9 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use asp_e2e::gitfix::{
-    criss_cross, force_rewrite_tip, foxtrot, gitignore_nested, linear_basic, merge_into_side,
-    merged_prs, mid_history_root, modes_and_symlinks, octopus, pointers, renames_across_merge,
-    FixtureFn, GitHttpServer,
+    criss_cross, force_rewrite_tip, foxtrot, gitignore_nested, linear_basic, merge_branch_upstream,
+    merge_into_side, merged_prs, mid_history_root, modes_and_symlinks, octopus, open_branches,
+    pointers, renames_across_merge, FixtureFn, GitHttpServer,
 };
 
 // ── Expected `git log --graph --pretty=format:%s HEAD` topologies ──────────
@@ -321,6 +321,79 @@ fn push_through_server() {
 
     // The bare repo's main now points at the pushed commit.
     assert_eq!(stdout(&client_git(&home, &repo.bare, &["rev-parse", "main"])), new_head);
+}
+
+#[test]
+fn open_branches_fixture_has_expected_refs() {
+    if !git_available() {
+        return;
+    }
+    let repo = open_branches();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Every open branch ref survives into the bare mirror.
+    let refs = stdout(&client_git(&home, &repo.bare, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]));
+    let have: Vec<&str> = refs.lines().collect();
+    for want in ["main", "feat/simple", "feature-1", "nested/deep", "orphan", "stale-pointer", "with-merge"] {
+        assert!(have.contains(&want), "missing ref {want}; have {have:?}");
+    }
+    // Merged PR branches were deleted (only the reopened feature-1 remains).
+    assert!(!have.contains(&"feature-2"), "merged feature-2 must be deleted");
+
+    let main = stdout(&client_git(&home, &repo.bare, &["rev-parse", "main"]));
+
+    // stale-pointer is an ancestor of main → the importer skips it.
+    let anc = client_git(&home, &repo.bare, &["merge-base", "--is-ancestor", "stale-pointer", &main]);
+    assert!(anc.status.success(), "stale-pointer must be an ancestor of main");
+
+    // The genuinely-open branches are NOT ancestors of main (they carry unique work).
+    for br in ["feat/simple", "feature-1", "nested/deep", "orphan", "with-merge"] {
+        let is_anc = client_git(&home, &repo.bare, &["merge-base", "--is-ancestor", br, &main]);
+        assert!(!is_anc.status.success(), "{br} must NOT be an ancestor of main (it is open)");
+    }
+
+    // orphan shares no history with main (unrelated root).
+    let mb = client_git(&home, &repo.bare, &["merge-base", "orphan", &main]);
+    assert!(!mb.status.success() || stdout(&mb).is_empty(), "orphan must share no merge-base with main");
+
+    // nested/deep's first-parent walk reaches a commit on feature-1's *side* history:
+    // its oldest unique commit's parent is F1a, which is reachable from main only via
+    // the PR#1 merge (i.e. it lived on the side lane, not first-parent main).
+    let deep_root_parent = stdout(&client_git(
+        &home, &repo.bare,
+        &["rev-list", "--first-parent", "nested/deep", "--not", "main", "--reverse"],
+    ));
+    // The oldest unique commit on nested/deep exists; its content is the deep.txt work.
+    assert!(!deep_root_parent.is_empty(), "nested/deep must carry unique commits");
+}
+
+#[test]
+fn merge_branch_upstream_lands_a_branch() {
+    if !git_available() {
+        return;
+    }
+    let repo = open_branches();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let old_main = stdout(&client_git(&home, &repo.bare, &["rev-parse", "main"]));
+    let new_main = merge_branch_upstream(&repo.bare, "feat/simple", true);
+    assert_ne!(old_main, new_main, "main must advance");
+
+    // The bare's main now points at the merge commit.
+    assert_eq!(stdout(&client_git(&home, &repo.bare, &["rev-parse", "main"])), new_main);
+    // feat/simple is now merged (an ancestor of main).
+    let anc = client_git(&home, &repo.bare, &["merge-base", "--is-ancestor", "feat/simple", &new_main]);
+    assert!(anc.status.success(), "feat/simple must be merged into main");
+    // The merge node has two parents (a real --no-ff merge).
+    let parents = stdout(&client_git(&home, &repo.bare, &["rev-list", "--parents", "-n", "1", &new_main]));
+    assert_eq!(parents.split_whitespace().count(), 3, "merge commit must have 2 parents");
+    // The post-clone extra commit rode in with the merge delta.
+    let names = stdout(&client_git(&home, &repo.bare, &["ls-tree", "-r", "--name-only", &new_main]));
+    assert!(names.lines().any(|l| l == "feat_simple-extra.txt"), "extra upstream commit merged in: {names}");
 }
 
 #[test]

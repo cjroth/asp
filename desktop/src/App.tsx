@@ -227,6 +227,9 @@ export default function App() {
   // for an https git URL; `depth` (blank = full history) drives a shallow import.
   const [token, setToken] = useState('');
   const [depth, setDepth] = useState('');
+  // "Also import open branches" (git-open-branches §5): a first-clone-only snapshot of
+  // every unmerged remote branch as a live ASP branch. Default OFF.
+  const [allBranches, setAllBranches] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [cloneProg, setCloneProg] = useState<{ done: number; total: number; phase: ClonePhase } | null>(null);
@@ -1462,7 +1465,7 @@ export default function App() {
           // Blank depth = full history; otherwise a positive shallow import.
           const n = parseInt(depth.trim(), 10);
           const d = depth.trim() && n > 0 ? n : undefined;
-          info = await api.cloneGit(connectDest || '', t, token.trim() || undefined, d, onProg);
+          info = await api.cloneGit(connectDest || '', t, token.trim() || undefined, d, allBranches, onProg);
         } else {
           info = await api.cloneRemote(connectDest || '', t, authKey || undefined, onProg);
         }
@@ -1470,6 +1473,7 @@ export default function App() {
         setAuthKey('');
         setToken('');
         setDepth('');
+        setAllBranches(false);
         setAdvancedOpen(false);
         setConnectDest(null);
         setEntry(null);
@@ -1505,7 +1509,7 @@ export default function App() {
         console.error('create vault failed', err);
       }
     }
-  }, [entry, connecting, ticket, connectDest, authKey, token, depth, newVaultName, desktop, updateMeta, openVault, refreshVaults]);
+  }, [entry, connecting, ticket, connectDest, authKey, token, depth, allBranches, newVaultName, desktop, updateMeta, openVault, refreshVaults]);
 
   const onShareVault = useCallback(async (id: string) => {
     setVaultMenuOpen(false);
@@ -2322,10 +2326,21 @@ export default function App() {
                       <span>Advanced</span>
                     </button>
                     {advancedOpen && (
-                      <label style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-                        <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>Import last N commits <span style={{ textTransform: 'none', letterSpacing: 0, fontWeight: 400, color: 'var(--faint)' }}>— blank = full history</span></span>
-                        <input value={depth} onChange={(e) => setDepth(e.target.value.replace(/[^0-9]/g, ''))} inputMode="numeric" spellCheck={false} placeholder="e.g. 50" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12.5, color: 'var(--text)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '11px 13px', outline: 'none', width: '100%', boxSizing: 'border-box' }} />
-                      </label>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
+                        <label style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                          <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>Import last N commits <span style={{ textTransform: 'none', letterSpacing: 0, fontWeight: 400, color: 'var(--faint)' }}>— blank = full history</span></span>
+                          <input value={depth} onChange={(e) => setDepth(e.target.value.replace(/[^0-9]/g, ''))} inputMode="numeric" spellCheck={false} placeholder="e.g. 50" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12.5, color: 'var(--text)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '11px 13px', outline: 'none', width: '100%', boxSizing: 'border-box' }} />
+                        </label>
+                        <label data-testid="git-all-branches-field" style={{ display: 'flex', gap: 9, alignItems: 'flex-start', cursor: 'pointer' }}>
+                          <input type="checkbox" checked={allBranches} onChange={(e) => setAllBranches(e.target.checked)} style={{ marginTop: 2, flex: 'none', accentColor: accent, cursor: 'pointer' }} />
+                          <span style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                            <span style={{ fontSize: 13, color: 'var(--text)' }}>Also import open branches</span>
+                            <span style={{ fontSize: 11.5, lineHeight: 1.5, color: 'var(--faint)' }}>
+                              Best for the first clone of a repo. Other devices should connect to this vault with an invite code instead of re-cloning from git.
+                            </span>
+                          </span>
+                        </label>
+                      </div>
                     )}
                   </div>
                 )}

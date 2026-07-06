@@ -610,6 +610,138 @@ pub fn foxtrot() -> FixtureRepo {
     r.finish()
 }
 
+/// (l) Open-branch fixture for `specs/git-open-branches.md` §7. Phase-1 material
+/// (two merged PRs) plus a spread of open (unmerged) branches exercising every
+/// phase-2 shape the model must survive. HEAD is left on `main`.
+///
+/// ```text
+/// main:  C0 ── M1 ─────── M2                         (M1 = PR#1, M2 = PR#2)
+///        │    /│         /
+///        │  F1a F1b     F2                           (feature-1 side lane; F2 side)
+///        │   └────── nested/deep: D1 ── D2           (b) forks off F1a — a SIDE lane
+///        │
+///        ├─ feat/simple:  S1 ── S2                   (a) 2 commits off main
+///        ├─ feature-1(open): R1                      (f) name collides → "feature-1-2"
+///        ├─ with-merge:   W1 ── (merge wm-side) ── W2 (c) internal --no-ff merge
+///        │                 \   /
+///        │                  WS1                       (wm-side, tombstoned sub-lane)
+///        ├─ stale-pointer → C0                        (e) ancestor of main → SKIPPED
+///        └─ orphan:  O1                               (d) unrelated root, fork=None
+/// ```
+///
+/// Open-branch ref names (for `--all-branches`): `feat/simple`, `feature-1`,
+/// `nested/deep`, `orphan`, `stale-pointer`, `with-merge`. Skipped at import:
+/// `stale-pointer` (reachable from `main`).
+pub fn open_branches() -> FixtureRepo {
+    let mut r = FixtureRepo::init("open_branches");
+    let c0 = r.commit_file("README.md", "# repo\n", "initial commit");
+
+    // PR #1: feature-1 — two commits; nested/deep will fork off its FIRST commit
+    // (a non-main lane) before it merges.
+    r.checkout_new("feature-1", None);
+    let f1a = r.commit_file("feature1.txt", "one\n", "feature 1 work a");
+    r.commit_file("feature1.txt", "one\ntwo\n", "feature 1 work b");
+    r.checkout("main");
+    r.merge("feature-1", "Merge pull request #1 from owner/feature-1", true);
+    r.delete_branch("feature-1");
+
+    // PR #2: feature-2 — one commit.
+    r.checkout_new("feature-2", None);
+    r.commit_file("feature2.txt", "two\n", "feature 2 work");
+    r.checkout("main");
+    r.merge("feature-2", "Merge pull request #2 from owner/feature-2", true);
+    r.delete_branch("feature-2");
+
+    // (e) stale-pointer → C0 (an ancestor of main). Created without switching; must be
+    // SKIPPED at import (its tip carries nothing not already reachable from HEAD).
+    r.git_ok(&["branch", "stale-pointer", &c0]);
+
+    // (a) feat/simple — two commits off the current main tip.
+    r.checkout_new("feat/simple", Some("main"));
+    r.commit_file("simple.txt", "s1\n", "simple 1");
+    r.commit_file("simple.txt", "s1\ns2\n", "simple 2");
+
+    // (b) nested/deep — forks off feature-1's SIDE lane (commit F1a), two commits.
+    r.checkout_new("nested/deep", Some(&f1a));
+    r.commit_file("deep.txt", "d1\n", "deep 1");
+    r.commit_file("deep.txt", "d1\nd2\n", "deep 2");
+
+    // (c) with-merge — an open branch containing its own internal --no-ff merge.
+    r.checkout_new("with-merge", Some("main"));
+    r.commit_file("wm.txt", "w1\n", "wm base");
+    r.checkout_new("wm-side", Some("with-merge"));
+    r.commit_file("wm-side.txt", "ws1\n", "wm side work");
+    r.checkout("with-merge");
+    r.merge("wm-side", "Merge branch 'wm-side' into with-merge", true);
+    r.delete_branch("wm-side");
+    r.commit_file("wm.txt", "w1\nw2\n", "wm after merge");
+
+    // (f) feature-1 (reopened) — an open branch whose name COLLIDES with the merged
+    // PR branch name; the importer must dedup it to `feature-1-2`.
+    r.checkout_new("feature-1", Some("main"));
+    r.commit_file("refeature.txt", "r1\n", "reopened feature-1 work");
+
+    // (d) orphan — an unrelated second root (no shared history with main).
+    r.orphan("orphan");
+    r.commit_file("orphan.txt", "o1\n", "orphan root");
+
+    r.checkout("main");
+    r.finish()
+}
+
+/// Merge an open branch upstream, as GitHub would when a PR lands (wave-2 pull test,
+/// `specs/git-open-branches.md` §4). Clones `bare`, optionally adds one commit to
+/// `branch` (a post-clone push that must import as part of the merge delta), merges
+/// `branch` into `main` with a real `--no-ff` merge node, and pushes **both** refs
+/// back. Returns the new `main` tip sha.
+pub fn merge_branch_upstream(bare: &Path, branch: &str, extra_commit: bool) -> Sha {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let clone = tmp.path().join("clone");
+    let bare_s = bare.to_string_lossy().to_string();
+    let clone_s = clone.to_string_lossy().to_string();
+
+    // A monotonic clock past `advance_tip`'s window so upstream ts stay ordered.
+    let det = |cwd: &Path, args: &[&str]| -> Output {
+        Command::new("git")
+            .current_dir(cwd)
+            .env("HOME", &home)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", AUTHOR_NAME)
+            .env("GIT_AUTHOR_EMAIL", AUTHOR_EMAIL)
+            .env("GIT_COMMITTER_NAME", COMMITTER_NAME)
+            .env("GIT_COMMITTER_EMAIL", COMMITTER_EMAIL)
+            .env("GIT_AUTHOR_DATE", "1820000000 +0000")
+            .env("GIT_COMMITTER_DATE", "1820000000 +0000")
+            .args(args)
+            .output()
+            .expect("spawn git")
+    };
+    let ok = |cwd: &Path, args: &[&str]| {
+        let out = det(cwd, args);
+        assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    ok(tmp.path(), &["clone", &bare_s, &clone_s]);
+    // Materialize a local branch tracking origin/<branch>.
+    ok(&clone, &["checkout", branch]);
+    if extra_commit {
+        let p = clone.join(format!("{branch}-extra.txt").replace('/', "_"));
+        std::fs::write(&p, "extra upstream commit before merge\n").unwrap();
+        ok(&clone, &["add", "-A"]);
+        ok(&clone, &["commit", "-m", &format!("extra work on {branch}")]);
+    }
+    ok(&clone, &["checkout", "main"]);
+    ok(&clone, &["merge", "--no-edit", "--no-ff", "-m", &format!("Merge branch '{branch}'"), branch]);
+    let new_main = ok(&clone, &["rev-parse", "HEAD"]);
+    // Push the merged main and the (possibly advanced) branch ref together.
+    ok(&clone, &["push", "origin", "main", branch]);
+    new_main
+}
+
 /// A canned-fixture builder function.
 pub type FixtureFn = fn() -> FixtureRepo;
 

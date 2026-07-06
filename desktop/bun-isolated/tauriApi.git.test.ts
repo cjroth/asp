@@ -35,25 +35,27 @@ afterAll(() => {
 });
 
 // Imported after the mock is registered so api.ts binds the mocked `invoke`.
-const { api } = await import('./api');
+const { api } = await import('../src/lib/api');
 
-test('cloneGit → clone_git with exactly {dest,url,token,depth}', async () => {
+test('cloneGit → clone_git with exactly {dest,url,token,depth,allBranches}', async () => {
   calls.length = 0;
-  await api.cloneGit('/dest', 'https://example.com/r.git', 'tok', 3);
+  await api.cloneGit('/dest', 'https://example.com/r.git', 'tok', 3, true);
   expect(calls).toHaveLength(1);
   expect(calls[0].cmd).toBe('clone_git');
-  expect(Object.keys(calls[0].args).sort()).toEqual(['depth', 'dest', 'token', 'url']);
-  expect(calls[0].args).toEqual({ dest: '/dest', url: 'https://example.com/r.git', token: 'tok', depth: 3 });
+  expect(Object.keys(calls[0].args).sort()).toEqual(['allBranches', 'depth', 'dest', 'token', 'url']);
+  expect(calls[0].args).toEqual({ dest: '/dest', url: 'https://example.com/r.git', token: 'tok', depth: 3, allBranches: true });
 });
 
-test('cloneGit passes undefined token/depth through under the same keys', async () => {
+test('cloneGit passes undefined token/depth + false allBranches through under the same keys', async () => {
   calls.length = 0;
-  await api.cloneGit('/dest', 'https://example.com/r.git', undefined, undefined);
+  await api.cloneGit('/dest', 'https://example.com/r.git', undefined, undefined, false);
   expect(calls[0].cmd).toBe('clone_git');
   // Keys must still be present (Rust Option<_> params) — arg names are the contract.
-  expect(Object.keys(calls[0].args).sort()).toEqual(['depth', 'dest', 'token', 'url']);
+  // `allBranches` binds to the snake-case `all_branches` param (f6c1d07 discipline).
+  expect(Object.keys(calls[0].args).sort()).toEqual(['allBranches', 'depth', 'dest', 'token', 'url']);
   expect(calls[0].args.token).toBeUndefined();
   expect(calls[0].args.depth).toBeUndefined();
+  expect(calls[0].args.allBranches).toBe(false);
 });
 
 test('gitPull → git_pull with {id}', async () => {
@@ -85,10 +87,6 @@ test('gitPendingDiff → git_pending_diff with {id}', async () => {
   expect(calls[0].args).toEqual({ id: 'vault-1' });
 });
 
-// Push is a spec non-goal in the browser — the web backend must reject clearly
-// (never silently no-op) so the UI can point the user at desktop/CLI.
-test('webApi.gitPush rejects (browser is clone/pull only)', async () => {
-  const { createWebApi } = await import('./webApi');
-  const webApi = createWebApi();
-  await expect(webApi.gitPush('vault-1', 'msg')).rejects.toThrow(/isn't supported/);
-});
+// NOTE: the "webApi.gitPush rejects" guard lives in src/lib/webApi.git.test.ts —
+// this file shares a bun process with bun-isolated/api.test.ts, whose
+// mock.module('../src/lib/webApi') stub would shadow the real webApi here.

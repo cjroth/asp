@@ -44,14 +44,18 @@ proto-3 peers — any future Kind addition needs another bump + fleet coordinati
 ## Cross-surface contracts
 
 - **Tauri invoke names (bind by Rust param name — f6c1d07):**
-  `clone_git{dest,url,token,depth}` `git_pull{id}` `git_status{id}`
+  `clone_git{dest,url,token,depth,allBranches}` (JS `allBranches` ↔ Rust
+  `all_branches: Option<bool>`, defaults false) `git_pull{id}` `git_status{id}`
   `git_push{id,message}` `git_pending_diff{id}`. Guard test:
   `desktop/src/lib/tauriApi.git.test.ts` — extend it for any new command.
   DTOs to TS are `#[serde(rename_all="camelCase")]` (`GitStatus {remoteUrl, atSha, …}`).
-- **wasm:** `WasmEngine.git_clone(url, token, proxy_base, depth, fetch_fn, on_progress)`;
-  JS owns transport via `fetch_fn: async (method, url, headers, body|null) → {status, body: Uint8Array}`;
-  progress phases `fetching|replaying|saving`. Browser is **clone/pull only** —
-  `webApi.gitPush` throws by design.
+  `Api.cloneGit(dest, url, token, depth, allBranches, onProgress?)`.
+- **wasm:** `WasmEngine.git_clone(url, token, proxy_base, depth, all_branches, fetch_fn, on_progress)`
+  (bool `all_branches` sits before `fetch_fn`; clone-report JSON adds
+  `open_branches` + `refs_skipped`); JS owns transport via `fetch_fn: async (method,
+  url, headers, body|null) → {status, body: Uint8Array}`; progress phases
+  `fetching|replaying|saving`. Browser is **clone/pull only** — `webApi.gitPush`
+  throws by design.
 - **Proxy URL shape:** `<proxy_base>/git/<host>/<upstream path>` +
   `/info/refs?service=git-upload-pack` or `/git-upload-pack`. Web reads
   `VITE_GIT_PROXY_BASE` (or `globalThis.__ASP_GIT_PROXY_BASE__`).
@@ -82,6 +86,20 @@ proto-3 peers — any future Kind addition needs another bump + fleet coordinati
   tests so they never touch the OS store. Tokens never enter synced state.
 - Desktop: clone opens a bare unshared `Engine` first (CLI pattern), then
   `handle()`-wraps; `run_off_thread` for `!Send` engine-across-await futures.
+- **Open-branches `--all-branches` (`specs/git-open-branches.md`):** the **web pull
+  does NOT do the §4 merge-after-import re-attachment** — that's native-only
+  (`gitremote::pull_once` → `synthesize_ingest_with_open_branches` +
+  `reconstruct_imported_branches`). On web, a later upstream merge of an imported open
+  branch imports as a NEW lane, not an attach-onto-existing (benign duplicate-history,
+  base-spec §4.3 class). Left a code comment in `git_pull_inner` (asp-wasm) saying so.
+- **CLI-over-http can't be hermetically tested for open-branches:** `parse_git_url`
+  rejects plain `http://` (the fixture smart-HTTP server is http), so a `git_clone_pull`
+  e2e clone through the CLI is impossible for `--all-branches`. Verify at the **library
+  level** instead: `git_open_branches_model.rs` (plan/genesis/fold ground truth),
+  `git_wasm_path.rs::wasm_clone_all_branches_folds_every_open_branch` (wasm half),
+  `desktop/engine/tests/git_bridge.rs::clone_git_all_branches_imports_open_branches`
+  (desktop engine, via the hermetic `git http-backend` server + `open_branches()`
+  fixture). Those env-mutating engine tests serialize on a `static ENV_LOCK`.
 
 ## Test-suite map (all must stay green)
 
@@ -89,8 +107,9 @@ proto-3 peers — any future Kind addition needs another bump + fleet coordinati
 cargo test -p asp-core            # incl. gitwire/gitrecord/gitgenesis/gitpolicy/gitproxy/gitpush units
 cargo test -p asp-core --test branch_scale        # R3 perf guardrail (N-vs-2N ratios)
 for t in git_harness git_import_model git_transport git_genesis git_clone_pull \
-         git_push git_wasm_path git_policy git_ingest_race git_convergence_prop; do
-  cargo test -p asp-e2e --test $t; done
+         git_push git_wasm_path git_policy git_ingest_race git_convergence_prop \
+         git_open_branches_model git_open_branches; do
+  cargo test -p asp-e2e --test $t; done   # last two: --all-branches (open-branches addendum)
 cargo test -p asp-desktop-engine  # incl. tests/git_bridge.rs hermetic clone/pull/push
 cd desktop && bun run typecheck && bun test src/lib && \
   bun test src/App.git.test.tsx && bun test src/App.gitpush.test.tsx

@@ -3,16 +3,20 @@
 //! git smart-HTTP server (no external network). Reuses the e2e `gitfix` harness,
 //! which CGI-execs `git http-backend` over a canned bare repo.
 //!
-//! This test mutates process-global env (`HOME`, keyring/relay opt-outs) so the
-//! `DesktopEngine` never touches the real `~/.asp` or spawns a relay; it is the
-//! ONLY test in this crate that does so, so there is no cross-test env race.
+//! These tests mutate process-global env (`HOME`, keyring/relay opt-outs) so the
+//! `DesktopEngine` never touches the real `~/.asp` or spawns a relay; they serialize
+//! through [`ENV_LOCK`] so their differing `HOME` values never race.
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::Mutex;
+
+/// Serializes the env-mutating git-bridge tests (each sets its own throwaway `HOME`).
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 use asp_core::Identity;
 use asp_desktop_engine::DesktopEngine;
-use asp_e2e::gitfix::{linear_basic, GitHttpServer};
+use asp_e2e::gitfix::{linear_basic, open_branches, GitHttpServer};
 
 /// Skip gracefully unless a usable system git is present (the fixture builds and the
 /// server both shell out to `git`).
@@ -31,6 +35,7 @@ fn clone_git_then_status_and_pull() {
     if !git_available() {
         return;
     }
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     // Isolate all desktop app state under a throwaway HOME, and keep the clone off
     // the OS keyring / any relay.
@@ -48,7 +53,7 @@ fn clone_git_then_status_and_pull() {
 
     let dest = home.path().join("cloned-vault");
     let info = engine
-        .clone_git(&dest, &url, None, None)
+        .clone_git(&dest, &url, None, None, false)
         .unwrap_or_else(|e| panic!("clone_git failed: {e}"));
 
     // The clone produced a real vault, registered + persisted.
@@ -105,6 +110,49 @@ fn clone_git_then_status_and_pull() {
     let plain = home.path().join("plain-vault");
     let plain_info = engine.add_local_folder(&plain).expect("add local");
     assert!(engine.git_status(&plain_info.id).expect("status").is_none());
+}
+
+/// `--all-branches` clone (`specs/git-open-branches.md` §5): the engine imports every
+/// unmerged `refs/heads/*` of the `open_branches` fixture as a live ASP branch, so its
+/// `list_branches` carries them (minus the skipped `stale-pointer`, minus `main`).
+#[test]
+fn clone_git_all_branches_imports_open_branches() {
+    if !git_available() {
+        return;
+    }
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let home = tempfile::tempdir().expect("home tmp");
+    std::env::set_var("HOME", home.path());
+    std::env::set_var("ASP_GIT_DISABLE_KEYRING", "1");
+    std::env::set_var("ASP_NO_RELAY", "1");
+
+    let repo = open_branches();
+    let server = GitHttpServer::spawn(repo.repo_root());
+    let url = server.repo_url(repo.name());
+
+    let engine = DesktopEngine::new(Identity::generate()).expect("engine");
+    let dest = home.path().join("all-branches-vault");
+    let info = engine
+        .clone_git(&dest, &url, None, None, true)
+        .unwrap_or_else(|e| panic!("clone_git --all-branches failed: {e}"));
+
+    // The live open branches from the fixture (ref-name order), with `feature-1`
+    // deduped to `feature-1-2` (it collides with the merged PR#1 branch name) and
+    // `stale-pointer` skipped (reachable from HEAD). `main` is always present.
+    let mut names: Vec<String> = engine.list_branches(&info.id).expect("list_branches").into_iter().map(|b| b.name).collect();
+    names.sort();
+    for expected in ["feat/simple", "feature-1-2", "main", "nested/deep", "orphan", "with-merge"] {
+        assert!(names.iter().any(|n| n == expected), "expected live branch {expected} in {names:?}");
+    }
+    assert!(!names.iter().any(|n| n == "stale-pointer"), "stale-pointer is reachable → skipped, not a branch: {names:?}");
+
+    // A plain clone of the SAME repo imports only the merged-PR side branches — no live
+    // open branches — proving `all_branches:false` stays base-behavior.
+    let plain_dest = home.path().join("plain-open-branches-vault");
+    let plain = engine.clone_git(&plain_dest, &url, None, None, false).expect("plain clone");
+    let plain_names: Vec<String> = engine.list_branches(&plain.id).expect("list_branches").into_iter().map(|b| b.name).collect();
+    assert!(!plain_names.iter().any(|n| n == "feat/simple" || n == "orphan"), "plain clone must not import open branches: {plain_names:?}");
 }
 
 /// The clone must be recorded in `~/.asp/desktop_folders.json` with `git:true`, so a

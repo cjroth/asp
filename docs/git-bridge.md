@@ -34,6 +34,7 @@ Flags (git sources only):
 | Flag | Effect |
 |---|---|
 | `--depth <n>` | Import only the last `n` first-parent commits of the default branch (plus side ancestry merged within that window), fronted by one snapshot batch. For big/monorepos — see [Large repos](#large-repos). |
+| `--all-branches` | Also import every **open** (unmerged) remote branch as a live ASP branch — see [Importing open branches](#importing-open-branches). |
 | `--new-identity` | Clone into a fresh random `vault_id` instead of the repo-derived one, when you deliberately want a vault that will *not* auto-converge with other clones of the same repo. |
 | `--token <t>` | HTTPS personal access token (also read from `ASP_GIT_TOKEN`). See [Authentication](#authentication). |
 | `--watch` | After cloning, stay running: watch the working tree and run the periodic pull + policy ticks. |
@@ -42,13 +43,42 @@ A clone is all-or-nothing: rows fold only after the whole pack decodes, so a tor
 download leaves no half-vault. A bad URL / missing repo / rejected auth fails before
 any vault directory is created.
 
+### Importing open branches
+
+By default a clone imports **only the default branch's history** — merged PRs become
+ASP branches, but branches still open upstream don't exist in the vault. `--all-branches`
+(desktop/web: the **"Also import open branches"** checkbox in the connect modal's
+Advanced section) additionally imports every `refs/heads/*` whose tip is *not* already
+reachable from the default branch, each as a **live** ASP branch (create record, no
+delete tombstone). Refs whose tip is already reachable (old release pointers, just-merged
+branches) are skipped; the clone report shows how many branches were imported and how
+many refs were skipped.
+
+- **One pack.** All open-branch tips are fetched in the same negotiation as the default
+  branch, so `--all-branches` is one download, not one per branch.
+- **Snapshot, not a subscription.** A checkbox clone captures the open branches *as they
+  are right now*. Only the **default branch** keeps syncing on later pulls; the imported
+  open branches are ordinary ASP branches and are not re-fetched. If an imported open
+  branch later merges upstream, the **native** pull re-attaches it — the upstream merge
+  imports as a merge node onto the existing ASP branch, which is then tombstoned, exactly
+  as if it had merged before the clone. (The **browser** pull does not yet do this
+  re-attachment; a later upstream merge imports as a new lane there — see below.)
+- **First clone only.** Because open branches move constantly, two checkbox clones taken
+  at different times emit different branch sets and may materialize the same git branch as
+  two ASP entities after sync. Use the checkbox for the **first** clone of a repo; bring
+  other devices onto that vault with an **invite code** (ordinary ASP sync), not a second
+  checkbox clone. Only the default-branch history is guaranteed identical across
+  independent clones of the same URL.
+
 ### Desktop
 
 Open the connect modal and paste a git URL into the same box you'd paste an invite
 code into. When the input looks like a git URL the access-key field becomes a
 **Token** field (shown only for `https://`; `ssh://` shows "uses your SSH agent").
 Pick a destination folder and clone; progress runs through `fetching → replaying →
-saving`. The vault card then carries a git status chip.
+saving`. The vault card then carries a git status chip. The Advanced section exposes a
+shallow-import depth and the **"Also import open branches"** checkbox
+([Importing open branches](#importing-open-branches)).
 
 ### Web
 

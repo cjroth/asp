@@ -112,6 +112,10 @@ enum Cmd {
         /// git only: clone into a fresh random vault id (two separate vaults).
         #[arg(long = "new-identity")]
         new_identity: bool,
+        /// git only: also import every open (unmerged) branch as a live ASP branch
+        /// (a snapshot of the open branches; git-open-branches §1/§5).
+        #[arg(long = "all-branches")]
+        all_branches: bool,
         /// git only: HTTPS token (PAT). Also read from `ASP_GIT_TOKEN`.
         #[arg(long, env = "ASP_GIT_TOKEN")]
         token: Option<String>,
@@ -449,8 +453,8 @@ async fn run(cli: Cli) -> Result<()> {
             ep.close().await;
             r
         }
-        Cmd::Clone { peer, into, watch, depth, new_identity, token } => {
-            clone_cmd(&cli, peer, into.clone(), *watch, *depth, *new_identity, token.clone()).await
+        Cmd::Clone { peer, into, watch, depth, new_identity, all_branches, token } => {
+            clone_cmd(&cli, peer, into.clone(), *watch, *depth, *new_identity, *all_branches, token.clone()).await
         }
         Cmd::Watch { listen, relay, relay_listen_addr, peers } => {
             watch_cmd(&cli, *listen, *relay, relay_listen_addr.clone(), peers.clone()).await
@@ -707,6 +711,7 @@ async fn clone_cmd(
     watch: bool,
     depth: Option<u32>,
     new_identity: bool,
+    all_branches: bool,
     token: Option<String>,
 ) -> Result<()> {
     // Auto-detect the source: a git URL clones over the bridge, anything else is an
@@ -714,7 +719,7 @@ async fn clone_cmd(
     if let asp_core::gitbridge::SourceKind::GitUrl(url) =
         asp_core::gitbridge::detect_source(peer)
     {
-        return git_clone_cmd(cli, url, into, watch, depth, new_identity, token).await;
+        return git_clone_cmd(cli, url, into, watch, depth, new_identity, all_branches, token).await;
     }
     let dir = into.or_else(|| cli.dir.clone()).unwrap_or_else(|| PathBuf::from("asp-vault"));
     let id = idstore::load_or_generate(&dir, cli.no_home_key)?;
@@ -753,6 +758,7 @@ async fn git_clone_cmd(
     watch: bool,
     depth: Option<u32>,
     new_identity: bool,
+    all_branches: bool,
     token: Option<String>,
 ) -> Result<()> {
     use asp_core::gitremote::{clone_from_git, resolve_git_auth, CloneOptions};
@@ -777,7 +783,7 @@ async fn git_clone_cmd(
         }
         let _ = done;
     };
-    let opts = CloneOptions { depth, new_identity, on_progress: Some(&on_progress) };
+    let opts = CloneOptions { depth, new_identity, all_branches, on_progress: Some(&on_progress) };
     let report = clone_from_git(&engine, &spec, &opts)
         .await
         .map_err(|e| anyhow!("git clone: {e}"))?;
@@ -791,6 +797,12 @@ async fn git_clone_cmd(
     );
     if !report.branches.is_empty() {
         println!("  branches: {}", report.branches.join(", "));
+    }
+    if all_branches {
+        println!(
+            "  {} open branch(es) imported, {} ref(s) skipped",
+            report.open_branches, report.refs_skipped
+        );
     }
     for w in &report.warnings {
         eprintln!("  warning: {w}");

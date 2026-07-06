@@ -49,8 +49,11 @@ test.skipIf(!HAVE_WASM)('WasmEngine.git_clone folds the repo tree from recorded 
   const eng = new wasm.WasmEngine(new Uint8Array(32).fill(7), ''); // pristine → adopts the git vault id
   const { fn, calls } = mockGitFetch();
 
-  const reportJson = await eng.git_clone('https://github.com/owner/repo', undefined, 'https://relay.test', undefined, fn, undefined);
-  const report = JSON.parse(reportJson) as { vault_id: string; commits: number; default_branch: string; remote_ref: string };
+  // allBranches=false → base clone behavior (the recorded fixture pack is linear/main-
+  // only, so an all_branches=true variant would no-op; asserting the param plumbs is the
+  // point here — the ground-truth open-branch fold lives in the Rust git_wasm_path test).
+  const reportJson = await eng.git_clone('https://github.com/owner/repo', undefined, 'https://relay.test', undefined, false, fn, undefined);
+  const report = JSON.parse(reportJson) as { vault_id: string; commits: number; default_branch: string; remote_ref: string; open_branches: number; refs_skipped: number };
 
   // The transport was hit with correctly-shaped proxy URLs (GET info/refs, POST pack).
   expect(calls[0]).toEqual({ method: 'GET', url: 'https://relay.test/git/github.com/owner/repo/info/refs?service=git-upload-pack' });
@@ -66,11 +69,21 @@ test.skipIf(!HAVE_WASM)('WasmEngine.git_clone folds the repo tree from recorded 
   expect(files['dir/b.txt']).toBeUndefined();
   expect(files['.aspignore']).toBeDefined();
 
-  // Report + ledger are coherent.
+  // Report + ledger are coherent; a base clone imports no open branches.
   expect(report.default_branch).toBe('main');
   expect(report.remote_ref).toBe('refs/heads/main');
+  expect(report.open_branches).toBe(0);
+  expect(report.refs_skipped).toBe(0);
   expect(eng.vault_id()).toBe(report.vault_id);
   const ledger = JSON.parse(eng.git_ledger_json()) as { at_sha: string | null; ingested: number };
   expect(ledger.at_sha).toBe('89d2010db2188ca6e11e8eaf7a844e7eea72f869');
   expect(ledger.ingested).toBe(report.commits);
+});
+
+// Push is a spec non-goal in the browser — the web backend must reject clearly
+// (never silently no-op) so the UI can point the user at desktop/CLI.
+test('webApi.gitPush rejects (browser is clone/pull only)', async () => {
+  const { createWebApi } = await import('./webApi');
+  const webApi = createWebApi();
+  await expect(webApi.gitPush('vault-1', 'msg')).rejects.toThrow(/isn't supported/);
 });

@@ -18,8 +18,10 @@ tests.
 
 **Non-goals (v1):** git submodule recursion, git-LFS smudging, importing *unmerged*
 remote refs (only HEAD's ancestry imports — which, per decision 1, includes merged
-side branches), pushing ASP branches other than `main`, auto-healing after an
-upstream force-push, browser-side push, shallow→deepen workflows, `git://` protocol.
+side branches; **superseded by the clone-time opt-in in
+`specs/git-open-branches.md`**), pushing ASP branches other than `main`,
+auto-healing after an upstream force-push, browser-side push, shallow→deepen
+workflows, `git://` protocol.
 
 **Decisions locked with Chris (2026-07-06, two interview rounds):**
 1. **History:** replay the **full commit DAG** reachable from the default branch's
@@ -613,8 +615,21 @@ map (paths under `crates/asp-core/src` and `tests/e2e/tests` unless noted):
 | **M5 — web** | wasm `fetch()` transport; relay `--git-proxy` with SSRF guards; web clone/pull UI | `gitproxy.rs`, `gitwire.rs`/`gitimport.rs` (wasm), `desktop/src/lib/webApi.ts` (`cloneGit`) | `git_wasm_path.rs`, proxy tests in `gitproxy.rs`; browser e2e `desktop/e2e/git-clone-check.mjs` (written; runs on a capable machine / CI) |
 | **M6 — policies** | `interval` auto-plan; `pending_git_diff()` / `author_plan()` LLM hook (`asp git diff` / `asp git plan`) | `gitpolicy.rs`, `gitpush.rs` | `git_policy.rs`; soak scenario in `.claude/skills/sync-soak-test/SKILL.md` (git-in-the-loop variant) |
 
+**Addendum — import open branches at clone** (`specs/git-open-branches.md`): opt-in
+phase-2 genesis that imports every unmerged `refs/heads/*` as a **live** ASP branch.
+Surfaces: CLI `asp clone --all-branches`; desktop/web Advanced-section checkbox "Also
+import open branches" → `cloneGit(…, allBranches, …)` → Tauri `clone_git{…,allBranches}`
+/ wasm `git_clone(…, all_branches, …)`; clone report gains `open_branches` +
+`refs_skipped`. `ImportOptions.open_branch_tips` drives the planner; `PlannedLane.live`
++ `ImportPlan.skipped_reachable` carry the outcome. Snapshot semantics (only the default
+branch keeps syncing); native pull re-attaches a later-merged imported branch via
+`synthesize_ingest_with_open_branches` (§4) — the web pull does not (documented
+follow-up). Tests: `git_open_branches_model.rs`, `git_open_branches.rs`,
+`git_wasm_path.rs` (all-branches fold), `branch_scale.rs` (live-lane variant), desktop
+`desktop/engine/tests/git_bridge.rs` + `desktop/src/App.git.test.tsx`.
+
 CLI surface (`crates/asp/src/main.rs` + `gitcli.rs`): `asp clone <git-url>
-[--depth] [--new-identity] [--token] [--watch]`; `asp git status|pull|push [-m]
+[--depth] [--all-branches] [--new-identity] [--token] [--watch]`; `asp git status|pull|push [-m]
 [--author]|diff [--json]|plan -m|policy [manual|interval|show]|rebaseline --yes|
 remote add <url> [--push-ref] [--policy] [--token]|remote remove|remote show`;
 `asp watch` (pull + interval-policy ticks); `asp relay --git-proxy [--git-proxy-addr]

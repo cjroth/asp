@@ -195,6 +195,28 @@ pub struct IngestContext {
     pub seen: HashSet<String>,
 }
 
+/// An imported **open branch**'s replay state, threaded into an ongoing ingest so
+/// that when that branch later merges upstream (`specs/git-open-branches.md` §4) the
+/// delta side lane which re-derives its commits reuses the EXISTING ASP branch
+/// instead of forking a duplicate: its already-imported commits are skipped, any
+/// post-clone commits chain onto its tip, its consuming merge points at it, and it
+/// gets a delete tombstone right after that merge. Reconstructed by the driver from
+/// the branch's create record + its imported rows.
+#[derive(Debug, Clone)]
+pub struct ImportedBranchSeed {
+    pub branch_id: String,
+    pub name: String,
+    pub parent_branch: Option<String>,
+    pub fork_vv: VersionVector,
+    pub created_lamport: u64,
+    pub created_ts: i64,
+    /// The last imported row on the branch (its tip commit's marker) — new commits
+    /// and the consuming merge chain onto this.
+    pub tip_row: Option<String>,
+    /// The branch's live file tips (`path`/`file_id`/tip row/content hash).
+    pub files: Vec<ImportedFile>,
+}
+
 /// The result of an ongoing [`synthesize_ingest`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestOutput {
@@ -258,6 +280,24 @@ pub fn synthesize_ingest(
     objects: &dyn GitBlobSource,
     out_store: &dyn BlobStore,
 ) -> AspResult<IngestOutput> {
+    synthesize_ingest_with_open_branches(plan_delta, base, &HashMap::new(), objects, out_store)
+}
+
+/// Like [`synthesize_ingest`], but with imported **open branches** pre-seeded
+/// (`specs/git-open-branches.md` §4). `imported_lanes` maps a delta-plan lane id to
+/// the existing ASP branch it resolves to (a live open branch imported at clone that
+/// is now merging upstream). Each such lane is seeded from the branch's imported
+/// state — so its already-imported commits are skipped, post-clone commits chain onto
+/// its tip, its consuming merge's `merge_parent` is the branch's real tip row, and its
+/// delete-after-merge tombstone reuses the existing branch id/lineage — instead of the
+/// base-spec behavior of forking a fresh duplicate branch. Empty map = base-spec pull.
+pub fn synthesize_ingest_with_open_branches(
+    plan_delta: &ImportPlan,
+    base: &IngestContext,
+    imported_lanes: &HashMap<LaneId, ImportedBranchSeed>,
+    objects: &dyn GitBlobSource,
+    out_store: &dyn BlobStore,
+) -> AspResult<IngestOutput> {
     let mut em = Emitter::new(
         objects,
         out_store,
@@ -277,6 +317,29 @@ pub fn synthesize_ingest(
             .insert(f.file_id.clone(), (f.row_id.clone(), f.content_hash.clone()));
     }
     em.lanes.insert(MAIN_LANE, main);
+    // Seed each merged open branch's lane from its imported state (§4). Marking the
+    // lane `preseeded` suppresses a duplicate branch-create record; the existing
+    // Emitter machinery then chains new commits, the merge, and the delete correctly.
+    for (lane_id, seed) in imported_lanes {
+        let mut ls = LaneState {
+            branch_id: seed.branch_id.clone(),
+            name: seed.name.clone(),
+            parent_branch: seed.parent_branch.clone(),
+            fork_vv: seed.fork_vv.clone(),
+            created_lamport: seed.created_lamport,
+            created_ts: seed.created_ts,
+            path_fid: HashMap::new(),
+            file_tip: HashMap::new(),
+            last_row: seed.tip_row.clone(),
+        };
+        for f in &seed.files {
+            ls.path_fid.insert(f.path.clone(), f.file_id.clone());
+            ls.file_tip
+                .insert(f.file_id.clone(), (f.row_id.clone(), f.content_hash.clone()));
+        }
+        em.lanes.insert(*lane_id, ls);
+        em.preseeded.insert(*lane_id);
+    }
     em.run(plan_delta)?;
 
     let (mode_table, symlinks, gitlinks) = em.finish_tables();
@@ -357,6 +420,9 @@ struct Emitter<'a> {
     cur_marker_seq: u64,
 
     seen: HashSet<String>,
+    /// Lanes pre-seeded from an existing imported open branch (git-open-branches §4):
+    /// their branch-create record is NOT re-emitted (the branch already exists).
+    preseeded: HashSet<LaneId>,
 
     // Tip mode/symlink table (main-lane tip state) + gitlink paths (from warnings).
     tip_modes: BTreeMap<String, EntryMode>,
@@ -401,6 +467,7 @@ impl<'a> Emitter<'a> {
             frontier_seq: HashMap::new(),
             cur_marker_seq: 0,
             seen: HashSet::new(),
+            preseeded: HashSet::new(),
             tip_modes: BTreeMap::new(),
             gitlink_paths,
         }
@@ -433,7 +500,7 @@ impl<'a> Emitter<'a> {
         let mut new_lanes: Vec<PlannedLane> = plan
             .lanes
             .iter()
-            .filter(|l| l.id != MAIN_LANE && l.created_at_commit == c.sha)
+            .filter(|l| l.id != MAIN_LANE && l.created_at_commit == c.sha && !self.preseeded.contains(&l.id))
             .cloned()
             .collect();
         new_lanes.sort_by_key(|l| l.id);
@@ -1063,10 +1130,12 @@ mod tests {
                 created_at_commit: root.to_string(),
                 merged_at_commit: None,
                 deleted_after_merge: false,
+                live: false,
             }],
             root_sha: root.to_string(),
             tip_sha: "bbbb000000000000000000000000000000000000".into(),
             warnings: vec![],
+            skipped_reachable: vec![],
         }
     }
 
@@ -1134,11 +1203,12 @@ mod tests {
             }],
             lanes: vec![PlannedLane {
                 id: MAIN_LANE, name: "main".into(), fork: None, created_at_commit: root.into(),
-                merged_at_commit: None, deleted_after_merge: false,
+                merged_at_commit: None, deleted_after_merge: false, live: false,
             }],
             root_sha: root.into(),
             tip_sha: root.into(),
             warnings: vec![],
+            skipped_reachable: vec![],
         };
         let store = MemBlobStore::new();
         let g = synthesize_genesis(&plan, &objs, &store).unwrap();
@@ -1187,11 +1257,12 @@ mod tests {
             lanes: vec![PlannedLane {
                 id: MAIN_LANE, name: "main".into(), fork: None,
                 created_at_commit: "dddd000000000000000000000000000000000000".into(),
-                merged_at_commit: None, deleted_after_merge: false,
+                merged_at_commit: None, deleted_after_merge: false, live: false,
             }],
             root_sha: root.into(),
             tip_sha: "dddd000000000000000000000000000000000000".into(),
             warnings: vec![],
+            skipped_reachable: vec![],
         };
         let ctx = IngestContext {
             site_id: site.clone(),
@@ -1262,12 +1333,13 @@ mod tests {
                 },
             ],
             lanes: vec![
-                PlannedLane { id: 0, name: "main".into(), fork: None, created_at_commit: c0.into(), merged_at_commit: None, deleted_after_merge: false },
-                PlannedLane { id: 1, name: "feature".into(), fork: Some(ForkPoint { lane: 0, commit_sha: c0.into(), commit_index: 0 }), created_at_commit: sidec.into(), merged_at_commit: Some(mrg.into()), deleted_after_merge: true },
+                PlannedLane { id: 0, name: "main".into(), fork: None, created_at_commit: c0.into(), merged_at_commit: None, deleted_after_merge: false, live: false },
+                PlannedLane { id: 1, name: "feature".into(), fork: Some(ForkPoint { lane: 0, commit_sha: c0.into(), commit_index: 0 }), created_at_commit: sidec.into(), merged_at_commit: Some(mrg.into()), deleted_after_merge: true, live: false },
             ],
             root_sha: c0.into(),
             tip_sha: mrg.into(),
             warnings: vec![],
+            skipped_reachable: vec![],
         };
         let store = MemBlobStore::new();
         let g = synthesize_genesis(&plan, &objs, &store).unwrap();

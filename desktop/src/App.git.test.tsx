@@ -80,8 +80,30 @@ describe('connect modal — git URL detection (git-bridge §7.2)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Connect' }));
 
     await waitFor(() => expect(cloneGit).toHaveBeenCalled());
-    expect(cloneGit).toHaveBeenCalledWith('', GIT_URL, 'ghp_secret', 25, expect.any(Function));
+    // allBranches defaults OFF (false) when the checkbox is untouched.
+    expect(cloneGit).toHaveBeenCalledWith('', GIT_URL, 'ghp_secret', 25, false, expect.any(Function));
     expect(cloneRemote).not.toHaveBeenCalled();
+  });
+
+  it('the "also import open branches" checkbox lives under Advanced for git URLs and passes allBranches=true when checked', async () => {
+    const box = await openConnect();
+    fireEvent.change(box, { target: { value: GIT_URL } });
+    await screen.findByTestId('git-token-field');
+
+    // The checkbox is not shown until Advanced is expanded.
+    expect(screen.queryByTestId('git-all-branches-field')).toBeNull();
+    fireEvent.click(screen.getByText('Advanced'));
+    const field = await screen.findByTestId('git-all-branches-field');
+    expect(screen.getByText('Also import open branches')).toBeTruthy();
+    // Helper copy encodes the first-clone-only guidance (spec §3).
+    expect(field.textContent).toMatch(/first clone of a repo/);
+    expect(field.textContent).toMatch(/invite code/);
+
+    fireEvent.click(field.querySelector('input[type="checkbox"]')!);
+    fireEvent.click(screen.getByRole('button', { name: 'Connect' }));
+
+    await waitFor(() => expect(cloneGit).toHaveBeenCalled());
+    expect(cloneGit).toHaveBeenCalledWith('', GIT_URL, undefined, undefined, true, expect.any(Function));
   });
 
   it('routes an ordinary ASP ticket to api.cloneRemote, not cloneGit', async () => {

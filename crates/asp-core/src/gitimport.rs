@@ -470,12 +470,20 @@ pub struct PlannedLane {
     pub fork: Option<ForkPoint>,
     /// The lane's first (oldest) commit — where its create record is authored.
     pub created_at_commit: String,
-    /// The merge commit that consumes this lane (`None` for `main`). The delete
+    /// The merge commit that consumes this lane (`None` for `main` and for every
+    /// **live** open-branch lane — an unmerged branch is never consumed). The delete
     /// record lands right after this merge's marker.
     pub merged_at_commit: Option<String>,
     /// Emit a branch-delete record right after the merge marker (git-bridge §3.1;
-    /// `false` for `main`, and for every lane when `keep_imported_branches`).
+    /// `false` for `main`, for a live open branch, and for every lane when
+    /// `keep_imported_branches`).
     pub deleted_after_merge: bool,
+    /// This lane is a **live imported open branch** (`specs/git-open-branches.md`
+    /// §1–§2): a create record, no delete tombstone. `false` for `main`, for merged
+    /// side lanes (phase 1), and for the internal sub-lanes of an open branch (which
+    /// ARE tombstoned relative to their branch). The emission layer / clone report
+    /// reads this to count/identify the imported open branches.
+    pub live: bool,
 }
 
 /// A degraded/skipped-content notice surfaced in the clone report (git-bridge §3.3).
@@ -491,7 +499,10 @@ pub enum ImportWarning {
 
 /// Options for [`plan_import`].
 ///
-/// `Default` = full DAG import (`depth: None`) with delete-after-merge records.
+/// `Default` = full DAG import (`depth: None`) with delete-after-merge records and
+/// **no** open branches (phase 1 only). All existing behavior is byte-identical to a
+/// plan without the [`open_branch_tips`](ImportOptions::open_branch_tips) field when
+/// that vec is empty (the load-bearing zero-regression property).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportOptions {
     /// Keep only the last `n` first-parent commits of `main` + side ancestry merged
@@ -501,6 +512,13 @@ pub struct ImportOptions {
     /// Skip the delete-after-merge records so imported branches stay live
     /// (`git.keep_imported_branches`, git-bridge §3.1).
     pub keep_imported_branches: bool,
+    /// Open (unmerged) branch tips to import as **live** ASP branches — phase 2 of
+    /// genesis (`specs/git-open-branches.md` §1–§2). Each entry is
+    /// `(ref_name, tip_sha)`; the ref name (e.g. `"cjroth/acp"`) becomes the live
+    /// branch's name verbatim (deduped `-2`/`-3` against phase-1 names). **Empty =
+    /// phase-1-only, byte-identical to the base spec.** Import order is canonical:
+    /// **ref name bytewise** (frozen tie-break).
+    pub open_branch_tips: Vec<(String, String)>,
 }
 
 /// The deterministic replay model everything in git-bridge §3 derives from.
@@ -519,6 +537,12 @@ pub struct ImportPlan {
     pub tip_sha: String,
     /// Degraded/skipped content, deterministically ordered.
     pub warnings: Vec<ImportWarning>,
+    /// Open-branch ref names skipped because their tip is already emitted — reachable
+    /// from HEAD (old release pointers, just-merged branches) or from an earlier
+    /// open branch (`specs/git-open-branches.md` §1). In the ref-name-bytewise import
+    /// order. Empty when `open_branch_tips` is empty. The clone report surfaces the
+    /// count (`refs_skipped_reachable`).
+    pub skipped_reachable: Vec<String>,
 }
 
 // ===========================================================================
@@ -857,6 +881,13 @@ pub fn plan_import(
         }
     }
 
+    // Everything reachable from HEAD (BEFORE any depth cut). Phase 2 uses this — not
+    // the post-cut planned set — to decide which open-branch commits are "unique":
+    // a commit reachable from HEAD is never a branch's own commit, even under
+    // `--depth` (its ancestry is HEAD's, just cut from the plan). A branch ref whose
+    // tip is in here is skipped (`specs/git-open-branches.md` §1). FROZEN tie-break.
+    let head_reachable: std::collections::HashSet<String> = meta.keys().cloned().collect();
+
     // --- first-parent chain of tip (newest → oldest), within reachable ---
     let mut main_chain: Vec<String> = Vec::new();
     {
@@ -898,8 +929,9 @@ pub fn plan_import(
         _ => None,
     };
 
-    // The set of shas that appear as PlannedCommits (governs "in-plan" first-parent).
-    let included: HashSet<String> = meta.keys().cloned().collect();
+    // The set of shas that appear as PlannedCommits (governs "in-plan" first-parent
+    // diff bases and fork points). Grows as phase 2 appends open-branch commits.
+    let mut included: HashSet<String> = meta.keys().cloned().collect();
 
     // --- canonical topo order over the in-plan set ---
     // Snapshot node (if any) is a root: parents cleared.
@@ -913,9 +945,7 @@ pub fn plan_import(
         };
         nodes.insert(sha.clone(), (parents_in, *ts));
     }
-    let order = canonical_topo_sort_v1(&nodes)?;
-    let index_of: HashMap<&str, usize> =
-        order.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+    let mut order = canonical_topo_sort_v1(&nodes)?;
 
     // --- lane assignment (§3.1) ---
     // Merge subjects (title lines) drive branch naming; gather them up front.
@@ -927,99 +957,73 @@ pub fn plan_import(
         }
     }
     let lanes_raw = assign_lanes(&order, &meta, &included, depth_snapshot.as_deref(), &tip, &subjects);
-    let AssignResult { lane_of, mut lanes, merges_of } = lanes_raw;
+    let AssignResult { mut lane_of, mut lanes, mut merges_of } = lanes_raw;
 
     // --- branch naming + collision dedup (in lane-creation order) ---
+    // `name_counts` stays alive so phase-2 open-branch names dedup against phase-1's.
     let mut name_counts: HashMap<String, usize> = HashMap::new();
     for lane in lanes.iter_mut() {
         if lane.id == MAIN_LANE {
             continue;
         }
         let base = lane.name.clone(); // holds the raw derived base at this point
-        let n = name_counts.entry(base.clone()).or_insert(0);
-        *n += 1;
-        lane.name = if *n == 1 { base } else { format!("{base}-{n}") };
+        lane.name = dedup_name(&base, &mut name_counts);
     }
 
-    // --- per-commit batches + warnings ---
-    let empty_snap = Snapshot::default();
+    // --- per-commit batches (phase 1) ---
     let mut snap_cache: HashMap<String, Snapshot> = HashMap::new();
     let mut gitlink_warns: BTreeMap<String, String> = BTreeMap::new();
     let mut lfs_paths: BTreeSet<String> = BTreeSet::new();
 
     let mut commits: Vec<PlannedCommit> = Vec::with_capacity(order.len());
     for sha in &order {
-        let is_snapshot = depth_snapshot.as_deref() == Some(sha.as_str());
-        let commit = db.commit(sha)?;
-        let tree_sha = commit.tree().to_hex().to_string();
-
-        // Cache expanded snapshots (a parent is reused by its children). Errors
-        // propagate — a missing/corrupt tree must fail the plan, never diff as empty.
-        if !snap_cache.contains_key(sha) {
-            let snap = db.snapshot_of_tree(&tree_sha)?;
-            snap_cache.insert(sha.clone(), snap);
-        }
-        let child_snap = snap_cache[sha].clone();
-
-        // Collect warnings from this commit's tree.
-        for (p, target) in &child_snap.gitlinks {
-            gitlink_warns.entry(p.clone()).or_insert_with(|| target.clone());
-        }
-        for (p, (bsha, mode)) in &child_snap.blobs {
-            if matches!(mode, EntryMode::Normal | EntryMode::Executable) && is_lfs_pointer(db, bsha) {
-                lfs_paths.insert(p.clone());
-            }
-        }
-
-        // First-parent snapshot: empty for a root / snapshot / out-of-plan parent.
-        let parents = meta.get(sha).map(|(p, _)| p.clone()).unwrap_or_default();
-        let parent_snap: Snapshot = if is_snapshot {
-            empty_snap.clone()
-        } else if let Some(p0) = parents.first().filter(|p| included.contains(*p)) {
-            let p0 = p0.clone();
-            if !snap_cache.contains_key(&p0) {
-                let p0_tree = db.commit(&p0)?.tree().to_hex().to_string();
-                let snap = db.snapshot_of_tree(&p0_tree)?;
-                snap_cache.insert(p0.clone(), snap);
-            }
-            snap_cache[&p0].clone()
-        } else {
-            empty_snap.clone()
-        };
-
-        let ops = diff_trees(&parent_snap, &child_snap);
-
-        let author = commit.author().map_err(|e| GitImportError::Decode(e.to_string()))?;
-        let committer = commit.committer().map_err(|e| GitImportError::Decode(e.to_string()))?;
-        let msg = commit.message();
-        // Reconstruct "subject + body"; git stores a trailing newline, so
-        // normalize the tail (deterministic, and what the UI wants to display).
-        let title = String::from_utf8_lossy(msg.title).trim_end().to_string();
-        let message = match msg.body {
-            Some(body) => {
-                let body = String::from_utf8_lossy(body);
-                format!("{}\n\n{}", title, body.trim_end())
-            }
-            None => title,
-        };
-
-        let merges = merges_of.get(sha).cloned().unwrap_or_default();
-
-        commits.push(PlannedCommit {
-            sha: sha.clone(),
-            lane: *lane_of.get(sha).expect("every commit is assigned a lane"),
-            parents: if is_snapshot { Vec::new() } else { parents },
-            merges,
-            author_name: String::from_utf8_lossy(author.name).trim().to_string(),
-            author_email: String::from_utf8_lossy(author.email).trim().to_string(),
-            committer_ts_ms: committer.seconds() * 1000,
-            message,
-            ops,
-            is_depth_cut_snapshot: is_snapshot,
-        });
+        commits.push(build_commit_batch(
+            db, sha, &meta, &included, depth_snapshot.as_deref(), &lane_of, &merges_of,
+            &mut snap_cache, &mut gitlink_warns, &mut lfs_paths,
+        )?);
     }
 
-    // Resolve fork commit indexes now that `order` is final.
+    // ===================================================================
+    // Phase 2 — open (unmerged) branches (specs/git-open-branches.md §2)
+    // ===================================================================
+    //
+    // Canonical order = ref name BYTEWISE (frozen). Each branch imports its UNIQUE
+    // commits — reachable from the branch tip, minus everything reachable from HEAD
+    // (`head_reachable`) and minus every earlier open branch (`emitted`). The
+    // branch's own first-parent chain becomes a LIVE lane (no delete); internal
+    // merges recurse into tombstoned sub-lanes exactly as phase 1. Fork point = the
+    // first already-PLANNED (`included`) commit walking the tip's first-parent chain;
+    // if that walk exits the planned set at a root, an unrelated root (orphan), or a
+    // depth-cut ancestor, the lane forks nowhere (`fork=None`) and its oldest commit
+    // snapshots vs the empty tree — same rule as a depth cut / grafted root.
+    let mut skipped_reachable: Vec<String> = Vec::new();
+    if !opts.open_branch_tips.is_empty() {
+        // `emitted` = reachable-from-HEAD ∪ every open branch imported so far. It is
+        // the boundary for "unique" gathering and for the skip decision. Distinct
+        // from `included` (the planned set) so `--depth` behaves correctly: a cut
+        // ancestor is in `emitted` (not unique) but not in `included` (→ snapshot).
+        let mut emitted: HashSet<String> = head_reachable;
+        let mut tips = opts.open_branch_tips.clone();
+        tips.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        for (ref_name, raw_tip) in &tips {
+            let btip = db.peel_to_commit(raw_tip)?;
+            if emitted.contains(&btip) {
+                // Tip already carries nothing new (reachable from HEAD or an earlier
+                // open branch) — skip, report the ref (§1).
+                skipped_reachable.push(ref_name.clone());
+                continue;
+            }
+            plan_open_branch(
+                db, ref_name, &btip, &mut emitted, &mut meta, &mut included, &mut lanes,
+                &mut lane_of, &mut merges_of, &mut name_counts, &mut order, &mut commits,
+                &mut snap_cache, &mut gitlink_warns, &mut lfs_paths,
+            )?;
+        }
+    }
+
+    // Resolve fork commit indexes now that `commits` (both phases) is final.
+    let index_of: HashMap<&str, usize> =
+        commits.iter().enumerate().map(|(i, c)| (c.sha.as_str(), i)).collect();
     for lane in lanes.iter_mut() {
         if let Some(fork) = lane.fork.as_mut() {
             fork.commit_index = *index_of.get(fork.commit_sha.as_str()).unwrap_or(&0);
@@ -1043,7 +1047,7 @@ pub fn plan_import(
         .clone()
         .unwrap_or_else(|| main_chain.last().cloned().unwrap_or_else(|| tip.clone()));
 
-    Ok(ImportPlan { commits, lanes, root_sha, tip_sha: tip, warnings })
+    Ok(ImportPlan { commits, lanes, root_sha, tip_sha: tip, warnings, skipped_reachable })
 }
 
 /// True if a blob's content is a git-LFS pointer (git-bridge §3.3).
@@ -1106,6 +1110,7 @@ fn assign_lanes(
         created_at_commit: main_root,
         merged_at_commit: None,
         deleted_after_merge: false,
+        live: false,
     });
 
     let is_merge = |sha: &str| meta.get(sha).map(|(ps, _)| ps.len() >= 2).unwrap_or(false);
@@ -1163,6 +1168,7 @@ fn assign_lanes(
                 created_at_commit: created_at,
                 merged_at_commit: Some(m.clone()),
                 deleted_after_merge: true,
+                live: false,
             });
             infos.push(MergeInfo { source_lane: new_lane, source_tip_sha: pi.clone() });
         }
@@ -1171,6 +1177,337 @@ fn assign_lanes(
     }
 
     AssignResult { lane_of, lanes, merges_of }
+}
+
+/// Apply the frozen `-2`/`-3`… collision dedup to a raw base name, mutating the
+/// shared `counts` (keyed by raw base). The **first** use of a base keeps it
+/// verbatim; the Nth (N≥2) becomes `base-N`. Phase 1 and phase 2 share one
+/// `counts` map so an open-branch name colliding with a phase-1 branch name dedups
+/// against it (git-open-branches §2), in lane-creation (emission) order.
+fn dedup_name(base: &str, counts: &mut HashMap<String, usize>) -> String {
+    let n = counts.entry(base.to_string()).or_insert(0);
+    *n += 1;
+    if *n == 1 {
+        base.to_string()
+    } else {
+        format!("{base}-{n}")
+    }
+}
+
+/// Build one commit's [`PlannedCommit`] batch: cache its tree snapshot, collect
+/// gitlink/LFS warnings, diff against the first parent's tree (empty for a root, a
+/// depth-cut snapshot, or an out-of-plan first parent), and reconstruct the message.
+/// Shared by phase 1 and phase 2 so their per-commit output is provably identical.
+///
+/// The diff base is the first parent **iff it is in `included`** (the planned set):
+/// this is what makes a phase-2 open-branch commit forking off a phase-1 commit diff
+/// against that real parent tree, while a commit whose first parent was cut by
+/// `--depth` (or is an unrelated/shallow root) snapshots against the empty tree.
+#[allow(clippy::too_many_arguments)]
+fn build_commit_batch(
+    db: &GitObjectDb,
+    sha: &str,
+    meta: &HashMap<String, (Vec<String>, i64)>,
+    included: &HashSet<String>,
+    depth_snapshot: Option<&str>,
+    lane_of: &HashMap<String, LaneId>,
+    merges_of: &HashMap<String, Vec<MergeInfo>>,
+    snap_cache: &mut HashMap<String, Snapshot>,
+    gitlink_warns: &mut BTreeMap<String, String>,
+    lfs_paths: &mut BTreeSet<String>,
+) -> Result<PlannedCommit, GitImportError> {
+    let is_snapshot = depth_snapshot == Some(sha);
+    let commit = db.commit(sha)?;
+    let tree_sha = commit.tree().to_hex().to_string();
+
+    // Cache expanded snapshots (a parent is reused by its children). Errors
+    // propagate — a missing/corrupt tree must fail the plan, never diff as empty.
+    if !snap_cache.contains_key(sha) {
+        let snap = db.snapshot_of_tree(&tree_sha)?;
+        snap_cache.insert(sha.to_string(), snap);
+    }
+    let child_snap = snap_cache[sha].clone();
+
+    // Collect warnings from this commit's tree.
+    for (p, target) in &child_snap.gitlinks {
+        gitlink_warns.entry(p.clone()).or_insert_with(|| target.clone());
+    }
+    for (p, (bsha, mode)) in &child_snap.blobs {
+        if matches!(mode, EntryMode::Normal | EntryMode::Executable) && is_lfs_pointer(db, bsha) {
+            lfs_paths.insert(p.clone());
+        }
+    }
+
+    // First-parent snapshot: empty for a root / snapshot / out-of-plan parent.
+    let parents = meta.get(sha).map(|(p, _)| p.clone()).unwrap_or_default();
+    let empty_snap = Snapshot::default();
+    let parent_snap: Snapshot = if is_snapshot {
+        empty_snap.clone()
+    } else if let Some(p0) = parents.first().filter(|p| included.contains(*p)) {
+        let p0 = p0.clone();
+        if !snap_cache.contains_key(&p0) {
+            let p0_tree = db.commit(&p0)?.tree().to_hex().to_string();
+            let snap = db.snapshot_of_tree(&p0_tree)?;
+            snap_cache.insert(p0.clone(), snap);
+        }
+        snap_cache[&p0].clone()
+    } else {
+        empty_snap.clone()
+    };
+
+    let ops = diff_trees(&parent_snap, &child_snap);
+
+    let author = commit.author().map_err(|e| GitImportError::Decode(e.to_string()))?;
+    let committer = commit.committer().map_err(|e| GitImportError::Decode(e.to_string()))?;
+    let msg = commit.message();
+    // Reconstruct "subject + body"; git stores a trailing newline, so normalize the
+    // tail (deterministic, and what the UI wants to display).
+    let title = String::from_utf8_lossy(msg.title).trim_end().to_string();
+    let message = match msg.body {
+        Some(body) => {
+            let body = String::from_utf8_lossy(body);
+            format!("{}\n\n{}", title, body.trim_end())
+        }
+        None => title,
+    };
+
+    let merges = merges_of.get(sha).cloned().unwrap_or_default();
+
+    Ok(PlannedCommit {
+        sha: sha.to_string(),
+        lane: *lane_of.get(sha).expect("every commit is assigned a lane"),
+        parents: if is_snapshot { Vec::new() } else { parents },
+        merges,
+        author_name: String::from_utf8_lossy(author.name).trim().to_string(),
+        author_email: String::from_utf8_lossy(author.email).trim().to_string(),
+        committer_ts_ms: committer.seconds() * 1000,
+        message,
+        ops,
+        is_depth_cut_snapshot: is_snapshot,
+    })
+}
+
+/// Plan one open (unmerged) branch into the accumulating plan (git-open-branches §2).
+///
+/// Appends the branch's unique commits (reachable from `tip`, not in `emitted`) to
+/// `order`/`commits`/`meta`/`included`/`emitted`, and its lanes to `lanes`/`lane_of`
+/// (one LIVE first-parent lane named `ref_name`, plus tombstoned sub-lanes for any
+/// internal merges). Canonical topo order (`committer_seconds, sha`) within the
+/// branch, same domain as phase 1.
+#[allow(clippy::too_many_arguments)]
+fn plan_open_branch(
+    db: &GitObjectDb,
+    ref_name: &str,
+    tip: &str,
+    emitted: &mut HashSet<String>,
+    meta: &mut HashMap<String, (Vec<String>, i64)>,
+    included: &mut HashSet<String>,
+    lanes: &mut Vec<PlannedLane>,
+    lane_of: &mut HashMap<String, LaneId>,
+    merges_of: &mut HashMap<String, Vec<MergeInfo>>,
+    name_counts: &mut HashMap<String, usize>,
+    order: &mut Vec<String>,
+    commits: &mut Vec<PlannedCommit>,
+    snap_cache: &mut HashMap<String, Snapshot>,
+    gitlink_warns: &mut BTreeMap<String, String>,
+    lfs_paths: &mut BTreeSet<String>,
+) -> Result<(), GitImportError> {
+    // 1. Gather this branch's UNIQUE commits: reachable from tip, stopping at any
+    //    already-emitted commit (reachable from HEAD or an earlier open branch) and
+    //    at shallow/absent boundaries. Those boundary commits are NOT included.
+    let mut new_meta: HashMap<String, (Vec<String>, i64)> = HashMap::new();
+    {
+        let mut stack = vec![tip.to_string()];
+        while let Some(sha) = stack.pop() {
+            if emitted.contains(&sha) || new_meta.contains_key(&sha) {
+                continue;
+            }
+            let Some((k, _)) = db.get(&sha) else { continue }; // shallow boundary
+            if k != GitObjKind::Commit {
+                return Err(GitImportError::NotACommit(sha));
+            }
+            let commit = db.commit(&sha)?;
+            let parents: Vec<String> = commit.parents().map(|p| p.to_hex().to_string()).collect();
+            let ts = commit.committer().map_err(|e| GitImportError::Decode(e.to_string()))?.seconds();
+            for p in &parents {
+                if !emitted.contains(p) && db.get(p).is_some() {
+                    stack.push(p.clone());
+                }
+            }
+            new_meta.insert(sha, (parents, ts));
+        }
+    }
+    // A tip that peels into nothing new (fully emitted) shouldn't reach here — the
+    // caller skips those — but guard anyway so an empty branch is a no-op.
+    if new_meta.is_empty() {
+        return Ok(());
+    }
+    let new_set: HashSet<String> = new_meta.keys().cloned().collect();
+
+    // 2. Canonical topo order over the new commits (parents restricted to the new
+    //    set; boundary parents are dropped so oldest commits are roots of the sort).
+    let mut nodes: BTreeMap<String, (Vec<String>, i64)> = BTreeMap::new();
+    for (sha, (parents, ts)) in &new_meta {
+        let parents_in: Vec<String> = parents.iter().filter(|p| new_set.contains(*p)).cloned().collect();
+        nodes.insert(sha.clone(), (parents_in, *ts));
+    }
+    let branch_order = canonical_topo_sort_v1(&nodes)?;
+
+    // 3. Merge subjects for internal merges (drive sub-lane naming).
+    let mut subjects: HashMap<String, String> = HashMap::new();
+    for sha in &branch_order {
+        if new_meta.get(sha).map(|(p, _)| p.len() >= 2).unwrap_or(false) {
+            subjects.insert(sha.clone(), db.commit(sha)?.message().title.to_string());
+        }
+    }
+
+    // 4. Lane assignment for this branch (appends to lanes/lane_of/merges_of).
+    assign_open_branch_lanes(
+        ref_name, tip, &branch_order, &new_meta, &new_set, lane_of, lanes, merges_of,
+        name_counts, &subjects,
+    );
+
+    // 5. Fold the new commits into the global planned/emitted sets + meta, then build
+    //    their batches in canonical order and append to `commits`/`order`. `included`
+    //    must contain the new commits BEFORE building so within-branch first parents
+    //    resolve as real diff bases (an earlier boundary parent stays out → snapshot).
+    for (sha, mp) in new_meta {
+        meta.insert(sha, mp);
+    }
+    for sha in &branch_order {
+        included.insert(sha.clone());
+        emitted.insert(sha.clone());
+    }
+    for sha in &branch_order {
+        commits.push(build_commit_batch(
+            db, sha, meta, included, None, lane_of, merges_of, snap_cache, gitlink_warns, lfs_paths,
+        )?);
+        order.push(sha.clone());
+    }
+    Ok(())
+}
+
+/// Lane assignment for one open branch (git-open-branches §2), mirroring
+/// [`assign_lanes`] but with the branch's own first-parent chain as a **new LIVE
+/// lane** (named `ref_name`, no delete) instead of `main`, and its internal merges
+/// spawning tombstoned sub-lanes. `lane_of` already holds every phase-1 (and earlier
+/// open-branch) commit, so a walk that reaches one of them forks off that lane.
+#[allow(clippy::too_many_arguments)]
+fn assign_open_branch_lanes(
+    ref_name: &str,
+    tip: &str,
+    order: &[String],
+    new_meta: &HashMap<String, (Vec<String>, i64)>,
+    new_set: &HashSet<String>,
+    lane_of: &mut HashMap<String, LaneId>,
+    lanes: &mut Vec<PlannedLane>,
+    merges_of: &mut HashMap<String, Vec<MergeInfo>>,
+    name_counts: &mut HashMap<String, usize>,
+    subjects: &HashMap<String, String>,
+) {
+    // First parent (unfiltered — boundary handling is explicit at each call site).
+    let parent0 = |sha: &str| -> Option<String> {
+        new_meta.get(sha).and_then(|(ps, _)| ps.first().cloned())
+    };
+
+    // --- the branch's own lane = tip's first-parent chain within the new set ---
+    let branch_lane = lanes.len();
+    let mut chain: Vec<String> = Vec::new();
+    let mut fork: Option<ForkPoint> = None;
+    {
+        let mut cur = tip.to_string();
+        loop {
+            chain.push(cur.clone());
+            match parent0(&cur) {
+                // First parent is another unique commit → keep walking this lane.
+                Some(par) if new_set.contains(&par) => cur = par,
+                // First already-planned commit → fork off whichever lane owns it.
+                Some(par) => {
+                    if let Some(&plane) = lane_of.get(&par) {
+                        fork = Some(ForkPoint { lane: plane, commit_sha: par, commit_index: 0 });
+                    }
+                    // Else `par` exists but was cut by `--depth` (not planned): treat
+                    // the boundary as a root — fork stays None, oldest commit snapshots.
+                    break;
+                }
+                // Repo root / unrelated (orphan) root → fork nowhere, diff-vs-empty.
+                None => break,
+            }
+        }
+    }
+    for c in &chain {
+        lane_of.insert(c.clone(), branch_lane);
+    }
+    let created_at = chain.last().cloned().unwrap_or_else(|| tip.to_string());
+    lanes.push(PlannedLane {
+        id: branch_lane,
+        name: dedup_name(ref_name, name_counts),
+        fork,
+        created_at_commit: created_at,
+        merged_at_commit: None,
+        deleted_after_merge: false,
+        live: true,
+    });
+
+    // --- expand internal merges (canonical order) into tombstoned sub-lanes ---
+    let is_merge = |sha: &str| new_meta.get(sha).map(|(ps, _)| ps.len() >= 2).unwrap_or(false);
+    let mut expanded: HashSet<String> = HashSet::new();
+    loop {
+        let next = order
+            .iter()
+            .find(|s| is_merge(s) && lane_of.contains_key(*s) && !expanded.contains(*s))
+            .cloned();
+        let Some(m) = next else { break };
+        expanded.insert(m.clone());
+
+        let subject = subjects.get(&m).cloned().unwrap_or_default();
+        let parents = new_meta.get(&m).map(|(p, _)| p.clone()).unwrap_or_default();
+        let mut infos: Vec<MergeInfo> = Vec::new();
+
+        for pi in parents.iter().skip(1) {
+            if let Some(&lane) = lane_of.get(pi) {
+                // Already assigned (this branch's lane, an earlier sub-lane, or a
+                // phase-1 / earlier-open-branch lane) → merge edge, no new lane.
+                infos.push(MergeInfo { source_lane: lane, source_tip_sha: pi.clone() });
+                continue;
+            }
+            if !new_set.contains(pi) {
+                // Boundary (cut ancestor / shallow) that is not planned — unassignable.
+                continue;
+            }
+            // New sub-lane: walk pi's first-parent chain back to an assigned commit.
+            let mut chain: Vec<String> = Vec::new();
+            let mut cur = pi.clone();
+            let fork: Option<ForkPoint> = loop {
+                if let Some(&lane) = lane_of.get(&cur) {
+                    break Some(ForkPoint { lane, commit_sha: cur.clone(), commit_index: 0 });
+                }
+                chain.push(cur.clone());
+                match parent0(&cur) {
+                    Some(par) if new_set.contains(&par) || lane_of.contains_key(&par) => cur = par,
+                    _ => break None,
+                }
+            };
+
+            let new_lane = lanes.len();
+            for c in &chain {
+                lane_of.insert(c.clone(), new_lane);
+            }
+            let created = chain.last().cloned().unwrap_or_else(|| pi.clone());
+            lanes.push(PlannedLane {
+                id: new_lane,
+                name: dedup_name(&branch_name_for(&subject, pi), name_counts),
+                fork,
+                created_at_commit: created,
+                merged_at_commit: Some(m.clone()),
+                deleted_after_merge: true,
+                live: false,
+            });
+            infos.push(MergeInfo { source_lane: new_lane, source_tip_sha: pi.clone() });
+        }
+
+        merges_of.insert(m.clone(), infos);
+    }
 }
 
 // ===========================================================================
@@ -1628,7 +1965,7 @@ mod tests {
         }
         let tip = shas.last().unwrap().clone();
         // main chain newest->oldest = [c4,c3,c2,c1,c0]; depth 2 keeps c4,c3; cut = c2.
-        let plan = plan_import(&db, &tip, &ImportOptions { depth: Some(2), keep_imported_branches: false }).unwrap();
+        let plan = plan_import(&db, &tip, &ImportOptions { depth: Some(2), keep_imported_branches: false, ..Default::default() }).unwrap();
         // snapshot + c3 + c4 = 3 commits.
         assert_eq!(plan.commits.len(), 3);
         let snap = plan.commits.iter().find(|c| c.is_depth_cut_snapshot).unwrap();
@@ -1647,7 +1984,7 @@ mod tests {
         let mut db = GitObjectDb::new();
         let c0 = commit_with_file(&mut db, "f", "0", &[], 1000, "c0");
         let c1 = commit_with_file(&mut db, "f", "1", &[&c0], 1060, "c1");
-        let plan = plan_import(&db, &c1, &ImportOptions { depth: Some(99), keep_imported_branches: false }).unwrap();
+        let plan = plan_import(&db, &c1, &ImportOptions { depth: Some(99), keep_imported_branches: false, ..Default::default() }).unwrap();
         assert_eq!(plan.commits.len(), 2);
         assert!(!plan.commits.iter().any(|c| c.is_depth_cut_snapshot));
     }
@@ -1684,7 +2021,7 @@ mod tests {
             mk_tree(&mut db, &[("100644", "README", &br), ("100644", "f1", &bf)])
         };
         let m = mk_commit(&mut db, &mtree, &[&i, &f1], 1120, "Merge branch 'feat'");
-        let plan = plan_import(&db, &m, &ImportOptions { depth: None, keep_imported_branches: true }).unwrap();
+        let plan = plan_import(&db, &m, &ImportOptions { depth: None, keep_imported_branches: true, ..Default::default() }).unwrap();
         assert!(plan.lanes.iter().all(|l| !l.deleted_after_merge));
     }
 
@@ -1726,7 +2063,7 @@ mod tests {
             assert_every_commit_assigned(&plan);
             // Random depth cut must also not panic.
             let d = 1 + (next() % 5);
-            let _ = plan_import(&db, &tip, &ImportOptions { depth: Some(d), keep_imported_branches: false }).unwrap();
+            let _ = plan_import(&db, &tip, &ImportOptions { depth: Some(d), keep_imported_branches: false, ..Default::default() }).unwrap();
         }
     }
 }

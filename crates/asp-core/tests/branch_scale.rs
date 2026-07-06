@@ -63,8 +63,23 @@ struct Corpus {
     deep_target: String,
 }
 
-/// Build a corpus of `n` imported branches the way genesis does.
+/// Build a corpus of `n` imported branches the way genesis does (delete-after-merge:
+/// each branch gets a create record AND a delete tombstone).
 fn synthesize(n: usize) -> Corpus {
+    build_corpus(n, true)
+}
+
+/// Build a corpus of `n` **live** open branches (`specs/git-open-branches.md` §6): a
+/// create record but NO delete tombstone — the pathological thousand-open-branch repo
+/// the R3 guardrail must also stay linear on (`BranchSet`/visibility/`build_graph` see
+/// N genuinely-live lanes, not N tombstones).
+fn synthesize_live(n: usize) -> Corpus {
+    build_corpus(n, false)
+}
+
+/// Shared builder: emit `n` imported branches; `tombstones` controls whether each
+/// branch also gets a delete record (merged, delete-after-merge) or stays live.
+fn build_corpus(n: usize, tombstones: bool) -> Corpus {
     let mut rows: Vec<LogRow> = Vec::with_capacity(n * 4);
     let mut reconciled: Vec<Branch> = Vec::with_capacity(n);
     let mut live: Vec<Branch> = Vec::with_capacity(n);
@@ -145,30 +160,33 @@ fn synthesize(n: usize) -> Corpus {
         }
 
         // --- Branch DELETE tombstone (higher lamport wins the LWW reconcile). ---
-        let del_lamport = tick();
-        let del_rec = Branch { deleted: true, ..create_rec.clone() };
-        let del_h = format!("bd-{i}");
-        blobs.insert(del_h.clone(), encode_branch_record(&del_rec));
-        rows.push(
-            LogRow {
-                site_id: SITE.to_string(),
-                lamport: del_lamport,
-                seq: del_lamport,
-                file_id: branch_id.clone(),
-                kind: Kind::Branch,
-                merge_class: MergeClass::Text,
-                result_hash: Some(del_h),
-                path: Some(name.clone()),
-                branch_id: MAIN_BRANCH_ID.to_string(),
-                ..LogRow::default()
-            }
-            .seal(),
-        );
+        // Skipped for the live-lane corpus, where every branch stays un-deleted.
+        if tombstones {
+            let del_lamport = tick();
+            let del_rec = Branch { deleted: true, ..create_rec.clone() };
+            let del_h = format!("bd-{i}");
+            blobs.insert(del_h.clone(), encode_branch_record(&del_rec));
+            rows.push(
+                LogRow {
+                    site_id: SITE.to_string(),
+                    lamport: del_lamport,
+                    seq: del_lamport,
+                    file_id: branch_id.clone(),
+                    kind: Kind::Branch,
+                    merge_class: MergeClass::Text,
+                    result_hash: Some(del_h),
+                    path: Some(name.clone()),
+                    branch_id: MAIN_BRANCH_ID.to_string(),
+                    ..LogRow::default()
+                }
+                .seal(),
+            );
+        }
 
-        // Converged (post-LWW) record is the tombstone; the live-lane variant is the
-        // same branch presented as un-deleted for the graph stress.
-        reconciled.push(del_rec.clone());
-        live.push(Branch { deleted: false, ..del_rec });
+        // Converged (post-LWW) record: the tombstone when merged, else the live create.
+        // The live-lane variant is always the same branch presented as un-deleted.
+        reconciled.push(Branch { deleted: tombstones, ..create_rec.clone() });
+        live.push(Branch { deleted: false, ..create_rec });
         deep_target = branch_id;
     }
 
@@ -206,8 +224,11 @@ const REPS: usize = 3;
 /// construction) OUT of the timed region — real callers hand `BranchSet::new` an
 /// already-owned `Vec<Branch>` (from `reconcile_branches`), so cloning it would
 /// time an allocation the production path never does.
-fn time_op(op: Op, n: usize) -> Duration {
-    let c = synthesize(n);
+/// Time an op on a corpus built by `build` (e.g. [`synthesize`] for delete-after-merge
+/// or [`synthesize_live`] for the live-lane variant), keeping the op's setup out of the
+/// timed region and only one N-sized corpus resident at a time.
+fn time_op_with(op: Op, n: usize, build: fn(usize) -> Corpus) -> Duration {
+    let c = build(n);
     let mut best = Duration::MAX;
     for _ in 0..REPS {
         let dt = match op {
@@ -281,8 +302,12 @@ fn ratio(a: Duration, b: Duration) -> f64 {
 
 /// Measure an op at N and 2N, print, and return (t_n, t_2n, ratio).
 fn scale(op: Op, n: usize) -> (Duration, Duration, f64) {
-    let a = time_op(op, n);
-    let b = time_op(op, 2 * n);
+    scale_with(op, n, synthesize)
+}
+
+fn scale_with(op: Op, n: usize, build: fn(usize) -> Corpus) -> (Duration, Duration, f64) {
+    let a = time_op_with(op, n, build);
+    let b = time_op_with(op, 2 * n, build);
     let r = ratio(a, b);
     eprintln!(
         "  {:<20} N={:>6}: {:>12?}   2N={:>6}: {:>12?}   ratio {:.2}x",
@@ -342,4 +367,28 @@ fn r3_build_graph_scaling_is_sub_quadratic() {
              fork-edge loop (branch.rs ~324-340) still present; see the test doc-comment"
         );
     }
+}
+
+/// git-open-branches §6 **live-lane** perf guardrail: a thousand-open-branch monorepo
+/// imports every open branch as a genuinely LIVE lane (no tombstone). `BranchSet::new`,
+/// the visibility fold hot path, and `build_graph` must stay sub-quadratic in live-lane
+/// count — `build_graph` especially, since its fork-edge pass is O(live lanes) and live
+/// lanes are exactly what a checkbox clone maximizes (a merged-PR corpus tombstones
+/// them out of the lane set; this corpus does not). Bounded N keeps it memory-safe.
+#[test]
+fn r3_live_lane_ops_stay_sub_quadratic() {
+    let n = std::env::var("BRANCH_SCALE_LIVE_N").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
+    eprintln!("\n=== git-open-branches §6 live-lane perf guardrail (N={n} live branches) ===");
+    for op in [Op::BranchSetNew, Op::VisibilityAndSees, Op::BuildGraph] {
+        let (a, b, r) = scale_with(op, n, synthesize_live);
+        assert!(b < Duration::from_secs(30), "{} too slow at 2N (live lanes): {:?}", op.label(), b);
+        if a > SIGNAL {
+            assert!(
+                r < MAX_RATIO,
+                "{} scales super-linearly on live lanes ({r:.2}x > {MAX_RATIO}x)",
+                op.label()
+            );
+        }
+    }
+    eprintln!("=== live-lane ops PASS (sub-quadratic at {n} live branches) ===\n");
 }

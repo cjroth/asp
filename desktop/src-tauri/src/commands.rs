@@ -47,11 +47,20 @@ pub fn clone_remote(state: State<AppState>, dest: String, ticket: String, auth_k
 }
 
 /// Clone a git repo into a new vault (git-bridge §7.2). Invoke-arg names MUST match
-/// the `tauriApi.cloneGit` binding exactly (`{dest,url,token,depth}`) — the f6c1d07
-/// lesson. Progress is emitted via the shell's `vault-scan-progress` event.
+/// the `tauriApi.cloneGit` binding exactly (`{dest,url,token,depth,allBranches}`) — the
+/// f6c1d07 lesson (`allBranches` binds to `all_branches` camel↔snake). `all_branches`
+/// is `Option<bool>` defaulting to false so an older caller that omits it still binds.
+/// Progress is emitted via the shell's `vault-scan-progress` event.
 #[tauri::command(async)]
-pub fn clone_git(state: State<AppState>, dest: String, url: String, token: Option<String>, depth: Option<u32>) -> R<VaultInfo> {
-    e(state.engine.clone_git(&PathBuf::from(dest), &url, token.as_deref(), depth))
+pub fn clone_git(
+    state: State<AppState>,
+    dest: String,
+    url: String,
+    token: Option<String>,
+    depth: Option<u32>,
+    all_branches: Option<bool>,
+) -> R<VaultInfo> {
+    e(state.engine.clone_git(&PathBuf::from(dest), &url, token.as_deref(), depth, all_branches.unwrap_or(false)))
 }
 
 /// Pull new upstream commits into a git-configured vault (git-bridge §4). Arg name

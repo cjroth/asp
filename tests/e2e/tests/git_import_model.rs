@@ -260,7 +260,7 @@ fn merged_prs_lane_topology() {
 
     // keep_imported_branches flips off every delete.
     let (_t, keep) =
-        build_plan(&repo.bare, &ImportOptions { depth: None, keep_imported_branches: true });
+        build_plan(&repo.bare, &ImportOptions { depth: None, keep_imported_branches: true, ..Default::default() });
     assert!(keep.lanes.iter().all(|l| !l.deleted_after_merge));
 }
 
@@ -403,7 +403,7 @@ fn depth_cut_matches_git_tree_at_cut_point() {
     let pack = pack_via_revs(&repo.bare, &tip);
     let db = GitObjectDb::from_pack(&pack, no_base_lookup).unwrap();
 
-    let opts = ImportOptions { depth: Some(2), keep_imported_branches: false };
+    let opts = ImportOptions { depth: Some(2), keep_imported_branches: false, ..Default::default() };
     let plan = plan_import(&db, &tip, &opts).unwrap();
     // snapshot + the last 2 first-parent commits.
     assert_eq!(plan.commits.len(), 3);
@@ -486,7 +486,7 @@ fn fuzz_random_git_histories_hold_the_invariant() {
         let tip = git_str(&r.bare, &["rev-parse", "HEAD"]);
         let pack = pack_via_revs(&r.bare, &tip);
         let db = GitObjectDb::from_pack(&pack, no_base_lookup).unwrap();
-        let dplan = plan_import(&db, &tip, &ImportOptions { depth: Some(depth), keep_imported_branches: false }).unwrap();
+        let dplan = plan_import(&db, &tip, &ImportOptions { depth: Some(depth), keep_imported_branches: false, ..Default::default() }).unwrap();
         assert_fidelity(&dplan, &r.bare, &format!("fuzz{trial}(depth={depth})"));
     }
 }

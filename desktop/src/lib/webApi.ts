@@ -264,15 +264,22 @@ export function createWebApi(): Api {
     // Clone a git repo into a new OPFS vault via the relay CORS proxy (git-bridge
     // §7.3). The wasm engine owns the git protocol + import; `gitFetch` supplies the
     // browser transport. Clone/pull only — the browser never pushes (spec non-goal).
-    cloneGit: async (_dest: string, url: string, token: string | undefined, depth: number | undefined, onProgress?: CloneProgress): Promise<VaultInfo> => {
+    cloneGit: async (_dest: string, url: string, token: string | undefined, depth: number | undefined, allBranches: boolean | undefined, onProgress?: CloneProgress): Promise<VaultInfo> => {
       await ensureWasm();
       const proxyBase = gitProxyBase();
       const id = 'w_' + randHex(8);
       const eng = new WasmEngine(await deviceSeed(), ''); // pristine → adopts the repo-derived vault id
       // wasm fires (phase, done, total); the Api progress cb wants (done, total, phase).
       const cb = onProgress ? (phase: string, done: number, total: number) => onProgress(done, total, phase as ClonePhase) : undefined;
-      const reportJson = await eng.git_clone(url, token ?? undefined, proxyBase, depth ?? undefined, gitFetch, cb);
-      const report = JSON.parse(reportJson) as { root_sha: string; remote_ref: string; default_branch: string };
+      // `allBranches` (git-open-branches §5): the wasm engine reads the ls-refs
+      // advertisement and imports every unmerged branch as a live ASP branch. Imported
+      // open branches are ordinary ASP branches, so nothing extra is stored in the
+      // registry (`git` entry unchanged).
+      const reportJson = await eng.git_clone(url, token ?? undefined, proxyBase, depth ?? undefined, allBranches ?? false, gitFetch, cb);
+      const report = JSON.parse(reportJson) as { root_sha: string; remote_ref: string; default_branch: string; open_branches: number; refs_skipped: number };
+      // The modal has no clone-report surface today (cloneGit returns a VaultInfo, not a
+      // report), so surface the open-branch counts in the console for now.
+      if (allBranches) console.info(`git clone: imported ${report.open_branches} open branch(es), skipped ${report.refs_skipped} reachable ref(s)`);
       const vault_id = eng.vault_id();
       engines.set(id, eng);
       onProgress?.(0, 0, 'saving');

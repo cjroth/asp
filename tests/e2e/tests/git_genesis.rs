@@ -246,7 +246,7 @@ fn merged_prs_branch_records_and_octopus_merges() {
     assert!(g.rows.iter().filter(|r| r.kind == Kind::Merge).count() == 2, "two merge markers");
 
     // keep_imported_branches → no delete records.
-    let (db2, plan2) = build(&repo.bare, &ImportOptions { depth: None, keep_imported_branches: true });
+    let (db2, plan2) = build(&repo.bare, &ImportOptions { depth: None, keep_imported_branches: true, ..Default::default() });
     let store = MemBlobStore::new();
     let g2 = synthesize_genesis(&plan2, &DbBlobSource::new(&db2), &store).unwrap();
     assert_eq!(g2.rows.iter().filter(|r| r.kind == Kind::Branch).count(), 2, "creates only, no deletes");

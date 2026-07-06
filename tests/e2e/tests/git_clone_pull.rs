@@ -310,7 +310,7 @@ fn depth_clone_folds_to_tip() {
 
     let tmp = tempfile::tempdir().unwrap();
     let engine = open_engine(tmp.path(), 8);
-    let opts = CloneOptions { depth: Some(2), new_identity: false, on_progress: None };
+    let opts = CloneOptions { depth: Some(2), new_identity: false, all_branches: false, on_progress: None };
     let report = block(clone_from_git(&engine, &https(&url, GitAuth::Anonymous), &opts)).expect("depth clone");
     assert!(report.commits >= 1, "depth clone imports the recent window + a snapshot");
 

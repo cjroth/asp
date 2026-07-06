@@ -797,7 +797,7 @@ impl DesktopEngine {
     /// [`Self::run_off_thread`], which is safe from any calling context (incl. inside
     /// Tauri's runtime), just like `block()`. Only after the clone completes do we
     /// share the engine via `handle()`.
-    pub fn clone_git(&self, dest: &Path, url: &str, token: Option<&str>, depth: Option<u32>) -> Result<VaultInfo> {
+    pub fn clone_git(&self, dest: &Path, url: &str, token: Option<&str>, depth: Option<u32>, all_branches: bool) -> Result<VaultInfo> {
         let gurl = git_clone_url(url).ok_or_else(|| anyhow!("not a valid git URL: {url}"))?;
         let auth = gitremote::resolve_git_auth(&gurl, token, None);
         let spec = GitRemoteSpec::new(gurl, auth);
@@ -817,7 +817,10 @@ impl DesktopEngine {
                         cb(&dest_label, done, total, phase);
                     }
                 };
-                let opts = CloneOptions { depth, new_identity: false, on_progress: Some(&progress) };
+                // `all_branches` is the "also import open branches" checkbox
+                // (`specs/git-open-branches.md` §5): import every unmerged `refs/heads/*`
+                // as a live ASP branch.
+                let opts = CloneOptions { depth, new_identity: false, all_branches, on_progress: Some(&progress) };
                 gitremote::clone_from_git(&eng, &spec, &opts).await
             });
             (eng, out)

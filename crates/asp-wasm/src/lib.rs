@@ -551,7 +551,15 @@ impl WasmEngine {
     /// genesis → paged integrate under batch. `on_progress(phase, done, total)` fires
     /// with `phase ∈ {"fetching","replaying","saving"}`. Resolves to JSON
     /// `{vault_id, commits, branches, warnings, tip_sha, root_sha, remote_ref,
-    /// default_branch}`.
+    /// default_branch, open_branches, refs_skipped}`.
+    ///
+    /// `all_branches` (the "also import open branches" checkbox,
+    /// `specs/git-open-branches.md` §5): when true the ls-refs advertisement's
+    /// `refs/heads/*` tips are added to the fetch wants and passed as
+    /// `ImportOptions.open_branch_tips`, so every unmerged branch imports as a **live**
+    /// ASP branch (phase 2 of genesis). `open_branches`/`refs_skipped` in the report
+    /// count the live lanes imported and the refs skipped as already-reachable. `false`
+    /// = default-branch history only (byte-identical to the base spec).
     #[cfg(target_arch = "wasm32")]
     #[allow(clippy::too_many_arguments)]
     pub fn git_clone(
@@ -560,12 +568,13 @@ impl WasmEngine {
         token: Option<String>,
         proxy_base: String,
         depth: Option<u32>,
+        all_branches: bool,
         fetch_fn: js_sys::Function,
         on_progress: Option<js_sys::Function>,
     ) -> js_sys::Promise {
         let eng = self.eng.clone();
         wasm_bindgen_futures::future_to_promise(async move {
-            git_clone_inner(eng, &git_url, token.as_deref(), &proxy_base, depth, fetch_fn, on_progress)
+            git_clone_inner(eng, &git_url, token.as_deref(), &proxy_base, depth, all_branches, fetch_fn, on_progress)
                 .await
                 .map(|json| wasm_bindgen::JsValue::from_str(&json))
                 .map_err(|e| wasm_bindgen::JsValue::from_str(&e))
@@ -732,6 +741,12 @@ struct CloneReport {
     root_sha: String,
     remote_ref: String,
     default_branch: String,
+    /// Live open branches imported (`all_branches`, `specs/git-open-branches.md` §1).
+    /// `0` for a plain clone.
+    open_branches: usize,
+    /// Open-branch refs skipped because already reachable from HEAD (§1). `0` for a
+    /// plain clone.
+    refs_skipped: usize,
 }
 
 #[allow(dead_code)]
@@ -746,6 +761,8 @@ fn clone_report_json(r: &CloneReport) -> Result<String, String> {
         root_sha: &'a str,
         remote_ref: &'a str,
         default_branch: &'a str,
+        open_branches: usize,
+        refs_skipped: usize,
     }
     serde_json::to_string(&R {
         vault_id: &r.vault_id,
@@ -756,6 +773,8 @@ fn clone_report_json(r: &CloneReport) -> Result<String, String> {
         root_sha: &r.root_sha,
         remote_ref: &r.remote_ref,
         default_branch: &r.default_branch,
+        open_branches: r.open_branches,
+        refs_skipped: r.refs_skipped,
     })
     .map_err(|e| e.to_string())
 }
@@ -772,6 +791,7 @@ fn apply_clone_pack(
     tip: &str,
     default_branch: &str,
     depth: Option<u32>,
+    open_branch_tips: Vec<(String, String)>,
     progress: &dyn Fn(&str, u64, u64),
 ) -> Result<CloneReport, String> {
     if !eng.is_pristine() {
@@ -779,7 +799,20 @@ fn apply_clone_pack(
     }
     progress("replaying", 0, 0);
     let db = gitimport::GitObjectDb::from_pack(pack, gitimport::no_base_lookup).map_err(|e| e.to_string())?;
-    let iopts = gitimport::ImportOptions { depth, keep_imported_branches: false };
+    // Every open-branch candidate tip must be in the fetched pack; a missing one (the
+    // server pruned the ref between ls-refs and fetch) is a clear error (mirrors the
+    // native `gitremote::clone_from_git` guard).
+    for (name, oid) in &open_branch_tips {
+        if db.get(oid).is_none() {
+            return Err(format!(
+                "open branch '{name}' tip {oid} was not in the fetched pack (remote pruned it?)"
+            ));
+        }
+    }
+    // `open_branch_tips` empty ⇒ phase-1-only, byte-identical to the base spec; when the
+    // "also import open branches" checkbox is on they drive phase 2 of genesis
+    // (`specs/git-open-branches.md` §1–§2).
+    let iopts = gitimport::ImportOptions { depth, keep_imported_branches: false, open_branch_tips };
     let plan = gitimport::plan_import(&db, tip, &iopts).map_err(|e| e.to_string())?;
 
     let scratch = MemBlobStore::new();
@@ -800,6 +833,8 @@ fn apply_clone_pack(
         .filter(|l| l.id != gitimport::MAIN_LANE)
         .map(|l| l.name.clone())
         .collect();
+    let open_branches = plan.lanes.iter().filter(|l| l.live).count();
+    let refs_skipped = plan.skipped_reachable.len();
     Ok(CloneReport {
         vault_id: g.vault_id,
         commits: plan.commits.len(),
@@ -809,6 +844,8 @@ fn apply_clone_pack(
         root_sha: plan.root_sha.clone(),
         remote_ref: format!("refs/heads/{default_branch}"),
         default_branch: default_branch.to_string(),
+        open_branches,
+        refs_skipped,
     })
 }
 
@@ -1047,13 +1084,14 @@ async fn call_fetch(
 }
 
 /// A stateless git-protocol-v2 exchange: GET info/refs → POST ls-refs → return the
-/// tip oid + default-branch name (shared by clone + pull).
+/// tip oid + default-branch name **and the full advertised ref list** (shared by
+/// clone + pull; the ref list feeds the `all_branches` open-branch wants — §5).
 #[cfg(target_arch = "wasm32")]
 async fn negotiate_head(
     fetch_fn: &js_sys::Function,
     base: &str,
     token: Option<&str>,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, Vec<gitwire::RefInfo>), String> {
     let (st, body) = call_fetch(
         fetch_fn,
         "GET",
@@ -1085,20 +1123,23 @@ async fn negotiate_head(
         return Err(format!("git proxy ls-refs returned HTTP {st2}"));
     }
     let refs = gitwire::parse_ls_refs_response(&body2).map_err(|e| e.to_string())?;
-    resolve_head(&refs)
+    let (tip, default_branch) = resolve_head(&refs)?;
+    Ok((tip, default_branch, refs))
 }
 
-/// POST a `fetch {want tip, done}` and return the demuxed packfile bytes.
+/// POST a `fetch {want …, done}` and return the demuxed packfile bytes. `wants` is the
+/// full want set — a single tip for a plain clone/pull, or HEAD + every open-branch
+/// tip for an `all_branches` clone (one negotiation, one pack; §6).
 #[cfg(target_arch = "wasm32")]
 async fn fetch_pack(
     fetch_fn: &js_sys::Function,
     base: &str,
     token: Option<&str>,
-    tip: &str,
+    wants: &[String],
     depth: Option<u32>,
 ) -> Result<Vec<u8>, String> {
     let fr = gitwire::FetchRequest {
-        wants: vec![tip.to_string()],
+        wants: wants.to_vec(),
         done: true,
         deepen: depth,
         ..Default::default()
@@ -1126,12 +1167,14 @@ async fn fetch_pack(
 }
 
 #[cfg(target_arch = "wasm32")]
+#[allow(clippy::too_many_arguments)]
 async fn git_clone_inner(
     eng: std::rc::Rc<MemEngine>,
     git_url: &str,
     token: Option<&str>,
     proxy_base: &str,
     depth: Option<u32>,
+    all_branches: bool,
     fetch_fn: js_sys::Function,
     on_progress: Option<js_sys::Function>,
 ) -> Result<String, String> {
@@ -1151,10 +1194,29 @@ async fn git_clone_inner(
     let base = git_proxy_base(proxy_base, git_url)?;
 
     progress("fetching", 0, 0);
-    let (tip, default_branch) = negotiate_head(&fetch_fn, &base, token).await?;
-    let pack = fetch_pack(&fetch_fn, &base, token, &tip, depth).await?;
+    let (tip, default_branch, refs) = negotiate_head(&fetch_fn, &base, token).await?;
 
-    let report = apply_clone_pack(&eng, &pack, &tip, &default_branch, depth, &progress)?;
+    // Open-branch candidates (`all_branches`, `specs/git-open-branches.md` §1/§6):
+    // every advertised `refs/heads/*` except the default branch, fetched in the SAME
+    // pack (single negotiation). The planner decides unique-vs-skipped-reachable.
+    let mut wants: Vec<String> = vec![tip.clone()];
+    let mut open_candidates: Vec<(String, String)> = Vec::new();
+    if all_branches {
+        for r in &refs {
+            let Some(short) = r.name.strip_prefix("refs/heads/") else { continue };
+            if short == default_branch {
+                continue;
+            }
+            open_candidates.push((short.to_string(), r.oid.clone()));
+            if !wants.contains(&r.oid) {
+                wants.push(r.oid.clone());
+            }
+        }
+    }
+
+    let pack = fetch_pack(&fetch_fn, &base, token, &wants, depth).await?;
+
+    let report = apply_clone_pack(&eng, &pack, &tip, &default_branch, depth, open_candidates, &progress)?;
     clone_report_json(&report)
 }
 
@@ -1180,7 +1242,16 @@ async fn git_pull_inner(
     let base = git_proxy_base(proxy_base, git_url)?;
 
     progress("fetching", 0, 0);
-    let (new_tip, default_branch) = negotiate_head(&fetch_fn, &base, token).await?;
+    // The web pull follows the default branch only (snapshot semantics for open
+    // branches, `specs/git-open-branches.md` §4/§5): open branches imported at clone
+    // are ordinary ASP branches and are NOT re-synced here. The `seen`-set dedup in
+    // `apply_ingest_pack` still stops duplicate rows, but the web path does NOT do the
+    // §4 merge-after-import re-attachment — the native driver does that via
+    // `synthesize_ingest_with_open_branches`/`reconstruct_imported_branches`. So if an
+    // imported open branch later merges upstream, the web pull imports the merge as a
+    // NEW lane rather than attaching it to the existing imported branch (benign
+    // duplicate-history, base-spec §4.3 class). Native follow-up is documented work.
+    let (new_tip, default_branch, _refs) = negotiate_head(&fetch_fn, &base, token).await?;
 
     // Cheap up-to-date short-circuit: the tip already has a ledger row.
     let already = seen_shas(&all_wire_rows(&eng)?);
@@ -1188,7 +1259,7 @@ async fn git_pull_inner(
         return Ok(r#"{"new_commits":0}"#.to_string());
     }
 
-    let pack = fetch_pack(&fetch_fn, &base, token, &new_tip, None).await?;
+    let pack = fetch_pack(&fetch_fn, &base, token, &[new_tip.clone()], None).await?;
     let n = apply_ingest_pack(&eng, &pack, &new_tip, &default_branch, &progress)?;
     Ok(format!(r#"{{"new_commits":{n}}}"#))
 }

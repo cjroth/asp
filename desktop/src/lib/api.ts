@@ -137,7 +137,10 @@ export interface Api {
   // Clone a git repo into a new vault (git-bridge §7.3). Web routes git-over-HTTPS
   // through the relay CORS proxy; desktop runs the native bridge. `onProgress`
   // reports 'fetching' → 'replaying' → 'saving'. Browser is clone/pull only (no push).
-  cloneGit(dest: string, url: string, token: string | undefined, depth: number | undefined, onProgress?: CloneProgress): Promise<VaultInfo>;
+  // `allBranches` (the "also import open branches" checkbox, git-open-branches §5):
+  // import every unmerged remote branch as a live ASP branch. Undefined/false = the
+  // default branch's history only.
+  cloneGit(dest: string, url: string, token: string | undefined, depth: number | undefined, allBranches: boolean | undefined, onProgress?: CloneProgress): Promise<VaultInfo>;
   // Pull new upstream commits into a git-configured vault (git-bridge §4).
   gitPull(id: string): Promise<void>;
   // The git status chip DTO, or null if the vault has no git remote configured.
@@ -201,8 +204,10 @@ const tauriApi: Api = {
   createVault: () => Promise.reject(new Error('createVault is web-only')),
   cloneRemote: (dest, ticket, authKey) => invoke<VaultInfo>('clone_remote', { dest, ticket, authKey }),
   // Invoke-arg names MUST match the Rust `#[tauri::command]` param names exactly
-  // (lesson of f6c1d07); the desktop slice binds `clone_git(dest, url, token, depth)`.
-  cloneGit: (dest, url, token, depth) => invoke<VaultInfo>('clone_git', { dest, url, token, depth }),
+  // (lesson of f6c1d07); the desktop slice binds
+  // `clone_git(dest, url, token, depth, all_branches)` — `allBranches` binds to the
+  // snake-case `all_branches` param.
+  cloneGit: (dest, url, token, depth, allBranches) => invoke<VaultInfo>('clone_git', { dest, url, token, depth, allBranches }),
   gitPull: (id) => invoke<void>('git_pull', { id }),
   gitStatus: (id) => invoke<GitStatus | null>('git_status', { id }),
   gitPush: (id, message) => invoke<GitPushSummary>('git_push', { id, message }),
