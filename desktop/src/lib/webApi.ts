@@ -9,7 +9,7 @@ import init, { WasmEngine } from 'asp-wasm';
 // `new URL('…', import.meta.url)` breaks under Vite dev: for a linked package it
 // resolves to a `file://` URL the browser refuses to fetch.
 import wasmUrl from 'asp-wasm/asp_wasm_bg.wasm?url';
-import type { Api, CloneProgress, FileAt, FileEntry, HistEvent, VaultInfo, VaultStatus } from './api';
+import type { Api, ClonePhase, CloneProgress, FileAt, FileEntry, GitStatus, HistEvent, PendingDiff, VaultInfo, VaultStatus } from './api';
 import { WELCOME_MD } from '../vault/welcome';
 import { makeCoalescer } from './coalesce';
 
@@ -25,7 +25,34 @@ interface RegEntry {
   // ticket open (`startLiveSync`), reconnecting if it drops.
   ticket?: string;
   authKey?: string | null;
+  // Set when this vault was cloned from a git remote (git-bridge §7.3). Node-private
+  // (lives only in the OPFS registry), so it's never synced to peers.
+  git?: { url: string; proxyBase: string; rootSha: string; remoteRef: string; defaultBranch: string };
+  // The HTTPS token (PAT) for the git remote, if any. Stored in the OPFS registry at
+  // the SAME trust level as `authKey` — a stolen browser profile leaks it, so the UI
+  // copy should recommend a fine-grained, single-repo PAT (git-bridge §7.3).
+  gitToken?: string;
 }
+
+// The relay `--git-proxy` base URL for browser git clone/pull (git-bridge §7.3). A
+// browser can't reach a git host's smart-HTTP endpoints directly (they send no CORS
+// headers), so every git request routes through the relay-co-hosted proxy. Point
+// this at your relay's `asp relay --git-proxy` listener via VITE_GIT_PROXY_BASE
+// (build-time) or a `globalThis.__ASP_GIT_PROXY_BASE__` override (runtime/dev).
+function gitProxyBase(): string {
+  const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
+  const base = (globalThis as { __ASP_GIT_PROXY_BASE__?: string }).__ASP_GIT_PROXY_BASE__ ?? env?.VITE_GIT_PROXY_BASE;
+  if (!base) throw new Error("git proxy is not configured — set VITE_GIT_PROXY_BASE to your relay's `asp relay --git-proxy` URL");
+  return base;
+}
+
+// The transport handed to the wasm git methods: wasm owns the git protocol + builds
+// the proxy URL and request bytes; JS just performs the actual CORS fetch. `headers`
+// is a plain object, `body` a Uint8Array|null; resolves to { status, body:Uint8Array }.
+const gitFetch = async (method: string, url: string, headers: Record<string, string>, body: Uint8Array | null) => {
+  const res = await fetch(url, { method, headers, body: body ? (body as BufferSource) : undefined, mode: 'cors' });
+  return { status: res.status, body: new Uint8Array(await res.arrayBuffer()) };
+};
 
 // ---- byte store: OPFS when available, in-memory fallback otherwise ----
 // OPFS needs a secure context and browser support; where it's missing (e.g. some
@@ -122,7 +149,20 @@ export function createWebApi(): Api {
   // Live connections, one per vault id. A browser can't accept inbound
   // connections, but once it dials the upstream it holds the link open and rows
   // stream both ways in realtime — no polling.
-  const live = new Map<string, { stop: boolean }>();
+  const live = new Map<string, { stop: boolean; gitTimer?: ReturnType<typeof setInterval> }>();
+
+  // Pull a git-configured vault once (git-bridge §4). Reads the vault's git config
+  // from the registry, drives the wasm incremental pull, and schedules a persist if
+  // anything landed. A no-op for a vault with no git remote. Returns the new-commit count.
+  async function gitPullOnce(id: string): Promise<number> {
+    const entry = (await registry()).find((r) => r.id === id);
+    if (!entry?.git) return 0;
+    const eng = await engineFor(id);
+    const json = await eng.git_pull(entry.git.url, entry.gitToken ?? undefined, entry.git.proxyBase, gitFetch, undefined);
+    const { new_commits } = JSON.parse(json) as { new_commits: number };
+    if (new_commits > 0) persistQueue.schedule(id, eng);
+    return new_commits;
+  }
 
   async function engineFor(id: string): Promise<WasmEngine> {
     const cached = engines.get(id);
@@ -221,17 +261,91 @@ export function createWebApi(): Api {
       return info({ id, vault_id });
     },
 
+    // Clone a git repo into a new OPFS vault via the relay CORS proxy (git-bridge
+    // §7.3). The wasm engine owns the git protocol + import; `gitFetch` supplies the
+    // browser transport. Clone/pull only — the browser never pushes (spec non-goal).
+    cloneGit: async (_dest: string, url: string, token: string | undefined, depth: number | undefined, onProgress?: CloneProgress): Promise<VaultInfo> => {
+      await ensureWasm();
+      const proxyBase = gitProxyBase();
+      const id = 'w_' + randHex(8);
+      const eng = new WasmEngine(await deviceSeed(), ''); // pristine → adopts the repo-derived vault id
+      // wasm fires (phase, done, total); the Api progress cb wants (done, total, phase).
+      const cb = onProgress ? (phase: string, done: number, total: number) => onProgress(done, total, phase as ClonePhase) : undefined;
+      const reportJson = await eng.git_clone(url, token ?? undefined, proxyBase, depth ?? undefined, gitFetch, cb);
+      const report = JSON.parse(reportJson) as { root_sha: string; remote_ref: string; default_branch: string };
+      const vault_id = eng.vault_id();
+      engines.set(id, eng);
+      onProgress?.(0, 0, 'saving');
+      await persist(id, eng);
+      const reg = await registry();
+      reg.unshift({
+        id,
+        vault_id,
+        git: { url, proxyBase, rootSha: report.root_sha, remoteRef: report.remote_ref, defaultBranch: report.default_branch },
+        gitToken: token,
+      });
+      await writeJson('registry.json', reg);
+      return info({ id, vault_id });
+    },
+
+    gitPull: async (id: string) => {
+      await gitPullOnce(id);
+    },
+
+    // The status chip DTO, computed from the fold ledger + registry config. Web is
+    // clone/pull only, so it never freezes (no force-push detection) and doesn't
+    // compute ahead/behind here — those are native-side (git-bridge §4.4, §5); the
+    // shared DTO keeps the shape identical to the desktop `git_status`.
+    gitStatus: async (id: string): Promise<GitStatus | null> => {
+      const entry = (await registry()).find((r) => r.id === id);
+      if (!entry?.git) return null;
+      const eng = await engineFor(id);
+      const { at_sha } = JSON.parse(eng.git_ledger_json()) as { at_sha: string | null; ingested: number };
+      return { remoteUrl: entry.git.url, atSha: at_sha, frozen: false, ahead: 0, behind: 0, policy: 'manual' };
+    },
+
+    // Pushing is a spec non-goal in the browser (no outbound smart-HTTP; clone/pull
+    // only) — reject clearly so the UI can point the user at the desktop app or CLI.
+    gitPush: async (): Promise<never> => {
+      throw new Error("Pushing to git from the browser isn't supported — use the desktop app or CLI.");
+    },
+
+    // The browser never pushes, so there's nothing pending to show — return an empty
+    // diff rather than throwing (harmless, keeps callers uniform across surfaces).
+    gitPendingDiff: async (): Promise<PendingDiff> => ({ filesChanged: 0, paths: [], unified: '' }),
+
     // Hold a live connection to the upstream open, reconnecting if it drops. The
     // engine integrates remote pushes in realtime and fires `onChange` so the UI
     // refreshes; locally-authored rows push out over the same connection. A vault
     // with no upstream (created locally) has nothing to connect to.
     startLiveSync: async (id, onChange) => {
       if (live.has(id)) return;
-      const up = await upstreamOf(id);
-      if (!up) return;
-      const eng = await engineFor(id);
-      const handle = { stop: false };
+      const entry = (await registry()).find((r) => r.id === id);
+      const up = entry?.ticket ? { ticket: entry.ticket, authKey: entry.authKey ?? null } : null;
+      if (!up && !entry?.git) return; // nothing to follow
+      const handle: { stop: boolean; gitTimer?: ReturnType<typeof setInterval> } = { stop: false };
       live.set(id, handle);
+      // A git-configured vault polls the remote every 60s while the tab is open. This
+      // is a fallback: a vault that ALSO holds a live ASP link to a native bridge peer
+      // receives git updates over ordinary sync for free (no git traffic), so this
+      // tick is belt-and-braces (git-bridge §7.3).
+      if (entry?.git) {
+        handle.gitTimer = setInterval(() => {
+          void gitPullOnce(id)
+            .then((n) => {
+              if (n > 0) {
+                try {
+                  onChange();
+                } catch {
+                  /* listener threw — ignore */
+                }
+              }
+            })
+            .catch(() => {});
+        }, 60_000);
+      }
+      if (!up) return; // git-only vault: the poll tick above is the whole story
+      const eng = await engineFor(id);
       void (async () => {
         while (!handle.stop) {
           try {
@@ -256,7 +370,10 @@ export function createWebApi(): Api {
 
     stopLiveSync: async (id) => {
       const h = live.get(id);
-      if (h) h.stop = true;
+      if (h) {
+        h.stop = true;
+        if (h.gitTimer) clearInterval(h.gitTimer);
+      }
       live.delete(id);
       persistQueue.flushKey(id); // leaving the vault — write its latest state now
     },

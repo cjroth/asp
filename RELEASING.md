@@ -41,6 +41,23 @@ scripts/bump-version.sh patch    # prints the resolved version; edits manifests
 git restore .                    # undo the preview
 ```
 
+## Protocol version
+
+Separate from the release version above, ASP has a wire-protocol number `PROTO`
+(`crates/asp-core/src/wire.rs`). Peers refuse a mismatched proto at the `Hello`
+handshake — an old node meeting a newer one gets a clear "peer speaks proto N,
+upgrade" error, never silent corruption.
+
+**Current: `PROTO = 4`** (bumped 3 → 4 for the git bridge, which adds the
+`GitCommit` / `GitIngest` / `GitPlan` log kinds — an old peer can't decode them).
+The 3 → 4 bump shipped as a **coordinated same-day upgrade** of the whole (small)
+fleet: no two-step "understand-then-author" release, because the peers are few and
+all operated by us. **When you bump `PROTO`, upgrade every peer you can't
+coordinate with in the same window, or a bridge node's git rows will lock older
+peers out at the handshake.** Revisit the two-step discipline (ship a release that
+*understands* the new kinds before one that *authors* them) once vaults exist that
+we don't operate. See `specs/git-bridge.md` §6.2.
+
 ## Security notes
 
 - Every third-party action is pinned to a full commit SHA (the trailing

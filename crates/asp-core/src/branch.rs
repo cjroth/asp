@@ -266,6 +266,9 @@ pub fn build_graph(rows: &[LogRow], live_branches: &[Branch], head: &str, cap: u
     let mut nodes: Vec<GraphNode> = Vec::new();
     // branch_id -> its commit ids in order (for parent chaining + fork lookup).
     let mut chain: HashMap<String, Vec<(u64, String)>> = HashMap::new();
+    // branch_id -> index in `nodes` of its first (empty-parent) commit, so the
+    // fork-edge pass is O(1) per lane instead of a full `nodes` scan.
+    let mut first_node_idx: HashMap<String, usize> = HashMap::new();
 
     // Group rows by branch in a single pass (was a full-log filter per lane,
     // i.e. O(lanes × rows); now O(rows)). Lanes are distinct branch ids, so each
@@ -316,6 +319,13 @@ pub fn build_graph(rows: &[LogRow], live_branches: &[Branch], head: &str, cap: u
             commits[w].parents.push(prev);
         }
         chain.insert(b.branch_id.clone(), commits.iter().map(|c| (c.lamport, c.commit_id.clone())).collect());
+        // The first coarsened commit of this lane keeps empty parents (the within-lane
+        // chaining above only fills index 1..). Record its node index so the fork-edge
+        // pass finds it in O(1) instead of re-scanning every node per lane — at ~50k
+        // imported branches that linear scan was the whole graph's O(lanes²) hot spot.
+        if !commits.is_empty() {
+            first_node_idx.insert(b.branch_id.clone(), nodes.len());
+        }
         nodes.extend(commits);
     }
 
@@ -331,10 +341,11 @@ pub fn build_graph(rows: &[LogRow], live_branches: &[Branch], head: &str, cap: u
         let parent_commit = chain.get(parent_id).and_then(|cs| {
             cs.iter().rfind(|(lam, _)| *lam <= fork_lamport).or_else(|| cs.last()).map(|(_, id)| id.clone())
         });
-        if let (Some(first), Some(pc)) = (
-            nodes.iter_mut().find(|n| n.branch_id == b.branch_id && n.parents.is_empty()),
-            parent_commit,
-        ) {
+        let first = first_node_idx
+            .get(&b.branch_id)
+            .map(|&i| &mut nodes[i])
+            .filter(|n| n.parents.is_empty());
+        if let (Some(first), Some(pc)) = (first, parent_commit) {
             first.parents.push(pc);
         }
     }

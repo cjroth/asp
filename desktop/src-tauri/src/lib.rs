@@ -50,6 +50,16 @@ pub fn run() {
             app.state::<AppState>().engine.set_change_listener(move |vault_id| {
                 let _ = handle.emit("vault-changed", vault_id);
             });
+            // Emit git clone/pull progress on the SAME `vault-scan-progress` event the
+            // startup reconcile uses, so a git clone drives the UI's determinate bar
+            // (phases `fetching` → `replaying` → `saving`).
+            let ph = app.handle().clone();
+            app.state::<AppState>().engine.set_scan_progress_listener(move |path, done, total, phase| {
+                let _ = ph.emit(
+                    "vault-scan-progress",
+                    serde_json::json!({ "path": path, "done": done, "total": total, "phase": phase }),
+                );
+            });
             // Re-open saved folders in the BACKGROUND so the window opens instantly.
             // A folder's open includes a startup reconcile that reads every file on
             // disk — ~tens of seconds for a 28k-file vault — which used to block the
@@ -83,6 +93,11 @@ pub fn run() {
             commands::vaults_ready,
             commands::add_local_folder,
             commands::clone_remote,
+            commands::clone_git,
+            commands::git_pull,
+            commands::git_status,
+            commands::git_push,
+            commands::git_pending_diff,
             commands::set_allow_connections,
             commands::set_local_relay,
             commands::get_local_relay,

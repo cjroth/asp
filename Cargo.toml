@@ -48,6 +48,10 @@ flate2 = "1"
 # errors / utils
 thiserror = "1"
 anyhow = "1"
+# git-bridge credentials: OS keychain (macOS Keychain / Secret Service / Windows
+# Credential Manager). Native-only; the bridge falls back to env/anonymous when the
+# platform store is unavailable, so a missing backend never panics (git-bridge §8).
+keyring = "3"
 # cli
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
@@ -60,6 +64,23 @@ n0-future = "0.3"
 qrcode = { version = "0.14", default-features = false }
 # async net (CLI driver)
 tokio = { version = "1", features = ["full"] }
+# git CORS proxy (native-only, co-hosted with the relay): a minimal HTTP server
+# (hyper 1.x — already in the tree transitively via iroh, version-aligned) plus an
+# rustls-only upstream client (reqwest, NOT native-tls). `stream` gives us a capped
+# streaming response body; `resolve_to_addrs` pins DNS to a vetted IP (SSRF/rebinding).
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+# git bridge: packfile decode with delta resolution + object/oid parsing.
+# Component crates only (never the `gix` facade); wasm-verified with exactly this
+# feature set (R1 probe): `wasm` is mandatory for wasm32, `parallel` must stay off,
+# zlib comes from gix-features (pure-Rust zlib-rs). Same config serves native + wasm.
+gix-pack = { version = "0.72", default-features = false, features = ["streaming-input", "wasm", "sha1"] }
+gix-object = { version = "0.62", default-features = false }
+gix-hash = { version = "0.25", default-features = false, features = ["sha1"] }
+gix-features = { version = "0.48", default-features = false, features = ["zlib"] }
 # watching
 notify = "6"
 walkdir = "2"

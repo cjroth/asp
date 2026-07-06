@@ -24,6 +24,11 @@ serde_bytes.workspace = true
 rmp-serde.workspace = true
 similar.workspace = true
 thiserror.workspace = true
+# git bridge read path (`gitimport`): pack decode + object parsing, wasm-safe.
+gix-pack.workspace = true
+gix-object.workspace = true
+gix-hash.workspace = true
+gix-features.workspace = true
 
 # Native-only: the SQLite substrate, derived-git encoding (sha1/flate2/toml), the
 # iroh QUIC transport (`iroh_net`) + relay server, and the debounced filesystem
@@ -42,6 +47,18 @@ n0-future.workspace = true
 tokio.workspace = true
 notify.workspace = true
 tracing.workspace = true
+# git CORS proxy (`gitproxy`): hyper server + rustls-only reqwest upstream client.
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+reqwest.workspace = true
+# git-bridge credentials (§8): resolve/persist HTTPS tokens via the OS keychain.
+# All calls are best-effort — a missing/locked backend falls back to env/anonymous.
+keyring = { workspace = true, features = ["apple-native", "windows-native", "sync-secret-service"] }
+# Stream combinators for capping the upstream response body chunk-by-chunk (mirrors
+# the wasm target's use below); default-features off keeps it to std stream utils.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # The wasm build keeps the full merge/fold/session engine; it just needs the JS
 # RNG backend for handshake nonces + random file ids (one engine, §Implementation).

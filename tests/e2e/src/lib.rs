@@ -10,6 +10,12 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// Hermetic git-fixture harness for the git-bridge feature (spec §10).
+pub mod gitfix;
+pub use gitfix::{
+    all_fixtures, force_rewrite_tip, FixtureRepo, GitHttpServer, Sha,
+};
+
 /// Locate the built `asp` binary (debug preferred, else release).
 pub fn asp_bin() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

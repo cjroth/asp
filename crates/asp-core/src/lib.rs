@@ -15,6 +15,10 @@ pub mod authkeys;
 pub mod branch;
 pub mod error;
 pub mod fold;
+pub mod gitgenesis;
+pub mod gitimport;
+pub mod gitrecord;
+pub mod gitwire;
 pub mod identity;
 pub mod log;
 pub mod memengine;
@@ -33,7 +37,17 @@ pub mod config;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod engine;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod gitbridge;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod gitexport;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod gitpolicy;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod gitpush;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod gitremote;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod gitproxy;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod net;
 #[cfg(not(target_arch = "wasm32"))]
@@ -50,6 +64,10 @@ pub use branch::{
 };
 pub use error::{AspError, AspResult};
 pub use fold::{compute_files, fold_order, FoldState};
+pub use gitrecord::{
+    build_commit_marker_row, build_ingest_row, build_plan_row, GitCommitMarker, GitIngestRecord,
+    GitPlanRecord, GitRowIdentity,
+};
 pub use identity::Identity;
 pub use log::{Kind, LogRow, MergeClass, MAIN_BRANCH_ID};
 pub use memengine::MemEngine;
@@ -64,4 +82,4 @@ pub use config::VaultConfig;
 #[cfg(not(target_arch = "wasm32"))]
 pub use engine::Engine;
 #[cfg(not(target_arch = "wasm32"))]
-pub use sqlite::SqliteStore as Store;
+pub use sqlite::{GitRemoteRow, SqliteStore as Store};

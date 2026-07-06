@@ -12,6 +12,10 @@
 //! dependency**, so it builds and is tested on plain Linux.
 
 use anyhow::{anyhow, Context, Result};
+use asp_core::gitbridge::GitRemoteSpec;
+use asp_core::gitpush::{self, PushReport};
+use asp_core::gitremote::{self, CloneOptions, PullReport};
+use asp_core::gitwire::parse_git_url;
 use asp_core::iroh_net;
 use asp_core::net::{AuthOpts, EngineRef};
 use asp_core::{Engine, Identity, Msg, VaultConfig, WireRow};
@@ -21,6 +25,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 
 /// Public, serializable view of a managed folder (what the UI renders).
@@ -103,6 +108,91 @@ pub struct FileAt {
     pub content: String,
 }
 
+/// The git-bridge status chip DTO (git-bridge §7.2). A camelCased projection of
+/// [`asp_core::gitremote::GitStatus`] — the core type is snake_case, so we map it
+/// here (rather than touching core) to match the shared TS `GitStatus` shape
+/// (`{remoteUrl, atSha, frozen, ahead, behind, policy}`) the web slice already uses.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitStatusDto {
+    pub remote_url: String,
+    pub at_sha: Option<String>,
+    pub frozen: bool,
+    pub ahead: usize,
+    pub behind: usize,
+    pub policy: String,
+}
+
+impl From<gitremote::GitStatus> for GitStatusDto {
+    fn from(s: gitremote::GitStatus) -> Self {
+        GitStatusDto {
+            remote_url: s.remote_url,
+            at_sha: s.at_sha,
+            frozen: s.frozen,
+            ahead: s.ahead,
+            behind: s.behind,
+            policy: s.policy,
+        }
+    }
+}
+
+/// A small summary of a [`DesktopEngine::git_pull`] (git-bridge §4). The web
+/// `gitPull` binding ignores the payload (`Promise<void>`); we return a shape so
+/// the desktop UI can surface "ingested N commits" / "frozen" if it wants to.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPullSummary {
+    pub new_commits: usize,
+    pub frozen: bool,
+    pub up_to_date: bool,
+}
+
+/// A small summary of a [`DesktopEngine::git_push`] (git-bridge §7.2). Push is
+/// desktop/CLI-only (the web binding rejects), so this shape is only ever produced
+/// natively; the UI surfaces "pushed <sha> (N commit(s))" or "nothing to commit".
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPushSummary {
+    /// The new remote tip sha, or `None` when nothing was unpushed.
+    pub pushed_sha: Option<String>,
+    /// Number of commits actually pushed (0 when nothing to commit).
+    pub commits: usize,
+}
+
+impl From<PushReport> for GitPushSummary {
+    fn from(r: PushReport) -> Self {
+        match r {
+            PushReport::Nothing => GitPushSummary { pushed_sha: None, commits: 0 },
+            PushReport::Pushed { pushed_sha, commits_pushed, .. } => {
+                GitPushSummary { pushed_sha: Some(pushed_sha), commits: commits_pushed }
+            }
+        }
+    }
+}
+
+/// The pending (unpushed) change set for a git-bridge folder (git-bridge §5.3), a
+/// camelCased projection of [`asp_core::gitpush::PendingDiff`]. The UI reads it to
+/// pre-fill the commit message and show what a push would send before confirming.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingDiffDto {
+    pub files_changed: usize,
+    pub paths: Vec<String>,
+    pub unified: String,
+}
+
+impl From<PullReport> for GitPullSummary {
+    fn from(r: PullReport) -> Self {
+        match r {
+            PullReport::UpToDate => GitPullSummary { new_commits: 0, frozen: false, up_to_date: true },
+            PullReport::Frozen => GitPullSummary { new_commits: 0, frozen: true, up_to_date: false },
+            PullReport::Updated { new_commits, .. } => {
+                GitPullSummary { new_commits, frozen: false, up_to_date: false }
+            }
+        }
+    }
+}
+
 type Conns = Arc<AsyncMutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<asp_core::Msg>>>>;
 
 struct Folder {
@@ -124,6 +214,13 @@ struct Folder {
     /// The upstream peer ticket this folder stays connected to, if any.
     #[allow(dead_code)]
     peer: Option<String>,
+    /// True when this folder was cloned from a git remote (git-bridge §7.2). Its
+    /// configured remote lives in the engine's own `git_remotes` table (not in
+    /// `FolderCfg.peer`); this flag just tells us to re-arm the periodic pull tick.
+    git: bool,
+    /// The periodic `git pull` tick for a git-bridge folder (abort to stop it) —
+    /// the desktop analogue of the CLI watch loop's `git_pull_tick`.
+    pull_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Persisted record of a managed folder (small app config — not protocol state).
@@ -132,9 +229,17 @@ struct FolderCfg {
     path: String,
     #[serde(default)]
     peer: Option<String>,
+    /// True for a git-bridge folder (cloned from a git URL) — so reopen knows to
+    /// re-arm its periodic pull tick. The remote URL itself is already persisted in
+    /// the engine's `git_remotes` table, so a bool is enough here.
+    #[serde(default)]
+    git: bool,
 }
 
 type ChangeCb = Arc<dyn Fn(String) + Send + Sync>;
+/// A clone/pull progress sink: `(path, done, total, phase)` — the same shape the
+/// startup reconcile emits, so the shell reuses its `vault-scan-progress` event.
+type ScanCb = Arc<dyn Fn(&str, u64, u64, &str) + Send + Sync>;
 
 pub struct DesktopEngine {
     rt: tokio::runtime::Runtime,
@@ -145,6 +250,10 @@ pub struct DesktopEngine {
     /// updates the instant a change lands (no waiting on a poll). Shared (Arc) so
     /// per-engine notifiers read it at fire time even if it's set after open.
     change_listener: Arc<Mutex<Option<ChangeCb>>>,
+    /// Fired with `(path, done, total, phase)` during a `clone_git`/`git_pull` so the
+    /// shell can emit a `vault-scan-progress` event (phases `fetching`|`replaying`|
+    /// `saving`). Set by the shell after construction, exactly like `change_listener`.
+    scan_listener: Arc<Mutex<Option<ScanCb>>>,
     /// When set, a co-hosted relay's URL — endpoints bind through it (and tickets
     /// advertise it) so same-machine/LAN peers route locally instead of via the
     /// public n0 relays. Backs the "faster local syncing" toggle.
@@ -157,6 +266,33 @@ pub struct DesktopEngine {
     /// it misses if the webview's listener isn't attached before the (often instant,
     /// e.g. empty-config) reopen emits it.
     ready: AtomicBool,
+}
+
+/// Parse an explicit git clone URL. Accepts everything [`parse_git_url`] does
+/// (https / ssh / scp-like) plus a **loopback** `http://` URL — a self-hosted git
+/// server on `127.0.0.1`/`localhost` served over plain HTTP. The bridge transport
+/// uses the URL's base verbatim, so an `http://` loopback base works; and because
+/// this is an *explicit* clone target (not the CLI's source auto-detection), there
+/// is no risk of mistaking it for a local path or an iroh ticket — the `http://`
+/// scheme is unambiguous. Non-loopback `http://` stays rejected (no plaintext creds
+/// over the network).
+fn git_clone_url(url: &str) -> Option<asp_core::gitwire::GitUrl> {
+    use asp_core::gitwire::GitUrl;
+    if let Some(g) = parse_git_url(url) {
+        return Some(g);
+    }
+    let s = url.trim();
+    if let Some(rest) = s.strip_prefix("http://") {
+        let authority = rest.split('/').next().unwrap_or("");
+        if authority.contains('@') {
+            return None; // no embedded userinfo
+        }
+        let host = authority.split(':').next().unwrap_or("");
+        if host == "localhost" || host == "127.0.0.1" || host == "[::1]" {
+            return Some(GitUrl::Https { base: s.trim_end_matches('/').to_string() });
+        }
+    }
+    None
 }
 
 fn random_id() -> String {
@@ -174,6 +310,7 @@ impl DesktopEngine {
             identity,
             folders: Mutex::new(HashMap::new()),
             change_listener: Arc::new(Mutex::new(None)),
+            scan_listener: Arc::new(Mutex::new(None)),
             relay_override: Mutex::new(None),
             relay_task: Mutex::new(None),
             ready: AtomicBool::new(false),
@@ -268,6 +405,14 @@ impl DesktopEngine {
         *self.change_listener.lock().unwrap() = Some(Arc::new(cb));
     }
 
+    /// Register a callback fired with `(path, done, total, phase)` during a
+    /// `clone_git`/`git_pull`. The shell wires this to the same `vault-scan-progress`
+    /// event the startup reconcile uses, so a git clone shows a determinate bar
+    /// (`fetching` → `replaying` → `saving`).
+    pub fn set_scan_progress_listener(&self, cb: impl Fn(&str, u64, u64, &str) + Send + Sync + 'static) {
+        *self.scan_listener.lock().unwrap() = Some(Arc::new(cb));
+    }
+
     /// Whether `reopen_saved` has completed. The UI polls this once on mount as a
     /// race-proof fallback to the `vaults-ready` event (see the `ready` field).
     pub fn vaults_ready(&self) -> bool {
@@ -359,16 +504,17 @@ impl DesktopEngine {
     /// Add (and initialize/open) a local folder as a vault. Captures current disk
     /// contents into the log, and remembers the path so it reopens next launch.
     pub fn add_local_folder(&self, path: &Path) -> Result<VaultInfo> {
-        let info = self.add_folder_inner(path, None)?;
-        self.remember_folder(path, None);
+        let info = self.add_folder_inner(path, None, false)?;
+        self.remember_folder(path, None, false);
         Ok(info)
     }
 
     /// Open/init a folder and register it (with its live services), without
     /// touching the persisted list. Shared by `add_local_folder`/`reopen_saved`.
-    /// `peer` is an optional upstream ticket to stay connected to.
-    fn add_folder_inner(&self, path: &Path, peer: Option<String>) -> Result<VaultInfo> {
-        self.add_folder_inner_progress(path, peer, &|_, _, _| {})
+    /// `peer` is an optional upstream ticket to stay connected to; `git` marks a
+    /// git-bridge folder (so its pull tick is re-armed by the caller).
+    fn add_folder_inner(&self, path: &Path, peer: Option<String>, git: bool) -> Result<VaultInfo> {
+        self.add_folder_inner_progress(path, peer, git, &|_, _, _| {})
     }
 
     /// Like [`add_folder_inner`] but reports the startup reconcile's scan/hash/save
@@ -378,6 +524,7 @@ impl DesktopEngine {
         &self,
         path: &Path,
         peer: Option<String>,
+        git: bool,
         on: &(dyn Fn(u64, u64, &str) + Sync),
     ) -> Result<VaultInfo> {
         let eng = if path.join(".asp/asp.db").exists() {
@@ -408,6 +555,8 @@ impl DesktopEngine {
             endpoint,
             connector,
             peer,
+            git,
+            pull_task: None,
         };
         let info = Self::info_of(&folder);
         self.folders.lock().unwrap().insert(id, folder);
@@ -516,12 +665,15 @@ impl DesktopEngine {
         }
     }
 
-    fn remember_folder(&self, path: &Path, peer: Option<String>) {
+    fn remember_folder(&self, path: &Path, peer: Option<String>, git: bool) {
         let p = path.to_string_lossy().to_string();
         let mut list = Self::saved_folders();
         match list.iter_mut().find(|c| c.path == p) {
-            Some(c) => c.peer = peer,
-            None => list.push(FolderCfg { path: p, peer }),
+            Some(c) => {
+                c.peer = peer;
+                c.git = c.git || git;
+            }
+            None => list.push(FolderCfg { path: p, peer, git }),
         }
         Self::write_saved_folders(&list);
     }
@@ -567,7 +719,7 @@ impl DesktopEngine {
                     s.spawn(move || {
                         let prog = |d: u64, t: u64, ph: &str| on_progress(&cfg.path, d, t, ph);
                         let info = self
-                            .add_folder_inner_progress(&PathBuf::from(&cfg.path), cfg.peer.clone(), &prog)
+                            .add_folder_inner_progress(&PathBuf::from(&cfg.path), cfg.peer.clone(), cfg.git, &prog)
                             .ok()?;
                         on_each(&info);
                         Some((cfg.clone(), info))
@@ -576,6 +728,13 @@ impl DesktopEngine {
                 .collect();
             handles.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
         });
+        // Re-arm the periodic git pull for every reopened git-bridge folder (its
+        // remote config was rehydrated with the engine; we just restart the tick).
+        for (cfg, info) in &opened {
+            if cfg.git {
+                self.arm_pull_tick(&info.id);
+            }
+        }
         let keep: Vec<FolderCfg> = opened.iter().map(|(c, _)| c.clone()).collect();
         Self::write_saved_folders(&keep);
         // Startup rehydrate is done — let the UI clear its loading gate (querying
@@ -614,11 +773,249 @@ impl DesktopEngine {
             endpoint,
             connector,
             peer,
+            git: false,
+            pull_task: None,
         };
         let info = Self::info_of(&folder);
         self.folders.lock().unwrap().insert(id, folder);
-        self.remember_folder(dest, Some(ticket.to_string()));
+        self.remember_folder(dest, Some(ticket.to_string()), false);
         Ok(info)
+    }
+
+    /// Bootstrap a new folder by cloning a **git** remote (git-bridge §7.2) — the
+    /// native mirror of the web slice's `cloneGit`. Wraps
+    /// [`asp_core::gitremote::clone_from_git`] the way [`clone_remote`] wraps the
+    /// iroh bootstrap: run the driver, then `handle()` the populated engine, build
+    /// the `Folder`, persist it (git-flagged), and arm the periodic pull.
+    ///
+    /// Concurrency note: `clone_from_git` is `async fn(&Engine, …)` and the on-disk
+    /// `Engine` holds a `!Sync` SQLite handle, so the future borrows `&Engine` across
+    /// `.await` and is therefore `!Send` — it cannot be driven by [`Self::block`]
+    /// (which spawns onto the shared multi-thread runtime). We instead clone into a
+    /// **bare, unshared** `Engine` (exactly as the CLI `clone` does) and drive the
+    /// future inline on a throwaway current-thread runtime on a fresh OS thread — see
+    /// [`Self::run_off_thread`], which is safe from any calling context (incl. inside
+    /// Tauri's runtime), just like `block()`. Only after the clone completes do we
+    /// share the engine via `handle()`.
+    pub fn clone_git(&self, dest: &Path, url: &str, token: Option<&str>, depth: Option<u32>) -> Result<VaultInfo> {
+        let gurl = git_clone_url(url).ok_or_else(|| anyhow!("not a valid git URL: {url}"))?;
+        let auth = gitremote::resolve_git_auth(&gurl, token, None);
+        let spec = GitRemoteSpec::new(gurl, auth);
+        // Open the (unshared) engine on the caller's thread so open errors surface
+        // cleanly; it is pristine, so `clone_from_git` accepts it.
+        let eng = Engine::open(dest, self.identity.clone()).context("git clone open")?;
+        let scan = self.scan_listener.clone();
+        let dest_label = dest.to_string_lossy().to_string();
+        let (eng, report) = Self::run_off_thread(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("git bridge current-thread runtime");
+            let out = rt.block_on(async {
+                let progress = move |phase: &str, done: u64, total: u64| {
+                    if let Some(cb) = scan.lock().unwrap().as_ref() {
+                        cb(&dest_label, done, total, phase);
+                    }
+                };
+                let opts = CloneOptions { depth, new_identity: false, on_progress: Some(&progress) };
+                gitremote::clone_from_git(&eng, &spec, &opts).await
+            });
+            (eng, out)
+        });
+        // `report` carries best-effort degraded-content notices (submodules/LFS) and
+        // the imported commit/tip summary; v1 surfaces vault state via `git_status`,
+        // so we just confirm the clone succeeded here.
+        let _report = report.map_err(|e| anyhow!("git clone: {e}"))?;
+        let engine = self.handle(eng);
+        let id = random_id();
+        let conns: Conns = Arc::new(AsyncMutex::new(HashMap::new()));
+        // A git folder's upstream is the git remote (in the engine's own sqlite), not
+        // an ASP peer — so `peer`/`connector` stay `None` (no iroh dial loop).
+        let folder = Folder {
+            id: id.clone(),
+            path: dest.to_path_buf(),
+            engine,
+            conns,
+            enabled: false,
+            listening_ticket: None,
+            listener: None,
+            endpoint: None,
+            connector: None,
+            peer: None,
+            git: true,
+            pull_task: None,
+        };
+        let info = Self::info_of(&folder);
+        self.folders.lock().unwrap().insert(id.clone(), folder);
+        self.remember_folder(dest, None, true);
+        self.arm_pull_tick(&id);
+        Ok(info)
+    }
+
+    /// Run a (possibly `!Send`) future's driver to completion on a throwaway
+    /// current-thread runtime on a fresh OS thread. The git-bridge drivers
+    /// (`clone_from_git`/`pull_once`) borrow the `!Sync` on-disk `Engine` across
+    /// `.await`, so their futures are `!Send` and cannot be spawned by [`Self::block`].
+    /// A fresh thread is never a runtime worker, so `block_on` there is safe from any
+    /// calling context — the same guarantee `block()` gives, minus the `Send` bound.
+    fn run_off_thread<T, F>(work: F) -> T
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        std::thread::spawn(work).join().expect("git bridge worker thread panicked")
+    }
+
+    /// Drive one `pull_once` against a configured remote to completion off-thread
+    /// (see [`Self::run_off_thread`]). The engine lock is held across the pull's
+    /// awaits — pulls are infrequent (5-min cadence) and short, exactly the tradeoff
+    /// the CLI's `git_pull_tick` documents.
+    #[allow(clippy::await_holding_lock)]
+    fn pull_blocking(engine: EngineRef, remote_id: String) -> Result<PullReport> {
+        let out = Self::run_off_thread(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("git bridge current-thread runtime");
+            rt.block_on(async move {
+                let e = engine.lock().unwrap();
+                gitremote::pull_once(&e, &remote_id, None).await
+            })
+        });
+        out.map_err(|e| anyhow!("{e}"))
+    }
+
+    /// Author a plan for `message` then drive one `push` to completion off-thread
+    /// (see [`Self::run_off_thread`]) — the desktop mapping of the CLI's manual push
+    /// policy (`author_plan` + `push`). The engine lock is held across the push's
+    /// awaits exactly like [`Self::pull_blocking`]: pushes are user-triggered and
+    /// short, and holding the guard keeps synthesis reading a stable log.
+    #[allow(clippy::await_holding_lock)]
+    fn push_blocking(engine: EngineRef, remote_id: String, message: String) -> Result<PushReport> {
+        let out = Self::run_off_thread(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("git bridge current-thread runtime");
+            rt.block_on(async move {
+                let e = engine.lock().unwrap();
+                // Manual policy = author a plan for the current frontier, then push it.
+                gitpush::author_plan(&e, &remote_id, &message, None)?;
+                gitpush::push(&e, &remote_id, |_phase| {}).await
+            })
+        });
+        out.map_err(|e| anyhow!("{e}"))
+    }
+
+    /// Commit the vault's pending changes as a git commit and push it upstream
+    /// (git-bridge §7.2, manual policy). Resolves the folder's single configured git
+    /// remote (same lookup as [`Self::git_pull`]), then authors a plan for `message`
+    /// and drives the push. Surfaces the typed errors verbatim: a frozen remote
+    /// (upstream history rewritten) or a non-fast-forward that survived the bounded
+    /// retry. `PushReport::Nothing` maps to `commits: 0` (nothing to commit).
+    pub fn git_push(&self, id: &str, message: &str) -> Result<GitPushSummary> {
+        let (engine, remote_id) = {
+            let folders = self.folders.lock().unwrap();
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            let rid = {
+                let e = f.engine.lock().unwrap();
+                e.store
+                    .git_remote_list()
+                    .map_err(|e| anyhow!("{e}"))?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("vault has no git remote configured"))?
+                    .remote_id
+            };
+            (f.engine.clone(), rid)
+        };
+        let report = Self::push_blocking(engine, remote_id, message.to_string())
+            .map_err(|e| anyhow!("git push: {e}"))?;
+        Ok(GitPushSummary::from(report))
+    }
+
+    /// The pending (unpushed) diff for a git-bridge folder (git-bridge §5.3), so the
+    /// UI can pre-fill the commit message and show what a push would send. Read-only
+    /// — no network, no off-thread drive (mirrors [`Self::git_status`]).
+    pub fn git_pending_diff(&self, id: &str) -> Result<PendingDiffDto> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let e = f.engine.lock().unwrap();
+        let remote_id = e
+            .store
+            .git_remote_list()
+            .map_err(|e| anyhow!("{e}"))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("vault has no git remote configured"))?
+            .remote_id;
+        let d = gitpush::pending_git_diff(&e, &remote_id).map_err(|e| anyhow!("{e}"))?;
+        Ok(PendingDiffDto { files_changed: d.files_changed, paths: d.paths, unified: d.unified })
+    }
+
+    /// Pull new upstream commits into a git-bridge folder (git-bridge §4). Looks up
+    /// the folder's single configured git remote, then drives `pull_once`.
+    pub fn git_pull(&self, id: &str) -> Result<GitPullSummary> {
+        let (engine, remote_id) = {
+            let folders = self.folders.lock().unwrap();
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            let rid = {
+                let e = f.engine.lock().unwrap();
+                e.store
+                    .git_remote_list()
+                    .map_err(|e| anyhow!("{e}"))?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("vault has no git remote configured"))?
+                    .remote_id
+            };
+            (f.engine.clone(), rid)
+        };
+        let report = Self::pull_blocking(engine, remote_id).map_err(|e| anyhow!("git pull: {e}"))?;
+        Ok(GitPullSummary::from(report))
+    }
+
+    /// The git-bridge status chip (git-bridge §7.2), or `None` if the vault has no
+    /// git remote configured (so the web `gitStatus` `Promise<GitStatus | null>`
+    /// contract holds). Read-only — no network, no off-thread drive.
+    pub fn git_status(&self, id: &str) -> Result<Option<GitStatusDto>> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        let e = f.engine.lock().unwrap();
+        let Some(r) = e.store.git_remote_list().map_err(|e| anyhow!("{e}"))?.into_iter().next() else {
+            return Ok(None);
+        };
+        let st = gitremote::git_status(&e, &r.remote_id).map_err(|e| anyhow!("{e}"))?;
+        Ok(Some(GitStatusDto::from(st)))
+    }
+
+    /// Arm (once) the periodic `git pull` tick for a git-bridge folder — the desktop
+    /// analogue of the CLI watch loop's `git_pull_tick`. Every 5 minutes it offloads
+    /// the (blocking, guard-holding) pull to the runtime's blocking pool so the async
+    /// worker is never parked. Idempotent: a folder that already has a tick is left
+    /// alone (no overlap).
+    fn arm_pull_tick(&self, id: &str) {
+        let mut folders = self.folders.lock().unwrap();
+        let Some(f) = folders.get_mut(id) else { return };
+        if !f.git || f.pull_task.is_some() {
+            return; // only git folders tick, and never stack two
+        }
+        let engine = f.engine.clone();
+        f.pull_task = Some(self.rt.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(300));
+            tick.tick().await; // interval's first tick is immediate — skip it (we just synced)
+            loop {
+                tick.tick().await;
+                let eng = engine.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let remotes = eng.lock().unwrap().store.git_remote_list().unwrap_or_default();
+                    for r in remotes {
+                        let _ = Self::pull_blocking(eng.clone(), r.remote_id);
+                    }
+                })
+                .await;
+            }
+        }));
     }
 
     /// Toggle "allow connections": bind (or tear down) a per-folder iroh listener
@@ -1094,8 +1491,95 @@ impl DesktopEngine {
             if let Some(h) = f.connector.take() {
                 h.abort();
             }
+            if let Some(h) = f.pull_task.take() {
+                h.abort();
+            }
             self.forget_folder(&f.path);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The git status chip DTO must serialize to the exact camelCase keys the shared
+    /// TS `GitStatus` type expects (`{remoteUrl, atSha, frozen, ahead, behind,
+    /// policy}`) — the web slice consumes this shape verbatim.
+    #[test]
+    fn git_status_dto_serializes_camelcase() {
+        let dto = GitStatusDto::from(gitremote::GitStatus {
+            remote_url: "https://example.com/r.git".into(),
+            at_sha: Some("deadbeef".into()),
+            frozen: false,
+            ahead: 2,
+            behind: 0,
+            policy: "manual".into(),
+        });
+        let v: serde_json::Value = serde_json::to_value(&dto).unwrap();
+        let obj = v.as_object().unwrap();
+        // Exactly these keys, all camelCase — no snake_case leakage.
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["ahead", "atSha", "behind", "frozen", "policy", "remoteUrl"]);
+        assert_eq!(obj["remoteUrl"], "https://example.com/r.git");
+        assert_eq!(obj["atSha"], "deadbeef");
+        assert_eq!(obj["policy"], "manual");
+    }
+
+    /// `atSha` is `null` (not omitted) before the first ingest, matching the TS
+    /// `atSha: string | null` contract.
+    #[test]
+    fn git_status_dto_null_at_sha() {
+        let dto = GitStatusDto {
+            remote_url: "u".into(),
+            at_sha: None,
+            frozen: true,
+            ahead: 0,
+            behind: 0,
+            policy: "manual".into(),
+        };
+        let v = serde_json::to_value(&dto).unwrap();
+        assert!(v["atSha"].is_null());
+        assert_eq!(v["frozen"], true);
+    }
+
+    /// The pull summary maps each `PullReport` variant to a stable camelCase shape.
+    #[test]
+    fn git_pull_summary_maps_variants() {
+        let up = serde_json::to_value(GitPullSummary::from(PullReport::UpToDate)).unwrap();
+        assert_eq!(up["upToDate"], true);
+        assert_eq!(up["newCommits"], 0);
+
+        let frozen = serde_json::to_value(GitPullSummary::from(PullReport::Frozen)).unwrap();
+        assert_eq!(frozen["frozen"], true);
+        assert_eq!(frozen["upToDate"], false);
+
+        let updated = serde_json::to_value(GitPullSummary::from(PullReport::Updated {
+            new_commits: 3,
+            branches_added: vec![],
+        }))
+        .unwrap();
+        assert_eq!(updated["newCommits"], 3);
+        assert_eq!(updated["upToDate"], false);
+    }
+
+    /// A `desktop_folders.json` written before the git-bridge slice (no `git` key)
+    /// must still deserialize — `git` defaults to `false` — so upgrading never drops
+    /// a user's existing vaults.
+    #[test]
+    fn folder_cfg_git_defaults_false_for_old_configs() {
+        let legacy = r#"[{"path":"/vaults/a"},{"path":"/vaults/b","peer":"tkt"}]"#;
+        let cfgs: Vec<FolderCfg> = serde_json::from_str(legacy).unwrap();
+        assert_eq!(cfgs.len(), 2);
+        assert!(!cfgs[0].git);
+        assert!(!cfgs[1].git);
+        assert_eq!(cfgs[1].peer.as_deref(), Some("tkt"));
+        // A git folder round-trips its flag.
+        let git_cfg = FolderCfg { path: "/v/g".into(), peer: None, git: true };
+        let s = serde_json::to_string(&git_cfg).unwrap();
+        let back: FolderCfg = serde_json::from_str(&s).unwrap();
+        assert!(back.git);
     }
 }

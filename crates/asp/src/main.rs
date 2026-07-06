@@ -97,9 +97,25 @@ struct Cli {
 enum Cmd {
     /// Create a new scoped vault and this node's identity.
     Init { path: Option<PathBuf> },
-    /// Bootstrap a new node from a listening peer (authenticate, catch-up, pin).
-    /// `peer` is an iroh ticket or a bare 64-hex node id.
-    Clone { peer: String, into: Option<PathBuf>, #[arg(long)] watch: bool },
+    /// Bootstrap a new node from a listening peer OR clone a git remote.
+    /// `<source>` is auto-detected: an iroh ticket / 64-hex node id, or a git URL
+    /// (`https://…`, `ssh://…`, `git@host:path`, or a path ending `.git`).
+    Clone {
+        peer: String,
+        into: Option<PathBuf>,
+        #[arg(long)]
+        watch: bool,
+        /// git only: import only the last N first-parent commits (+ merged side
+        /// ancestry), fronted by a snapshot (git-bridge §3.4).
+        #[arg(long)]
+        depth: Option<u32>,
+        /// git only: clone into a fresh random vault id (two separate vaults).
+        #[arg(long = "new-identity")]
+        new_identity: bool,
+        /// git only: HTTPS token (PAT). Also read from `ASP_GIT_TOKEN`.
+        #[arg(long, env = "ASP_GIT_TOKEN")]
+        token: Option<String>,
+    },
     /// The primary long-running command: watch + sync. `--listen` also accepts peers.
     Watch {
         #[arg(long)]
@@ -127,6 +143,18 @@ enum Cmd {
         /// HTTP bind address for the relay (default 0.0.0.0:8080).
         #[arg(long = "listen-addr")]
         bind: Option<String>,
+        /// Also run the git CORS proxy (lets browser clones reach git hosts). Unlike
+        /// relayed ASP traffic, git payloads are TLS-terminated here (plaintext).
+        #[arg(long = "git-proxy")]
+        git_proxy: bool,
+        /// Bind address for the git CORS proxy (default 0.0.0.0:8081). Separate
+        /// listener from the iroh relay's own port.
+        #[arg(long = "git-proxy-addr")]
+        git_proxy_addr: Option<String>,
+        /// Restrict the git proxy to these exact upstream hosts (repeatable). Empty =
+        /// any host (still SSRF-vetted).
+        #[arg(long = "git-proxy-allow")]
+        git_proxy_allow: Vec<String>,
     },
     /// Print this node's connection ticket (and node id) as text + a QR code.
     Ticket,
@@ -385,8 +413,18 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Log { json } => log_cmd(&cli, *json),
         Cmd::Git { args } => {
-            let engine = open_engine(&cli)?;
-            gitcli::run(&engine.git_dir, args)
+            // New bridge verbs (pull/push/status/remote/rebaseline) are intercepted
+            // BEFORE the read-only derived-repo allowlist; anything else falls through.
+            match args.first().map(|s| s.as_str()) {
+                Some(
+                    "pull" | "push" | "status" | "remote" | "rebaseline" | "diff" | "plan"
+                    | "policy",
+                ) => git_bridge_cmd(&cli, args).await,
+                _ => {
+                    let engine = open_engine(&cli)?;
+                    gitcli::run(&engine.git_dir, args)
+                }
+            }
         }
         Cmd::Scope => scope_cmd(&cli),
         Cmd::Completions { shell } => {
@@ -411,13 +449,23 @@ async fn run(cli: Cli) -> Result<()> {
             ep.close().await;
             r
         }
-        Cmd::Clone { peer, into, watch } => clone_cmd(&cli, peer, into.clone(), *watch).await,
+        Cmd::Clone { peer, into, watch, depth, new_identity, token } => {
+            clone_cmd(&cli, peer, into.clone(), *watch, *depth, *new_identity, token.clone()).await
+        }
         Cmd::Watch { listen, relay, relay_listen_addr, peers } => {
             watch_cmd(&cli, *listen, *relay, relay_listen_addr.clone(), peers.clone()).await
         }
-        Cmd::Relay { bind } => {
+        Cmd::Relay { bind, git_proxy, git_proxy_addr, git_proxy_allow } => {
             let bind = bind.clone().unwrap_or_else(|| "0.0.0.0:8080".into());
             let addr: std::net::SocketAddr = bind.parse().map_err(|_| anyhow!("bad relay bind address: {bind}"))?;
+            if *git_proxy {
+                let paddr = git_proxy_addr.clone().unwrap_or_else(|| "0.0.0.0:8081".into());
+                let paddr: std::net::SocketAddr = paddr.parse().map_err(|_| anyhow!("bad git-proxy bind address: {paddr}"))?;
+                let mut cfg = asp_core::gitproxy::GitProxyConfig::new(paddr);
+                cfg.allow_hosts = git_proxy_allow.clone();
+                let (proxy_addr, _handle) = asp_core::gitproxy::spawn_git_proxy(cfg).await?;
+                println!("git CORS proxy on http://{proxy_addr} (TLS-terminated git traffic)");
+            }
             println!("starting iroh relay on {addr} (forwards ciphertext, stores nothing)");
             iroh_net::run_relay(addr).await
         }
@@ -651,7 +699,23 @@ fn scope_cmd(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn clone_cmd(cli: &Cli, peer: &str, into: Option<PathBuf>, watch: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn clone_cmd(
+    cli: &Cli,
+    peer: &str,
+    into: Option<PathBuf>,
+    watch: bool,
+    depth: Option<u32>,
+    new_identity: bool,
+    token: Option<String>,
+) -> Result<()> {
+    // Auto-detect the source: a git URL clones over the bridge, anything else is an
+    // ASP peer (iroh ticket / node id) — git-URL syntax is unambiguous (git-bridge §7.1).
+    if let asp_core::gitbridge::SourceKind::GitUrl(url) =
+        asp_core::gitbridge::detect_source(peer)
+    {
+        return git_clone_cmd(cli, url, into, watch, depth, new_identity, token).await;
+    }
     let dir = into.or_else(|| cli.dir.clone()).unwrap_or_else(|| PathBuf::from("asp-vault"));
     let id = idstore::load_or_generate(&dir, cli.no_home_key)?;
     let engine = Engine::open(&dir, id).map_err(|e| anyhow!("clone open: {e}"))?;
@@ -678,6 +742,345 @@ async fn clone_cmd(cli: &Cli, peer: &str, into: Option<PathBuf>, watch: bool) ->
     }
     ep.close().await;
     Ok(())
+}
+
+/// Clone a git remote into a fresh vault (git-bridge §3/§7.1).
+#[allow(clippy::too_many_arguments)]
+async fn git_clone_cmd(
+    cli: &Cli,
+    url: asp_core::gitwire::GitUrl,
+    into: Option<PathBuf>,
+    watch: bool,
+    depth: Option<u32>,
+    new_identity: bool,
+    token: Option<String>,
+) -> Result<()> {
+    use asp_core::gitremote::{clone_from_git, resolve_git_auth, CloneOptions};
+
+    let dir = into.or_else(|| cli.dir.clone()).unwrap_or_else(|| PathBuf::from("asp-vault"));
+    let id = idstore::load_or_generate(&dir, cli.no_home_key)?;
+    let engine = Engine::open(&dir, id).map_err(|e| anyhow!("clone open: {e}"))?;
+
+    let auth = resolve_git_auth(&url, token.as_deref(), None);
+    let spec = asp_core::gitbridge::GitRemoteSpec::new(url, auth);
+    let last_phase = std::sync::Mutex::new(String::new());
+    let on_progress = move |phase: &str, done: u64, total: u64| {
+        let mut lp = last_phase.lock().unwrap();
+        if *lp != phase {
+            *lp = phase.to_string();
+            match phase {
+                "fetching" => eprintln!("fetching git objects…"),
+                "replaying" => eprintln!("replaying commit history…"),
+                "saving" => eprintln!("saving {total} rows…"),
+                _ => {}
+            }
+        }
+        let _ = done;
+    };
+    let opts = CloneOptions { depth, new_identity, on_progress: Some(&on_progress) };
+    let report = clone_from_git(&engine, &spec, &opts)
+        .await
+        .map_err(|e| anyhow!("git clone: {e}"))?;
+
+    println!(
+        "cloned git repo into {} — {} commit(s), vault {}, at {}",
+        dir.display(),
+        report.commits,
+        &report.vault_id[..8.min(report.vault_id.len())],
+        &report.tip_sha[..8.min(report.tip_sha.len())],
+    );
+    if !report.branches.is_empty() {
+        println!("  branches: {}", report.branches.join(", "));
+    }
+    for w in &report.warnings {
+        eprintln!("  warning: {w}");
+    }
+
+    if watch {
+        let seed = engine.identity.seed();
+        let ep = iroh_net::bind_endpoint_relay(&seed, !cli.no_relay, cli.relay_url.as_deref()).await?;
+        return run_watch_loop(cli, Arc::new(Mutex::new(engine)), ep, false, cli.relay_url.clone(), vec![]).await;
+    }
+    Ok(())
+}
+
+/// The single configured git remote for this vault, or a clear error. v1 assumes one
+/// remote per vault (the clone target).
+fn only_git_remote(engine: &Engine) -> Result<asp_core::GitRemoteRow> {
+    let mut remotes = engine.store.git_remote_list().map_err(|e| anyhow!("{e}"))?;
+    match remotes.len() {
+        0 => Err(anyhow!("no git remote configured — `asp clone <git-url>` or `asp git remote add <url>` first")),
+        1 => Ok(remotes.remove(0)),
+        _ => Err(anyhow!("multiple git remotes configured; ambiguous")),
+    }
+}
+
+/// Validate a rollup-policy string (git-bridge §5.3). `llm` is not an engine policy —
+/// it is `manual` plus the external `asp git diff` / `asp git plan` primitives — so
+/// only `manual` and `interval` are accepted here.
+fn validate_policy(p: &str) -> Result<&str> {
+    match p {
+        "manual" | "interval" => Ok(p),
+        other => Err(anyhow!(
+            "unknown policy '{other}' (use `manual` or `interval`; \
+             for LLM-driven rollup keep `manual` and drive `asp git diff`/`asp git plan`)"
+        )),
+    }
+}
+
+/// Open `$EDITOR`/`$VISUAL` on a temp file pre-filled with `seed` and the pending
+/// `diff` as `#`-commented context (git-bridge §5.3 manual policy). Returns the edited
+/// message (comment lines stripped), or `None` when there is no editor / it aborted /
+/// the message ended up empty — the caller then falls back to the generated summary.
+fn edit_commit_message(seed: &str, diff: &str) -> Option<String> {
+    let editor = std::env::var("EDITOR").ok().or_else(|| std::env::var("VISUAL").ok())?;
+    if editor.trim().is_empty() {
+        return None;
+    }
+    let path = std::env::temp_dir().join(format!("asp-commit-{}.txt", std::process::id()));
+    let mut body = String::new();
+    body.push_str(seed);
+    body.push_str("\n\n# Please enter the commit message for your changes. Lines starting\n# with '#' are ignored. Below is the pending diff.\n#\n");
+    for line in diff.lines() {
+        body.push_str("# ");
+        body.push_str(line);
+        body.push('\n');
+    }
+    std::fs::write(&path, &body).ok()?;
+    let status = std::process::Command::new(editor).arg(&path).status().ok()?;
+    let out = if status.success() {
+        std::fs::read_to_string(&path).ok()
+    } else {
+        None
+    };
+    let _ = std::fs::remove_file(&path);
+    let edited = out?;
+    let msg: String = edited
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let msg = msg.trim().to_string();
+    if msg.is_empty() {
+        None
+    } else {
+        Some(msg)
+    }
+}
+
+/// `asp git <pull|push|status|remote|rebaseline>` — the bridge verbs (git-bridge §7.1).
+async fn git_bridge_cmd(cli: &Cli, args: &[String]) -> Result<()> {
+    use asp_core::gitremote::{git_status, pull_once, rebaseline, store_git_token, PullReport};
+
+    let engine = open_engine(cli)?;
+    let verb = args.first().map(|s| s.as_str()).unwrap_or("");
+    let has_flag = |name: &str| args.iter().any(|a| a == name);
+    let flag_val = |name: &str| -> Option<String> {
+        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+    };
+
+    match verb {
+        "status" => {
+            let remote = only_git_remote(&engine)?;
+            let st = git_status(&engine, &remote.remote_id).map_err(|e| anyhow!("{e}"))?;
+            if has_flag("--json") {
+                println!("{}", serde_json::to_string_pretty(&st)?);
+            } else {
+                let at = st.at_sha.as_deref().map(|s| &s[..8.min(s.len())]).unwrap_or("-");
+                println!("remote:  {}", st.remote_url);
+                println!("at:      {at}");
+                println!("ahead:   {}  behind: {}", st.ahead, st.behind);
+                println!("policy:  {}", st.policy);
+                if st.frozen {
+                    println!("state:   FROZEN — upstream history was rewritten; run `asp git rebaseline`");
+                }
+            }
+            Ok(())
+        }
+        "pull" => {
+            let remote = only_git_remote(&engine)?;
+            match pull_once(&engine, &remote.remote_id, None).await.map_err(|e| anyhow!("{e}"))? {
+                PullReport::UpToDate => println!("already up to date"),
+                PullReport::Frozen => println!(
+                    "FROZEN — upstream history was rewritten; run `asp git rebaseline` to recover"
+                ),
+                PullReport::Updated { new_commits, branches_added } => {
+                    println!("pulled {new_commits} new commit(s)");
+                    if !branches_added.is_empty() {
+                        println!("  branches: {}", branches_added.join(", "));
+                    }
+                }
+            }
+            Ok(())
+        }
+        "push" => {
+            use asp_core::gitpush::{author_plan, pending_git_diff, push, PushReport};
+            let remote = only_git_remote(&engine)?;
+            let author = flag_val("--author");
+            let explicit_msg = flag_val("-m").or_else(|| flag_val("--message"));
+
+            // Manual policy: pre-fill the message from the pending diff summary, then
+            // open $EDITOR (unless `-m` was given, or no editor is available).
+            let pending = pending_git_diff(&engine, &remote.remote_id).map_err(|e| anyhow!("{e}"))?;
+            let message = match explicit_msg {
+                Some(m) => m,
+                None => {
+                    if pending.files_changed == 0 {
+                        println!("nothing to push (no pending changes)");
+                        return Ok(());
+                    }
+                    let seed = format!(
+                        "asp: {} file(s) changed ({})",
+                        pending.files_changed,
+                        pending.paths.join(", ")
+                    );
+                    edit_commit_message(&seed, &pending.unified).unwrap_or(seed)
+                }
+            };
+
+            author_plan(&engine, &remote.remote_id, &message, author.as_deref())
+                .map_err(|e| anyhow!("{e}"))?;
+            match push(&engine, &remote.remote_id, |_phase| {}).await.map_err(|e| anyhow!("{e}"))? {
+                PushReport::Nothing => println!("nothing to push"),
+                PushReport::Pushed { pushed_sha, commits_pushed, .. } => {
+                    println!(
+                        "pushed {commits_pushed} commit(s) to {} — now at {}",
+                        remote.url,
+                        &pushed_sha[..8.min(pushed_sha.len())]
+                    );
+                }
+            }
+            Ok(())
+        }
+        "diff" => {
+            // The `llm` primitive (git-bridge §5.3): the pending diff since the last
+            // plan/ingest frontier, for an external agent (or a human) to inspect
+            // before deciding a commit boundary + message.
+            use asp_core::gitpush::pending_git_diff;
+            let remote = only_git_remote(&engine)?;
+            let pd = pending_git_diff(&engine, &remote.remote_id).map_err(|e| anyhow!("{e}"))?;
+            if has_flag("--json") {
+                let out = serde_json::json!({
+                    "files_changed": pd.files_changed,
+                    "paths": pd.paths,
+                    "unified": pd.unified,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                print!("{}", pd.unified);
+                println!("# {} file(s) changed ({})", pd.files_changed, pd.paths.join(", "));
+            }
+            Ok(())
+        }
+        "plan" => {
+            // The `llm` primitive (git-bridge §5.3): author a plan (a commit boundary +
+            // message) WITHOUT pushing. An external agent calls `asp git diff` +
+            // `asp git plan -m …` on its own cadence; `asp git push` (or the interval
+            // tick) then synthesizes + pushes. The engine never calls a model.
+            use asp_core::gitpush::author_plan;
+            let remote = only_git_remote(&engine)?;
+            let author = flag_val("--author");
+            let message = flag_val("-m")
+                .or_else(|| flag_val("--message"))
+                .ok_or_else(|| anyhow!("usage: asp git plan -m <message> [--author <a>]"))?;
+            let row = author_plan(&engine, &remote.remote_id, &message, author.as_deref())
+                .map_err(|e| anyhow!("{e}"))?;
+            println!(
+                "authored plan {} — run `asp git push` (or let the interval policy) to synthesize + push",
+                &row.id[..8.min(row.id.len())]
+            );
+            Ok(())
+        }
+        "policy" => {
+            // Show or set the per-remote rollup policy (git-bridge §5.3).
+            let remote = only_git_remote(&engine)?;
+            match args.get(1).map(|s| s.as_str()) {
+                None | Some("") | Some("show") => {
+                    println!("policy: {}", remote.policy);
+                    Ok(())
+                }
+                Some(p) => {
+                    let p = validate_policy(p)?;
+                    let mut row = remote;
+                    row.policy = p.to_string();
+                    engine.store.git_remote_upsert(&row).map_err(|e| anyhow!("{e}"))?;
+                    println!("policy set to {p}");
+                    Ok(())
+                }
+            }
+        }
+        "rebaseline" => {
+            let remote = only_git_remote(&engine)?;
+            if !has_flag("--yes") {
+                eprintln!(
+                    "rebaseline re-imports the rewritten upstream tip as one snapshot batch.\n\
+                     Re-run with --yes to confirm."
+                );
+                return Ok(());
+            }
+            match rebaseline(&engine, &remote.remote_id).await.map_err(|e| anyhow!("{e}"))? {
+                PullReport::Updated { .. } => println!("rebaselined — freeze cleared, vault snapped to the new tip"),
+                other => println!("rebaseline: {other:?}"),
+            }
+            Ok(())
+        }
+        "remote" => {
+            let sub = args.get(1).map(|s| s.as_str()).unwrap_or("");
+            match sub {
+                "add" => {
+                    let url = args.get(2).ok_or_else(|| anyhow!("usage: asp git remote add <url> [--push-ref R] [--policy P] [--token T]"))?;
+                    let giturl = asp_core::gitwire::parse_git_url(url)
+                        .ok_or_else(|| anyhow!("not a git url: {url}"))?;
+                    let rid = asp_core::gitbridge::remote_id(url);
+                    let _ = &giturl; // validated above; auth resolves lazily at pull time
+                    let token = flag_val("--token");
+                    let auth_ref = token.as_deref().and_then(|t| store_git_token(&rid, t));
+                    let policy = match flag_val("--policy") {
+                        Some(p) => validate_policy(&p)?.to_string(),
+                        None => "manual".to_string(),
+                    };
+                    let row = asp_core::GitRemoteRow {
+                        remote_id: rid.clone(),
+                        url: url.clone(),
+                        push_ref: flag_val("--push-ref"),
+                        policy,
+                        auth_ref,
+                        default_branch: None,
+                        last_ingested_sha: None,
+                        remote_ref: None,
+                        root_sha: None,
+                        frozen: false,
+                        last_pushed_sha: None,
+                        last_pushed_frontier: None,
+                    };
+                    engine.store.git_remote_upsert(&row).map_err(|e| anyhow!("{e}"))?;
+                    println!("added git remote {rid} ({url})");
+                    Ok(())
+                }
+                "remove" => {
+                    let remote = only_git_remote(&engine)?;
+                    engine.store.git_remote_remove(&remote.remote_id).map_err(|e| anyhow!("{e}"))?;
+                    println!("removed git remote {}", remote.remote_id);
+                    Ok(())
+                }
+                "show" | "" => {
+                    for r in engine.store.git_remote_list().map_err(|e| anyhow!("{e}"))? {
+                        let at = r.last_ingested_sha.as_deref().map(|s| &s[..8.min(s.len())]).unwrap_or("-");
+                        println!(
+                            "{}  {}  ({}{})  at {at}",
+                            r.remote_id,
+                            r.url,
+                            r.policy,
+                            if r.frozen { ", frozen" } else { "" },
+                        );
+                    }
+                    Ok(())
+                }
+                other => Err(anyhow!("unknown `asp git remote` subcommand: {other}")),
+            }
+        }
+        other => Err(anyhow!("unknown git bridge verb: {other}")),
+    }
 }
 
 async fn watch_cmd(
@@ -834,8 +1237,121 @@ async fn run_watch_loop(
     let _watcher = net::spawn_watcher(engine.clone(), conns.clone(), debounce).context("watcher")?;
 
     println!("watching {} (node {})", root.display(), &site[..12.min(site.len())]);
-    tokio::signal::ctrl_c().await.ok();
+
+    // When a git remote is configured, arm a periodic fetch/ingest tick alongside the
+    // fs watcher + peer reconnects (git-bridge §4/§7.1). Kept minimal: a plain interval
+    // branch in the same select as ctrl-c. The pull runs inline (not spawned) so it may
+    // borrow the engine across its awaits without a Send bound; it briefly serializes
+    // with the fs watcher, which is fine at a 5-minute cadence.
+    let has_git_remote = {
+        let e = engine.lock().unwrap();
+        !e.store.git_remote_list().unwrap_or_default().is_empty()
+    };
+    if has_git_remote {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The rollup-policy tick (git-bridge §5.3): a faster cadence than the pull so an
+        // `interval`-policy remote authors + pushes near its quiescence/window bound. A
+        // no-op for `manual`/`llm` remotes (they never author automatically).
+        let mut policy_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        policy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => break,
+                _ = tick.tick() => {
+                    // Small jitter so multiple bridges don't fetch in lockstep (§4.3).
+                    let jitter = std::time::Duration::from_millis(rand::random::<u64>() % 30_000);
+                    tokio::time::sleep(jitter).await;
+                    git_pull_tick(&engine).await;
+                }
+                _ = policy_tick.tick() => {
+                    git_policy_tick(&engine).await;
+                }
+            }
+        }
+    } else {
+        tokio::signal::ctrl_c().await.ok();
+    }
     Ok(())
+}
+
+/// One periodic-pull pass over every configured git remote. Errors/frozen states are
+/// logged, never fatal — the watch loop keeps running.
+///
+/// The engine lock is intentionally held across the pull's awaits: the whole engine
+/// (SQLite) sits behind one `std::sync::Mutex`, `pull_once` interleaves async fetches
+/// with sync store writes, and pulls are infrequent (5-min cadence) + short — so
+/// briefly serializing with the fs watcher is the pragmatic v1 choice. The future is
+/// only awaited inline (never spawned), so no `Send` bound is violated.
+#[allow(clippy::await_holding_lock)]
+async fn git_pull_tick(engine: &EngineRef) {
+    use asp_core::gitremote::{pull_once, PullReport};
+    let remotes = {
+        let e = engine.lock().unwrap();
+        e.store.git_remote_list().unwrap_or_default()
+    };
+    for r in remotes {
+        // Hold the lock across the pull's awaits: pulls are infrequent (5-min cadence)
+        // and short, so briefly serializing with the fs watcher is acceptable for v1.
+        let result = {
+            let e = engine.lock().unwrap();
+            pull_once(&e, &r.remote_id, None).await
+        };
+        match result {
+            Ok(PullReport::Updated { new_commits, .. }) if new_commits > 0 => {
+                tracing::info!(remote = %r.remote_id, new_commits, "git pull: ingested new commits");
+            }
+            Ok(PullReport::Frozen) => {
+                tracing::warn!(remote = %r.remote_id, "git pull: upstream history rewritten — frozen (run `asp git rebaseline`)");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(remote = %r.remote_id, "git pull failed: {e}"),
+        }
+    }
+}
+
+/// One `interval`-policy pass over every configured git remote (git-bridge §5.3).
+/// A no-op for `manual`/`llm` remotes. Errors are logged, never fatal.
+///
+/// Like [`git_pull_tick`], the engine lock is held across the tick's awaits: the whole
+/// engine sits behind one `std::sync::Mutex`, `interval_tick` interleaves an async push
+/// (and a short dedup jitter sleep) with sync store writes, and it only actually
+/// authors/pushes at the quiescence/window boundary — so briefly serializing with the
+/// fs watcher is the pragmatic v1 choice. Awaited inline (never spawned) so no `Send`
+/// bound is violated.
+#[allow(clippy::await_holding_lock)]
+async fn git_policy_tick(engine: &EngineRef) {
+    use asp_core::gitpolicy::{interval_tick, IntervalParams, PolicyAction, POLICY_INTERVAL};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let remotes = {
+        let e = engine.lock().unwrap();
+        e.store.git_remote_list().unwrap_or_default()
+    };
+    for r in remotes {
+        if r.policy != POLICY_INTERVAL {
+            continue;
+        }
+        let result = {
+            let e = engine.lock().unwrap();
+            let params =
+                IntervalParams::from_config(&asp_core::config::VaultConfig::new(&e.store))
+                    .unwrap_or_default();
+            interval_tick(&e, &r.remote_id, now, params).await
+        };
+        match result {
+            Ok(PolicyAction::Pushed { sha }) => {
+                tracing::info!(remote = %r.remote_id, sha = %&sha[..8.min(sha.len())], "git interval policy: authored + pushed");
+            }
+            Ok(PolicyAction::Authored { plans }) => {
+                tracing::info!(remote = %r.remote_id, plans, "git interval policy: authored plan (nothing new to push)");
+            }
+            Ok(PolicyAction::Skip) => {}
+            Err(e) => tracing::warn!(remote = %r.remote_id, "git interval policy failed: {e}"),
+        }
+    }
 }
 
 #[cfg(test)]

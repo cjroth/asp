@@ -885,8 +885,9 @@ impl MemEngine {
     }
 
     /// The append-only history as `(id, ts, lamport, kind, path, branch_id)`, path
-    /// resolved from each file_id's latest path (edits/deletes carry none). Branch
-    /// and tag records are metadata, not file-history events, so they're skipped.
+    /// resolved from each file_id's latest path (edits/deletes carry none). Branch,
+    /// tag, and the git-bridge marker records (GitCommit/GitIngest/GitPlan, §6.1)
+    /// are metadata, not file-history events, so they're skipped.
     pub fn history(&self) -> Vec<(String, i64, u64, String, String, String)> {
         let mut latest: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let mut rows: Vec<LogRow> = self.rows.borrow().clone();
@@ -896,7 +897,7 @@ impl MemEngine {
             if let Some(p) = &r.path {
                 latest.insert(r.file_id.clone(), p.clone());
             }
-            if matches!(r.kind, Kind::Branch | Kind::Tag) {
+            if matches!(r.kind, Kind::Branch | Kind::Tag | Kind::GitCommit | Kind::GitIngest | Kind::GitPlan) {
                 continue;
             }
             let path = r.path.clone().or_else(|| latest.get(&r.file_id).cloned()).unwrap_or_default();
@@ -1174,6 +1175,81 @@ mod tests {
         let b = MemEngine::create(Identity::from_seed(&[2; 32]), "");
         assert_eq!(b.import_state(&snap).unwrap(), 5);
         assert_eq!(b.read_file("big.bin").unwrap().unwrap(), big_a);
+    }
+
+    #[test]
+    fn integrates_git_kind_rows_and_state_round_trips() {
+        // git-bridge §6.1: rows of the three new kinds must integrate cleanly
+        // (single + batch), leave file state untouched (they're fold no-ops), and
+        // survive export_state/import_state.
+        use crate::gitrecord::{
+            build_commit_marker_row, build_ingest_row, build_plan_row, GitCommitMarker, GitIngestRecord,
+            GitPlanRecord, GitRowIdentity,
+        };
+        use crate::store::{BlobStore, MemBlobStore};
+
+        let scratch = MemBlobStore::new();
+        let ident = GitRowIdentity { site_id: "repo-site".into(), lamport: 10, seq: 0, ts: 5, parent: None };
+        let marker = GitCommitMarker {
+            sha: "feedface".into(),
+            author_name: "Ada".into(),
+            author_email: "ada@x".into(),
+            committer_ts: 5,
+            message: "import".into(),
+            parents: vec![],
+            branch_id: "main".into(),
+        };
+        let ingest = GitIngestRecord {
+            commit_sha: "feedface".into(),
+            upto_site: "repo-site".into(),
+            upto_seq: 0,
+            modes: vec![("bin".into(), 0o100755)],
+            symlinks: vec![],
+            gitlinks: vec![],
+            remote_ref: "refs/heads/main".into(),
+            rebaselined: false,
+        };
+        let plan = GitPlanRecord {
+            frontier: std::collections::BTreeMap::from([("repo-site".to_string(), 0i64)]),
+            message: "asp: 0 files".into(),
+            author: "Bot <b@x>".into(),
+            planned_ts: 5,
+        };
+        let to_wire = |row: LogRow| {
+            let hash = row.result_hash.clone().unwrap();
+            let bytes = scratch.get_blob(&hash).unwrap().unwrap();
+            WireRow { row, blobs: vec![WireBlob { hash, bytes }] }
+        };
+        let git_rows = vec![
+            to_wire(build_commit_marker_row(&scratch, &ident, &marker).unwrap()),
+            to_wire(build_ingest_row(&scratch, &ident, &ingest).unwrap()),
+            to_wire(build_plan_row(&scratch, &ident, &plan).unwrap()),
+        ];
+
+        // Single-integrate path.
+        let a = MemEngine::create(Identity::from_seed(&[3; 32]), "v1");
+        a.record_write("real.md", b"content\n").unwrap();
+        let files_before = a.files_map().unwrap();
+        for wr in &git_rows {
+            assert!(a.integrate(wr).unwrap(), "git row integrates as new");
+        }
+        assert_eq!(a.files_map().unwrap(), files_before, "git kinds are fold no-ops");
+        assert_eq!(a.row_count(), 4, "1 real + 3 git rows");
+        for wr in &git_rows {
+            assert!(!a.integrate(wr).unwrap(), "re-integration dedups");
+        }
+
+        // Batch-integrate path into a second engine converges to the same fold.
+        let b = MemEngine::create(Identity::from_seed(&[4; 32]), "v1");
+        b.record_write("real.md", b"content\n").unwrap();
+        assert!(b.integrate_many(&git_rows).unwrap().iter().all(|added| *added));
+        assert_eq!(b.files_map().unwrap(), a.files_map().unwrap());
+
+        // export/import round-trips the git rows.
+        let snap = a.export_state().unwrap();
+        let restored = MemEngine::create(Identity::from_seed(&[5; 32]), "");
+        assert_eq!(restored.import_state(&snap).unwrap(), 4, "all rows restored");
+        assert_eq!(restored.files_map().unwrap(), a.files_map().unwrap());
     }
 
     /// A snapshot is host-supplied input: corrupt bytes, a tampered row, and a

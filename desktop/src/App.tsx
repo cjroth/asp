@@ -7,7 +7,8 @@
 import { open } from '@tauri-apps/plugin-dialog';
 import { listen } from '@tauri-apps/api/event';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type BranchGraphData, type ClonePhase, type FileEntry, type HistEvent, type VaultInfo, type VaultStatus } from './lib/api';
+import { api, type Api, type BranchGraphData, type ClonePhase, type FileEntry, type GitStatus, type HistEvent, type PendingDiff, type VaultInfo, type VaultStatus } from './lib/api';
+import { gitUrlScheme } from './lib/giturl';
 import CustomizeModal, { type CustomizeInit } from './vault/CustomizeModal';
 import FileTree from './vault/FileTree';
 import HistoryBar from './vault/HistoryBar';
@@ -82,6 +83,60 @@ function lanes0Name(graph: BranchGraphData | null, currentBranch: string): strin
   return graph?.branches.find((b) => b.id === currentBranch)?.name ?? 'this branch';
 }
 
+// ---- git push (git-bridge §7.2) — small testable helpers ----
+
+// Whether the "Commit & push to git" affordance shows: a git-configured vault
+// (`gitStatus` non-null) AND the desktop shell (the browser can't push — the web
+// binding rejects, spec non-goal). Kept pure so a test can assert the gate.
+export function canPushGit(gitStatus: GitStatus | null, desktop: boolean): boolean {
+  return !!gitStatus && desktop;
+}
+
+// Pre-fill message from the pending diff: `asp: N file(s) changed (a, b, c…)`.
+// Empty for a clean tree (nothing to commit → the confirm button stays disabled).
+export function gitPushSummary(diff: Pick<PendingDiff, 'filesChanged' | 'paths'>): string {
+  if (diff.filesChanged === 0) return '';
+  const shown = diff.paths.slice(0, 3).join(', ');
+  const more = diff.paths.length > 3 ? '…' : '';
+  const suffix = diff.paths.length ? ` (${shown}${more})` : '';
+  return `asp: ${diff.filesChanged} file(s) changed${suffix}`;
+}
+
+// Result of a push attempt for the dialog to render. `ok` drives the success state;
+// `error` carries a friendly message (frozen → rebaseline; clean → nothing to commit).
+export interface GitPushOutcome {
+  ok: boolean;
+  pushedSha: string | null;
+  commits: number;
+  error: string | null;
+  status?: GitStatus | null;
+}
+
+// Run the manual push (author plan + push) and map typed failures to friendly text.
+// Pure over the injected `client` so a test can drive it without rendering the app.
+export async function runGitPush(
+  client: Pick<Api, 'gitPush' | 'gitStatus'>,
+  id: string,
+  message: string,
+): Promise<GitPushOutcome> {
+  try {
+    const res = await client.gitPush(id, message);
+    if (res.commits === 0) {
+      return { ok: false, pushedSha: null, commits: 0, error: 'Nothing to commit — no changes since the last push.' };
+    }
+    const status = await client.gitStatus(id);
+    return { ok: true, pushedSha: res.pushedSha, commits: res.commits, error: null, status };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const friendly = /frozen|rewritten|rebaseline/i.test(msg)
+      ? 'History was rewritten upstream — run rebaseline.'
+      : /nothing to commit/i.test(msg)
+        ? 'Nothing to commit.'
+        : msg;
+    return { ok: false, pushedSha: null, commits: 0, error: friendly };
+  }
+}
+
 export default function App() {
   const desktop = isDesktop();
   const [prefs, setPrefsState] = useState<Prefs>(loadPrefs);
@@ -113,6 +168,9 @@ export default function App() {
   const [screen, setScreen] = useState<'connect' | 'editor'>('connect');
   const [vaults, setVaults] = useState<VaultInfo[]>([]);
   const [statuses, setStatuses] = useState<Record<string, VaultStatus>>({});
+  // The active vault's git-bridge status chip DTO, or null for a non-git vault
+  // (git-bridge §7.2). Fetched on open + after a pull + on a light interval.
+  const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
 
   const [files, setFiles] = useState<FileEntry[]>([]);
@@ -165,6 +223,11 @@ export default function App() {
   const [newVaultName, setNewVaultName] = useState('');
   const [ticket, setTicket] = useState('');
   const [authKey, setAuthKey] = useState('');
+  // Git-bridge connect fields (git-bridge §7.2). `token` replaces the access key
+  // for an https git URL; `depth` (blank = full history) drives a shallow import.
+  const [token, setToken] = useState('');
+  const [depth, setDepth] = useState('');
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [cloneProg, setCloneProg] = useState<{ done: number; total: number; phase: ClonePhase } | null>(null);
   // Surfaced clone/connect failure (e.g. a stalled transfer) so the connect dialog
@@ -191,6 +254,10 @@ export default function App() {
   const [vaultCtx, setVaultCtx] = useState<{ x: number; y: number; id: string; vaultId: string; name: string } | null>(null);
   const [customize, setCustomize] = useState<CustomizeInit | null>(null);
   const [removeVaultState, setRemoveVaultState] = useState<{ id: string; name: string; path: string; trash: boolean } | null>(null);
+  // The "Commit & push to git" dialog (git-bridge §7.2), or null when closed.
+  // `diff` is the pending change set (pre-fills `message`); `done` holds the pushed
+  // sha after a successful push; `error` shows a frozen/nothing-to-commit message.
+  const [gitPushState, setGitPushState] = useState<{ message: string; diff: PendingDiff | null; loading: boolean; pushing: boolean; error: string | null; done: string | null } | null>(null);
   // Pending delete awaiting confirmation. `paths` is the exact set to remove
   // (already expanded for multi-selection); `label`/`count` drive the message.
   const [deleteConfirm, setDeleteConfirm] = useState<{ paths: string[]; label: string; count: number } | null>(null);
@@ -717,6 +784,72 @@ export default function App() {
     [withOpening, flushSave, refreshFiles, scheduleHistory],
   );
   openVaultRef.current = openVault;
+
+  // Git-bridge §7.2: keep the active vault's git-status chip fresh — fetched on
+  // open, on a light 30s interval, and after a pull. `gitStatus()` returns null
+  // for a non-git vault (so no chip renders). Resets when switching vaults.
+  useEffect(() => {
+    const id = activeId;
+    setGitStatus(null);
+    if (!id) return;
+    let cancelled = false;
+    const load = () => {
+      void api.gitStatus(id).then((s) => { if (!cancelled) setGitStatus(s); }).catch(() => {});
+    };
+    load();
+    const iv = setInterval(load, 30000);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, [activeId]);
+
+  // Pull new upstream commits into the active git vault, then refresh the tree,
+  // the open file, the timeline and the status chip.
+  const onGitPull = useCallback(async () => {
+    const id = activeIdRef.current;
+    if (!id) return;
+    setVaultMenuOpen(false);
+    try {
+      await api.gitPull(id);
+      await refreshFiles(id);
+      await refreshActiveContent();
+      scheduleHistory(id);
+      const s = await api.gitStatus(id);
+      setGitStatus(s);
+    } catch (err) {
+      console.error('git pull failed', err);
+    }
+  }, [refreshFiles, refreshActiveContent, scheduleHistory]);
+
+  // Open the "Commit & push to git" dialog: fetch the pending diff and pre-fill an
+  // editable commit message with a summary of what would be pushed (git-bridge §7.2).
+  const openGitPush = useCallback(async () => {
+    const id = activeIdRef.current;
+    if (!id) return;
+    setVaultMenuOpen(false);
+    setGitPushState({ message: '', diff: null, loading: true, pushing: false, error: null, done: null });
+    try {
+      const diff = await api.gitPendingDiff(id);
+      setGitPushState({ message: gitPushSummary(diff), diff, loading: false, pushing: false, error: null, done: null });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setGitPushState({ message: '', diff: null, loading: false, pushing: false, error: msg, done: null });
+    }
+  }, []);
+
+  // Confirm the push: author a plan + push, refresh the status chip, then show the
+  // pushed sha (or a friendly error) inside the dialog.
+  const confirmGitPush = useCallback(async () => {
+    const id = activeIdRef.current;
+    if (!id) return;
+    let message = '';
+    setGitPushState((s) => {
+      if (!s) return s;
+      message = s.message;
+      return { ...s, pushing: true, error: null };
+    });
+    const outcome = await runGitPush(api, id, message);
+    if (outcome.ok) setGitStatus(outcome.status ?? null);
+    setGitPushState((s) => (s ? { ...s, pushing: false, error: outcome.error, done: outcome.ok ? outcome.pushedSha : null } : s));
+  }, []);
 
   const selectFile = useCallback(
     async (path: string) => {
@@ -1312,15 +1445,32 @@ export default function App() {
       const t = ticket.trim();
       // Desktop needs a destination folder; web clones straight into OPFS.
       if (!t || (desktop && !connectDest)) return;
+      // A git URL routes to the git bridge; anything else is an ASP peer ticket.
+      const scheme = gitUrlScheme(t);
+      // SSH clones need the local ssh-agent, unavailable in the browser.
+      if (scheme === 'ssh' && !desktop) {
+        setConnectError('SSH clone isn’t supported in the browser — use an https:// URL or the desktop app.');
+        return;
+      }
       setConnecting(true);
       setConnectError(null);
-      setCloneProg({ done: 0, total: 0, phase: 'receiving' });
+      setCloneProg({ done: 0, total: 0, phase: scheme ? 'fetching' : 'receiving' });
       try {
-        const info = await api.cloneRemote(connectDest || '', t, authKey || undefined, (done, total, phase) =>
-          setCloneProg({ done, total, phase }),
-        );
+        const onProg = (done: number, total: number, phase: ClonePhase) => setCloneProg({ done, total, phase });
+        let info: VaultInfo;
+        if (scheme) {
+          // Blank depth = full history; otherwise a positive shallow import.
+          const n = parseInt(depth.trim(), 10);
+          const d = depth.trim() && n > 0 ? n : undefined;
+          info = await api.cloneGit(connectDest || '', t, token.trim() || undefined, d, onProg);
+        } else {
+          info = await api.cloneRemote(connectDest || '', t, authKey || undefined, onProg);
+        }
         setTicket('');
         setAuthKey('');
+        setToken('');
+        setDepth('');
+        setAdvancedOpen(false);
         setConnectDest(null);
         setEntry(null);
         await refreshVaults();
@@ -1355,7 +1505,7 @@ export default function App() {
         console.error('create vault failed', err);
       }
     }
-  }, [entry, connecting, ticket, connectDest, authKey, newVaultName, desktop, updateMeta, openVault, refreshVaults]);
+  }, [entry, connecting, ticket, connectDest, authKey, token, depth, newVaultName, desktop, updateMeta, openVault, refreshVaults]);
 
   const onShareVault = useCallback(async (id: string) => {
     setVaultMenuOpen(false);
@@ -1613,9 +1763,17 @@ export default function App() {
   const ctxTargetPath = ctxMenu && !ctxMenu.root ? ctxMenu.path ?? null : null;
 
   const count = selectedPath ? countLabel(docText, selectedPath) : '';
+  // Git-bridge §7.2: when the connect input looks like a git URL, the modal swaps
+  // the access-key field for Token (https) or an SSH-agent note (ssh), and submit
+  // routes to `cloneGit` instead of `cloneRemote`. `gitScheme` is null for an ASP
+  // ticket / node id (the ordinary peer path).
+  const gitScheme = entry === 'connect' ? gitUrlScheme(ticket) : null;
+  // SSH clones need a local ssh-agent, which the browser has no access to.
+  const sshOnWeb = gitScheme === 'ssh' && !desktop;
   // Submit is blocked until the modal has what it needs — desktop additionally
-  // requires a chosen destination folder; web needs none (it writes to OPFS).
-  const entryBlocked = entry === 'connect' ? connecting || !ticket.trim() || (desktop && !connectDest) : desktop && !connectDest;
+  // requires a chosen destination folder; web needs none (it writes to OPFS). An
+  // ssh git URL on web can never proceed, so block it (with an inline hint below).
+  const entryBlocked = entry === 'connect' ? connecting || !ticket.trim() || (desktop && !connectDest) || sshOnWeb : desktop && !connectDest;
 
   // ===================================================================
   // RENDER
@@ -1651,7 +1809,7 @@ export default function App() {
               <Icon.PlusIcon size={16} stroke="currentColor" />
               <span>New Vault</span>
             </button>
-            <button onClick={() => { setEntry('connect'); setTicket(''); setAuthKey(''); setConnectDest(null); }} style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, height: 46, padding: '0 14px', border: '1px solid var(--line)', borderRadius: 11, background: 'var(--bg)', color: 'var(--text2)', fontSize: 14, fontWeight: 500, fontFamily: 'inherit', cursor: 'pointer' }}>
+            <button onClick={() => { setEntry('connect'); setTicket(''); setAuthKey(''); setToken(''); setDepth(''); setAdvancedOpen(false); setConnectError(null); setConnectDest(null); }} style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, height: 46, padding: '0 14px', border: '1px solid var(--line)', borderRadius: 11, background: 'var(--bg)', color: 'var(--text2)', fontSize: 14, fontWeight: 500, fontFamily: 'inherit', cursor: 'pointer' }}>
               <Icon.ConnectIcon size={15} stroke="currentColor" />
               <span>Connect Vault</span>
             </button>
@@ -1724,7 +1882,23 @@ export default function App() {
                   <div style={{ fontSize: 14, fontWeight: 600, letterSpacing: '-0.01em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{activeMeta?.displayName || 'Vault'}</div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 2 }}>
                     <span style={{ width: 6, height: 6, borderRadius: '50%', background: accent, animation: 'aspPulse 2.4s ease-in-out infinite', flex: 'none' }} />
-                    <span style={{ fontSize: 11, color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{syncSummary}</span>
+                    <span style={{ fontSize: 11, color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 'none' }}>{syncSummary}</span>
+                    {gitStatus && (
+                      <>
+                        <span style={{ fontSize: 11, color: 'var(--faint2)', flex: 'none' }}>·</span>
+                        <span
+                          data-testid="git-chip"
+                          title={gitStatus.frozen ? `${gitStatus.remoteUrl} — upstream history was rewritten; rebaseline this vault` : gitStatus.remoteUrl}
+                          style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: gitStatus.frozen ? '#c0392b' : 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}
+                        >
+                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            git · {gitStatus.atSha ? gitStatus.atSha.slice(0, 7) : '—'}
+                            {(gitStatus.ahead > 0 || gitStatus.behind > 0) ? ` ↑${gitStatus.ahead} ↓${gitStatus.behind}` : ''}
+                            {gitStatus.frozen ? ' · ⚠ rebaseline' : ''}
+                          </span>
+                        </span>
+                      </>
+                    )}
                   </div>
                 </div>
                 <Icon.CaretDown style={{ flex: 'none', transition: 'transform .15s', transform: vaultMenuOpen ? 'rotate(180deg)' : 'rotate(0deg)' }} />
@@ -1759,6 +1933,20 @@ export default function App() {
                       <Icon.ShareIcon style={{ flex: 'none' }} />
                       <span style={{ fontSize: 13.5 }}>Share this vault…</span>
                     </div>
+                    {gitStatus && (
+                      <div className="asp-hover-soft" data-testid="git-pull-item" onClick={() => void onGitPull()} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 9px', borderRadius: 8, cursor: 'pointer', color: 'var(--text2)' }}>
+                        <Icon.ConnectIcon size={15} stroke="var(--text2)" style={{ flex: 'none' }} />
+                        <span style={{ fontSize: 13.5 }}>Pull from git</span>
+                      </div>
+                    )}
+                    {/* Push is desktop/CLI-only (the browser can't push — spec non-goal),
+                        so this item shows only for a git vault in the desktop shell. */}
+                    {canPushGit(gitStatus, desktop) && (
+                      <div className="asp-hover-soft" data-testid="git-push-item" onClick={() => void openGitPush()} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 9px', borderRadius: 8, cursor: 'pointer', color: 'var(--text2)' }}>
+                        <Icon.ShareIcon style={{ flex: 'none' }} />
+                        <span style={{ fontSize: 13.5 }}>Commit &amp; push to git</span>
+                      </div>
+                    )}
                     <div className="asp-hover-soft" onClick={() => { setVaultMenuOpen(false); if (activeMeta) setRemoveVaultState({ id: activeMeta.id, name: activeMeta.displayName, path: activeMeta.path, trash: false }); }} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 9px', borderRadius: 8, cursor: 'pointer', color: 'var(--text2)' }}>
                       <Icon.TrashIcon stroke="var(--text2)" style={{ flex: 'none' }} />
                       <span style={{ fontSize: 13.5 }}>Remove this vault…</span>
@@ -2104,25 +2292,67 @@ export default function App() {
             {entry === 'connect' && !cloneProg && (
               <>
                 <label style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-                  <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>Invite code</span>
-                  <textarea autoFocus value={ticket} onChange={(e) => setTicket(e.target.value)} rows={2} spellCheck={false} placeholder="Paste the code someone shared with you" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12.5, lineHeight: 1.5, color: 'var(--text)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '11px 13px', resize: 'none', outline: 'none', width: '100%', boxSizing: 'border-box' }} />
+                  <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>Invite code <span style={{ textTransform: 'none', letterSpacing: 0, fontWeight: 400, color: 'var(--faint)' }}>or git URL</span></span>
+                  <textarea autoFocus value={ticket} onChange={(e) => setTicket(e.target.value)} rows={2} spellCheck={false} placeholder="Paste an invite code, or a git URL (https://… or git@…)" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12.5, lineHeight: 1.5, color: 'var(--text)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '11px 13px', resize: 'none', outline: 'none', width: '100%', boxSizing: 'border-box' }} />
                 </label>
-                <label style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-                  <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>Access key <span style={{ textTransform: 'none', letterSpacing: 0, fontWeight: 400, color: 'var(--faint)' }}>— if required</span></span>
-                  <input value={authKey} onChange={(e) => setAuthKey(e.target.value)} type="password" spellCheck={false} placeholder="Leave blank if you weren't given one" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12.5, color: 'var(--text)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '11px 13px', outline: 'none', width: '100%', boxSizing: 'border-box' }} />
-                </label>
+                {gitScheme === 'https' ? (
+                  <label data-testid="git-token-field" style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                    <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>Token <span style={{ textTransform: 'none', letterSpacing: 0, fontWeight: 400, color: 'var(--faint)' }}>— for a private repo</span></span>
+                    <input value={token} onChange={(e) => setToken(e.target.value)} type="password" spellCheck={false} placeholder="Personal access token (leave blank if public)" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12.5, color: 'var(--text)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '11px 13px', outline: 'none', width: '100%', boxSizing: 'border-box' }} />
+                    <span style={{ fontSize: 11.5, lineHeight: 1.5, color: 'var(--faint)' }}>
+                      Use a fine-grained, single-repo access token — that limits what a leaked token can reach.{!desktop && ' It’s saved in this browser’s storage, so a stolen browser profile could expose it.'}
+                    </span>
+                  </label>
+                ) : gitScheme === 'ssh' ? (
+                  <div data-testid="git-ssh-note" style={{ fontSize: 12.5, lineHeight: 1.55, color: sshOnWeb ? '#c0392b' : 'var(--text2)', background: sshOnWeb ? '#c0392b12' : 'var(--bg-input)', border: `1px solid ${sshOnWeb ? '#c0392b40' : 'var(--line)'}`, borderRadius: 10, padding: '11px 13px' }}>
+                    {sshOnWeb
+                      ? 'SSH clone isn’t supported in the browser — use an https:// URL or the desktop app.'
+                      : 'This clones over SSH using your local SSH agent — no token needed.'}
+                  </div>
+                ) : (
+                  <label style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                    <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>Access key <span style={{ textTransform: 'none', letterSpacing: 0, fontWeight: 400, color: 'var(--faint)' }}>— if required</span></span>
+                    <input value={authKey} onChange={(e) => setAuthKey(e.target.value)} type="password" spellCheck={false} placeholder="Leave blank if you weren't given one" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12.5, color: 'var(--text)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '11px 13px', outline: 'none', width: '100%', boxSizing: 'border-box' }} />
+                  </label>
+                )}
+                {gitScheme && !sshOnWeb && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    <button type="button" onClick={() => setAdvancedOpen((v) => !v)} style={{ alignSelf: 'flex-start', display: 'flex', alignItems: 'center', gap: 6, background: 'none', border: 'none', padding: 0, cursor: 'pointer', fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: 'var(--faint)' }}>
+                      <Icon.CaretDown style={{ flex: 'none', transition: 'transform .15s', transform: advancedOpen ? 'rotate(180deg)' : 'rotate(-90deg)' }} />
+                      <span>Advanced</span>
+                    </button>
+                    {advancedOpen && (
+                      <label style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                        <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--faint2)' }}>Import last N commits <span style={{ textTransform: 'none', letterSpacing: 0, fontWeight: 400, color: 'var(--faint)' }}>— blank = full history</span></span>
+                        <input value={depth} onChange={(e) => setDepth(e.target.value.replace(/[^0-9]/g, ''))} inputMode="numeric" spellCheck={false} placeholder="e.g. 50" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12.5, color: 'var(--text)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '11px 13px', outline: 'none', width: '100%', boxSizing: 'border-box' }} />
+                      </label>
+                    )}
+                  </div>
+                )}
               </>
             )}
             {cloneProg && (() => {
               const { done, total, phase } = cloneProg;
-              const determinate = phase === 'receiving' && total > 0;
+              // 'receiving' (peer clone) and 'fetching' (git pack download) can
+              // report a real count → determinate bar; 'replaying'/'saving' are
+              // indeterminate work phases.
+              const determinate = (phase === 'receiving' || phase === 'fetching') && total > 0;
               const pct = determinate ? Math.min(100, Math.round((done / total) * 100)) : 0;
+              // Git phases get their own copy; the ASP peer path keeps its wording.
+              const title =
+                phase === 'saving' ? 'Saving to this device…'
+                  : phase === 'fetching' ? 'Fetching from git…'
+                    : phase === 'replaying' ? 'Replaying history…'
+                      : 'Receiving notes…';
+              const sub =
+                phase === 'saving' ? 'Almost done — writing everything to local storage.'
+                  : phase === 'fetching' ? 'Downloading the repository over a secure connection.'
+                    : phase === 'replaying' ? 'Rebuilding the note history from the repository.'
+                      : 'Pulling the vault over a direct connection. Hang tight.';
               return (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 9, background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 15px' }}>
                   <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 10 }}>
-                    <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>
-                      {phase === 'saving' ? 'Saving to this device…' : 'Receiving notes…'}
-                    </span>
+                    <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>{title}</span>
                     <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, color: 'var(--faint)' }}>
                       {determinate ? `${done.toLocaleString()} / ${total.toLocaleString()}` : done > 0 ? done.toLocaleString() : ''}
                     </span>
@@ -2134,9 +2364,7 @@ export default function App() {
                       <div style={{ position: 'absolute', top: 0, bottom: 0, width: '40%', borderRadius: 3, background: accent, animation: 'aspIndet 1.1s ease-in-out infinite' }} />
                     )}
                   </div>
-                  <span style={{ fontSize: 11.5, color: 'var(--faint)' }}>
-                    {phase === 'saving' ? 'Almost done — writing everything to local storage.' : 'Pulling the vault over a direct connection. Hang tight.'}
-                  </span>
+                  <span style={{ fontSize: 11.5, color: 'var(--faint)' }}>{sub}</span>
                 </div>
               );
             })()}
@@ -2257,6 +2485,69 @@ export default function App() {
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 2 }}>
               <button autoFocus onClick={() => setRemoveVaultState(null)} style={{ fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: 'var(--text2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 9, padding: '8px 16px', cursor: 'pointer' }}>Cancel</button>
               <button onClick={() => void confirmRemove()} style={{ fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: 'var(--bg)', background: '#c0392b', border: 'none', borderRadius: 9, padding: '8px 16px', cursor: 'pointer' }}>{removeVaultState.trash ? 'Remove & Trash folder' : 'Remove from asp'}</button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Commit & push to git (git-bridge §7.2) — desktop/CLI-only. Shows the pending
+          diff + an editable commit message; confirm authors a plan and pushes. */}
+      {gitPushState && (
+        <>
+          <div onClick={() => setGitPushState(null)} style={{ position: 'fixed', inset: 0, zIndex: 72, background: 'var(--overlay)', backdropFilter: 'blur(2px)' }} />
+          <div
+            data-testid="git-push-dialog"
+            onKeyDown={(e) => { if (e.key === 'Escape') { e.preventDefault(); setGitPushState(null); } }}
+            style={{ position: 'fixed', zIndex: 73, top: '50%', left: '50%', transform: 'translate(-50%,-50%)', width: 'min(560px,94vw)', maxHeight: '86vh', background: 'var(--bg)', borderRadius: 16, boxShadow: '0 24px 60px rgba(28,25,23,0.28)', padding: 20, display: 'flex', flexDirection: 'column', gap: 12 }}
+          >
+            <div>
+              <div style={{ fontSize: 16, fontWeight: 600, letterSpacing: '-0.01em' }}>Commit &amp; push to git</div>
+              <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 4, lineHeight: 1.5 }}>
+                {gitPushState.loading
+                  ? 'Checking for pending changes…'
+                  : gitPushState.done
+                    ? `Pushed ${gitPushState.done.slice(0, 7)} upstream.`
+                    : (gitPushState.diff?.filesChanged ?? 0) === 0
+                      ? 'Nothing to commit — your vault matches the last push.'
+                      : `${gitPushState.diff?.filesChanged} file(s) changed — review and push.`}
+              </div>
+            </div>
+
+            {!gitPushState.loading && !gitPushState.done && (
+              <>
+                <textarea
+                  data-testid="git-push-message"
+                  value={gitPushState.message}
+                  onChange={(e) => { const v = e.target.value; setGitPushState((s) => (s ? { ...s, message: v } : s)); }}
+                  placeholder="Commit message"
+                  rows={2}
+                  style={{ fontFamily: 'inherit', fontSize: 13, color: 'var(--text)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '9px 12px', resize: 'vertical', outline: 'none' }}
+                />
+                {(gitPushState.diff?.unified || gitPushState.diff?.paths.length) ? (
+                  <pre
+                    data-testid="git-push-diff"
+                    className="asp-scroll"
+                    style={{ margin: 0, fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, lineHeight: 1.5, color: 'var(--text2)', background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '10px 12px', overflow: 'auto', maxHeight: '38vh', whiteSpace: 'pre' }}
+                  >{gitPushState.diff?.unified || (gitPushState.diff?.paths ?? []).join('\n')}</pre>
+                ) : null}
+              </>
+            )}
+
+            {gitPushState.error && (
+              <div data-testid="git-push-error" style={{ fontSize: 12.5, color: '#c0392b', lineHeight: 1.5 }}>{gitPushState.error}</div>
+            )}
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 2 }}>
+              <button onClick={() => setGitPushState(null)} style={{ fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: 'var(--text2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 9, padding: '8px 16px', cursor: 'pointer' }}>{gitPushState.done ? 'Close' : 'Cancel'}</button>
+              {!gitPushState.done && (
+                <button
+                  data-testid="git-push-confirm"
+                  disabled={gitPushState.loading || gitPushState.pushing || (gitPushState.diff?.filesChanged ?? 0) === 0}
+                  title={(gitPushState.diff?.filesChanged ?? 0) === 0 ? 'Nothing to commit' : undefined}
+                  onClick={() => void confirmGitPush()}
+                  style={{ fontFamily: 'inherit', fontSize: 13, fontWeight: 500, color: 'var(--bg)', background: accent, border: 'none', borderRadius: 9, padding: '8px 16px', cursor: (gitPushState.loading || gitPushState.pushing || (gitPushState.diff?.filesChanged ?? 0) === 0) ? 'not-allowed' : 'pointer', opacity: (gitPushState.loading || gitPushState.pushing || (gitPushState.diff?.filesChanged ?? 0) === 0) ? 0.5 : 1 }}
+                >{gitPushState.pushing ? 'Pushing…' : 'Commit & push'}</button>
+              )}
             </div>
           </div>
         </>

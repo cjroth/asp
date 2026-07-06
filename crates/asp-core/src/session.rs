@@ -196,7 +196,13 @@ impl Session {
         match msg {
             Msg::Hello { proto, node_id, vault_id, is_listener: _, auth_key } => {
                 if proto != PROTO {
-                    return Ok(vec![Step::Closed(format!("proto mismatch: {proto} != {PROTO}"))]);
+                    // Both numbers, plus a direction + action hint. A proto-3 peer
+                    // meeting a proto-4 (git-bridge) node lands here and gets a clear
+                    // "upgrade" message rather than corrupt rows (git-bridge §6.2).
+                    let action = if proto < PROTO { "upgrade this peer" } else { "upgrade the other peer" };
+                    return Ok(vec![Step::Closed(format!(
+                        "proto mismatch: peer speaks proto {proto}, we speak {PROTO} — {action} to the same version"
+                    ))]);
                 }
                 // Listener: validate a presented AUTH_KEY against the configured
                 // enrollment set (§Security). A mismatch denies loudly with no

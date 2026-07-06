@@ -19,3 +19,8 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+serde_json.workspace = true
+# The hermetic git smart-HTTP fixture harness (a bare repo served by CGI-exec'ing
+# `git http-backend`) — lets the git-bridge clone test run offline against a real
+# git server. asp-e2e depends only on asp-core, so this adds no cycle.
+asp-e2e = { path = "../../tests/e2e" }

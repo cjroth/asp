@@ -189,8 +189,16 @@ fn apply_rows(store: &dyn BlobStore, ordered: &[LogRow], states: &mut HashMap<St
             // A merge marker (§2.6) carries no content of its own — the per-file
             // merge results are separate Edit rows — so it is a no-op on file state;
             // it exists for the graph / derived-git DAG. A branch record (§7) and a
-            // tag record are metadata, never a file mutation. None touches the fold.
-            Kind::Merge | Kind::Branch | Kind::Tag => {}
+            // tag record are metadata, never a file mutation. The three git-bridge
+            // markers (§6.1) — GitCommit (import marker), GitIngest (ledger),
+            // GitPlan (commit plan) — are likewise content-free of file bytes: their
+            // payloads ride in `result_hash` blobs. None touches the fold.
+            Kind::Merge
+            | Kind::Branch
+            | Kind::Tag
+            | Kind::GitCommit
+            | Kind::GitIngest
+            | Kind::GitPlan => {}
         }
     }
     Ok(())
@@ -510,5 +518,36 @@ mod tests {
         let files = compute_files(&s, &[create, edit, del]).unwrap();
         let live: Vec<_> = files.iter().filter(|f| !f.deleted).collect();
         assert!(live.is_empty(), "delete must dominate concurrent edit");
+    }
+
+    #[test]
+    fn git_marker_kinds_are_fold_no_ops() {
+        // git-bridge §6.1: GitCommit/GitIngest/GitPlan carry no file bytes, so a log
+        // that interleaves them with real edits must fold to exactly the file state
+        // the edits alone produce — mirroring how Merge/Branch/Tag are no-ops.
+        let s = crate::store::MemBlobStore::new();
+        let h0 = s.put_blob(b"v0\n").unwrap();
+        let h1 = s.put_blob(b"v1\n").unwrap();
+        let create = mkrow("aa", 1, 0, "f1", Kind::Create, None, None, Some(&h0), Some("a.md"));
+        let edit = mkrow("aa", 2, 1, "f1", Kind::Edit, Some(&create.id), Some(&h0), Some(&h1), None);
+        let baseline = compute_files(&s, &[create.clone(), edit.clone()]).unwrap();
+
+        // Same edits, plus one row of each new kind (content-free payload blobs).
+        let mut gc = mkrow("gg", 3, 0, "mk", Kind::GitCommit, None, None, Some(&s.put_blob(b"marker").unwrap()), Some("deadbeef"));
+        gc.merge_class = MergeClass::Binary;
+        let gc = gc.seal();
+        let mut gi = mkrow("gg", 4, 1, "ing", Kind::GitIngest, None, None, Some(&s.put_blob(b"ledger").unwrap()), None);
+        gi.merge_class = MergeClass::Binary;
+        let gi = gi.seal();
+        let mut gp = mkrow("gg", 5, 2, "pln", Kind::GitPlan, None, None, Some(&s.put_blob(b"plan").unwrap()), None);
+        gp.merge_class = MergeClass::Binary;
+        let gp = gp.seal();
+
+        let with_markers = compute_files(&s, &[create, gc, edit, gi, gp]).unwrap();
+        let norm = |mut v: Vec<FileRow>| {
+            v.sort_by(|a, b| a.path.cmp(&b.path));
+            v
+        };
+        assert_eq!(norm(with_markers), norm(baseline), "git markers must not alter file state");
     }
 }

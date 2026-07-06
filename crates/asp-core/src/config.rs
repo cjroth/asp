@@ -13,6 +13,27 @@ pub const KEY_VAULT_ID: &str = "vault_id";
 pub const KEY_DEFAULT_KEY_TTL: &str = "default_key_ttl";
 pub const KEY_DEBOUNCE_MS: &str = "debounce_ms";
 
+/// Vault-wide default commit author (`"Name <email>"`) for authored git plans
+/// (git-bridge §5.1/§5.3). Consulted by `gitpush::author_plan` when the caller
+/// passes no explicit author. Config-level so every surface (CLI push, interval
+/// tick, desktop) agrees; the value is recorded *in* the synced plan, so reading
+/// it at author time keeps synthesis deterministic.
+pub const KEY_GIT_AUTHOR: &str = "git.author";
+/// `interval` policy: max time (seconds) between plans while the vault has pending
+/// rows before one is force-authored (git-bridge §5.3, default 4h).
+pub const KEY_GIT_INTERVAL_WINDOW: &str = "git.interval.window_secs";
+/// `interval` policy: quiet-period (seconds) after the last edit before a plan is
+/// authored (git-bridge §5.3, default 10min).
+pub const KEY_GIT_INTERVAL_QUIESCENCE: &str = "git.interval.quiescence_secs";
+/// `interval` policy: dedup jitter (seconds) waited before authoring, during which
+/// an equal-frontier plan from another bridge cancels ours (git-bridge §5.3).
+pub const KEY_GIT_INTERVAL_JITTER: &str = "git.interval.jitter_secs";
+
+/// `interval` policy defaults (git-bridge §5.3).
+pub const DEFAULT_GIT_INTERVAL_WINDOW_SECS: i64 = 4 * 60 * 60;
+pub const DEFAULT_GIT_INTERVAL_QUIESCENCE_SECS: i64 = 10 * 60;
+pub const DEFAULT_GIT_INTERVAL_JITTER_SECS: i64 = 3;
+
 /// Typed view over the `config` table.
 pub struct VaultConfig<'a> {
     store: &'a SqliteStore,
@@ -67,5 +88,39 @@ impl<'a> VaultConfig<'a> {
             .get_config(KEY_DEBOUNCE_MS)?
             .and_then(|s| s.parse().ok())
             .unwrap_or(400))
+    }
+
+    /// The vault-wide default git commit author (`"Name <email>"`), if set
+    /// (git-bridge §5.1). `None` (or blank) falls back to `gitpush::default_author`.
+    pub fn git_author(&self) -> AspResult<Option<String>> {
+        Ok(self
+            .store
+            .get_config(KEY_GIT_AUTHOR)?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()))
+    }
+
+    pub fn set_git_author(&self, v: &str) -> AspResult<()> {
+        self.store.set_config(KEY_GIT_AUTHOR, v)
+    }
+
+    /// `interval` policy window/quiescence/jitter in seconds, config override else
+    /// default (git-bridge §5.3).
+    pub fn git_interval_window_secs(&self) -> AspResult<i64> {
+        self.git_i64(KEY_GIT_INTERVAL_WINDOW, DEFAULT_GIT_INTERVAL_WINDOW_SECS)
+    }
+    pub fn git_interval_quiescence_secs(&self) -> AspResult<i64> {
+        self.git_i64(KEY_GIT_INTERVAL_QUIESCENCE, DEFAULT_GIT_INTERVAL_QUIESCENCE_SECS)
+    }
+    pub fn git_interval_jitter_secs(&self) -> AspResult<i64> {
+        self.git_i64(KEY_GIT_INTERVAL_JITTER, DEFAULT_GIT_INTERVAL_JITTER_SECS)
+    }
+
+    fn git_i64(&self, key: &str, default: i64) -> AspResult<i64> {
+        Ok(self
+            .store
+            .get_config(key)?
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(default))
     }
 }

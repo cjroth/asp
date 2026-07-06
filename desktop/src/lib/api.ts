@@ -87,8 +87,39 @@ export interface TagInfo {
   at_ts: number;
   branch_id: string;
 }
-export type ClonePhase = 'receiving' | 'saving';
+// 'receiving'|'saving' cover an ASP peer clone; 'fetching'|'replaying' are the extra
+// git-bridge phases (fetch the pack over the proxy, then replay it into rows).
+export type ClonePhase = 'receiving' | 'saving' | 'fetching' | 'replaying';
 export type CloneProgress = (done: number, total: number, phase: ClonePhase) => void;
+
+// The git-bridge status chip DTO (git-bridge §7.2). Shared verbatim by both
+// backends: web computes it from the fold ledger, desktop's `git_status` command
+// returns the same shape (asp_core::gitremote::GitStatus, camelCased at the Tauri
+// boundary). `atSha` is null before the first ingest; `ahead`/`behind` are
+// best-effort in v1 (exact frontier accounting lands with push).
+export interface GitStatus {
+  remoteUrl: string;
+  atSha: string | null;
+  frozen: boolean;
+  ahead: number;
+  behind: number;
+  policy: string;
+}
+
+// The result of a `gitPush` (git-bridge §7.2). `pushedSha` is the new remote tip,
+// or null when nothing was unpushed; `commits` is 0 for "nothing to commit".
+export interface GitPushSummary {
+  pushedSha: string | null;
+  commits: number;
+}
+
+// The pending (unpushed) change set for a git vault (git-bridge §5.3) — pre-fills
+// the push dialog's commit message and shows what a push would send.
+export interface PendingDiff {
+  filesChanged: number;
+  paths: string[];
+  unified: string;
+}
 
 export interface Api {
   listVaults(): Promise<VaultInfo[]>;
@@ -103,6 +134,20 @@ export interface Api {
   // live bar: `phase` is 'receiving' while pages stream in, then 'saving' while
   // the state is written to OPFS. `total` may be 0 until the peer's count is known.
   cloneRemote(dest: string, ticket: string, authKey?: string, onProgress?: CloneProgress): Promise<VaultInfo>;
+  // Clone a git repo into a new vault (git-bridge §7.3). Web routes git-over-HTTPS
+  // through the relay CORS proxy; desktop runs the native bridge. `onProgress`
+  // reports 'fetching' → 'replaying' → 'saving'. Browser is clone/pull only (no push).
+  cloneGit(dest: string, url: string, token: string | undefined, depth: number | undefined, onProgress?: CloneProgress): Promise<VaultInfo>;
+  // Pull new upstream commits into a git-configured vault (git-bridge §4).
+  gitPull(id: string): Promise<void>;
+  // The git status chip DTO, or null if the vault has no git remote configured.
+  gitStatus(id: string): Promise<GitStatus | null>;
+  // Commit the vault's pending changes and push them upstream (git-bridge §7.2).
+  // Desktop/CLI-only — the web backend rejects (browser is clone/pull only).
+  gitPush(id: string, message: string): Promise<GitPushSummary>;
+  // The pending (unpushed) diff, so the push dialog can pre-fill the message and
+  // show what would be sent. Web returns an empty diff (nothing to push there).
+  gitPendingDiff(id: string): Promise<PendingDiff>;
   setAllowConnections(id: string, on: boolean, authKey?: string): Promise<string | null>;
   // Co-host a local relay so same-machine/LAN peers sync without the public n0
   // relay ("faster local syncing"). Desktop-only; returns the new state.
@@ -155,6 +200,13 @@ const tauriApi: Api = {
   addLocalFolder: (path) => invoke<VaultInfo>('add_local_folder', { path }),
   createVault: () => Promise.reject(new Error('createVault is web-only')),
   cloneRemote: (dest, ticket, authKey) => invoke<VaultInfo>('clone_remote', { dest, ticket, authKey }),
+  // Invoke-arg names MUST match the Rust `#[tauri::command]` param names exactly
+  // (lesson of f6c1d07); the desktop slice binds `clone_git(dest, url, token, depth)`.
+  cloneGit: (dest, url, token, depth) => invoke<VaultInfo>('clone_git', { dest, url, token, depth }),
+  gitPull: (id) => invoke<void>('git_pull', { id }),
+  gitStatus: (id) => invoke<GitStatus | null>('git_status', { id }),
+  gitPush: (id, message) => invoke<GitPushSummary>('git_push', { id, message }),
+  gitPendingDiff: (id) => invoke<PendingDiff>('git_pending_diff', { id }),
   setAllowConnections: (id, on, authKey) => invoke<string | null>('set_allow_connections', { id, on, authKey }),
   setLocalRelay: (on) => invoke<boolean>('set_local_relay', { on }),
   getLocalRelay: () => invoke<boolean>('get_local_relay'),

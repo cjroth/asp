@@ -40,6 +40,15 @@ crates/
     wire.rs        msgpack frame protocol + signed handshake transcript
     engine.rs      capture → fold → materialize, snapshots/PITR, admission
     gitexport.rs   minimal stock-git object writer (derived read-only history)
+    gitwire.rs     pkt-line + smart-HTTP protocol-v2 framing (sans-IO, wasm-safe)
+    gitimport.rs   pack decode → commit DAG walk → deterministic ImportPlan (wasm-safe)
+    gitgenesis.rs  ImportPlan → LogRows genesis + ongoing ingest (wasm-safe)
+    gitrecord.rs   git-bridge log kinds (GitCommit / GitIngest / GitPlan payloads)
+    gitbridge.rs   native transports (HTTPS/SSH) + bare-repo store + push pack writer
+    gitremote.rs   native clone/pull/status/rebaseline driver + git_remotes table + keyring
+    gitpush.rs     deterministic commit synthesis from GitPlans + push + pending diff
+    gitpolicy.rs   rollup policies: interval auto-plan + LLM-driven CLI primitives
+    gitproxy.rs    relay CORS proxy for browser git (SSRF-guarded)
     config.rs      synced config; genesis-immutable tiebreak_key
     scope.rs       hand-rolled .aspignore matcher
     iroh_net.rs    native iroh (QUIC) driver over the sans-IO Session; relay server
@@ -49,7 +58,7 @@ crates/
   asp/             the native CLI (full node)
     main.rs        clap CLI; flag > env > config resolution
     idstore.rs     device-global identity (~/.asp/id_ed25519, never synced)
-    gitcli.rs      read-only `asp git` allowlist
+    gitcli.rs      read-only `asp git` allowlist + bridge verbs (pull/push/remote/…)
   asp-wasm/        wasm-bindgen surface over asp-core (the one engine in wasm)
 sdks/typescript/   @asp/sdk — Vault over the wasm engine (iroh-in-wasm transport)
 plugins/obsidian/  Context for Obsidian — reference thin-client over @asp/sdk
@@ -92,6 +101,68 @@ conformance vectors and the SDK⇄real-`asp` parity e2e.
   fill migration). Bootstrap via **`AUTH_KEY` enrollment** (`Authorization:
   Bearer`, `?auth_key=`, or `bearer.<key>` subprotocol; 401 on mismatch) or
   **TOFU** bounded to the empty-set window (`--no-tofu` disables it).
+
+### Git bridge
+
+ASP can **clone from, and two-way-sync with, an ordinary git remote** (GitHub,
+Gitea, self-hosted, `ssh://` or `https://`). Paste a git URL anywhere you'd paste
+an invite code — CLI, desktop, or web — and you get a live vault whose timeline is
+the repo's full commit history; the vault then stays connected, pulling upstream
+commits in and rolling vault edits back up into real git commits that push.
+
+**The mental model is one line: a git remote is just another ASP peer.** Upstream
+commits enter the log as ordinary rows under a repo-derived `site_id`, chained like
+any peer's edits; the existing 3-way fold merges a local edit that raced an upstream
+commit with no new machinery. Outbound, the vault's rows roll up into synthesized
+git commits built on top of the imported history, so pushes are plain fast-forwards
+a human can read. Everything a bridge node needs is either derived from the log or
+carried in synced records, so **any** native node may bridge — no leader election.
+
+Quickstart:
+
+```sh
+asp clone https://github.com/owner/repo ./repo   # full DAG imports as the timeline
+# …edit files in ./repo like any vault…
+asp git push -m "tidy the docs"                  # rolls pending edits into a commit + pushes
+asp git status                                   # remote / at-sha / ahead·behind / policy
+```
+
+**Determinism — paste the same URL on two machines and they converge.** Every
+imported row's identity (`vault_id`, repo `site_id`, `file_id`) is a pure function
+of the git history (`vault_id = sha256("asp-git-vault/v1" ‖ root_sha)`), so two
+independent clones of the same repo author byte-identical rows and can immediately
+ASP-sync with *each other* over normal anti-entropy. (`--new-identity` opts out into
+a separate random vault.)
+
+**Rollup policies** decide who authors commits and when. Default `manual` — nothing
+pushes without `asp git push` (or the desktop button). `interval` lets a watching
+bridge auto-commit quiescent changes. For LLM-authored messages the engine never
+calls a model: it exposes `asp git diff` (the pending unified diff) and `asp git
+plan -m` (record a commit boundary + message); an external agent drives them and the
+message rides in the synced plan, so synthesis stays deterministic.
+
+**Browser** clone/pull is read-only (no push) and routes through a CORS proxy
+co-hosted with the relay (`asp relay --git-proxy`), because git hosts send no CORS
+headers on smart-HTTP endpoints. Unlike relayed ASP traffic (which stays
+end-to-end-encrypted), **git payloads are TLS-terminated at that proxy** — it sees
+plaintext; run your own. The proxy is SSRF-guarded (HTTPS/443 only, rejects
+private/loopback ranges, size/rate caps, optional `--git-proxy-allow` host
+allowlist).
+
+**Credentials never enter the synced log or config.** HTTPS tokens live in the OS
+keyring (`asp-git/<remote_id>`) or `ASP_GIT_TOKEN`; SSH URLs use your own `ssh`
+binary (agent, `~/.ssh/config`, hardware keys). Browser tokens sit in OPFS
+`registry.json` — same trust as the stored auth key; a stolen profile leaks it, so
+use fine-grained single-repo PATs.
+
+**v1 non-goals:** submodule recursion, git-LFS smudging, importing *unmerged* remote
+refs, pushing ASP branches other than `main`, auto-healing after an upstream
+force-push (manual `asp git rebaseline`), browser push, and the `git://` protocol.
+
+The clone/git-bridge log records are `PROTO 4` (bumped from 3); an old peer that
+predates the bump gets a clear "peer speaks proto 4, upgrade" handshake refusal, not
+corruption. See [`docs/git-bridge.md`](docs/git-bridge.md) for the full guide and
+[`specs/git-bridge.md`](specs/git-bridge.md) for the design.
 
 ## Download & install
 

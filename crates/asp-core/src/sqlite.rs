@@ -68,10 +68,63 @@ CREATE TABLE IF NOT EXISTS git_blobs(content_hash TEXT PRIMARY KEY, git_oid TEXT
 -- working tree). Purely a local performance cache: never synced, and a miss only
 -- costs a re-read, so it can be dropped at any time without affecting correctness.
 CREATE TABLE IF NOT EXISTS fs_stat(path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL, hash TEXT NOT NULL);
+-- git-bridge remote config (git-bridge §4.1/§6.3). Node-private: URLs, auth refs,
+-- and ingest cursor differ per node, so this table is NEVER synced. `root_sha` is
+-- the imported main-chain root (the key for the derived repo `site_id`, needed by
+-- ongoing pulls). `auth_ref` names a keyring entry, never a token itself (§8).
+CREATE TABLE IF NOT EXISTS git_remotes(
+  remote_id TEXT PRIMARY KEY, url TEXT NOT NULL, push_ref TEXT,
+  policy TEXT NOT NULL DEFAULT 'manual', auth_ref TEXT, default_branch TEXT,
+  last_ingested_sha TEXT, remote_ref TEXT, root_sha TEXT,
+  frozen INTEGER NOT NULL DEFAULT 0,
+  -- Push cursor (git-bridge §5.2): the last commit sha we pushed and the effective
+  -- frontier it represents (JSON version vector). A plan whose effective frontier is
+  -- covered by `last_pushed_frontier` is already pushed; the rest synthesize on top.
+  last_pushed_sha TEXT, last_pushed_frontier TEXT
+);
+-- Derived cache of the ledger's mode/symlink/gitlink table (git-bridge §3.3/§6.3):
+-- ASP doesn't model the +x bit, so push synthesis replays these. Rebuildable from
+-- the GitIngest rows in the fold; node-private, like git_blobs.
+CREATE TABLE IF NOT EXISTS git_modes(path TEXT PRIMARY KEY, mode INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'file');
 "#;
 
 pub struct SqliteStore {
     conn: Connection,
+}
+
+/// A row of the node-private `git_remotes` table (git-bridge §4.1/§6.3). Holds the
+/// per-remote bridge config + ingest cursor; never synced (URLs/credentials/cursor
+/// are node-local).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRemoteRow {
+    /// `remote_id(url)` — stable 16-hex id derived from the normalized URL.
+    pub remote_id: String,
+    /// The remote URL (no embedded credentials — tokens live in the keyring, §8).
+    pub url: String,
+    /// The ref push synthesis targets (default: the remote default branch). `None`
+    /// until a push slice sets it.
+    pub push_ref: Option<String>,
+    /// Rollup policy (`manual` in v1).
+    pub policy: String,
+    /// The keyring entry name holding this remote's token, if any (§8).
+    pub auth_ref: Option<String>,
+    /// The remote's default branch short name (e.g. `main`).
+    pub default_branch: Option<String>,
+    /// The last upstream commit sha ingested into the vault (the pull cursor).
+    pub last_ingested_sha: Option<String>,
+    /// The full remote ref the cursor tracks (e.g. `refs/heads/main`).
+    pub remote_ref: Option<String>,
+    /// The imported main-chain root sha — the key for the derived repo `site_id`
+    /// (git-bridge §3.2), needed to author ongoing-pull rows under the same site.
+    pub root_sha: Option<String>,
+    /// Set after an upstream force-push is detected; cleared by `rebaseline` (§4.4).
+    pub frozen: bool,
+    /// The last commit sha this node pushed to the remote (git-bridge §5.2), or `None`
+    /// before the first push. Used as the push base and for idempotent-race detection.
+    pub last_pushed_sha: Option<String>,
+    /// The effective frontier (JSON version vector) the last-pushed tip represents.
+    /// A plan whose effective frontier is covered by this is already pushed.
+    pub last_pushed_frontier: Option<String>,
 }
 
 impl SqliteStore {
@@ -92,6 +145,7 @@ impl SqliteStore {
         conn.execute_batch(SCHEMA)?;
         let store = SqliteStore { conn };
         store.migrate_branching()?;
+        store.migrate_git_push()?;
         Ok(store)
     }
 
@@ -124,6 +178,23 @@ impl SqliteStore {
         // Same discipline for tag records: a partial index so `tag_rows()` is a tiny
         // probe rather than a full `log` scan. Idempotent, safe on pre-tag DBs.
         self.conn.execute_batch("CREATE INDEX IF NOT EXISTS log_kind_tag ON log(kind) WHERE kind='tag'")?;
+        Ok(())
+    }
+
+    /// Idempotent migration adding the push cursor columns to `git_remotes` created
+    /// before the push slice (git-bridge §5.2). New DBs already have them.
+    fn migrate_git_push(&self) -> AspResult<()> {
+        let have: std::collections::HashSet<String> = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(git_remotes)")?;
+            let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            cols.collect::<Result<_, _>>()?
+        };
+        if !have.contains("last_pushed_sha") {
+            self.conn.execute_batch("ALTER TABLE git_remotes ADD COLUMN last_pushed_sha TEXT")?;
+        }
+        if !have.contains("last_pushed_frontier") {
+            self.conn.execute_batch("ALTER TABLE git_remotes ADD COLUMN last_pushed_frontier TEXT")?;
+        }
         Ok(())
     }
 
@@ -643,6 +714,127 @@ impl SqliteStore {
             .conn
             .query_row("SELECT value FROM config WHERE key=?1", params![key], |r| r.get::<_, String>(0))
             .optional()?)
+    }
+
+    // ----- git remotes (git-bridge §4.1/§6.3, node-private) -----
+
+    /// Insert or replace a git-remote config row (keyed by `remote_id`).
+    pub fn git_remote_upsert(&self, r: &GitRemoteRow) -> AspResult<()> {
+        self.conn.execute(
+            "INSERT INTO git_remotes(remote_id, url, push_ref, policy, auth_ref, default_branch, last_ingested_sha, remote_ref, root_sha, frozen, last_pushed_sha, last_pushed_frontier)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+             ON CONFLICT(remote_id) DO UPDATE SET
+               url=?2, push_ref=?3, policy=?4, auth_ref=?5, default_branch=?6,
+               last_ingested_sha=?7, remote_ref=?8, root_sha=?9, frozen=?10,
+               last_pushed_sha=?11, last_pushed_frontier=?12",
+            params![
+                r.remote_id, r.url, r.push_ref, r.policy, r.auth_ref, r.default_branch,
+                r.last_ingested_sha, r.remote_ref, r.root_sha, r.frozen as i64,
+                r.last_pushed_sha, r.last_pushed_frontier
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn git_remote_from(row: &rusqlite::Row) -> rusqlite::Result<GitRemoteRow> {
+        Ok(GitRemoteRow {
+            remote_id: row.get(0)?,
+            url: row.get(1)?,
+            push_ref: row.get(2)?,
+            policy: row.get(3)?,
+            auth_ref: row.get(4)?,
+            default_branch: row.get(5)?,
+            last_ingested_sha: row.get(6)?,
+            remote_ref: row.get(7)?,
+            root_sha: row.get(8)?,
+            frozen: row.get::<_, i64>(9)? != 0,
+            last_pushed_sha: row.get(10)?,
+            last_pushed_frontier: row.get(11)?,
+        })
+    }
+
+    /// The git-remote config for `remote_id`, if any.
+    pub fn git_remote_get(&self, remote_id: &str) -> AspResult<Option<GitRemoteRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT remote_id, url, push_ref, policy, auth_ref, default_branch, last_ingested_sha, remote_ref, root_sha, frozen, last_pushed_sha, last_pushed_frontier
+                 FROM git_remotes WHERE remote_id=?1",
+                params![remote_id],
+                Self::git_remote_from,
+            )
+            .optional()?)
+    }
+
+    /// Every configured git remote (creation order is not preserved — sorted by id).
+    pub fn git_remote_list(&self) -> AspResult<Vec<GitRemoteRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT remote_id, url, push_ref, policy, auth_ref, default_branch, last_ingested_sha, remote_ref, root_sha, frozen, last_pushed_sha, last_pushed_frontier
+             FROM git_remotes ORDER BY remote_id",
+        )?;
+        let rows = stmt.query_map([], Self::git_remote_from)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Remove a git-remote config row.
+    pub fn git_remote_remove(&self, remote_id: &str) -> AspResult<()> {
+        self.conn.execute("DELETE FROM git_remotes WHERE remote_id=?1", params![remote_id])?;
+        Ok(())
+    }
+
+    /// Set/clear the frozen (force-push detected) flag (git-bridge §4.4).
+    pub fn git_remote_set_frozen(&self, remote_id: &str, frozen: bool) -> AspResult<()> {
+        self.conn.execute(
+            "UPDATE git_remotes SET frozen=?2 WHERE remote_id=?1",
+            params![remote_id, frozen as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Advance the ingest cursor after a successful pull (git-bridge §4.2).
+    pub fn git_remote_set_ingested(&self, remote_id: &str, sha: &str, remote_ref: &str) -> AspResult<()> {
+        self.conn.execute(
+            "UPDATE git_remotes SET last_ingested_sha=?2, remote_ref=?3 WHERE remote_id=?1",
+            params![remote_id, sha, remote_ref],
+        )?;
+        Ok(())
+    }
+
+    /// Advance the push cursor after a successful push (git-bridge §5.2): the tip sha
+    /// and the JSON-encoded effective frontier it represents.
+    pub fn git_remote_set_pushed(&self, remote_id: &str, sha: &str, frontier_json: &str) -> AspResult<()> {
+        self.conn.execute(
+            "UPDATE git_remotes SET last_pushed_sha=?2, last_pushed_frontier=?3 WHERE remote_id=?1",
+            params![remote_id, sha, frontier_json],
+        )?;
+        Ok(())
+    }
+
+    // ----- git modes (derived mode/symlink/gitlink cache) -----
+
+    /// Record one path's git mode + kind (`file`/`symlink`/`gitlink`).
+    pub fn git_mode_put(&self, path: &str, mode: u32, kind: &str) -> AspResult<()> {
+        self.conn.execute(
+            "INSERT INTO git_modes(path, mode, kind) VALUES(?1,?2,?3)
+             ON CONFLICT(path) DO UPDATE SET mode=?2, kind=?3",
+            params![path, mode as i64, kind],
+        )?;
+        Ok(())
+    }
+
+    /// Every recorded `(path, mode, kind)`.
+    pub fn git_mode_get_all(&self) -> AspResult<Vec<(String, u32, String)>> {
+        let mut stmt = self.conn.prepare("SELECT path, mode, kind FROM git_modes ORDER BY path")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32, r.get::<_, String>(2)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Drop the whole mode cache (before a full rebuild from the ledger).
+    pub fn git_mode_clear(&self) -> AspResult<()> {
+        self.conn.execute("DELETE FROM git_modes", [])?;
+        Ok(())
     }
 
     // ----- peers -----

@@ -159,7 +159,7 @@ fn read_and_hash(files: &[FileStat], on: &ProgressFn) -> Vec<(String, i64, i64, 
                 // Report every 64 files (and cheaply) so the bar advances without
                 // flooding the host with a callback per file on a 28k-file vault.
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if n % 64 == 0 || n == total {
+                if n.is_multiple_of(64) || n == total {
                     on(n, total, "hashing");
                 }
                 r
@@ -510,10 +510,25 @@ impl Engine {
             // any parked branch rebuilds from the log. Cheap: the cache is tiny and
             // integrate isn't the branch-switch hot path.
             self.fold_cache.borrow_mut().clear();
-            self.materialize()?;
-            self.notify_change();
+            // In batch mode (a paged clone/ingest: `set_batch(true)`) defer the
+            // fold+materialize+notify so a large multi-page catch-up folds ONCE; the
+            // caller materializes after `set_batch(false)`. Not batched → behave as
+            // before (materialize + notify every call).
+            if !self.batch.get() {
+                self.materialize()?;
+                self.notify_change();
+            }
         }
         Ok(flags)
+    }
+
+    /// Enable/disable batch mode. While enabled, [`integrate_many`](Self::integrate_many)
+    /// defers its fold + materialize + change-notify so a large **paged** catch-up
+    /// (a git clone/ingest streamed page-by-page) folds only once. The caller MUST
+    /// disable it and call [`materialize`](Self::materialize) afterwards. Mirrors the
+    /// `batch` guard `capture_rescan` already uses for a whole-disk diff.
+    pub fn set_batch(&self, on: bool) {
+        self.batch.set(on);
     }
 
     /// One page of a site's rows (as wire rows, blobs bundled) after `after`,
@@ -1751,6 +1766,85 @@ mod tests {
         let wr = a.record_write("x.md", b"from A\n").unwrap().unwrap();
         b.integrate(&wr).unwrap();
         assert_eq!(fs::read(db.path().join("x.md")).unwrap(), b"from A\n");
+    }
+
+    #[test]
+    fn integrates_git_kind_rows_without_touching_files() {
+        // git-bridge §6.1: the native Engine must accept rows of the three new
+        // kinds through both integrate paths, treat them as fold no-ops (real files
+        // unchanged, none created for the markers), and dedup on replay.
+        use crate::gitrecord::{
+            build_commit_marker_row, build_ingest_row, build_plan_row, GitCommitMarker, GitIngestRecord,
+            GitPlanRecord, GitRowIdentity,
+        };
+        use crate::store::{BlobStore, MemBlobStore};
+
+        let scratch = MemBlobStore::new();
+        // (site_id, seq) is UNIQUE + dense per site — each row needs its own seq.
+        let ident_at = |seq: u64| GitRowIdentity {
+            site_id: "repo-site".into(),
+            lamport: 100 + seq,
+            seq,
+            ts: 9,
+            parent: None,
+        };
+        let marker = GitCommitMarker {
+            sha: "abc123".into(),
+            author_name: "Ada".into(),
+            author_email: "ada@x".into(),
+            committer_ts: 9,
+            message: "import".into(),
+            parents: vec![],
+            branch_id: MAIN_BRANCH_ID.to_string(),
+        };
+        let ingest = GitIngestRecord {
+            commit_sha: "abc123".into(),
+            upto_site: "repo-site".into(),
+            upto_seq: 0,
+            modes: vec![],
+            symlinks: vec![],
+            gitlinks: vec![],
+            remote_ref: "refs/heads/main".into(),
+            rebaselined: false,
+        };
+        let plan = GitPlanRecord {
+            frontier: std::collections::BTreeMap::new(),
+            message: "asp: 0 files".into(),
+            author: "Bot <b@x>".into(),
+            planned_ts: 9,
+        };
+        let to_wire = |row: LogRow| {
+            let hash = row.result_hash.clone().unwrap();
+            let bytes = scratch.get_blob(&hash).unwrap().unwrap();
+            WireRow { row, blobs: vec![WireBlob { hash, bytes }] }
+        };
+        let git_rows = vec![
+            to_wire(build_commit_marker_row(&scratch, &ident_at(0), &marker).unwrap()),
+            to_wire(build_ingest_row(&scratch, &ident_at(1), &ingest).unwrap()),
+            to_wire(build_plan_row(&scratch, &ident_at(2), &plan).unwrap()),
+        ];
+
+        // Single-integrate path.
+        let da = tempdir().unwrap();
+        let a = eng(da.path(), 1);
+        a.record_write("real.md", b"content\n").unwrap().unwrap();
+        for wr in &git_rows {
+            assert!(a.integrate(wr).unwrap(), "git row integrates as new");
+        }
+        assert_eq!(fs::read(da.path().join("real.md")).unwrap(), b"content\n", "unchanged");
+        // No marker leaked onto disk (path=sha is metadata, not a file).
+        assert!(!da.path().join("abc123").exists());
+        for wr in &git_rows {
+            assert!(!a.integrate(wr).unwrap(), "re-integration dedups");
+        }
+
+        // Batch-integrate path.
+        let db = tempdir().unwrap();
+        let b = eng(db.path(), 2);
+        b.record_write("real.md", b"content\n").unwrap().unwrap();
+        assert!(b.integrate_many(&git_rows).unwrap().iter().all(|added| *added));
+        assert_eq!(fs::read(db.path().join("real.md")).unwrap(), b"content\n");
+        assert!(b.integrate_many(&git_rows).unwrap().iter().all(|added| !*added), "batch dedup");
     }
 
     #[test]

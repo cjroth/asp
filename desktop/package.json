@@ -7,12 +7,13 @@
     "sync:wasm": "bash scripts/sync-wasm.sh",
     "dev:web": "bun run sync:wasm && vite",
     "build:web": "bun run sync:wasm && tsc && vite build",
-    "dev": "tauri dev",
+    "dev": "node scripts/check-display.mjs && tauri dev",
     "build": "tauri build",
     "test": "bun test src && bun test bun-isolated",
     "typecheck": "tsc --noEmit",
     "e2e:web": "bun run build:web && bash e2e/web-run.sh",
     "e2e:webapp": "xvfb-run -a node e2e/webapp-check.mjs",
+    "e2e:git": "xvfb-run -a node e2e/git-clone-check.mjs",
     "bench": "cargo run --release -p asp-desktop-engine --example bench_ops --"
   },
   "dependencies": {

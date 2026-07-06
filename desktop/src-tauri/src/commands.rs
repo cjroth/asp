@@ -8,7 +8,8 @@
 //! freeze rendering/input. `(async)` dispatches each to a worker thread.
 
 use asp_desktop_engine::{
-    BranchDto, DesktopEngine, FileAt, FileEntry, Graph, HistEvent, TagDto, VaultInfo, VaultStatus,
+    BranchDto, DesktopEngine, FileAt, FileEntry, GitPullSummary, GitPushSummary, GitStatusDto,
+    Graph, HistEvent, PendingDiffDto, TagDto, VaultInfo, VaultStatus,
 };
 use std::path::PathBuf;
 use tauri::State;
@@ -43,6 +44,44 @@ pub fn add_local_folder(state: State<AppState>, path: String) -> R<VaultInfo> {
 #[tauri::command(async)]
 pub fn clone_remote(state: State<AppState>, dest: String, ticket: String, auth_key: Option<String>) -> R<VaultInfo> {
     e(state.engine.clone_remote(&PathBuf::from(dest), &ticket, auth_key.as_deref()))
+}
+
+/// Clone a git repo into a new vault (git-bridge §7.2). Invoke-arg names MUST match
+/// the `tauriApi.cloneGit` binding exactly (`{dest,url,token,depth}`) — the f6c1d07
+/// lesson. Progress is emitted via the shell's `vault-scan-progress` event.
+#[tauri::command(async)]
+pub fn clone_git(state: State<AppState>, dest: String, url: String, token: Option<String>, depth: Option<u32>) -> R<VaultInfo> {
+    e(state.engine.clone_git(&PathBuf::from(dest), &url, token.as_deref(), depth))
+}
+
+/// Pull new upstream commits into a git-configured vault (git-bridge §4). Arg name
+/// matches `tauriApi.gitPull({ id })`.
+#[tauri::command(async)]
+pub fn git_pull(state: State<AppState>, id: String) -> R<GitPullSummary> {
+    e(state.engine.git_pull(&id))
+}
+
+/// The git-bridge status chip DTO (camelCase), or `null` when the vault has no git
+/// remote. Arg name matches `tauriApi.gitStatus({ id })`.
+#[tauri::command(async)]
+pub fn git_status(state: State<AppState>, id: String) -> R<Option<GitStatusDto>> {
+    e(state.engine.git_status(&id))
+}
+
+/// Commit the vault's pending changes and push them upstream (git-bridge §7.2).
+/// Arg names match `tauriApi.gitPush({ id, message })`. Push is desktop/CLI-only —
+/// the web binding rejects (browser is clone/pull only, a spec non-goal).
+#[tauri::command(async)]
+pub fn git_push(state: State<AppState>, id: String, message: String) -> R<GitPushSummary> {
+    e(state.engine.git_push(&id, &message))
+}
+
+/// The pending (unpushed) diff for a git vault (git-bridge §5.3), so the push
+/// dialog can pre-fill the message and show what would be sent. Arg name matches
+/// `tauriApi.gitPendingDiff({ id })`.
+#[tauri::command(async)]
+pub fn git_pending_diff(state: State<AppState>, id: String) -> R<PendingDiffDto> {
+    e(state.engine.git_pending_diff(&id))
 }
 
 #[tauri::command(async)]

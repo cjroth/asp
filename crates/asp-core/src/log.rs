@@ -38,6 +38,22 @@ pub enum Kind {
     /// metadata — the JSON-encoded `Tag` rides in `result_hash`'s blob, keyed by
     /// `file_id = tag_id`, and converges last-writer-wins. Never touches the fold.
     Tag,
+    /// A **git import marker** (git-bridge §3.1, §6.1): one per imported upstream
+    /// commit, attributing the batch's file rows to the git author. Like `Branch`
+    /// it is content-free of file bytes — its msgpack `GitCommitMarker` payload
+    /// (`gitrecord.rs`) rides in `result_hash`'s blob, and `path` = the commit sha
+    /// for a cheap indexed lookup. A no-op on the fold.
+    GitCommit,
+    /// A synced **ingest ledger record** (git-bridge §4.1, §6.1): appended after
+    /// each ingested commit so every node can answer "which git commit is the vault
+    /// at?" from the fold. Metadata only — its `GitIngestRecord` payload rides in
+    /// `result_hash`'s blob. A no-op on the fold.
+    GitIngest,
+    /// A synced **commit plan** (git-bridge §5.1, §6.1): "everything up to frontier
+    /// F becomes one commit with message M". Drives deterministic commit synthesis
+    /// so any node may push idempotently. Metadata only — its `GitPlanRecord`
+    /// payload rides in `result_hash`'s blob. A no-op on the fold.
+    GitPlan,
 }
 
 impl Kind {
@@ -51,6 +67,9 @@ impl Kind {
             Kind::Merge => "merge",
             Kind::Branch => "branch",
             Kind::Tag => "tag",
+            Kind::GitCommit => "gitcommit",
+            Kind::GitIngest => "gitingest",
+            Kind::GitPlan => "gitplan",
         }
     }
     pub fn parse(s: &str) -> Option<Kind> {
@@ -63,6 +82,9 @@ impl Kind {
             "merge" => Kind::Merge,
             "branch" => Kind::Branch,
             "tag" => Kind::Tag,
+            "gitcommit" => Kind::GitCommit,
+            "gitingest" => Kind::GitIngest,
+            "gitplan" => Kind::GitPlan,
             _ => return None,
         })
     }
@@ -295,6 +317,28 @@ mod tests {
     fn kind_branch_and_merge_round_trip() {
         for k in [Kind::Merge, Kind::Branch] {
             assert_eq!(Kind::parse(k.as_str()), Some(k));
+        }
+    }
+
+    #[test]
+    fn kind_git_variants_round_trip() {
+        // git-bridge §6.1: the three new kinds must survive as_str/parse (a
+        // Kind::parse -> None at the sqlite read boundary silently drops rows) and
+        // serde msgpack (rename_all = "lowercase" => "gitcommit"/etc), which is what
+        // makes an old proto-3 peer reject them (git-bridge §6.2).
+        for (k, s) in [
+            (Kind::GitCommit, "gitcommit"),
+            (Kind::GitIngest, "gitingest"),
+            (Kind::GitPlan, "gitplan"),
+        ] {
+            assert_eq!(k.as_str(), s);
+            assert_eq!(Kind::parse(s), Some(k));
+            let bytes = rmp_serde::to_vec_named(&k).unwrap();
+            let back: Kind = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(back, k);
+            // The msgpack payload encodes the lowercase string, so an old peer's
+            // decoder (which lacks these variants) fails on it.
+            assert_eq!(rmp_serde::from_slice::<String>(&bytes).unwrap(), s);
         }
     }
 
