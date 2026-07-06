@@ -333,6 +333,14 @@ export default function HistoryBar(props: HistoryBarProps) {
   const pxX = (ts: number) => (xAt(ts) / 100) * trackSize.w;
   const multiLane = lanes.length > 1;
 
+  // Lane axis is vertical: with many branches (e.g. a --all-branches clone with
+  // ~128 lanes) the stack is far taller than the track. The surface takes the
+  // lanes' natural height and the track clips + scrolls on that axis, so nothing
+  // ever paints over the panes above. A normal 1–6 lane vault fits exactly
+  // (surfaceH === trackSize.h) and shows no scrollbar — unchanged for those.
+  const surfaceH = geom.contentH;
+  const laneOverflow = surfaceH > trackSize.h + 1;
+
   // Per-lane connecting polylines (so a lane reads as one continuous history) and
   // the x of each lane's most-recent dot (to anchor the branch label on the right).
   const perLane = useMemo(() => {
@@ -422,9 +430,15 @@ export default function HistoryBar(props: HistoryBarProps) {
             <button onClick={props.onNow} style={{ fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: timeTravel ? 'var(--text2)' : 'var(--faint2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 7, padding: '4px 12px', cursor: 'pointer', flex: 'none' }}>Now</button>
           </div>
 
-          <div ref={trackRef} data-testid="history-track" onPointerDown={onTrackDown} style={{ position: 'relative', flex: 1, margin: '0 16px 11px', cursor: 'crosshair', touchAction: 'none' }}>
+          <div ref={trackRef} data-testid="history-track" onPointerDown={onTrackDown} className={laneOverflow ? 'asp-scroll' : undefined} style={{ position: 'relative', flex: 1, margin: '0 16px 11px', cursor: 'crosshair', touchAction: 'none', overflowX: 'hidden', overflowY: laneOverflow ? 'auto' : 'hidden' }}>
+            {/* Scroll surface: sized to the lanes' natural height. When lanes fit it
+                equals the track (no scroll); when they overflow, the track above
+                clips and scrolls on the lane (vertical) axis. All graph elements
+                — guides, dots, labels, edges, playhead — live inside so they can
+                never paint over sibling panes and labels scroll with their lane. */}
+            <div data-testid="history-surface" style={{ position: 'relative', width: '100%', height: surfaceH, minHeight: '100%' }}>
             {/* SVG overlay: lane guides + per-lane connecting line + fork edges. */}
-            <svg width={trackSize.w} height={trackSize.h} style={{ position: 'absolute', inset: 0, overflow: 'visible', pointerEvents: 'none' }}>
+            <svg width={trackSize.w} height={surfaceH} style={{ position: 'absolute', inset: 0, overflow: 'visible', pointerEvents: 'none' }}>
               {lanes.map((l) => (
                 <line key={l.branchId} x1={0} y1={geom.y(l.lane)} x2={trackSize.w} y2={geom.y(l.lane)} stroke="var(--line)" strokeWidth={1} />
               ))}
@@ -545,6 +559,7 @@ export default function HistoryBar(props: HistoryBarProps) {
               </div>
               </>
             )}
+            </div>
           </div>
         </div>
       )}

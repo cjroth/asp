@@ -94,11 +94,20 @@ export function nodesToEvents(graph: BranchGraphData | null): TrackEvent[] {
 
 /** Vertical geometry for `laneCount` lanes inside a track of `height` px: the y of
  *  each lane and a per-lane row height, kept within [minRow, maxRow] and centred.
- *  One lane → the single centred row the timeline has always used. */
-export function laneGeometry(laneCount: number, height: number): { rowH: number; y: (lane: number) => number; top: number } {
+ *  One lane → the single centred row the timeline has always used.
+ *
+ *  `contentH` is the natural pixel height the lanes need. While they fit it equals
+ *  `height` (lanes stay centred, exactly as before — no visual change). Once the
+ *  row height bottoms out at its 16px floor and the stack is taller than the track
+ *  (roughly >6 lanes in the default bar), `contentH` grows past `height` and the
+ *  lanes are laid top-down; HistoryBar sizes its scroll surface to `contentH` so
+ *  the pane scrolls on the lane axis instead of painting outside its bounds. */
+export function laneGeometry(laneCount: number, height: number): { rowH: number; y: (lane: number) => number; top: number; contentH: number } {
   const n = Math.max(1, laneCount);
   const rowH = Math.max(16, Math.min(30, (height - 12) / n));
   const used = rowH * n;
-  const top = (height - used) / 2 + rowH / 2;
-  return { rowH, top, y: (lane: number) => top + lane * rowH };
+  const fits = used <= height;
+  const contentH = fits ? height : used + 12;
+  const top = fits ? (height - used) / 2 + rowH / 2 : rowH / 2 + 6;
+  return { rowH, top, contentH, y: (lane: number) => top + lane * rowH };
 }
