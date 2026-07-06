@@ -22,6 +22,7 @@ import {
   packLanes,
   packedLanes,
   packedLanesGrouped,
+  popoverPosition,
 } from './timeline';
 
 const ev = (id: string, ts: number, branchId: string, kind = 'edit'): TrackEvent => ({ id, ts, kind, path: `${id}.md`, branchId });
@@ -641,5 +642,57 @@ describe('fisheyeLaneYs — 1-D vertical lane magnification (wave B)', () => {
       const g2 = fisheyeLaneYs(laneCount, trackH, focusY);
       for (let l = 0; l < laneCount; l++) expect(g2.y(l)).toBe(g.y(l));
     }
+  });
+});
+
+describe('popoverPosition', () => {
+  const vp = { width: 1000, height: 800 };
+  // A dot near the window bottom (the pane lives there) → 'above' is the norm.
+  const dot = (left: number, top: number) => ({ left, top, width: 18, height: 18 });
+
+  it('centers horizontally on the dot and places above it', () => {
+    const p = popoverPosition(dot(500, 760), { width: 320, height: 200 }, vp);
+    expect(p.placement).toBe('above');
+    // centered: left = dotCenter(509) - width/2(160) = 349
+    expect(p.left).toBe(349);
+    // above: top = dotTop(760) - gap(10) - height(200) = 550
+    expect(p.top).toBe(550);
+    expect(p.height).toBe(200);
+  });
+
+  it('clamps to the left edge with the margin', () => {
+    const p = popoverPosition(dot(2, 760), { width: 320, height: 100 }, vp);
+    expect(p.left).toBe(8); // margin, not negative
+  });
+
+  it('clamps to the right edge with the margin', () => {
+    const p = popoverPosition(dot(995, 760), { width: 320, height: 100 }, vp);
+    expect(p.left).toBe(1000 - 320 - 8); // 672
+  });
+
+  it('flips below the dot when there is no room above', () => {
+    const p = popoverPosition(dot(500, 20), { width: 320, height: 200 }, vp);
+    expect(p.placement).toBe('below');
+    // below: top = dotTop(20) + height(18) + gap(10) = 48
+    expect(p.top).toBe(48);
+  });
+
+  it('caps the height to the viewport fraction and scrolls (above)', () => {
+    // Desired 600 but the 0.4 cap is 320; there IS room above (760 - 10 - 8 = 742).
+    const p = popoverPosition(dot(500, 760), { width: 320, height: 600 }, vp);
+    expect(p.height).toBe(320); // 0.4 * 800
+    expect(p.placement).toBe('above');
+    expect(p.top).toBe(760 - 10 - 320);
+  });
+
+  it('shrinks to the available room when neither side fits the cap', () => {
+    // Short window, dot mid-screen: cap 0.4*300=120, but room each side is tiny.
+    const shortVp = { width: 1000, height: 300 };
+    const p = popoverPosition({ left: 500, top: 150, width: 18, height: 18 }, { width: 320, height: 260 }, shortVp);
+    // roomAbove = 150-10-8 = 132; roomBelow = 300-168-10-8 = 114 → above (roomier)
+    expect(p.placement).toBe('above');
+    const cap = 300 * 0.4; // 120
+    expect(p.height).toBe(cap); // capped, since cap(120) < roomAbove(132)
+    expect(p.top).toBe(150 - 10 - 120);
   });
 });

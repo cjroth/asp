@@ -593,3 +593,71 @@ export function declutterLabels(items: LabelBox[], pad = 2): Set<string> {
   }
   return keptSet;
 }
+
+// ---- hover-diff popover placement ------------------------------------------
+
+/** A viewport-space rectangle (the hovered dot's getBoundingClientRect). */
+export interface AnchorRect {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+export interface Size {
+  width: number;
+  height: number;
+}
+export interface PopoverPos {
+  left: number;
+  top: number;
+  /** Above the dot when there is room (the common case — the pane sits at the
+   *  window bottom); flips below when the diff is too tall to fit above. */
+  placement: 'above' | 'below';
+  /** The height the popover may actually use in the chosen placement — the
+   *  desired height clamped to a fraction of the viewport AND to the room on the
+   *  chosen side. The caller sets this as `maxHeight` (body scrolls internally). */
+  height: number;
+}
+
+/** Pure placement for the hover-diff popover, in viewport coordinates. Centered
+ *  horizontally on the dot and clamped to the viewport (with an edge margin);
+ *  vertically it prefers ABOVE the dot and flips BELOW only when the (capped)
+ *  height can't fit above. The returned `height` is capped both by
+ *  `maxHeightFraction` of the viewport and by the room available on the chosen
+ *  side, so a tall diff near a short window shrinks + scrolls instead of
+ *  overflowing. DOM-free → unit-testable. */
+export function popoverPosition(
+  anchor: AnchorRect,
+  pop: Size,
+  viewport: Size,
+  opts: { gap?: number; margin?: number; maxHeightFraction?: number } = {},
+): PopoverPos {
+  const gap = opts.gap ?? 10;
+  const margin = opts.margin ?? 8;
+  const maxHeightFraction = opts.maxHeightFraction ?? 0.4;
+
+  // Horizontal: centered on the dot, clamped so the box stays on-screen.
+  const cx = anchor.left + anchor.width / 2;
+  const maxLeft = Math.max(margin, viewport.width - pop.width - margin);
+  const left = Math.min(Math.max(margin, cx - pop.width / 2), maxLeft);
+
+  // Vertical: room above/below the dot (after the gap + edge margin), and the
+  // hard height cap. Prefer above; flip below if the capped box can't fit above;
+  // if neither side fits, take the roomier side and let it shrink + scroll.
+  const cap = viewport.height * maxHeightFraction;
+  const roomAbove = anchor.top - gap - margin;
+  const roomBelow = viewport.height - (anchor.top + anchor.height) - gap - margin;
+  const desired = Math.min(pop.height, cap);
+  let placement: 'above' | 'below';
+  if (desired <= roomAbove) placement = 'above';
+  else if (desired <= roomBelow) placement = 'below';
+  else placement = roomAbove >= roomBelow ? 'above' : 'below';
+
+  const room = placement === 'above' ? roomAbove : roomBelow;
+  const height = Math.max(0, Math.min(desired, room));
+  const top =
+    placement === 'above'
+      ? anchor.top - gap - height
+      : anchor.top + anchor.height + gap;
+  return { left, top, placement, height };
+}

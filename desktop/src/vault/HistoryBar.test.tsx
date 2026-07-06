@@ -124,7 +124,7 @@ describe('HistoryBar', () => {
     fireEvent(document, new MouseEvent('pointermove', { clientX: 60, bubbles: true }));
     fireEvent(document, new MouseEvent('pointerup', { clientX: 60, bubbles: true }));
 
-    const tick = container.querySelector('div[title]') as HTMLElement;
+    const tick = container.querySelector('[data-testid="commit-dot"]') as HTMLElement;
     fireEvent(tick, new MouseEvent('pointerdown', { clientX: 10, bubbles: true }));
     expect(setPlayhead).toHaveBeenCalled();
   });
