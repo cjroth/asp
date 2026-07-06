@@ -61,6 +61,19 @@ comparison-workarounds — not just logic.
 - E2E: real `asp` binaries (`tests/e2e/src/lib.rs`), real `git http-backend`
   (`tests/e2e/src/gitfix.rs`). Hermetic; system git is a sanctioned dev-only dep.
 
+## The targeted-tests blind spot (a regression that actually shipped)
+
+This VM's memory ceiling forces "targeted test files only, never full `bun test
+src`" — which means the heavy App suites (App.test.tsx, App.design.test.tsx, …)
+silently fall outside every slice's gates. That shipped two real regressions in
+one commit: a new `api.gitStatus` call crashed every App-mounting suite whose
+bespoke api mock predated it (1/35 passing), and changed modal copy broke
+`getByPlaceholderText` selectors. Rule: **when you change the shared `Api`
+surface, App-mount behavior, or user-facing copy, sweep the heavy suites
+file-by-file** (`for f in src/App.*.test.tsx; do bun test "$f"; done` — one at a
+time is memory-safe) before calling the slice done. Adding a fn to `Api` means
+grepping every `mock.module('./lib/api'` site.
+
 ## Flaky-environment protocol (do this BEFORE debugging a "regression")
 
 The networked e2e lane (iroh QUIC via relay) fails under this VM's load with no
