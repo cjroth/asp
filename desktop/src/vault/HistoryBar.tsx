@@ -20,7 +20,7 @@ import {
   zoomAround,
   zoomKeepingFocus,
 } from './history';
-import { declutterLabels, forkEdges, laneColor, laneCountOf, laneForEvent, laneGeometry, laneIndex, nodesToEvents, packedLanes } from './timeline';
+import { declutterLabels, FISHEYE_THRESHOLD, fisheyeLaneYs, forkEdges, laneColor, laneCountOf, laneForEvent, laneGeometry, laneIndex, nodesToEvents, packedLanes } from './timeline';
 import { lineDiff } from './diffLines';
 import * as Icon from './icons';
 import { deriveLog, logColor, logText } from './log';
@@ -89,6 +89,10 @@ export default function HistoryBar(props: HistoryBarProps) {
   const [tagName, setTagName] = useState('');
   // Measured track pixel size — lane y and SVG edge coords are in px.
   const [trackSize, setTrackSize] = useState({ w: 640, h: 96 });
+  // Wave-B vertical fisheye: the cursor's y within the track (px), or null when
+  // not hovering. Drives lane magnification only when rows are thin; reads ONLY
+  // mouse-Y, never the time (x) axis. rAF-throttled + rounded to 2px steps.
+  const [focusY, setFocusY] = useState<number | null>(null);
   // Layout mode: 'time' spaces dots by wall-clock time (default); 'seq' spaces them
   // evenly by edit order (a cleaner, uniform view when edits cluster in time).
   const [seqMode, setSeqMode] = useState(false);
@@ -131,7 +135,19 @@ export default function HistoryBar(props: HistoryBarProps) {
   const laneIdx = useMemo(() => laneIndex(lanes), [lanes]);
   const laneCount = useMemo(() => laneCountOf(lanes), [lanes]);
   const edges = useMemo(() => forkEdges(lanes, events), [lanes, events]);
-  const geom = useMemo(() => laneGeometry(laneCount, trackSize.h), [laneCount, trackSize.h]);
+  // Uniform base geometry (surface height, threshold check) + the fisheye seam.
+  // The current-branch lane is pinned alongside main so both anchors stay
+  // readable under magnification. `geom` is the SINGLE lane→pixel-y seam: guides,
+  // polylines, dots and labels all position through geom.y so the whole lane
+  // moves coherently. It is an exact identity transform unless rows are thin AND
+  // the cursor is over the track (focusY != null) — normal vaults see no change.
+  const baseGeom = useMemo(() => laneGeometry(laneCount, trackSize.h), [laneCount, trackSize.h]);
+  const curLane = laneIdx.get(currentBranch);
+  const geom = useMemo(
+    () => fisheyeLaneYs(laneCount, trackSize.h, focusY, { pinned: curLane != null ? [0, 1, curLane] : [0, 1] }),
+    [laneCount, trackSize.h, focusY, curLane],
+  );
+  const fisheyeActive = baseGeom.rowH < FISHEYE_THRESHOLD && laneCount > 1;
   const tags = graph?.tags ?? [];
 
   // Cap rendered tick nodes: a vault import clusters thousands of events at one
@@ -188,6 +204,36 @@ export default function HistoryBar(props: HistoryBarProps) {
 
   const seqModeRef = useRef(seqMode);
   seqModeRef.current = seqMode;
+
+  // ---- fisheye focus (vertical hover) ----
+  // Read only the cursor's Y, round to 2px, and commit at most once per frame so
+  // magnification tracks the cursor without a re-render per pixel. When rows are
+  // already comfortable it's a no-op (never sets focusY → zero extra renders).
+  const fisheyeRef = useRef(fisheyeActive);
+  fisheyeRef.current = fisheyeActive;
+  const focusRaf = useRef<number | null>(null);
+  const pendingFocus = useRef<number | null>(null);
+  useEffect(() => () => { if (focusRaf.current != null) cancelAnimationFrame(focusRaf.current); }, []);
+  const onTrackMove = (e: React.MouseEvent) => {
+    if (!fisheyeRef.current) return; // identity regime → don't churn state
+    const el = trackRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    pendingFocus.current = Math.round((e.clientY - r.top) / 2) * 2;
+    if (focusRaf.current == null) {
+      focusRaf.current = requestAnimationFrame(() => {
+        focusRaf.current = null;
+        setFocusY(pendingFocus.current);
+      });
+    }
+  };
+  const onTrackLeave = () => {
+    if (focusRaf.current != null) { cancelAnimationFrame(focusRaf.current); focusRaf.current = null; }
+    // Snap back to the uniform layout (see report: SVG + DOM move together, and
+    // easing only the DOM half while SVG geometry snaps reads worse than a clean
+    // snap; the rAF-throttled hover already reads smooth).
+    setFocusY(null);
+  };
 
   // ---- track interaction ----
   const onTrackDown = (e: React.PointerEvent) => {
@@ -379,8 +425,10 @@ export default function HistoryBar(props: HistoryBarProps) {
       const x = anchor != null ? anchor + 12 : trackSize.w - 4;
       const tip = perBranch.lastTs.get(l.branchId);
       const inWindow = tip != null && tip >= view.start && tip <= view.end;
+      // The magnified (hovered) lane's label always wins; the current branch too.
+      const focused = geom.active && l.lane === geom.focusLane;
       const priority =
-        l.branchId === currentBranch ? Number.MAX_SAFE_INTEGER : inWindow ? 1e15 + (tip ?? 0) : (tip ?? 0);
+        focused || l.branchId === currentBranch ? Number.MAX_SAFE_INTEGER : inWindow ? 1e15 + (tip ?? 0) : (tip ?? 0);
       const w = Math.min(140, 16 + l.name.length * 6.5);
       return { id: l.branchId, x, y: geom.y(l.lane) - 9, w, h: 18, priority };
     });
@@ -457,7 +505,7 @@ export default function HistoryBar(props: HistoryBarProps) {
             <button onClick={props.onNow} style={{ fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: timeTravel ? 'var(--text2)' : 'var(--faint2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 7, padding: '4px 12px', cursor: 'pointer', flex: 'none' }}>Now</button>
           </div>
 
-          <div ref={trackRef} data-testid="history-track" onPointerDown={onTrackDown} style={{ position: 'relative', flex: 1, margin: '0 16px 11px', cursor: 'crosshair', touchAction: 'none', overflowX: 'hidden', overflowY: 'hidden' }}>
+          <div ref={trackRef} data-testid="history-track" onPointerDown={onTrackDown} onMouseMove={onTrackMove} onMouseLeave={onTrackLeave} style={{ position: 'relative', flex: 1, margin: '0 16px 11px', cursor: 'crosshair', touchAction: 'none', overflowX: 'hidden', overflowY: 'hidden' }}>
             {/* Surface: a positioning root filling the track. Lanes always fit (no
                 scroll — scroll is reserved for the time axis); the track clips BOTH
                 axes so no graph element (dot, label, edge, playhead) ever paints

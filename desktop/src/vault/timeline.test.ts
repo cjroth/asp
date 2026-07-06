@@ -4,7 +4,11 @@ import type { TrackEvent } from './history';
 import {
   branchSpans,
   declutterLabels,
+  FISHEYE_PIN_MIN,
+  FISHEYE_THRESHOLD,
+  fisheyeLaneYs,
   forkEdges,
+  IDEAL_ROW,
   type LaneSpan,
   laneColor,
   laneCountOf,
@@ -312,6 +316,140 @@ describe('declutterLabels — pixel-space collision pass', () => {
     for (let i = 1; i < kept.length; i++) {
       // non-overlap with the 2px pad on both sides.
       expect(kept[i - 1].x + kept[i - 1].w + 2).toBeLessThanOrEqual(kept[i].x - 2);
+    }
+  });
+});
+
+describe('fisheyeLaneYs — 1-D vertical lane magnification (wave B)', () => {
+  // A "thin" configuration where fisheye actually engages: 40 lanes in a 200px
+  // track → uniform rowH = 5px (< threshold). Focus near the middle.
+  const N = 40, H = 200;
+  const uniform = () => laneGeometry(N, H);
+
+  it('is EXACT identity when focusY is null (byte-for-byte the uniform seam)', () => {
+    const g = fisheyeLaneYs(N, H, null);
+    const u = uniform();
+    expect(g.active).toBe(false);
+    expect(g.focusLane).toBeNull();
+    for (let l = 0; l < N; l++) {
+      expect(g.y(l)).toBe(u.y(l)); // exact equality, not close-to
+      expect(g.rowH(l)).toBe(u.rowH);
+    }
+    expect(g.contentH).toBe(H);
+  });
+
+  it('is EXACT identity when rows are already comfortable (rowH >= threshold)', () => {
+    // 4 lanes in 200px → uniform rowH = 16 (>= 10). Even with a live focus, no-op.
+    const u = laneGeometry(4, 200);
+    expect(u.rowH).toBeGreaterThanOrEqual(FISHEYE_THRESHOLD);
+    const g = fisheyeLaneYs(4, 200, 100); // focus present but ignored
+    expect(g.active).toBe(false);
+    for (let l = 0; l < 4; l++) expect(g.y(l)).toBe(u.y(l));
+  });
+
+  it('a single lane is always identity (nothing to magnify)', () => {
+    const g = fisheyeLaneYs(1, 40, 20);
+    expect(g.active).toBe(false);
+    expect(g.y(0)).toBe(laneGeometry(1, 40).y(0));
+  });
+
+  it('when active: total height conserved — stack fits [0, trackH], strictly monotonic', () => {
+    for (const focusY of [10, 50, 100, 150, 199]) {
+      const g = fisheyeLaneYs(N, H, focusY);
+      expect(g.active).toBe(true);
+      let prev = -Infinity;
+      for (let l = 0; l < N; l++) {
+        const y = g.y(l);
+        expect(Number.isFinite(y)).toBe(true);
+        expect(y).toBeGreaterThan(prev); // strictly below the lane above
+        prev = y;
+      }
+      // First centre >= 0, last centre + half its row <= trackH (fits, no clip growth).
+      expect(g.y(0) - g.rowH(0) / 2).toBeGreaterThanOrEqual(-1e-6);
+      expect(g.y(N - 1) + g.rowH(N - 1) / 2).toBeLessThanOrEqual(H + 1e-6);
+    }
+  });
+
+  it('the focused (nearest) lane swells to >= IDEAL_ROW*0.9 at any focus position', () => {
+    // Sweep every 1px; the lane nearest the cursor must always be near-full height.
+    for (let focusY = 0; focusY <= H; focusY++) {
+      const g = fisheyeLaneYs(N, H, focusY);
+      expect(g.rowH(g.focusLane!)).toBeGreaterThanOrEqual(IDEAL_ROW * 0.9);
+    }
+  });
+
+  it('pinned anchor lanes keep >= PIN_MIN px even when the focus is far away', () => {
+    // Focus at the very bottom → lanes 0/1 (pinned) are as far from focus as possible.
+    const g = fisheyeLaneYs(N, H, H, { pinned: [0, 1] });
+    expect(g.rowH(0)).toBeGreaterThanOrEqual(FISHEYE_PIN_MIN - 1e-6);
+    expect(g.rowH(1)).toBeGreaterThanOrEqual(FISHEYE_PIN_MIN - 1e-6);
+    // And a custom pin (a selected branch) is honoured too.
+    const g2 = fisheyeLaneYs(N, H, 0, { pinned: [0, 1, 30] });
+    expect(g2.rowH(30)).toBeGreaterThanOrEqual(FISHEYE_PIN_MIN - 1e-6);
+  });
+
+  it('is continuous in focusY — no jumps as the cursor moves (Lipschitz-ish)', () => {
+    for (let focusY = 5; focusY < H - 5; focusY += 1) {
+      const a = fisheyeLaneYs(N, H, focusY);
+      const b = fisheyeLaneYs(N, H, focusY + 1);
+      for (let l = 0; l < N; l++) {
+        // A 1px focus step moves any lane centre by only a few px (no discontinuity).
+        expect(Math.abs(a.y(l) - b.y(l))).toBeLessThan(8);
+      }
+    }
+  });
+
+  it('is deterministic — identical output across two independent calls', () => {
+    const a = fisheyeLaneYs(N, H, 73);
+    const b = fisheyeLaneYs(N, H, 73);
+    for (let l = 0; l < N; l++) {
+      expect(a.y(l)).toBe(b.y(l));
+      expect(a.rowH(l)).toBe(b.rowH(l));
+    }
+  });
+
+  it('sum of row heights fills the track exactly (conservation)', () => {
+    const g = fisheyeLaneYs(N, H, 90);
+    let sum = 0;
+    for (let l = 0; l < N; l++) sum += g.rowH(l);
+    expect(sum).toBeCloseTo(H, 4);
+  });
+
+  it('fuzz (seeded LCG): random laneCount/trackH/focusY hold every invariant, no NaN, deterministic', () => {
+    let seed = 0x0bad_c0de;
+    const rnd = () => ((seed = (seed * 1_103_515_245 + 12_345) & 0x7fff_ffff) / 0x7fff_ffff);
+    for (let iter = 0; iter < 400; iter++) {
+      const laneCount = 2 + Math.floor(rnd() * 200); // 2..201
+      const trackH = 90 + Math.floor(rnd() * 320); // 90..409 (feasible pane sizes)
+      const focusY = rnd() * trackH;
+      const g = fisheyeLaneYs(laneCount, trackH, focusY);
+      const u = laneGeometry(laneCount, trackH);
+      if (u.rowH >= FISHEYE_THRESHOLD) {
+        // Identity regime: exact match, regardless of focus.
+        expect(g.active).toBe(false);
+        for (let l = 0; l < laneCount; l++) expect(g.y(l)).toBe(u.y(l));
+        continue;
+      }
+      expect(g.active).toBe(true);
+      let prev = -Infinity, sum = 0;
+      for (let l = 0; l < laneCount; l++) {
+        const y = g.y(l), rh = g.rowH(l);
+        expect(Number.isNaN(y)).toBe(false);
+        expect(Number.isNaN(rh)).toBe(false);
+        expect(rh).toBeGreaterThan(0);
+        expect(y).toBeGreaterThan(prev);
+        prev = y;
+        sum += rh;
+      }
+      expect(sum).toBeCloseTo(trackH, 3); // conservation
+      expect(g.y(laneCount - 1) + g.rowH(laneCount - 1) / 2).toBeLessThanOrEqual(trackH + 1e-6);
+      // Focused + pinned guarantees.
+      expect(g.rowH(g.focusLane!)).toBeGreaterThanOrEqual(IDEAL_ROW * 0.9 - 1e-6);
+      expect(g.rowH(0)).toBeGreaterThanOrEqual(FISHEYE_PIN_MIN - 1e-6);
+      expect(g.rowH(1)).toBeGreaterThanOrEqual(FISHEYE_PIN_MIN - 1e-6);
+      // Determinism: a second identical call matches byte-for-byte.
+      const g2 = fisheyeLaneYs(laneCount, trackH, focusY);
+      for (let l = 0; l < laneCount; l++) expect(g2.y(l)).toBe(g.y(l));
     }
   });
 });

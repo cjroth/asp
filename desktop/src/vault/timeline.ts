@@ -119,6 +119,120 @@ export function laneGeometry(laneCount: number, height: number): { rowH: number;
   return { rowH, top, contentH: height, y: (lane: number) => top + lane * rowH };
 }
 
+// ---- wave B: 1-D vertical fisheye (lane magnification) ----------------------
+// When packed rows are thin, hovering the track vertically magnifies the lanes
+// nearest the cursor — the macOS dock rotated 90°. The hovered lane swells to
+// ~IDEAL_ROW, its neighbours taper via a cosine bump, and the rest compress so
+// the whole stack stays EXACTLY `height` tall (no clip change, no scroll). It is
+// a strict no-op (identity) when rows are already comfortable or nothing is
+// hovered — normal vaults see zero change. Pure so waves B/C can reason about it.
+
+/** rowH below this (px) counts as "thin" → fisheye engages. At/above it, the
+ *  layout is already legible and fisheye is an identity transform. */
+export const FISHEYE_THRESHOLD = 10;
+/** Falloff reach of the magnification, in lanes (each side of the focus). */
+export const FISHEYE_RADIUS = 3.5;
+/** Floor (px) guaranteed to pinned anchor lanes (main, current, selected) even
+ *  when they're far from the focus, so they stay readable under magnification. */
+export const FISHEYE_PIN_MIN = 8;
+
+export interface FisheyeGeom {
+  /** Centre-line y (px) of a lane — same seam semantics as laneGeometry.y. */
+  y: (lane: number) => number;
+  /** The lane's row height (px) under the current magnification. */
+  rowH: (lane: number) => number;
+  /** Surface height — always the track height (clip contract unchanged). */
+  contentH: number;
+  /** Lane nearest the cursor (the "focused" lane), or null when inactive. */
+  focusLane: number | null;
+  /** True only when the magnification is actually applied. */
+  active: boolean;
+}
+
+/** 1-D vertical fisheye over `laneCount` lanes in a `height`px track, focused at
+ *  `focusY` px (null = no hover). Invariants (see timeline.test.ts):
+ *   - focusY null OR uniform rowH >= threshold OR laneCount<=1 ⇒ EXACT identity
+ *     with laneGeometry (same y for every lane; zero visual change).
+ *   - monotonic: y(i+1) > y(i) always; the stack fits [0, height].
+ *   - focused (nearest) lane gets >= IDEAL_ROW*0.9; pinned lanes get >= PIN_MIN.
+ *   - continuous in focusY (no jumps), deterministic, never NaN.
+ *  `pinned` defaults to lanes {0,1} — main and the wave-A current-branch pin.
+ */
+export function fisheyeLaneYs(
+  laneCount: number,
+  height: number,
+  focusY: number | null,
+  opts?: { pinned?: Iterable<number>; radius?: number; threshold?: number; pinMin?: number; ideal?: number },
+): FisheyeGeom {
+  const n = Math.max(1, laneCount);
+  const base = laneGeometry(n, height);
+  const threshold = opts?.threshold ?? FISHEYE_THRESHOLD;
+  // Identity: comfortable rows, no hover, or a single lane → the uniform layout,
+  // byte-for-byte (return the same y closure so equality is exact).
+  if (focusY == null || base.rowH >= threshold || n <= 1) {
+    return { y: base.y, rowH: () => base.rowH, contentH: base.contentH, focusLane: null, active: false };
+  }
+  const radius = opts?.radius ?? FISHEYE_RADIUS;
+  const ideal = opts?.ideal ?? IDEAL_ROW;
+  const pinMin = opts?.pinMin ?? FISHEYE_PIN_MIN;
+  const pinned = new Set<number>(opts?.pinned ?? [0, 1]);
+
+  // Continuous focus position in lane space: invert the uniform seam so the
+  // magnification tracks the cursor smoothly. The nearest integer lane is "the"
+  // focused lane (label priority, guaranteed height).
+  const fLane = Math.max(0, Math.min(n - 1, (focusY - base.top) / base.rowH));
+  const focusLane = Math.round(fLane);
+
+  const kernel = (lane: number): number => {
+    const d = Math.abs(lane - fLane) / radius;
+    return d >= 1 ? 0 : 0.5 * (1 + Math.cos(Math.PI * d));
+  };
+
+  // Desired height per lane: a cosine bump peaking at `ideal` on the focus lane,
+  // floored to pinMin for anchors and to a hair above 0 for everyone (keeps the
+  // stack strictly monotonic even where the bump is zero). baseMin is kept
+  // negligible so it never inflates the desired total into the down-scale branch
+  // (which would relax the pin/focus floors) — for any feasible pane the bump
+  // total (~ideal*2*radius) plus two pin floors stays well under `height`.
+  const baseMin = 1e-4;
+  const desired = new Array<number>(n);
+  let sumD = 0;
+  for (let i = 0; i < n; i++) {
+    desired[i] = Math.max(kernel(i) * ideal, pinned.has(i) ? pinMin : 0, baseMin);
+    sumD += desired[i];
+  }
+
+  const h = new Array<number>(n);
+  if (sumD <= height) {
+    // Headroom: spread it uniformly so the stack is EXACTLY `height`. Because we
+    // only ADD a constant, the focus lane keeps its full `ideal*kernel` bump
+    // (>= 0.9*ideal at the nearest lane) and pinned lanes stay >= pinMin.
+    const c = (height - sumD) / n;
+    for (let i = 0; i < n; i++) h[i] = desired[i] + c;
+  } else {
+    // Tiny pane: floors+bump already exceed the track. Scale to fit — graceful,
+    // rare (needs height < ~72px); the >=0.9*ideal guarantee relaxes here.
+    const s = height / sumD;
+    for (let i = 0; i < n; i++) h[i] = desired[i] * s;
+  }
+
+  // Cumulative centre-line per lane; fills [0, height] (sum h === height).
+  const centre = new Array<number>(n);
+  let acc = 0;
+  for (let i = 0; i < n; i++) {
+    centre[i] = acc + h[i] / 2;
+    acc += h[i];
+  }
+  const at = (lane: number) => Math.max(0, Math.min(n - 1, Math.round(lane)));
+  return {
+    y: (lane: number) => centre[at(lane)],
+    rowH: (lane: number) => h[at(lane)],
+    contentH: base.contentH,
+    focusLane,
+    active: true,
+  };
+}
+
 // ---- interval lane packing -------------------------------------------------
 // Pack branches onto as few display lanes as possible by treating each branch's
 // activity window as an interval and running greedy interval partitioning
