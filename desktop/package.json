@@ -4,8 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev:web": "vite",
-    "build:web": "tsc && vite build",
+    "sync:wasm": "bash scripts/sync-wasm.sh",
+    "dev:web": "bun run sync:wasm && vite",
+    "build:web": "bun run sync:wasm && tsc && vite build",
     "dev": "tauri dev",
     "build": "tauri build",
     "test": "bun test src && bun test bun-isolated",
