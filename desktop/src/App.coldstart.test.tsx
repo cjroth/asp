@@ -22,6 +22,7 @@ let READY = false;
 mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }));
 mock.module('./lib/api', () => ({
   api: {
+    gitStatus: vi.fn(async () => null), gitPull: vi.fn(async () => {}), gitPendingDiff: vi.fn(async () => ({ filesChanged: 0, paths: [], unified: '' })), gitPush: vi.fn(async () => ({ pushedSha: null, commits: 0 })), cloneGit: vi.fn(),
     listVaults: vi.fn(async () => VAULTS),
     vaultsReady: vi.fn(async () => READY),
     listBranches: vi.fn(async () => [{ branch_id: 'main', name: 'main', parent: null, current: true }]),

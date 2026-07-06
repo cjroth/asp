@@ -32,6 +32,7 @@ const listVaults = vi.fn(async () => [{ id: 'v1', path: '/home/me/massive', vaul
 mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/massive') }));
 mock.module('./lib/api', () => ({
   api: {
+    gitStatus: vi.fn(async () => null), gitPull: vi.fn(async () => {}), gitPendingDiff: vi.fn(async () => ({ filesChanged: 0, paths: [], unified: '' })), gitPush: vi.fn(async () => ({ pushedSha: null, commits: 0 })), cloneGit: vi.fn(),
     startLiveSync: vi.fn(), stopLiveSync: vi.fn(), setLocalRelay: vi.fn(async () => false), getLocalRelay: vi.fn(async () => false),
     listVaults: () => listVaults(),
     addLocalFolder: vi.fn(async (p: string) => ({ id: 'v1', path: p, vault_id: 'vid', enabled: false, listening_ticket: null })),

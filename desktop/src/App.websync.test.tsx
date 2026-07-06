@@ -37,6 +37,7 @@ const listVaults = vi.fn(async () => [{ id: 'w1', path: '', vault_id: 'wv', enab
 mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => null) }));
 mock.module('./lib/api', () => ({
   api: {
+    gitStatus: vi.fn(async () => null), gitPull: vi.fn(async () => {}), gitPendingDiff: vi.fn(async () => ({ filesChanged: 0, paths: [], unified: '' })), gitPush: vi.fn(async () => ({ pushedSha: null, commits: 0 })), cloneGit: vi.fn(),
     listVaults: () => listVaults(),
     addLocalFolder: vi.fn(),
     cloneRemote: vi.fn(),

@@ -12,6 +12,7 @@ const setAllowConnections = vi.fn(async () => null);
 mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => null) }));
 mock.module('./lib/api', () => ({
   api: {
+    gitStatus: vi.fn(async () => null), gitPull: vi.fn(async () => {}), gitPendingDiff: vi.fn(async () => ({ filesChanged: 0, paths: [], unified: '' })), gitPush: vi.fn(async () => ({ pushedSha: null, commits: 0 })), cloneGit: vi.fn(),
     startLiveSync: vi.fn(), stopLiveSync: vi.fn(), setLocalRelay: vi.fn(async () => false), getLocalRelay: vi.fn(async () => false),
     listVaults: vi.fn(async () => [{ id: 'w0', path: '', vault_id: 'wv0', enabled: true, listening_ticket: null }]),
     getIdentity: vi.fn(async () => 'ssh-ed25519 WEBKEY me@browser'),

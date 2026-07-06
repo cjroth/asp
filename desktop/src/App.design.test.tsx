@@ -44,6 +44,7 @@ const getStatus = vi.fn(async (id: string) => ({ id, vault_id: id === 'v1' ? 'vi
 mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/home/me/picked') }));
 mock.module('./lib/api', () => ({
   api: {
+    gitStatus: vi.fn(async () => null), gitPull: vi.fn(async () => {}), gitPendingDiff: vi.fn(async () => ({ filesChanged: 0, paths: [], unified: '' })), gitPush: vi.fn(async () => ({ pushedSha: null, commits: 0 })), cloneGit: vi.fn(),
     startLiveSync: vi.fn(), stopLiveSync: vi.fn(), setLocalRelay: vi.fn(async () => false), getLocalRelay: vi.fn(async () => false),
     listVaults: () => listVaults(),
     addLocalFolder: (p: string) => addLocalFolder(p),
@@ -135,7 +136,7 @@ describe('App — connect screen', () => {
   it('connects a vault via the entry modal', async () => {
     render(<App />);
     fireEvent.click(await screen.findByText('Connect Vault'));
-    fireEvent.change(screen.getByPlaceholderText(/Paste the code/), { target: { value: 'asp1ticket' } });
+    fireEvent.change(screen.getByPlaceholderText(/Paste an invite code/), { target: { value: 'asp1ticket' } });
     fireEvent.click(screen.getByText('Choose…'));
     await screen.findByText('/home/me/picked');
     fireEvent.click(screen.getByText('Connect'));
@@ -170,7 +171,7 @@ describe('App — connect screen', () => {
   it('Connect modal auto-focuses the invite field; plain Enter is a newline, Cmd/Ctrl+Enter submits', async () => {
     render(<App />);
     fireEvent.click(await screen.findByText('Connect Vault'));
-    const code = screen.getByPlaceholderText(/Paste the code/);
+    const code = screen.getByPlaceholderText(/Paste an invite code/);
     expect(document.activeElement).toBe(code);
     fireEvent.change(code, { target: { value: 'asp1ticket' } });
     fireEvent.click(screen.getByText('Choose…'));
@@ -186,9 +187,9 @@ describe('App — connect screen', () => {
   it('Connect modal closes on Escape', async () => {
     render(<App />);
     fireEvent.click(await screen.findByText('Connect Vault'));
-    const code = screen.getByPlaceholderText(/Paste the code/);
+    const code = screen.getByPlaceholderText(/Paste an invite code/);
     fireEvent.keyDown(code, { key: 'Escape' });
-    await waitFor(() => expect(screen.queryByPlaceholderText(/Paste the code/)).toBeNull());
+    await waitFor(() => expect(screen.queryByPlaceholderText(/Paste an invite code/)).toBeNull());
     expect(cloneRemote).not.toHaveBeenCalled();
   });
 });
@@ -681,7 +682,7 @@ describe('App — empty + edge states', () => {
     fireEvent.click(document.querySelector('[style*="z-index: 58"]') as HTMLElement); // overlay closes it
 
     fireEvent.click(await screen.findByText('Connect Vault'));
-    fireEvent.change(screen.getByPlaceholderText(/Paste the code/), { target: { value: 'asp1x' } });
+    fireEvent.change(screen.getByPlaceholderText(/Paste an invite code/), { target: { value: 'asp1x' } });
     fireEvent.change(screen.getByPlaceholderText(/Leave blank/), { target: { value: 'KEY' } });
     fireEvent.click(document.querySelector('[style*="z-index: 58"]') as HTMLElement);
   });

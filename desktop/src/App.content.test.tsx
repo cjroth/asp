@@ -18,6 +18,7 @@ const readFile = vi.fn(async (_id: string, p: string) => { await slow(10); retur
 mock.module('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/v') }));
 mock.module('./lib/api', () => ({
   api: {
+    gitStatus: vi.fn(async () => null), gitPull: vi.fn(async () => {}), gitPendingDiff: vi.fn(async () => ({ filesChanged: 0, paths: [], unified: '' })), gitPush: vi.fn(async () => ({ pushedSha: null, commits: 0 })), cloneGit: vi.fn(),
     startLiveSync: vi.fn(), stopLiveSync: vi.fn(), setLocalRelay: vi.fn(async () => false), getLocalRelay: vi.fn(async () => false),
     listVaults: async () => [{ id: 'v1', path: '/v', vault_id: 'vid', enabled: false, listening_ticket: null }],
     getStatus: async (id: string) => ({ id, vault_id: 'vid', rows: 3, files: 3, head: 'h', listening_ticket: null, peers: [], last_ts: 1 }),
