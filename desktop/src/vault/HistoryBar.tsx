@@ -20,7 +20,7 @@ import {
   zoomAround,
   zoomKeepingFocus,
 } from './history';
-import { forkEdges, laneColor, laneForEvent, laneGeometry, laneIndex, lanesFromGraph, nodesToEvents } from './timeline';
+import { declutterLabels, forkEdges, laneColor, laneCountOf, laneForEvent, laneGeometry, laneIndex, nodesToEvents, packedLanes } from './timeline';
 import { lineDiff } from './diffLines';
 import * as Icon from './icons';
 import { deriveLog, logColor, logText } from './log';
@@ -123,11 +123,15 @@ export default function HistoryBar(props: HistoryBarProps) {
   const filterTs = timeTravel ? playhead : null;
   const axisTicks = useMemo(() => axisTicksFor(view), [view]);
 
-  // Lanes (branches) + per-event lane index + fork edges + tags.
-  const lanes = useMemo(() => lanesFromGraph(graph), [graph]);
+  // Lanes (branches) with client-side PACKED display lanes (the Rust creation-order
+  // lane is ignored for layout): stale branches share lanes so a 128-branch clone
+  // collapses to a legible handful. Geometry uses the packed lane count, not the
+  // branch count.
+  const lanes = useMemo(() => packedLanes(graph), [graph]);
   const laneIdx = useMemo(() => laneIndex(lanes), [lanes]);
+  const laneCount = useMemo(() => laneCountOf(lanes), [lanes]);
   const edges = useMemo(() => forkEdges(lanes, events), [lanes, events]);
-  const geom = useMemo(() => laneGeometry(lanes.length, trackSize.h), [lanes.length, trackSize.h]);
+  const geom = useMemo(() => laneGeometry(laneCount, trackSize.h), [laneCount, trackSize.h]);
   const tags = graph?.tags ?? [];
 
   // Cap rendered tick nodes: a vault import clusters thousands of events at one
@@ -333,33 +337,56 @@ export default function HistoryBar(props: HistoryBarProps) {
   const pxX = (ts: number) => (xAt(ts) / 100) * trackSize.w;
   const multiLane = lanes.length > 1;
 
-  // Lane axis is vertical: with many branches (e.g. a --all-branches clone with
-  // ~128 lanes) the stack is far taller than the track. The surface takes the
-  // lanes' natural height and the track clips + scrolls on that axis, so nothing
-  // ever paints over the panes above. A normal 1–6 lane vault fits exactly
-  // (surfaceH === trackSize.h) and shows no scrollbar — unchanged for those.
-  const surfaceH = geom.contentH;
-  const laneOverflow = surfaceH > trackSize.h + 1;
+  // Lanes ALWAYS fit the track now (adaptive rowH, no lane-axis scroll — scroll is
+  // reserved for time). The surface just fills the track and the track clips BOTH
+  // axes so nothing ever paints over the panes above. The surface element is kept
+  // as a positioning root for every graph element.
+  const surfaceH = geom.contentH; // === trackSize.h
 
-  // Per-lane connecting polylines (so a lane reads as one continuous history) and
-  // the x of each lane's most-recent dot (to anchor the branch label on the right).
-  const perLane = useMemo(() => {
-    const byLane = new Map<number, { xPct: number; ts: number }[]>();
+  // Per-BRANCH connecting polylines (each branch's own history reads as one line,
+  // even when several stale branches share a display lane) plus the x/ts of each
+  // branch's most-recent dot (to anchor + prioritise its label).
+  const perBranch = useMemo(() => {
+    const byBranch = new Map<string, { xPct: number; ts: number }[]>();
     for (const r of rendered) {
-      const lane = laneForEvent(r.e, laneIdx);
-      if (!byLane.has(lane)) byLane.set(lane, []);
-      byLane.get(lane)!.push({ xPct: r.xPct, ts: r.e.ts });
+      const b = r.e.branchId;
+      if (!byBranch.has(b)) byBranch.set(b, []);
+      byBranch.get(b)!.push({ xPct: r.xPct, ts: r.e.ts });
     }
-    const polylines = new Map<number, string>();
-    const lastX = new Map<number, number>();
-    for (const [lane, pts] of byLane) {
-      const sorted = [...pts].sort((a, b) => a.xPct - b.xPct);
+    const polylines = new Map<string, { lane: number; pts: string }>();
+    const lastX = new Map<string, number>();
+    const lastTs = new Map<string, number>();
+    for (const [b, pts] of byBranch) {
+      const lane = laneIdx.get(b) ?? 0;
       const y = geom.y(lane);
-      polylines.set(lane, sorted.map((p) => `${(p.xPct / 100) * trackSize.w},${y}`).join(' '));
-      lastX.set(lane, (Math.max(...sorted.map((p) => p.xPct)) / 100) * trackSize.w);
+      const sorted = [...pts].sort((a, c) => a.xPct - c.xPct);
+      polylines.set(b, { lane, pts: sorted.map((p) => `${(p.xPct / 100) * trackSize.w},${y}`).join(' ') });
+      let mx = -Infinity, mxTs = -Infinity;
+      for (const p of pts) { if (p.xPct > mx) mx = p.xPct; if (p.ts > mxTs) mxTs = p.ts; }
+      lastX.set(b, (mx / 100) * trackSize.w);
+      lastTs.set(b, mxTs);
     }
-    return { polylines, lastX };
+    return { polylines, lastX, lastTs };
   }, [rendered, laneIdx, geom, trackSize.w]);
+
+  // Pixel-space label declutter: chip per branch tip, prioritised current > tips in
+  // the visible time window (recent first) > others, kept only if it doesn't collide
+  // with a higher-priority kept chip. Hidden tips fall back to a dot + title hover.
+  const labelKeep = useMemo(() => {
+    if (!multiLane) return new Set<string>();
+    const items = lanes.map((l) => {
+      const anchor = perBranch.lastX.get(l.branchId);
+      const x = anchor != null ? anchor + 12 : trackSize.w - 4;
+      const tip = perBranch.lastTs.get(l.branchId);
+      const inWindow = tip != null && tip >= view.start && tip <= view.end;
+      const priority =
+        l.branchId === currentBranch ? Number.MAX_SAFE_INTEGER : inWindow ? 1e15 + (tip ?? 0) : (tip ?? 0);
+      const w = Math.min(140, 16 + l.name.length * 6.5);
+      return { id: l.branchId, x, y: geom.y(l.lane) - 9, w, h: 18, priority };
+    });
+    return declutterLabels(items);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lanes, perBranch, geom, trackSize.w, view.start, view.end, currentBranch, multiLane]);
 
   return (
     <div style={{ flex: 'none', height: barHeight, background: 'var(--bg-sub)', borderTop: '1px solid var(--line)', display: 'flex', flexDirection: 'column', userSelect: 'none', transition: props.animate ? 'height .16s ease' : 'none' }}>
@@ -430,21 +457,20 @@ export default function HistoryBar(props: HistoryBarProps) {
             <button onClick={props.onNow} style={{ fontFamily: 'inherit', fontSize: 12, fontWeight: 500, color: timeTravel ? 'var(--text2)' : 'var(--faint2)', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 7, padding: '4px 12px', cursor: 'pointer', flex: 'none' }}>Now</button>
           </div>
 
-          <div ref={trackRef} data-testid="history-track" onPointerDown={onTrackDown} className={laneOverflow ? 'asp-scroll' : undefined} style={{ position: 'relative', flex: 1, margin: '0 16px 11px', cursor: 'crosshair', touchAction: 'none', overflowX: 'hidden', overflowY: laneOverflow ? 'auto' : 'hidden' }}>
-            {/* Scroll surface: sized to the lanes' natural height. When lanes fit it
-                equals the track (no scroll); when they overflow, the track above
-                clips and scrolls on the lane (vertical) axis. All graph elements
-                — guides, dots, labels, edges, playhead — live inside so they can
-                never paint over sibling panes and labels scroll with their lane. */}
+          <div ref={trackRef} data-testid="history-track" onPointerDown={onTrackDown} style={{ position: 'relative', flex: 1, margin: '0 16px 11px', cursor: 'crosshair', touchAction: 'none', overflowX: 'hidden', overflowY: 'hidden' }}>
+            {/* Surface: a positioning root filling the track. Lanes always fit (no
+                scroll — scroll is reserved for the time axis); the track clips BOTH
+                axes so no graph element (dot, label, edge, playhead) ever paints
+                over the panes above, even at very high packed lane counts. */}
             <div data-testid="history-surface" style={{ position: 'relative', width: '100%', height: surfaceH, minHeight: '100%' }}>
-            {/* SVG overlay: lane guides + per-lane connecting line + fork edges. */}
+            {/* SVG overlay: one guide per display lane + per-branch connecting line + fork edges. */}
             <svg width={trackSize.w} height={surfaceH} style={{ position: 'absolute', inset: 0, overflow: 'visible', pointerEvents: 'none' }}>
-              {lanes.map((l) => (
-                <line key={l.branchId} x1={0} y1={geom.y(l.lane)} x2={trackSize.w} y2={geom.y(l.lane)} stroke="var(--line)" strokeWidth={1} />
+              {Array.from({ length: laneCount }, (_, lane) => (
+                <line key={lane} x1={0} y1={geom.y(lane)} x2={trackSize.w} y2={geom.y(lane)} stroke="var(--line)" strokeWidth={1} />
               ))}
-              {/* Connecting line through each lane's dots — history reads as continuous. */}
-              {[...perLane.polylines.entries()].map(([lane, pts]) => (
-                <polyline key={lane} data-testid="lane-line" points={pts} fill="none" stroke={laneColor(lane, accent)} strokeWidth={2} strokeLinecap="round" opacity={0.55} />
+              {/* Connecting line through each branch's dots — a branch reads as continuous. */}
+              {[...perBranch.polylines.entries()].map(([b, { lane, pts }]) => (
+                <polyline key={b} data-testid="lane-line" points={pts} fill="none" stroke={laneColor(lane, accent)} strokeWidth={2} strokeLinecap="round" opacity={0.55} />
               ))}
               {edges.map((e) => {
                 const x = pxX(e.ts);
@@ -482,20 +508,37 @@ export default function HistoryBar(props: HistoryBarProps) {
               );
             })}
 
-            {/* branch labels: on the RIGHT, next to each lane's most recent dot. */}
+            {/* branch labels: on the RIGHT, next to each branch's most recent dot.
+                Decluttered by a pixel collision pass — a hidden label collapses to
+                just a dot marker whose native `title` reveals the branch name. */}
             {multiLane &&
               lanes.map((l) => {
-                const anchor = perLane.lastX.get(l.lane);
+                const anchor = perBranch.lastX.get(l.branchId);
                 const left = anchor != null ? Math.min(anchor + 12, trackSize.w - 4) : trackSize.w - 4;
+                const isCur = l.branchId === currentBranch;
+                const color = laneColor(l.lane, accent);
+                if (!labelKeep.has(l.branchId)) {
+                  // Decluttered tip: dot only; hover shows the name (full hover
+                  // affordances arrive with fisheye in wave B).
+                  return (
+                    <div
+                      key={l.branchId}
+                      data-testid={`lane-tip-${l.name}`}
+                      onPointerDown={(e) => { e.stopPropagation(); if (!isCur) props.onCheckoutBranch(l.branchId); }}
+                      title={isCur ? `${l.name} · current branch` : `${l.name} — switch`}
+                      style={{ position: 'absolute', left, top: geom.y(l.lane) - 4, width: 8, height: 8, marginLeft: -1, borderRadius: '50%', background: color, cursor: isCur ? 'default' : 'pointer', zIndex: 4 }}
+                    />
+                  );
+                }
                 return (
                   <div
                     key={l.branchId}
                     data-testid={`lane-label-${l.name}`}
-                    onPointerDown={(e) => { e.stopPropagation(); if (l.branchId !== currentBranch) props.onCheckoutBranch(l.branchId); }}
-                    title={l.branchId === currentBranch ? 'Current branch' : `Switch to ${l.name}`}
-                    style={{ position: 'absolute', left, top: geom.y(l.lane) - 9, height: 18, display: 'flex', alignItems: 'center', gap: 4, padding: '0 6px', fontSize: 10.5, fontWeight: l.branchId === currentBranch ? 700 : 500, color: l.branchId === currentBranch ? laneColor(l.lane, accent) : 'var(--faint)', background: 'var(--bg-sub)', borderRadius: 5, cursor: l.branchId === currentBranch ? 'default' : 'pointer', zIndex: 4, maxWidth: 140, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
+                    onPointerDown={(e) => { e.stopPropagation(); if (!isCur) props.onCheckoutBranch(l.branchId); }}
+                    title={isCur ? 'Current branch' : `Switch to ${l.name}`}
+                    style={{ position: 'absolute', left, top: geom.y(l.lane) - 9, height: 18, display: 'flex', alignItems: 'center', gap: 4, padding: '0 6px', fontSize: 10.5, fontWeight: isCur ? 700 : 500, color: isCur ? color : 'var(--faint)', background: 'var(--bg-sub)', borderRadius: 5, cursor: isCur ? 'default' : 'pointer', zIndex: 4, maxWidth: 140, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
                   >
-                    <BranchDot color={laneColor(l.lane, accent)} />
+                    <BranchDot color={color} />
                     {l.name}
                   </div>
                 );
