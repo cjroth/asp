@@ -29,6 +29,14 @@ pub trait BlobStore {
         debug_assert_eq!(h, hash, "put_blob_with_hash: precomputed hash mismatch");
         Ok(())
     }
+
+    /// Like [`put_blob_with_hash`](BlobStore::put_blob_with_hash) but takes the bytes by
+    /// value, letting an in-memory store **move** them in instead of copying — saving a
+    /// full memcpy per blob on the (memory-bandwidth-bound) clone path. Default falls
+    /// back to the borrowing form; [`MemBlobStore`] overrides it to move.
+    fn put_blob_with_hash_owned(&self, hash: &str, bytes: Vec<u8>) -> AspResult<()> {
+        self.put_blob_with_hash(hash, &bytes)
+    }
 }
 
 /// A materialized file row (§files) — the fold's output, surface-independent.
@@ -74,6 +82,11 @@ impl BlobStore for MemBlobStore {
             .borrow_mut()
             .entry(hash.to_string())
             .or_insert_with(|| bytes.to_vec());
+        Ok(())
+    }
+    fn put_blob_with_hash_owned(&self, hash: &str, bytes: Vec<u8>) -> AspResult<()> {
+        // Move the owned Vec straight in (no memcpy); on a dedup hit `bytes` is dropped.
+        self.blobs.borrow_mut().entry(hash.to_string()).or_insert(bytes);
         Ok(())
     }
 }

@@ -1160,7 +1160,9 @@ fn precompute_blobs(
         };
 
         for ((sha, bytes), meta) in chunk.into_iter().zip(metas) {
-            store.put_blob_with_hash(&meta.content_hash, &bytes)?;
+            // Move the owned bytes into the store (no copy) — the read from the object
+            // DB above already paid the one unavoidable memcpy.
+            store.put_blob_with_hash_owned(&meta.content_hash, bytes)?;
             map.insert(sha, meta);
         }
     }
