@@ -77,7 +77,10 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "s
 # Component crates only (never the `gix` facade); wasm-verified with exactly this
 # feature set (R1 probe): `wasm` is mandatory for wasm32, `parallel` must stay off,
 # zlib comes from gix-features (pure-Rust zlib-rs). Same config serves native + wasm.
-gix-pack = { version = "0.72", default-features = false, features = ["streaming-input", "wasm", "sha1"] }
+# `pack-cache-lru-dynamic` adds the pure-Rust `clru` dep for the memory-capped
+# delta-base cache used in `absorb_pack_with_progress` (wasm-safe: no getrandom,
+# no on-disk index, no parallelism).
+gix-pack = { version = "0.72", default-features = false, features = ["streaming-input", "wasm", "sha1", "pack-cache-lru-dynamic"] }
 gix-object = { version = "0.62", default-features = false }
 gix-hash = { version = "0.25", default-features = false, features = ["sha1"] }
 gix-features = { version = "0.48", default-features = false, features = ["zlib"] }

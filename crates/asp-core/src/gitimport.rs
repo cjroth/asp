@@ -270,6 +270,28 @@ impl GitObjectDb {
             .map_err(|e| GitImportError::Pack(e.to_string()))?;
         let mut inflate = zlib::Inflate::default();
 
+        // Delta-base cache. Git objects are delta-compressed into chains up to ~50
+        // deep; with `cache::Never` every delta re-inflates its ENTIRE base chain
+        // from scratch, so decode time scales with pack size (a top-3 clone cost).
+        // gix keys this cache by `(pack_id, in-pack offset)` and short-circuits a
+        // chain at the first cached ancestor (`resolve_deltas`), so a bounded LRU
+        // over recently-decoded bases turns O(chain) re-inflation into O(1) hits.
+        // We decode offset-ascending and ofs-delta bases always point backward, so
+        // a base is decoded (and cached) before every delta that consumes it.
+        //
+        // The cache only stores/returns already-decoded bytes — the reconstructed
+        // object bytes (and thus every synthesized SHA / fold) are byte-identical to
+        // the `cache::Never` path. It is memory-CAPPED (not count-capped) so a huge
+        // pack can't blow the budget; a full clone already peaks multi-GB and this
+        // adds a bounded slice on top.
+        //
+        // Single instance for the whole (single-threaded) loop maximizes reuse. The
+        // `pack-cache-lru-dynamic`/`clru` backing is pure-Rust and wasm-safe (no
+        // getrandom, no on-disk index, no parallelism), so the same path serves
+        // native + wasm32.
+        const DELTA_CACHE_CAP_BYTES: usize = 128 * 1024 * 1024;
+        let mut cache = cache::lru::MemoryCappedHashmap::new(DELTA_CACHE_CAP_BYTES);
+
         // Phase 2 — decode each entry, retrying deltas whose (ref-)base isn't decoded
         // yet, until either everything resolves or a pass makes no progress.
         let mut pending = offsets;
@@ -306,7 +328,7 @@ impl GitObjectDb {
                     None
                 };
                 let decode_result =
-                    file.decode_entry(entry, &mut out, &mut inflate, &resolve, &mut cache::Never);
+                    file.decode_entry(entry, &mut out, &mut inflate, &resolve, &mut cache);
                 match decode_result {
                     Ok(outcome) => {
                         let kind: GitObjKind = outcome.kind.into();
