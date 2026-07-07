@@ -661,6 +661,20 @@ impl Engine {
                 }
             }
         };
+        // Materialize-time VIEW filter (A — scoped-sync §3.3). A partial replica
+        // hides files whose CURRENT folded path is out of its subdir scope (e.g. a
+        // file that renamed OUT of the subdir after it had entered the log via
+        // monotonic SYNC membership). They stay in the log + fold cache but are
+        // absent from the `files` table and the working tree — mirroring branch
+        // visibility (`vis.sees`). Applied HERE, the sole fold→files projection, so
+        // it is consistent for capture too: `capture_rescan` diffs disk against
+        // `live_files`, and an out-of-scope file is in neither, so no spurious
+        // create/delete is ever authored for it. A full replica (`None`) is
+        // unaffected — byte-identical to before scoped sync.
+        let files: Vec<FileRow> = match self.partial_scope()? {
+            Some(scope) => files.into_iter().filter(|f| crate::scope::allows(&scope, &f.path)).collect(),
+            None => files,
+        };
         self.store.sync_files(&files)?;
 
         // New desired set, built WITHOUT reading blobs: content files (path ->
@@ -1821,6 +1835,28 @@ impl Engine {
 
     pub fn revoke(&self, node_hex: &str) -> AspResult<bool> {
         self.store.delete_authkey_by_node(node_hex)
+    }
+
+    /// The local partial-replica scope (scoped-sync §3.1), or `None` for a full
+    /// replica. `Some(paths)` means this node was `clone --subdir`'d: it hides
+    /// out-of-scope files (view filter) and is a pull-only LEAF (refuses to listen,
+    /// to add a second upstream, and to push to a git remote). Node-local config.
+    pub fn partial_scope(&self) -> AspResult<Option<Vec<String>>> {
+        match self.store.get_config("partial_scope")? {
+            Some(json) => Ok(serde_json::from_str::<Vec<String>>(&json).ok().filter(|v| !v.is_empty())),
+            None => Ok(None),
+        }
+    }
+
+    /// Mark this node a partial replica scoped to `allowed` (scoped-sync §3.1),
+    /// or clear the flag with an empty slice. Set by `clone --subdir`.
+    pub fn set_partial_scope(&self, allowed: &[String]) -> AspResult<()> {
+        self.store.set_config("partial_scope", &serde_json::to_string(allowed).unwrap_or_else(|_| "[]".into()))
+    }
+
+    /// True iff this is a partial pull-only-leaf replica (§3.1).
+    pub fn is_partial(&self) -> bool {
+        self.partial_scope().ok().flatten().is_some()
     }
 
     /// Is `file_id` a scope member (§3.3): did any of its `Create`/`Rename` rows

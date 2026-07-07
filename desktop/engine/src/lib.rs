@@ -17,7 +17,7 @@ use asp_core::gitpush::{self, PushReport};
 use asp_core::gitremote::{self, CloneOptions, PullReport};
 use asp_core::gitwire::parse_git_url;
 use asp_core::iroh_net;
-use asp_core::net::{AuthOpts, EngineRef};
+use asp_core::net::{AuthOpts, Conns, EngineRef};
 use asp_core::{Engine, Identity, Msg, VaultConfig, WireRow};
 pub use asp_core::Graph;
 use serde::{Deserialize, Serialize};
@@ -192,8 +192,6 @@ impl From<PullReport> for GitPullSummary {
         }
     }
 }
-
-type Conns = Arc<AsyncMutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<asp_core::Msg>>>>;
 
 struct Folder {
     id: String,
@@ -613,8 +611,8 @@ impl DesktopEngine {
         let conns = conns.clone();
         self.block(async move {
             let map = conns.lock().await;
-            for tx in map.values() {
-                let _ = tx.send(Msg::Push { row: Box::new(wr.clone()) });
+            for entry in map.values() {
+                let _ = entry.tx.send(Msg::Push { row: Box::new(wr.clone()) });
             }
         });
     }

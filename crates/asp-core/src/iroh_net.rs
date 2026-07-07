@@ -656,6 +656,52 @@ mod tests {
         server.abort();
     }
 
+    /// A — a scoped (`--subdir`) clone over REAL iroh QUIC receives only in-scope
+    /// files; out-of-scope rows never cross the wire (scoped-sync §3, §9). Exercises
+    /// the real `stream_catchup` scope filter end-to-end, not just the in-process
+    /// pump. The grant is also read-only (the recommended "read-only single-subdir
+    /// clone from a hub" slice).
+    #[tokio::test]
+    async fn iroh_scoped_clone_only_receives_in_scope_files() {
+        let srv_dir = tempdir().unwrap();
+        let cli_dir = tempdir().unwrap();
+        let srv_id = Identity::from_seed(&[31; 32]);
+        let cli_id = Identity::from_seed(&[32; 32]);
+        let srv = Engine::init(srv_dir.path(), srv_id.clone()).unwrap();
+        srv.record_write("work/a.md", b"in scope A\n").unwrap();
+        srv.record_write("work/sub/b.md", b"in scope B\n").unwrap();
+        srv.record_write("personal/secret.md", b"OUT of scope\n").unwrap();
+        // Grant the client a work/-scoped, read-only replica.
+        srv.authorize_with_policy(&cli_id.to_ssh_string(), None, true, "test", Some(vec!["work".into()]), true).unwrap();
+
+        let srv_ep = bind_endpoint(&srv_id.seed(), false).await.unwrap();
+        let cli_ep = bind_endpoint(&cli_id.seed(), false).await.unwrap();
+        let dial = loopback_addr(&srv_ep);
+        let srv_engine: EngineRef = Arc::new(StdMutex::new(srv));
+        let server = tokio::spawn(serve(srv_engine, srv_ep, AuthOpts::default(), new_conns()));
+
+        let cli = Engine::init(cli_dir.path(), cli_id).unwrap();
+        cli.set_partial_scope(&["work".to_string()]).unwrap();
+        let cli_engine: EngineRef = Arc::new(StdMutex::new(cli));
+        clone_bootstrap(cli_engine.clone(), &cli_ep, dial, &AuthOpts::default())
+            .await
+            .expect("scoped clone over iroh should succeed");
+
+        assert_eq!(std::fs::read(cli_dir.path().join("work/a.md")).unwrap(), b"in scope A\n");
+        assert_eq!(std::fs::read(cli_dir.path().join("work/sub/b.md")).unwrap(), b"in scope B\n");
+        assert!(!cli_dir.path().join("personal/secret.md").exists(), "out-of-scope file must never cross the wire");
+        let has_out = cli_engine
+            .lock()
+            .unwrap()
+            .store
+            .all_rows()
+            .unwrap()
+            .iter()
+            .any(|r| r.path.as_deref() == Some("personal/secret.md"));
+        assert!(!has_out, "no out-of-scope row reached the scoped replica's log");
+        server.abort();
+    }
+
     /// An unauthorized, keyless peer is denied admission over iroh and no data
     /// leaks — the `authorized_keys` trust gate is enforced on the QUIC stream.
     #[tokio::test]

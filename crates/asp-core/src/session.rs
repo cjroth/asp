@@ -799,6 +799,65 @@ mod tests {
         }
     }
 
+    /// A — wasm parity for the materialize-time VIEW filter (scoped-sync §3.3): a
+    /// partial `MemEngine` replica hides files whose current path left its scope.
+    #[test]
+    fn partial_replica_memengine_view_filter_parity() {
+        use crate::MemEngine;
+        let source = MemEngine::create(Identity::from_seed(&[1; 32]), "v");
+        source.record_write("work/stay.md", b"stay\n").unwrap();
+        source.record_write("work/leaving.md", b"leaving\n").unwrap();
+        source.record_rename("work/leaving.md", "personal/leaving.md").unwrap();
+        let replica = MemEngine::create(Identity::from_seed(&[2; 32]), "v");
+        replica.set_partial_scope(&["work".to_string()]);
+        scoped_pump(&source, &replica, &["work"]);
+        let files = replica.files_map().unwrap();
+        assert!(files.contains_key("work/stay.md"), "in-scope file visible");
+        assert!(!files.keys().any(|p| p.contains("leaving")), "renamed-out file hidden on the wasm replica");
+    }
+
+    /// A — the materialize-time VIEW filter on a partial replica (scoped-sync §3.3).
+    /// A file that renamed OUT of the subdir is a monotonic SYNC member (its chain
+    /// ships) but must be HIDDEN from the replica's disk + live files — and a
+    /// subsequent `capture_rescan` must author NO spurious delete for it (the
+    /// view-filter/capture consistency, since capture diffs disk against live_files).
+    #[test]
+    fn partial_replica_view_filter_hides_out_of_scope_and_capture_is_stable() {
+        let ds = tempdir().unwrap();
+        let dr = tempdir().unwrap();
+        let source = Engine::init(ds.path(), Identity::from_seed(&[1; 32])).unwrap();
+        let replica = Engine::init(dr.path(), Identity::from_seed(&[2; 32])).unwrap();
+        let vid = source.store.get_config("vault_id").unwrap().unwrap();
+        replica.store.set_config("vault_id", &vid).unwrap();
+        // The replica is a partial pull-only leaf scoped to work/.
+        replica.set_partial_scope(&["work".to_string()]).unwrap();
+
+        source.record_write("work/stay.md", b"stay\n").unwrap();
+        source.record_write("work/leaving.md", b"leaving\n").unwrap();
+        source.record_rename("work/leaving.md", "personal/leaving.md").unwrap(); // OUT of scope
+
+        source
+            .authorize_with_policy(&Identity::from_seed(&[2; 32]).to_ssh_string(), None, true, "test", Some(vec!["work".into()]), false)
+            .unwrap();
+        let mut ls = Session::new(Role::Listener, &source, ctx(), nid(2), Vec::new());
+        let mut cr = Session::new(Role::Connector, &replica, ctx(), nid(1), Vec::new());
+        pump(&source, &mut ls, &replica, &mut cr);
+
+        // The in-scope file materialized; the renamed-out file is hidden from BOTH
+        // paths (the old in-scope path and the new out-of-scope path).
+        assert_eq!(std::fs::read(dr.path().join("work/stay.md")).unwrap(), b"stay\n");
+        assert!(!dr.path().join("work/leaving.md").exists(), "old in-scope path is gone");
+        assert!(!dr.path().join("personal/leaving.md").exists(), "renamed-out file is hidden from disk");
+        let live: Vec<String> = replica.store.live_files().unwrap().into_iter().map(|f| f.path).collect();
+        assert!(live.iter().any(|p| p == "work/stay.md"));
+        assert!(!live.iter().any(|p| p.contains("leaving")), "renamed-out file hidden from live files");
+
+        // Capture must author NOTHING — the hidden file is in neither disk nor
+        // live_files, so no spurious delete/create is generated.
+        let authored = replica.capture_rescan().unwrap();
+        assert!(authored.is_empty(), "view filter must not make capture author spurious rows: {authored:?}");
+    }
+
     #[test]
     fn proto_mismatch_closes_the_session() {
         let d = tempdir().unwrap();

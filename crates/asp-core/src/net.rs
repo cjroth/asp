@@ -53,8 +53,8 @@ pub struct ConnEntry {
 
 /// Registry of live peer connections for real-time fan-out (hub forward-then-
 /// merge + the watcher's live push). Transport-agnostic — shared by the iroh
-/// driver. Keyed by a process-unique connection id.
-pub(crate) type Conns = Arc<Mutex<HashMap<u64, ConnEntry>>>;
+/// driver and the desktop engine. Keyed by a process-unique connection id.
+pub type Conns = Arc<Mutex<HashMap<u64, ConnEntry>>>;
 pub(crate) static CONN_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub fn now_unix() -> u64 {

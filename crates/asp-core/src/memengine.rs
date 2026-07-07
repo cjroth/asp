@@ -946,8 +946,30 @@ impl MemEngine {
         let rows = self.rows.borrow();
         let scoped: Vec<LogRow> = rows.iter().filter(|r| vis.sees(r)).cloned().collect();
         let files = compute_files(&self.blobs, &scoped)?;
+        // Materialize-time VIEW filter (A — scoped-sync §3.3), wasm parity with the
+        // native engine: a partial replica hides files whose current path left its
+        // subdir scope. Inactive (`None`) on a full replica — byte-identical.
+        let files = match self.partial_scope() {
+            Some(scope) => files.into_iter().filter(|f| crate::scope::allows(&scope, &f.path)).collect(),
+            None => files,
+        };
         *self.files.borrow_mut() = files;
         Ok(())
+    }
+
+    /// The local partial-replica scope (scoped-sync §3.1), wasm parity with
+    /// `Engine::partial_scope`. `Some` => a pull-only partial leaf.
+    pub fn partial_scope(&self) -> Option<Vec<String>> {
+        self.config
+            .borrow()
+            .get("partial_scope")
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// Mark this node a partial replica scoped to `allowed` (scoped-sync §3.1).
+    pub fn set_partial_scope(&self, allowed: &[String]) {
+        self.config.borrow_mut().insert("partial_scope".into(), serde_json::to_string(allowed).unwrap_or_else(|_| "[]".into()));
     }
 
     /// The materialized file rows (the fold's output) — surface-independent

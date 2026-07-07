@@ -119,6 +119,14 @@ enum Cmd {
         /// git only: HTTPS token (PAT). Also read from `ASP_GIT_TOKEN`.
         #[arg(long, env = "ASP_GIT_TOKEN")]
         token: Option<String>,
+        /// Clone only a subdirectory (scoped-sync §3): a pull-only PARTIAL replica
+        /// that receives just this path prefix and hides everything else. Repeatable.
+        /// The source must have granted this key the same subdir (`asp authorize
+        /// <key> --subdir PATH`). A partial replica refuses to `--listen`, to add a
+        /// second upstream, and to push to a git remote. NOTE: widening the scope
+        /// later requires a fresh re-clone (the version vector can't backfill).
+        #[arg(long = "subdir")]
+        subdir: Vec<String>,
     },
     /// The primary long-running command: watch + sync. `--listen` also accepts peers.
     Watch {
@@ -482,8 +490,8 @@ async fn run(cli: Cli) -> Result<()> {
             ep.close().await;
             r
         }
-        Cmd::Clone { peer, into, watch, depth, new_identity, all_branches, token } => {
-            clone_cmd(&cli, peer, into.clone(), *watch, *depth, *new_identity, *all_branches, token.clone()).await
+        Cmd::Clone { peer, into, watch, depth, new_identity, all_branches, token, subdir } => {
+            clone_cmd(&cli, peer, into.clone(), *watch, *depth, *new_identity, *all_branches, token.clone(), subdir.clone()).await
         }
         Cmd::Watch { listen, relay, relay_listen_addr, peers } => {
             watch_cmd(&cli, *listen, *relay, relay_listen_addr.clone(), peers.clone()).await
@@ -733,6 +741,7 @@ fn scope_cmd(cli: &Cli) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn clone_cmd(
     cli: &Cli,
     peer: &str,
@@ -742,17 +751,32 @@ async fn clone_cmd(
     new_identity: bool,
     all_branches: bool,
     token: Option<String>,
+    subdir: Vec<String>,
 ) -> Result<()> {
     // Auto-detect the source: a git URL clones over the bridge, anything else is an
     // ASP peer (iroh ticket / node id) — git-URL syntax is unambiguous (git-bridge §7.1).
     if let asp_core::gitbridge::SourceKind::GitUrl(url) =
         asp_core::gitbridge::detect_source(peer)
     {
+        if !subdir.is_empty() {
+            return Err(anyhow!("--subdir is an ASP partial clone; it does not apply to a git clone"));
+        }
         return git_clone_cmd(cli, url, into, watch, depth, new_identity, all_branches, token).await;
     }
+    // Normalize the partial-replica scope (scoped-sync §3.1): a pull-only leaf that
+    // receives only these prefixes. Recorded locally BEFORE the catch-up so the
+    // view filter hides any out-of-scope rows the moment they materialize.
+    let allowed: Vec<String> = subdir
+        .iter()
+        .map(|s| s.replace('\\', "/").trim_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     let dir = into.or_else(|| cli.dir.clone()).unwrap_or_else(|| PathBuf::from("asp-vault"));
     let id = idstore::load_or_generate(&dir, cli.no_home_key)?;
     let engine = Engine::open(&dir, id).map_err(|e| anyhow!("clone open: {e}"))?;
+    if !allowed.is_empty() {
+        engine.set_partial_scope(&allowed).map_err(|e| anyhow!("record partial scope: {e}"))?;
+    }
     seed_authorized_keys(cli, &engine)?;
     let auth = auth_opts(cli, &engine);
     let seed = engine.identity.seed();
@@ -770,7 +794,11 @@ async fn clone_cmd(
         }
         VaultConfig::new(&e.store).vault_id()?.unwrap_or_default()
     };
-    println!("cloned vault {} into {}", &vid[..8.min(vid.len())], dir.display());
+    if allowed.is_empty() {
+        println!("cloned vault {} into {}", &vid[..8.min(vid.len())], dir.display());
+    } else {
+        println!("cloned PARTIAL vault {} into {} (subdir: {}) — pull-only", &vid[..8.min(vid.len())], dir.display(), allowed.join(", "));
+    }
     if watch {
         return run_watch_loop(cli, engine, ep, false, cli.relay_url.clone(), vec![peer.to_string()]).await;
     }
@@ -919,6 +947,17 @@ async fn git_bridge_cmd(cli: &Cli, args: &[String]) -> Result<()> {
     let flag_val = |name: &str| -> Option<String> {
         args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
     };
+
+    // A partial (`--subdir`) replica must NEVER push to a git remote or author a
+    // push plan (scoped-sync §3.4): its fold is a partial tree, so a push would
+    // DELETE every out-of-scope file on the remote, and a plan authored here would
+    // sync to full nodes that then push that partial tree. Hard-disabled.
+    if matches!(verb, "push" | "plan") && engine.is_partial() {
+        return Err(anyhow!(
+            "git {verb} is disabled on a partial (--subdir) replica — its fold is a partial tree, \
+             so pushing it would delete every out-of-scope file on the remote. Use a full replica to push."
+        ));
+    }
 
     match verb {
         "status" => {
@@ -1132,6 +1171,16 @@ async fn watch_cmd(
     peers: Vec<String>,
 ) -> Result<()> {
     let engine = open_engine(cli)?;
+    // Partial (`--subdir`) replicas are pull-only LEAVES (scoped-sync §3.1): their
+    // sparse version vector would hand a third peer a permanent hole, so they must
+    // never serve (`--listen`) and must pin exactly ONE upstream. Enforced here,
+    // structurally.
+    if engine.is_partial() && listen {
+        return Err(anyhow!(
+            "this is a partial (--subdir) replica — it is pull-only and cannot --listen \
+             (its scoped version vector would strand a downstream peer). Re-clone the full vault to serve peers."
+        ));
+    }
     seed_authorized_keys(cli, &engine)?;
     let ttl_days = default_ttl_days(cli, &engine);
     let filled = engine.migrate_keys(ttl_days).map_err(|e| anyhow!("{e}"))?;
@@ -1141,6 +1190,16 @@ async fn watch_cmd(
     // No --peer → connect to the saved peer(s) (clone's `origin`); a supplied
     // --peer is offered for saving (consent), then used.
     let resolved = resolve_peers(&engine, &peers);
+    if engine.is_partial() {
+        let distinct: std::collections::HashSet<&String> = resolved.iter().collect();
+        if distinct.len() > 1 {
+            return Err(anyhow!(
+                "a partial (--subdir) replica pins exactly one upstream, but {} were given \
+                 (a second upstream breaks the scoped version vector). Re-clone the full vault for a mesh.",
+                distinct.len()
+            ));
+        }
+    }
 
     // `--relay`: co-host an iroh relay in this same process and pin it as this
     // node's home relay so the ticket routes peers through it (all-in-one box).
@@ -1363,6 +1422,12 @@ async fn git_pull_tick(engine: &EngineRef) {
 #[allow(clippy::await_holding_lock)]
 async fn git_policy_tick(engine: &EngineRef) {
     use asp_core::gitpolicy::{interval_tick, IntervalParams, PolicyAction, POLICY_INTERVAL};
+    // A partial (`--subdir`) replica never authors an auto-push plan (scoped-sync
+    // §3.4): its partial-tree plan would sync to full nodes and delete out-of-scope
+    // files on the remote. Suppress the whole interval policy on such a node.
+    if engine.lock().unwrap().is_partial() {
+        return;
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
