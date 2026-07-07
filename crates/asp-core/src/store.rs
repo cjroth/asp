@@ -17,6 +17,18 @@ pub trait BlobStore {
     fn put_blob(&self, bytes: &[u8]) -> AspResult<String>;
     fn get_blob(&self, hash: &str) -> AspResult<Option<Vec<u8>>>;
     fn has_blob(&self, hash: &str) -> AspResult<bool>;
+
+    /// Insert `bytes` under an **already-computed** content hash, skipping the
+    /// SHA-256 that `put_blob` would recompute. `hash` MUST equal
+    /// `content_hash(bytes)` — the caller computed it (e.g. in a parallel pre-pass).
+    /// The default re-hashes and debug-asserts equality (correct, but no speedup);
+    /// [`MemBlobStore`] overrides it to insert directly. Used by the parallel genesis
+    /// pre-pass to move blob hashing off the single-threaded emission loop.
+    fn put_blob_with_hash(&self, hash: &str, bytes: &[u8]) -> AspResult<()> {
+        let h = self.put_blob(bytes)?;
+        debug_assert_eq!(h, hash, "put_blob_with_hash: precomputed hash mismatch");
+        Ok(())
+    }
 }
 
 /// A materialized file row (§files) — the fold's output, surface-independent.
@@ -56,5 +68,12 @@ impl BlobStore for MemBlobStore {
     }
     fn has_blob(&self, hash: &str) -> AspResult<bool> {
         Ok(self.blobs.borrow().contains_key(hash))
+    }
+    fn put_blob_with_hash(&self, hash: &str, bytes: &[u8]) -> AspResult<()> {
+        self.blobs
+            .borrow_mut()
+            .entry(hash.to_string())
+            .or_insert_with(|| bytes.to_vec());
+        Ok(())
     }
 }

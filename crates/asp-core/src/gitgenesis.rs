@@ -251,6 +251,15 @@ pub fn synthesize_genesis(
     let mut em = Emitter::new(objects, out_store, plan, site_id, 0, 1, DEFAULT_REMOTE_REF.to_string());
     // The `main` lane exists from the start, seeded empty (git-bridge §3.2).
     em.lanes.insert(MAIN_LANE, LaneState::main());
+    // Native: hash every referenced blob in parallel up front (see `precompute_blobs`),
+    // pre-populating `out_store` and the `blob sha -> content_hash/is_binary` map the
+    // sequential emission loop then consults — moving the SHA-256 work off the single
+    // thread while keeping emission order + row bytes identical. wasm has no threads,
+    // so it keeps the inline sequential path (`precomp` stays `None`).
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        em.precomp = Some(precompute_blobs(objects, plan, out_store)?);
+    }
     em.run(plan)?;
 
     // `.aspignore` seeding (git-bridge §3.3): generated from the tip's .gitignores,
@@ -423,6 +432,13 @@ struct Emitter<'a> {
     /// Lanes pre-seeded from an existing imported open branch (git-open-branches §4):
     /// their branch-create record is NOT re-emitted (the branch already exists).
     preseeded: HashSet<LaneId>,
+    /// Optional precomputed `git blob sha -> (content_hash, is_binary)` map. When
+    /// `Some` (a pristine native genesis), the CPU-heavy blob hashing + binary sniff
+    /// have already run in parallel and the `out_store` is pre-populated, so `emit_op`
+    /// just consults the map instead of hashing/storing inline. `None` (wasm genesis,
+    /// and every ongoing ingest) keeps the original sequential inline path. Both paths
+    /// emit byte-identical rows — the map only relocates *where* the hashing happened.
+    precomp: Option<HashMap<String, BlobMeta>>,
 
     // Tip mode/symlink table (main-lane tip state) + gitlink paths (from warnings).
     tip_modes: BTreeMap<String, EntryMode>,
@@ -468,6 +484,7 @@ impl<'a> Emitter<'a> {
             cur_marker_seq: 0,
             seen: HashSet::new(),
             preseeded: HashSet::new(),
+            precomp: None,
             tip_modes: BTreeMap::new(),
             gitlink_paths,
         }
@@ -664,13 +681,11 @@ impl<'a> Emitter<'a> {
 
         match op {
             FileOp::Create { path, blob_sha, mode } => {
-                let bytes = self.objects.blob(blob_sha).unwrap_or_default();
-                let h = self.store.put_blob(&bytes)?;
+                let (h, mc) = self.resolve_blob(blob_sha, path, *mode)?;
                 let fid = match self.lanes[&lane].path_fid.get(path) {
                     Some(f) => f.clone(),
                     None => git_file_id(&self.root_sha, &c.sha, path),
                 };
-                let mc = mode_class(*mode, path, &bytes);
                 let (seq, lamport) = self.tick();
                 let row = self.content_row(
                     &branch_id, lamport, seq, ts, &fid, Kind::Create, mc, None, None,
@@ -687,10 +702,8 @@ impl<'a> Emitter<'a> {
                 }
             }
             FileOp::Edit { path, blob_sha, mode, .. } => {
-                let bytes = self.objects.blob(blob_sha).unwrap_or_default();
-                let h = self.store.put_blob(&bytes)?;
+                let (h, mc) = self.resolve_blob(blob_sha, path, *mode)?;
                 let (fid, parent, base) = self.file_ref(lane, path);
-                let mc = mode_class(*mode, path, &bytes);
                 let (seq, lamport) = self.tick();
                 let row = self.content_row(
                     &branch_id, lamport, seq, ts, &fid, Kind::Edit, mc, parent, base,
@@ -723,10 +736,8 @@ impl<'a> Emitter<'a> {
                 }
             }
             FileOp::RenameExact { from, to, blob_sha, mode } => {
-                let bytes = self.objects.blob(blob_sha).unwrap_or_default();
-                let h = self.store.put_blob(&bytes)?;
+                let (h, mc) = self.resolve_blob(blob_sha, to, *mode)?;
                 let (fid, parent, base) = self.file_ref(lane, from);
-                let mc = mode_class(*mode, to, &bytes);
                 let (seq, lamport) = self.tick();
                 let row = self.content_row(
                     &branch_id, lamport, seq, ts, &fid, Kind::Rename, mc, parent, base,
@@ -773,6 +784,28 @@ impl<'a> Emitter<'a> {
             }
             None => (git_file_id(&self.root_sha, "orphan", path), None, None),
         }
+    }
+
+    /// Resolve a file op's blob to `(content_hash, merge_class)`. With a precomputed
+    /// map (native pristine genesis) both are read from the map and the `out_store` was
+    /// already populated by the parallel pre-pass — no inline hashing. Without one (wasm
+    /// genesis, ongoing ingest, or a defensive precomp miss) it falls back to the
+    /// original inline path: fetch bytes, `put_blob` (hashes), `classify`. Both yield
+    /// byte-identical `(hash, class)` for the same blob + path + mode.
+    fn resolve_blob(
+        &self,
+        blob_sha: &str,
+        class_path: &str,
+        mode: EntryMode,
+    ) -> AspResult<(String, MergeClass)> {
+        if let Some(map) = &self.precomp {
+            if let Some(m) = map.get(blob_sha) {
+                return Ok((m.content_hash.clone(), mode_class_pre(mode, class_path, m.is_binary)));
+            }
+        }
+        let bytes = self.objects.blob(blob_sha).unwrap_or_default();
+        let h = self.store.put_blob(&bytes)?;
+        Ok((h, mode_class(mode, class_path, &bytes)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1018,6 +1051,122 @@ fn mode_class(mode: EntryMode, path: &str, bytes: &[u8]) -> MergeClass {
     }
 }
 
+/// [`mode_class`] driven by a precomputed `is_binary` flag instead of the raw bytes.
+/// Byte-identical to `mode_class(mode, path, bytes)` because [`classify`] decides
+/// binary-vs-not purely from `is_binary = !utf8 || contains(0)`, and its remaining
+/// branch depends only on the path extension (so `classify(path, &[])` reproduces the
+/// non-binary class). See `class_matches_precomputed_binary` in the tests.
+fn mode_class_pre(mode: EntryMode, path: &str, is_binary: bool) -> MergeClass {
+    match mode {
+        EntryMode::Symlink => MergeClass::Text,
+        _ if is_binary => MergeClass::Binary,
+        _ => classify(path, &[]),
+    }
+}
+
+/// Precomputed per-blob facts the parallel pre-pass hands the sequential emitter: the
+/// blob's `content_hash` and whether it classifies as binary. Keyed by git blob sha.
+#[derive(Clone)]
+struct BlobMeta {
+    content_hash: String,
+    is_binary: bool,
+}
+
+/// The two per-blob byte scans the emission loop needs — SHA-256 (content hash) and the
+/// binary sniff — bundled so a worker computes both in one pass over the bytes.
+#[cfg(not(target_arch = "wasm32"))]
+fn hash_meta(bytes: &[u8]) -> BlobMeta {
+    BlobMeta {
+        content_hash: content_hash(bytes),
+        // Must mirror `crate::log::classify`'s binary test exactly (identity-bearing).
+        is_binary: std::str::from_utf8(bytes).is_err() || bytes.contains(&0),
+    }
+}
+
+/// Parallel genesis pre-pass (native only). Collects every content blob referenced by
+/// the plan's file ops, hashes each one's bytes (SHA-256) and binary-sniffs it in
+/// parallel over scoped worker threads, pre-populating `store` (via
+/// [`BlobStore::put_blob_with_hash`], so no re-hash) and returning a
+/// `git blob sha -> BlobMeta` map. This is pure and order-independent — the map only
+/// relocates *where* the CPU-heavy hashing runs; [`synthesize_genesis`]'s emission
+/// order, seq/lamport assignment, and row bytes are unchanged.
+///
+/// Reads are single-threaded (a cheap `HashMap` lookup + `Vec` clone from the in-RAM
+/// object DB) and chunked by a byte budget so peak RSS stays ≈ object DB + store + one
+/// chunk, rather than holding a second full copy of all blob bytes. The parallel work
+/// is the hashing itself, done over owned `Vec`s (no shared `!Sync` state).
+#[cfg(not(target_arch = "wasm32"))]
+fn precompute_blobs(
+    objects: &dyn GitBlobSource,
+    plan: &ImportPlan,
+    store: &dyn BlobStore,
+) -> AspResult<HashMap<String, BlobMeta>> {
+    // Unique content-blob shas referenced by file ops (dedup: the same blob recurs
+    // across commits; order is irrelevant — the result is a map).
+    let mut unique: HashSet<&str> = HashSet::new();
+    for c in &plan.commits {
+        for op in &c.ops {
+            match op {
+                FileOp::Create { blob_sha, .. }
+                | FileOp::Edit { blob_sha, .. }
+                | FileOp::RenameExact { blob_sha, .. } => {
+                    unique.insert(blob_sha.as_str());
+                }
+                _ => {}
+            }
+        }
+    }
+    let unique: Vec<String> = unique.into_iter().map(|s| s.to_string()).collect();
+    let mut map: HashMap<String, BlobMeta> = HashMap::with_capacity(unique.len());
+
+    // Bounded worker count — respect the OrbStack core budget (cap at 6).
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(6);
+
+    // Byte-bounded chunks: read a batch of blobs single-threaded, hash the batch in
+    // parallel, drain it into the store, repeat. Keeps the transient copy small.
+    const CHUNK_BYTES: usize = 128 * 1024 * 1024;
+    let mut idx = 0;
+    while idx < unique.len() {
+        let mut chunk: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut acc = 0usize;
+        while idx < unique.len() && (chunk.is_empty() || acc < CHUNK_BYTES) {
+            let sha = &unique[idx];
+            let bytes = objects.blob(sha).unwrap_or_default();
+            acc += bytes.len();
+            chunk.push((sha.clone(), bytes));
+            idx += 1;
+        }
+
+        let metas: Vec<BlobMeta> = if workers <= 1 || chunk.len() < 32 {
+            chunk.iter().map(|(_, b)| hash_meta(b)).collect()
+        } else {
+            let chunk_ref: &[(String, Vec<u8>)] = &chunk;
+            let sz = chunk_ref.len().div_ceil(workers).max(1);
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..chunk_ref.len())
+                    .step_by(sz)
+                    .map(|start| {
+                        let end = (start + sz).min(chunk_ref.len());
+                        s.spawn(move || {
+                            chunk_ref[start..end].iter().map(|(_, b)| hash_meta(b)).collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().flat_map(|h| h.join().expect("hash worker panicked")).collect()
+            })
+        };
+
+        for ((sha, bytes), meta) in chunk.into_iter().zip(metas) {
+            store.put_blob_with_hash(&meta.content_hash, &bytes)?;
+            map.insert(sha, meta);
+        }
+    }
+    Ok(map)
+}
+
 fn push_mode(modes: &mut Vec<(String, u32)>, symlinks: &mut Vec<String>, path: &str, mode: EntryMode) {
     match mode {
         EntryMode::Executable => modes.push((path.to_string(), mode.git_mode())),
@@ -1136,6 +1285,86 @@ mod tests {
             tip_sha: "bbbb000000000000000000000000000000000000".into(),
             warnings: vec![],
             skipped_reachable: vec![],
+        }
+    }
+
+    /// Run genesis forcing the inline **sequential** path (`precomp = None`) — the
+    /// exact code wasm runs, and what native ran before the parallel pre-pass. Used to
+    /// prove the parallel path relocates hashing without changing any output byte.
+    fn synthesize_genesis_seq(
+        plan: &ImportPlan,
+        objects: &dyn GitBlobSource,
+        out_store: &dyn BlobStore,
+    ) -> AspResult<GenesisOutput> {
+        let site_id = git_site_id(&plan.root_sha);
+        let vault_id = git_vault_id(&plan.root_sha);
+        let mut em = Emitter::new(objects, out_store, plan, site_id, 0, 1, DEFAULT_REMOTE_REF.to_string());
+        em.lanes.insert(MAIN_LANE, LaneState::main());
+        // precomp intentionally left None → inline sequential hashing.
+        em.run(plan)?;
+        let aspignore = em.build_aspignore();
+        em.emit_aspignore(&plan.root_sha, &plan.tip_sha, &aspignore)?;
+        let (mode_table, symlinks, gitlinks) = em.finish_tables();
+        Ok(GenesisOutput { vault_id, rows: em.rows, ledger: em.ledger, aspignore, mode_table, symlinks, gitlinks })
+    }
+
+    #[test]
+    fn parallel_prepass_matches_sequential_bytes() {
+        // The load-bearing relocation guard: the parallel pre-pass path
+        // (`synthesize_genesis`, native = precomp Some) must emit byte-identical rows,
+        // vault id, ledger, and store contents to the inline sequential path.
+        let mut objs = HashMap::new();
+        // Add a binary blob (embedded NUL) + a code blob so classify's binary vs
+        // extension branches are both exercised through the precomputed `is_binary`.
+        objs.insert("blobBin".to_string(), vec![0u8, 1, 2, 3, 0, 255]);
+        let plan = linear_plan(&mut objs);
+        let mut plan = plan;
+        plan.commits[1].ops.push(FileOp::Create {
+            path: "data.bin".into(),
+            blob_sha: "blobBin".into(),
+            mode: EntryMode::Normal,
+        });
+
+        let sp = MemBlobStore::new();
+        let sq = MemBlobStore::new();
+        let gp = synthesize_genesis(&plan, &objs, &sp).unwrap();
+        let gq = synthesize_genesis_seq(&plan, &objs, &sq).unwrap();
+        assert_eq!(gp.rows, gq.rows, "parallel vs sequential rows byte-identical");
+        assert_eq!(gp.vault_id, gq.vault_id);
+        assert_eq!(gp.ledger, gq.ledger);
+        assert_eq!(gp.mode_table, gq.mode_table);
+        // Every blob referenced by a row resolves identically in both stores.
+        for r in &gp.rows {
+            for h in [r.base_hash.clone(), r.result_hash.clone()].into_iter().flatten() {
+                assert_eq!(
+                    sp.get_blob(&h).unwrap(),
+                    sq.get_blob(&h).unwrap(),
+                    "store blob {h} matches across paths"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn class_matches_precomputed_binary() {
+        // `mode_class_pre` (precomputed is_binary) must equal `mode_class` (raw bytes)
+        // for every mode — this equivalence is identity-bearing (MergeClass ∈ merkle id).
+        let cases: &[(&str, &[u8])] = &[
+            ("main.rs", b"fn main() {}\n"),
+            ("notes.txt", b"hello\n"),
+            ("img.png", &[0x89, b'P', b'N', b'G', 0, 1, 2]),
+            ("weird", &[0xff, 0xfe, 0x00]),
+            ("empty.rs", b""),
+        ];
+        for (path, bytes) in cases {
+            let is_bin = std::str::from_utf8(bytes).is_err() || bytes.contains(&0);
+            for mode in [EntryMode::Normal, EntryMode::Executable, EntryMode::Symlink] {
+                assert_eq!(
+                    mode_class(mode, path, bytes),
+                    mode_class_pre(mode, path, is_bin),
+                    "class mismatch for {path:?} mode {mode:?}"
+                );
+            }
         }
     }
 
