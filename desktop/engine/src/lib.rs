@@ -252,7 +252,7 @@ pub struct DesktopEngine {
     change_listener: Arc<Mutex<Option<ChangeCb>>>,
     /// Fired with `(path, done, total, phase)` during a `clone_git`/`git_pull` so the
     /// shell can emit a `vault-scan-progress` event (phases `fetching`|`replaying`|
-    /// `saving`). Set by the shell after construction, exactly like `change_listener`.
+    /// `saving`|`materialize`). Set by the shell after construction, exactly like `change_listener`.
     scan_listener: Arc<Mutex<Option<ScanCb>>>,
     /// When set, a co-hosted relay's URL — endpoints bind through it (and tickets
     /// advertise it) so same-machine/LAN peers route locally instead of via the
@@ -408,7 +408,7 @@ impl DesktopEngine {
     /// Register a callback fired with `(path, done, total, phase)` during a
     /// `clone_git`/`git_pull`. The shell wires this to the same `vault-scan-progress`
     /// event the startup reconcile uses, so a git clone shows a determinate bar
-    /// (`fetching` → `replaying` → `saving`).
+    /// (`fetching` → `replaying` → `saving` → `materialize`).
     pub fn set_scan_progress_listener(&self, cb: impl Fn(&str, u64, u64, &str) + Send + Sync + 'static) {
         *self.scan_listener.lock().unwrap() = Some(Arc::new(cb));
     }
