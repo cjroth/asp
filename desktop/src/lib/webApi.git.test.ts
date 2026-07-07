@@ -80,6 +80,34 @@ test.skipIf(!HAVE_WASM)('WasmEngine.git_clone folds the repo tree from recorded 
   expect(ledger.ingested).toBe(report.commits);
 });
 
+// The split web-persistence API (rows separate from content-addressed blobs)
+// must round-trip an engine byte-identically — the fix for the large-clone OOM
+// (no single giant buffer holding every blob's bytes). Mirrors the native
+// `rows_state_split_persistence_round_trips` test at the JS boundary.
+test.skipIf(!HAVE_WASM)('split rows/blob persistence round-trips the engine byte-identically', async () => {
+  const wasm = (await import(PKG)) as typeof import('asp-wasm');
+  const enc = new TextEncoder();
+  const a = new wasm.WasmEngine(new Uint8Array(32).fill(9), 'vsplit');
+  a.record_write('a.md', enc.encode('alpha\n'));
+  a.record_write('a.md', enc.encode('alpha\nedited\n')); // edit → base+result differ
+  a.record_write('b.md', enc.encode('alpha\n')); // duplicate content ⇒ shared blob
+
+  const rows = a.export_rows_state();
+  const hashes = JSON.parse(a.blob_hashes()) as string[];
+  // The loader can derive the same hash set straight from the rows bytes.
+  expect(JSON.parse(a.blob_hashes_of_rows(rows))).toEqual(hashes);
+  const blobs = new Map(hashes.map((h) => [h, a.get_blob(h) as Uint8Array]));
+
+  // Restore into a fresh engine: blobs first, then the rows.
+  const b = new wasm.WasmEngine(new Uint8Array(32).fill(8), '');
+  for (const h of JSON.parse(b.blob_hashes_of_rows(rows)) as string[]) {
+    expect(b.put_blob(blobs.get(h) as Uint8Array)).toBe(h);
+  }
+  b.load_rows_state(rows);
+  expect(b.files_json()).toBe(a.files_json());
+  expect(b.export_rows_state()).toEqual(rows);
+});
+
 // Push is a spec non-goal in the browser — the web backend must reject clearly
 // (never silently no-op) so the UI can point the user at desktop/CLI.
 test('webApi.gitPush rejects (browser is clone/pull only)', async () => {

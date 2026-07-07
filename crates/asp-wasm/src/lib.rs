@@ -221,6 +221,55 @@ impl WasmEngine {
         self.eng.import_state(bytes).map_err(to_err)
     }
 
+    // -------- split web persistence (rows separate from content-addressed blobs) --------
+    //
+    // `dump_state`/`load_state` serialize the WHOLE engine — every row AND every
+    // blob's bytes — into one contiguous buffer, which on a large git clone needs
+    // 2-3 full-size copies at once and OOMs wasm32's ~4 GB linear memory (the
+    // "error while writing multi-byte MessagePack value" clone failure). These
+    // split it: a tiny rows-only snapshot plus one content-addressed blob at a
+    // time, so no single giant buffer is ever built.
+
+    /// Rows-only web-persistence snapshot (no blob bytes). Persist the referenced
+    /// blobs separately (`blob_hashes` + `get_blob`); restore them with `put_blob`
+    /// before `load_rows_state`.
+    pub fn export_rows_state(&self) -> Result<Vec<u8>, JsError> {
+        self.eng.export_rows_state().map_err(to_err)
+    }
+
+    /// Restore an `export_rows_state` snapshot. Feed the referenced blobs back via
+    /// `put_blob` (hash list from `blob_hashes_of_rows`) BEFORE calling this so
+    /// branch reconciliation and the fold see their bytes. Returns rows added.
+    pub fn load_rows_state(&self, bytes: &[u8]) -> Result<usize, JsError> {
+        self.eng.load_rows_state(bytes).map_err(to_err)
+    }
+
+    /// The content hashes this engine holds (rows' base+result blobs, present in
+    /// the store) as a JSON string array — one content-addressed OPFS entry each.
+    pub fn blob_hashes(&self) -> Result<String, JsError> {
+        serde_json::to_string(&self.eng.blob_hashes()).map_err(to_err)
+    }
+
+    /// The content hashes an `export_rows_state` snapshot references, decoded
+    /// WITHOUT importing it (JSON string array) — so the loader can restore each
+    /// blob before `load_rows_state`.
+    pub fn blob_hashes_of_rows(&self, bytes: &[u8]) -> Result<String, JsError> {
+        let hashes = MemEngine::blob_hashes_in_rows_state(bytes).map_err(to_err)?;
+        serde_json::to_string(&hashes).map_err(to_err)
+    }
+
+    /// Store a blob (content-addressed); returns its hash. The loader feeds
+    /// persisted blobs back through this before `load_rows_state`.
+    pub fn put_blob(&self, bytes: &[u8]) -> Result<String, JsError> {
+        self.eng.put_blob(bytes).map_err(to_err)
+    }
+
+    /// Fetch a stored blob's bytes by hash (web persistence writes these out one
+    /// content-addressed entry at a time via `blob_hashes`).
+    pub fn get_blob(&self, hash: &str) -> Result<Option<Vec<u8>>, JsError> {
+        self.eng.get_blob(hash).map_err(to_err)
+    }
+
     /// The materialized working tree as JSON `{path: [u8]}`.
     pub fn files_json(&self) -> Result<String, JsError> {
         let m = self.eng.files_map().map_err(to_err)?;

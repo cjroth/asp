@@ -57,6 +57,25 @@ struct StateSnapshot {
 /// misparsing.
 const STATE_SNAPSHOT_VERSION: u32 = 1;
 
+/// Rows-only engine state for **web** persistence: the row log with NO blob
+/// bytes. Blobs are persisted separately, one content-addressed entry per hash
+/// (see [`MemEngine::export_rows_state`]), so restoring a large (e.g.
+/// git-cloned) vault never builds one giant msgpack buffer holding every blob —
+/// that copy pushed a ~GB clone past wasm32's linear-memory ceiling and failed
+/// the msgpack write. The combined [`StateSnapshot`] form
+/// (`export_state`/`import_state`) the Obsidian thin client persists is left
+/// untouched.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RowsSnapshot {
+    version: u32,
+    vault_id: String,
+    rows: Vec<LogRow>,
+}
+
+/// Bumped on any incompatible change to [`RowsSnapshot`] (mirrors
+/// [`STATE_SNAPSHOT_VERSION`]).
+const ROWS_SNAPSHOT_VERSION: u32 = 1;
+
 pub struct MemEngine {
     identity: Identity,
     /// Per-vault authoring id, distinct from `identity` (the connection key), so
@@ -812,6 +831,113 @@ impl MemEngine {
         Ok(added)
     }
 
+    // ----- split web persistence (rows separate from content-addressed blobs) -----
+
+    /// Serialize just the row log (with the vault id) as msgpack — the web
+    /// persistence form. Unlike [`export_state`] this carries NO blob bytes: the
+    /// referenced blobs are written out separately, one content-addressed entry
+    /// per hash (the host reads [`blob_hashes`] + [`get_blob`]), so persisting a
+    /// large git-cloned vault never allocates one buffer the size of every blob.
+    /// See [`RowsSnapshot`].
+    pub fn export_rows_state(&self) -> AspResult<Vec<u8>> {
+        let snap = RowsSnapshot {
+            version: ROWS_SNAPSHOT_VERSION,
+            vault_id: SessionVault::vault_id(self),
+            rows: self.rows.borrow().clone(),
+        };
+        rmp_serde::to_vec_named(&snap).map_err(|e| AspError::Protocol(e.to_string()))
+    }
+
+    /// Re-integrate a snapshot produced by [`export_rows_state`]. Validates row
+    /// Merkle ids and adopts/refuses the vault id exactly like [`import_state`].
+    /// The referenced blobs must already be in the store — feed them via
+    /// [`put_blob`] *first* (get the hash list from [`blob_hashes_in_rows_state`])
+    /// so branch reconciliation and the fold see their bytes. Returns the number
+    /// of rows newly added (idempotent: re-loading yields 0).
+    pub fn load_rows_state(&self, bytes: &[u8]) -> AspResult<usize> {
+        let snap: RowsSnapshot =
+            rmp_serde::from_slice(bytes).map_err(|e| AspError::Protocol(e.to_string()))?;
+        if snap.version != ROWS_SNAPSHOT_VERSION {
+            return Err(AspError::Protocol(format!(
+                "unsupported engine rows snapshot version {}",
+                snap.version
+            )));
+        }
+        for r in &snap.rows {
+            if !r.id_valid() {
+                return Err(AspError::Protocol("state row id does not match its contents".into()));
+            }
+        }
+        let mine = SessionVault::vault_id(self);
+        if !snap.vault_id.is_empty() {
+            if mine.is_empty() {
+                self.adopt_vault_id(&snap.vault_id)?;
+            } else if mine != snap.vault_id {
+                return Err(AspError::Protocol("state snapshot is for a different vault".into()));
+            }
+        }
+        let mut added = 0usize;
+        {
+            let mut ids = self.row_ids.borrow_mut();
+            let mut store = self.rows.borrow_mut();
+            for r in snap.rows {
+                if ids.insert(r.id.clone()) {
+                    store.push(r);
+                    added += 1;
+                }
+            }
+        }
+        if added > 0 {
+            self.reconcile_branches();
+            self.materialize()?;
+        }
+        Ok(added)
+    }
+
+    /// The content hashes this engine's rows reference (`base_hash` +
+    /// `result_hash`), deduped and confined to those actually present in the blob
+    /// store — the set web persistence writes out as individual content-addressed
+    /// entries.
+    pub fn blob_hashes(&self) -> Vec<String> {
+        let mut out = std::collections::BTreeSet::new();
+        for r in self.rows.borrow().iter() {
+            for h in [r.base_hash.as_ref(), r.result_hash.as_ref()].into_iter().flatten() {
+                if !out.contains(h) && self.blobs.has_blob(h).unwrap_or(false) {
+                    out.insert(h.clone());
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// The content hashes referenced by a [`export_rows_state`] snapshot, decoded
+    /// WITHOUT integrating it — so the web loader can restore each blob into the
+    /// store (via [`put_blob`]) *before* [`load_rows_state`], which branch
+    /// reconciliation and the fold require. Deduped.
+    pub fn blob_hashes_in_rows_state(bytes: &[u8]) -> AspResult<Vec<String>> {
+        let snap: RowsSnapshot =
+            rmp_serde::from_slice(bytes).map_err(|e| AspError::Protocol(e.to_string()))?;
+        let mut out = std::collections::BTreeSet::new();
+        for r in &snap.rows {
+            for h in [r.base_hash.as_ref(), r.result_hash.as_ref()].into_iter().flatten() {
+                out.insert(h.clone());
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// Store a blob (content-addressed), returning its hash — the web loader
+    /// feeds persisted blobs back through this before [`load_rows_state`].
+    pub fn put_blob(&self, bytes: &[u8]) -> AspResult<String> {
+        self.blobs.put_blob(bytes)
+    }
+
+    /// Fetch a stored blob's bytes by hash (web persistence writes these out one
+    /// content-addressed entry at a time via [`blob_hashes`]).
+    pub fn get_blob(&self, hash: &str) -> AspResult<Option<Vec<u8>>> {
+        self.blobs.get_blob(hash)
+    }
+
     pub fn materialize(&self) -> AspResult<()> {
         // Fold the checked-out branch's visible rows (§2.3). On a single-branch
         // vault visible(main) is every row — byte-identical to before.
@@ -1289,6 +1415,61 @@ mod tests {
         // A snapshot for a different vault.
         let other = MemEngine::create(Identity::from_seed(&[3; 32]), "v2");
         assert!(other.import_state(&snap).is_err(), "refuses a snapshot for another vault");
+    }
+
+    /// Split web persistence (`export_rows_state` + per-blob `get_blob`/`put_blob`
+    /// + `load_rows_state`) must reconstruct a byte-identical engine — same rows,
+    /// same fold, same materialized files — while the rows snapshot carries NO
+    /// blob bytes (that one giant combined buffer is the browser-clone OOM this
+    /// splits apart).
+    #[test]
+    fn rows_state_split_persistence_round_trips() {
+        let a = MemEngine::create(Identity::from_seed(&[11; 32]), "vsplit");
+        a.record_write("a.md", b"alpha\n").unwrap();
+        a.record_write("b.md", b"bravo\n").unwrap();
+        a.record_write("a.md", b"alpha\nedited\n").unwrap(); // edit → base+result differ
+        a.record_write("dup.md", b"bravo\n").unwrap(); // duplicate content of b.md
+        a.record_write("big.bin", &vec![0xABu8; 200_000]).unwrap(); // make the size gap real
+        a.record_remove("b.md").unwrap();
+
+        let rows_bytes = a.export_rows_state().unwrap();
+        let hashes = a.blob_hashes();
+        // The same hash set is derivable straight from the snapshot bytes (the
+        // loader path, which has no live engine yet).
+        assert_eq!(hashes, MemEngine::blob_hashes_in_rows_state(&rows_bytes).unwrap());
+        // Duplicate content ("bravo\n") is stored under one hash (content-addressed):
+        // 4 distinct blobs for 5 authored contents.
+        assert_eq!(hashes.len(), 4, "content-addressed dedup collapses the duplicate");
+        let blobs: Vec<(String, Vec<u8>)> =
+            hashes.iter().map(|h| (h.clone(), a.get_blob(h).unwrap().unwrap())).collect();
+
+        // The rows snapshot holds NO blob bytes: it is far smaller than the combined
+        // snapshot (which inlines every blob), and contains none of the blobs verbatim.
+        let combined = a.export_state().unwrap();
+        assert!(rows_bytes.len() + 100_000 < combined.len(), "rows-only snapshot excludes blob bytes");
+        for (_, b) in &blobs {
+            assert!(
+                !rows_bytes.windows(b.len().max(1)).any(|w| w == b.as_slice()),
+                "rows snapshot must not carry blob bytes"
+            );
+        }
+
+        // Restore into a FRESH engine: blobs first (branch reconcile + fold read
+        // them), then the rows.
+        let restored = MemEngine::create(Identity::from_seed(&[12; 32]), "");
+        for h in MemEngine::blob_hashes_in_rows_state(&rows_bytes).unwrap() {
+            let bytes = blobs.iter().find(|(k, _)| *k == h).map(|(_, v)| v.clone()).unwrap();
+            assert_eq!(restored.put_blob(&bytes).unwrap(), h, "blob restores under its hash");
+        }
+        assert_eq!(restored.load_rows_state(&rows_bytes).unwrap(), a.row_count());
+
+        // Byte-identical: rows (via the deterministic snapshot), the fold detail,
+        // and the materialized working tree.
+        assert_eq!(restored.export_rows_state().unwrap(), rows_bytes);
+        assert_eq!(restored.files_detail(), a.files_detail());
+        assert_eq!(restored.files_map().unwrap(), a.files_map().unwrap());
+        // Re-loading the same snapshot is idempotent.
+        assert_eq!(restored.load_rows_state(&rows_bytes).unwrap(), 0);
     }
 
     /// Batch deletes: one fold, unknown paths skipped, and the authored rows

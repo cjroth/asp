@@ -126,7 +126,15 @@ async function readJson<T>(name: string, fallback: T): Promise<T> {
 }
 const writeJson = (name: string, obj: unknown) => writeBytes(name, enc.encode(JSON.stringify(obj)));
 
+// Persistence layout. Legacy vaults kept the WHOLE engine (rows + every blob's
+// bytes) in one `.state` blob — serializing that on a large git clone OOMs the
+// wasm32 heap. The split layout writes a tiny rows-only snapshot (`.rows`) plus
+// one immutable content-addressed entry per blob (`.blob.<hash>`), and a
+// `.blobs` index listing the hashes so a vault delete can find them all.
 const stateName = (id: string) => `vault-${id}.state`;
+const rowsName = (id: string) => `vault-${id}.rows`;
+const blobName = (id: string, hash: string) => `vault-${id}.blob.${hash}`;
+const blobIndexName = (id: string) => `vault-${id}.blobs`;
 
 export function createWebApi(): Api {
   let wasmReady: Promise<void> | null = null;
@@ -146,6 +154,12 @@ export function createWebApi(): Api {
 
   const registry = () => readJson<RegEntry[]>('registry.json', []);
   const engines = new Map<string, WasmEngine>();
+  // Content-addressed blobs already on disk for a vault this session — a blob is
+  // immutable under its hash, so persist only writes the ones it hasn't yet
+  // (no more re-serializing the whole vault on every keystroke, webApi.ts:180).
+  const writtenBlobs = new Map<string, Set<string>>();
+  // Vaults whose legacy combined `.state` we've already reclaimed post-migration.
+  const clearedOldState = new Set<string>();
   // Live connections, one per vault id. A browser can't accept inbound
   // connections, but once it dials the upstream it holds the link open and rows
   // stream both ways in realtime — no polling.
@@ -171,17 +185,59 @@ export function createWebApi(): Api {
     const reg = await registry();
     const entry = reg.find((r) => r.id === id);
     const eng = new WasmEngine(await deviceSeed(), entry?.vault_id ?? '');
-    const state = await readBytes(stateName(id));
-    if (state) eng.load_state(state);
+    const rows = await readBytes(rowsName(id));
+    if (rows) {
+      // Split layout: restore each referenced blob into the engine BEFORE loading
+      // the rows (branch reconciliation + the fold read blob bytes), then import.
+      const hashes = JSON.parse(eng.blob_hashes_of_rows(rows)) as string[];
+      const present = new Set<string>();
+      for (const h of hashes) {
+        const b = await readBytes(blobName(id, h));
+        if (b) {
+          eng.put_blob(b);
+          present.add(h);
+        }
+      }
+      eng.load_rows_state(rows);
+      writtenBlobs.set(id, present); // already on disk — persist won't rewrite these
+      clearedOldState.add(id); // this vault is already split; no legacy state to clear
+    } else {
+      // Back-compat: pre-split vaults kept the whole engine (rows + every blob) in
+      // one `.state` blob. Load it; the next persist migrates to the split layout.
+      const state = await readBytes(stateName(id));
+      if (state) eng.load_state(state);
+    }
     engines.set(id, eng);
     return eng;
   }
-  const persist = (id: string, eng: WasmEngine) => writeBytes(stateName(id), eng.dump_state());
-  // `dump_state` re-serializes the WHOLE engine (every row + blob) to OPFS, so on
-  // a big vault doing it on every keystroke-save / synced row is the dominant
-  // cost. Coalesce it: edits return immediately and the state is written at most
-  // once per quiet window. Durability is the live peer sync; OPFS is a cache that
-  // a reload re-syncs — and we flush on page-hide so nothing pending is lost.
+  // Persist as a tiny rows-only snapshot plus one content-addressed entry per NEW
+  // blob (immutable ⇒ never rewritten). This both fixes the browser-clone OOM (no
+  // single giant buffer holding every blob) and the per-keystroke cost the old
+  // comment flagged — an edit writes `.rows` + only the one new blob it created.
+  // Durability is the live peer sync; OPFS is a cache a reload re-syncs. We flush
+  // on page-hide so nothing pending is lost.
+  const persist = async (id: string, eng: WasmEngine): Promise<void> => {
+    await writeBytes(rowsName(id), eng.export_rows_state());
+    const written = writtenBlobs.get(id) ?? new Set<string>();
+    const hashes = JSON.parse(eng.blob_hashes()) as string[];
+    let changed = false;
+    for (const h of hashes) {
+      if (written.has(h)) continue;
+      const bytes = eng.get_blob(h);
+      if (bytes) {
+        await writeBytes(blobName(id, h), bytes);
+        written.add(h);
+        changed = true;
+      }
+    }
+    writtenBlobs.set(id, written);
+    if (changed) await writeJson(blobIndexName(id), [...written]);
+    // Reclaim the legacy combined blob once (a no-op if this vault never had one).
+    if (!clearedOldState.has(id)) {
+      clearedOldState.add(id);
+      await removeFile(stateName(id));
+    }
+  };
   const persistQueue = makeCoalescer<WasmEngine>((id, eng) => void persist(id, eng).catch(() => {}), 700);
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', () => {
@@ -500,6 +556,14 @@ export function createWebApi(): Api {
     removeVault: async (id) => {
       persistQueue.cancel(id); // don't let a debounced write resurrect the state file
       engines.delete(id);
+      writtenBlobs.delete(id);
+      clearedOldState.delete(id);
+      // Delete every content-addressed blob this vault wrote (from its index),
+      // then the index, rows snapshot, and any legacy combined state.
+      const hashes = await readJson<string[]>(blobIndexName(id), []);
+      for (const h of hashes) await removeFile(blobName(id, h));
+      await removeFile(blobIndexName(id));
+      await removeFile(rowsName(id));
       await removeFile(stateName(id));
       const reg = (await registry()).filter((r) => r.id !== id);
       await writeJson('registry.json', reg);
