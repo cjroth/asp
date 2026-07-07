@@ -13,6 +13,7 @@
 
 use crate::authkeys::{AdmitCtx, PeerPolicy};
 use crate::error::{AspError, AspResult};
+use crate::log::{Kind, LogRow};
 use crate::order::NodeId;
 use crate::wire::{Msg, WireRow, PROTO};
 use std::collections::BTreeMap;
@@ -151,6 +152,16 @@ pub(crate) fn push_rows_chunked(out: &mut Vec<Step>, rows: Vec<WireRow>) {
     if !chunk.is_empty() {
         out.push(Step::Send(Msg::Rows { rows: chunk }));
     }
+}
+
+/// A row that mutates file CONTENT — the kinds a read-only peer (B) may not push
+/// (scoped-sync §4.2). Metadata rows (`Branch`/`Tag`/`Merge`/`GitCommit`/
+/// `GitIngest`/`GitPlan`) are not file mutations and are never gated by read-only.
+pub(crate) fn is_file_mutation(row: &LogRow) -> bool {
+    matches!(
+        row.kind,
+        Kind::Create | Kind::Edit | Kind::Rename | Kind::Delete | Kind::Reclass
+    )
 }
 
 impl Session {
@@ -329,6 +340,25 @@ impl Session {
     }
 
     fn integrate_batch(&self, vault: &dyn SessionVault, rows: Vec<WireRow>) -> AspResult<Vec<WireRow>> {
+        // Read-only enforcement (B — scoped-sync §4). A peer the listener admitted as
+        // `read_only` may PULL but not push file mutations: drop its inbound
+        // Create/Edit/Rename/Delete/Reclass rows here, at the single integrator,
+        // BEFORE they enter the log — so they neither fold locally nor fan out to
+        // other peers (the leak path a fold-time filter would miss, §4.1 regime 1).
+        // This lives in the sans-IO Session, so the native Engine and the wasm
+        // MemEngine enforce it identically (mandatory — else the browser is the laxer
+        // node, §10 risk 5). Metadata rows (Branch/Tag/Merge/Git*) are not file
+        // mutations and still integrate.
+        //
+        // We DROP silently rather than replying `Msg::Denied`: our own `Msg::Denied`
+        // handler closes the connection (below), so denying a live push would tear
+        // down the read-only peer's ongoing read pull. The source simply refuses to
+        // integrate the peer's writes — the Trust-mode topological boundary (§4.4).
+        let rows: Vec<WireRow> = if self.policy.read_only {
+            rows.into_iter().filter(|wr| !is_file_mutation(&wr.row)).collect()
+        } else {
+            rows
+        };
         // Fold once for the whole batch (see SessionVault::integrate_many) — the
         // old per-row loop re-folded the log on every row, O(n²) over a catch-up.
         let flags = vault.integrate_many(&rows)?;
@@ -451,6 +481,63 @@ mod tests {
 
         assert!(la.authed() && cb.authed(), "both mem sessions authenticate");
         assert_eq!(b.files_map().unwrap().get("m.md").map(|v| v.as_slice()), Some(&b"from mem A\n"[..]), "B pulled A's file");
+    }
+
+    /// B — read-only enforcement at the single integrator (scoped-sync §4, §9). The
+    /// listener admits the connector as `read_only`; the connector's authored file
+    /// row must NEVER enter the listener's log, while the listener's rows must still
+    /// reach the connector (one-way sync from a hub), and the connection stays up.
+    #[test]
+    fn read_only_peer_cannot_push_but_still_pulls_memengine() {
+        use crate::MemEngine;
+        let a = MemEngine::create(Identity::from_seed(&[1; 32]), "v"); // listener / source
+        let b = MemEngine::create(Identity::from_seed(&[2; 32]), "v"); // connector / read-only replica
+        a.authorize_with_policy(&Identity::from_seed(&[2; 32]).to_ssh_string(), None, true, "test", None, true)
+            .unwrap();
+        a.record_write("from_source.md", b"source note\n").unwrap();
+        b.record_write("from_readonly.md", b"local edit\n").unwrap();
+
+        let mut la = Session::new(Role::Listener, &a, ctx(), nid(2), Vec::new());
+        let mut cb = Session::new(Role::Connector, &b, ctx(), nid(1), Vec::new());
+        pump(&a, &mut la, &b, &mut cb);
+
+        assert!(la.authed() && cb.authed(), "connection stays up — no Denied/close");
+        assert!(la.policy().read_only, "listener retained the read-only grant");
+        assert!(b.files_map().unwrap().contains_key("from_source.md"), "read-only peer still PULLS the source's rows");
+        assert!(
+            !a.files_map().unwrap().contains_key("from_readonly.md"),
+            "the read-only peer's authored row must never enter the source",
+        );
+    }
+
+    /// Native-Engine mirror of the read-only enforcement (parity — the reject lives
+    /// in the sans-IO Session, so both surfaces must behave identically, §10 risk 5).
+    #[test]
+    fn read_only_peer_cannot_push_but_still_pulls_native() {
+        let da = tempdir().unwrap();
+        let db = tempdir().unwrap();
+        let a = Engine::init(da.path(), Identity::from_seed(&[1; 32])).unwrap();
+        let b = Engine::init(db.path(), Identity::from_seed(&[2; 32])).unwrap();
+        let vid = a.store.get_config("vault_id").unwrap().unwrap();
+        b.store.set_config("vault_id", &vid).unwrap();
+        a.authorize_with_policy(&Identity::from_seed(&[2; 32]).to_ssh_string(), None, true, "test", None, true)
+            .unwrap();
+        a.record_write("from_source.md", b"source note\n").unwrap();
+        b.record_write("from_readonly.md", b"local edit\n").unwrap();
+
+        let mut la = Session::new(Role::Listener, &a, ctx(), nid(2), Vec::new());
+        let mut cb = Session::new(Role::Connector, &b, ctx(), nid(1), Vec::new());
+        pump(&a, &mut la, &b, &mut cb);
+
+        assert!(la.authed() && cb.authed(), "connection stays up");
+        assert!(std::fs::read(db.path().join("from_source.md")).is_ok(), "read-only peer pulls the source's file");
+        assert!(
+            a.store.file_id_for_path("from_readonly.md").unwrap().is_none(),
+            "the read-only peer's push never materializes at the source",
+        );
+        // And it is not merely hidden — the row itself never entered the source's log.
+        let a_has_readonly_row = a.store.all_rows().unwrap().iter().any(|r| r.site_id == b.site_id());
+        assert!(!a_has_readonly_row, "no row authored by the read-only peer reached the source's log");
     }
 
     #[test]

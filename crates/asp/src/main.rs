@@ -166,8 +166,21 @@ enum Cmd {
     Commit,
     /// Generate / show the node's SSH public key.
     Key,
-    /// Authorize a peer public key in the admission table.
-    Authorize { pubkey: String, #[arg(long)] ttl: Option<String> },
+    /// Authorize a peer public key in the admission table. Scoped-sync grants
+    /// (scoped-sync §3.7): `--subdir PATH` (repeatable) limits what the peer
+    /// receives to those path prefixes; `--read-only` forbids it pushing changes.
+    Authorize {
+        pubkey: String,
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Restrict this peer to a subdirectory (path prefix). Repeatable; omit for
+        /// the whole vault. A peer granted `--subdir` receives only in-scope files.
+        #[arg(long = "subdir")]
+        subdir: Vec<String>,
+        /// Forbid this peer from pushing file changes to us (one-way / pull-only).
+        #[arg(long = "read-only")]
+        read_only: bool,
+    },
     /// Revoke a peer (by OpenSSH line or hex node id).
     Revoke { pubkey: String },
     /// Inspect / extend the admission table.
@@ -383,11 +396,27 @@ async fn run(cli: Cli) -> Result<()> {
             println!("captured {} change(s)", rows.len());
             Ok(())
         }
-        Cmd::Authorize { pubkey, ttl } => {
+        Cmd::Authorize { pubkey, ttl, subdir, read_only } => {
             let engine = open_engine(&cli)?;
             let (expires_at, never) = resolve_ttl(ttl.as_deref(), &engine, &cli)?;
-            let node = engine.authorize(pubkey, expires_at, never, "cli").map_err(|e| anyhow!("authorize: {e}"))?;
-            println!("authorized {}", &node.to_hex()[..16]);
+            // Normalize `--subdir` prefixes to forward-slash, strip leading/trailing
+            // slashes; an empty list = the whole vault (allowed_paths=None).
+            let allowed: Vec<String> = subdir
+                .iter()
+                .map(|s| s.replace('\\', "/").trim_matches('/').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let allowed_paths = if allowed.is_empty() { None } else { Some(allowed) };
+            let node = engine
+                .authorize_with_policy(pubkey, expires_at, never, "cli", allowed_paths.clone(), *read_only)
+                .map_err(|e| anyhow!("authorize: {e}"))?;
+            let scope = match (&allowed_paths, read_only) {
+                (Some(p), true) => format!(" (read-only, subdir: {})", p.join(", ")),
+                (Some(p), false) => format!(" (subdir: {})", p.join(", ")),
+                (None, true) => " (read-only)".to_string(),
+                (None, false) => String::new(),
+            };
+            println!("authorized {}{}", &node.to_hex()[..16], scope);
             Ok(())
         }
         Cmd::Revoke { pubkey } => {
