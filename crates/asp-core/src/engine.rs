@@ -688,6 +688,7 @@ impl Engine {
         // reopen skips re-hashing it.
         let mut aspignore_changed = false;
         let mut fs_updates: Vec<(String, i64, i64, String)> = Vec::new();
+        let _t_writetree = std::time::Instant::now();
         // Decide which files even need consideration on this thread (cheap `exists`
         // stat skips unchanged files without touching sqlite), and ensure every
         // parent dir up front — deduped, so `create_dir_all`'s stat/mkdir syscalls
@@ -817,6 +818,7 @@ impl Engine {
             fs_updates = fs_updates_out.into_inner().expect("out poisoned");
         }
         self.store.upsert_fs_stat(&fs_updates)?;
+        tracing::debug!(ms = _t_writetree.elapsed().as_millis() as u64, files = to_process.len(), "materialize: write-tree phase");
 
         // Materialize empty directories (the content-free dir entities).
         for path in &desired_dirs {
@@ -849,7 +851,9 @@ impl Engine {
         // desktop app turns it off; the CLI keeps it on so `asp git` stays current).
         if self.export_git.get() {
             let derived_time = self.store.max_lamport()?;
+            let _t_export = std::time::Instant::now();
             self.export_git_tree(&hashes, derived_time);
+            tracing::debug!(ms = _t_export.elapsed().as_millis() as u64, files = hashes.len(), "materialize: export_git phase");
         }
 
         Ok(hashes)
@@ -867,6 +871,17 @@ impl Engine {
     /// cache, so an unchanged file is never re-read/re-hashed into the git store.
     /// Best-effort: a git-store hiccup never fails a write.
     fn export_git_tree(&self, entries: &BTreeMap<String, String>, derived_time: u64) {
+        // Pre-warm the derived git blob objects across a worker pool. Encoding a git
+        // blob (frame → sha1 → zlib deflate → write loose object) is the dominant
+        // cost of a fresh clone's export — ~15s single-threaded for thunderbird's
+        // 867 MB / 41k files — and it is pure per-blob CPU. Blob objects are
+        // content-addressed, so computing them in any order and writing them
+        // independently yields the identical `.asp/git` object store; the tree/commit
+        // SHAs are still built sequentially below (frozen-identity path unchanged).
+        // Best-effort: a prewarm hiccup falls through to the sequential closure.
+        if let Err(e) = self.prewarm_git_blobs(entries) {
+            tracing::debug!(error = %e, "git export blob prewarm failed; falling back to sequential encode");
+        }
         let git_dir = &self.git_dir;
         let store = &self.store;
         let cache = &self.git_oids;
@@ -899,6 +914,122 @@ impl Engine {
             cache.borrow_mut().insert(content_hash.to_string(), oid);
             Ok(oid)
         });
+    }
+
+    /// Compute + persist the derived git blob object for every content hash in
+    /// `entries` that isn't already resolved, across a worker pool. The sqlite
+    /// handle is `!Sync`, so a single producer thread fetches each blob's raw bytes
+    /// (a memcpy) and streams them over a bounded channel; the workers do the
+    /// expensive per-blob CPU — frame + sha1 + zlib deflate + write the loose object
+    /// (`write_blob_object` is content-addressed and skips an object that already
+    /// exists, so concurrent writers never collide). Resolved oids are persisted to
+    /// `git_blobs` in one batch and seeded into the in-memory memo, so the
+    /// sequential `gitexport::export` that follows is all cache hits (no re-fetch, no
+    /// re-encode). Bounded backpressure keeps peak memory to a handful of blobs.
+    fn prewarm_git_blobs(&self, entries: &BTreeMap<String, String>) -> AspResult<()> {
+        use std::sync::mpsc::sync_channel;
+        use std::sync::Mutex;
+
+        // Distinct content hashes still needing a git blob object (skip the in-memory
+        // memo; the durable `git_blobs` cache is consulted on the producer thread).
+        let need: Vec<String> = {
+            let cache = self.git_oids.borrow();
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut v: Vec<String> = Vec::new();
+            for h in entries.values() {
+                if cache.contains_key(h) {
+                    continue;
+                }
+                if seen.insert(h.as_str()) {
+                    v.push(h.clone());
+                }
+            }
+            v
+        };
+        if need.is_empty() {
+            return Ok(());
+        }
+
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8);
+        let git_dir = &self.git_dir;
+        let store = &self.store;
+        let (tx, rx) = sync_channel::<(String, Vec<u8>)>(workers * 4);
+        let rx = Mutex::new(rx);
+        let resolved: Mutex<Vec<(String, [u8; 20])>> = Mutex::new(Vec::new());
+        let worker_err: Mutex<Option<AspError>> = Mutex::new(None);
+
+        let read_err: AspResult<()> = std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let item = { rx.lock().expect("rx poisoned").recv() };
+                    let Ok((h, bytes)) = item else { break };
+                    match gitexport::write_blob_object(git_dir, &bytes) {
+                        Ok(oid) => resolved.lock().expect("resolved poisoned").push((h, oid)),
+                        Err(e) => {
+                            let mut slot = worker_err.lock().expect("err poisoned");
+                            if slot.is_none() {
+                                *slot = Some(e);
+                            }
+                        }
+                    }
+                });
+            }
+            // Producer: this (sqlite-owning) thread resolves each hash from the durable
+            // cache or fetches its raw bytes and hands the encode to a worker.
+            let mut err: AspResult<()> = Ok(());
+            let mut cached: Vec<(String, [u8; 20])> = Vec::new();
+            for h in &need {
+                match store.git_oid_for(h) {
+                    Ok(Some(hex)) => {
+                        if let Ok(b) = hex::decode(&hex) {
+                            if b.len() == 20 {
+                                let mut o = [0u8; 20];
+                                o.copy_from_slice(&b);
+                                cached.push((h.clone(), o));
+                                continue;
+                            }
+                        }
+                        // Malformed durable oid — recompute from bytes (fall through).
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        err = Err(e);
+                        break;
+                    }
+                }
+                match store.get_blob(h) {
+                    Ok(b) => {
+                        if tx.send((h.clone(), b.unwrap_or_default())).is_err() {
+                            break; // workers gone (they only exit on channel close)
+                        }
+                    }
+                    Err(e) => {
+                        err = Err(e);
+                        break;
+                    }
+                }
+            }
+            drop(tx);
+            if !cached.is_empty() {
+                resolved.lock().expect("resolved poisoned").extend(cached);
+            }
+            err
+        });
+
+        read_err?;
+        if let Some(e) = worker_err.into_inner().expect("err poisoned") {
+            return Err(e);
+        }
+
+        // Persist the newly-encoded oids in one transaction and seed the memo.
+        let oids = resolved.into_inner().expect("resolved poisoned");
+        let hexed: Vec<(String, String)> = oids.iter().map(|(h, o)| (h.clone(), hex::encode(o))).collect();
+        self.store.put_git_oids(hexed.iter().map(|(h, o)| (h.as_str(), o.as_str())))?;
+        let mut cache = self.git_oids.borrow_mut();
+        for (h, o) in oids {
+            cache.insert(h, o);
+        }
+        Ok(())
     }
 
     /// Incremental-materialize fast path for a LOCAL LINEAR EDIT: an `Edit` row

@@ -510,6 +510,23 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Batch-insert `(content_hash, git_oid)` pairs in ONE transaction — the derived
+    /// git export computes every blob's oid in parallel then persists them here in
+    /// bulk (far cheaper than N autocommitted inserts on a fresh clone's 41k blobs).
+    pub fn put_git_oids<'a>(&self, pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> AspResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO git_blobs(content_hash, git_oid) VALUES(?1,?2) ON CONFLICT(content_hash) DO NOTHING",
+            )?;
+            for (content_hash, git_oid) in pairs {
+                stmt.execute(params![content_hash, git_oid])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Next Lamport tick = max(observed) + 1, derived from the durable log.
     pub fn next_lamport(&self, observed: u64) -> AspResult<u64> {
         let max_log: i64 = self
