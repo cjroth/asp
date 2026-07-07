@@ -482,24 +482,23 @@ impl Engine {
             if !wr.row.id_valid() {
                 return Err(AspError::Protocol("row id does not match its contents".into()));
             }
-            for b in &wr.blobs {
-                let h = self.store.put_blob(&b.bytes)?;
-                if h != b.hash {
-                    return Err(AspError::Protocol("blob hash mismatch".into()));
-                }
-            }
         }
-        let mut flags = Vec::with_capacity(wrs.len());
+        // Persist bundled blobs (content-hash verified) then append rows, each in
+        // ONE transaction — without it every INSERT auto-commits its own WAL
+        // transaction, and at ~41k rows + ~41k blobs those ~82k fsync'd commits
+        // dominated a large git clone's "saving" phase (see SqliteStore::append_rows
+        // / put_blobs, and replace_files for the same pattern).
+        self.store
+            .put_blobs(wrs.iter().flat_map(|wr| wr.blobs.iter().map(|b| (b.hash.as_str(), b.bytes.as_slice()))))?;
+        let flags = self.store.append_rows(wrs.iter().map(|wr| &wr.row))?;
         let mut any = false;
         let mut any_branch = false;
-        for wr in wrs {
-            let added = self.store.append_row(&wr.row)?;
+        for (wr, &added) in wrs.iter().zip(flags.iter()) {
             if added {
                 any = true;
                 any_branch |= wr.row.kind == Kind::Branch;
                 self.note_dirty(&wr.row.file_id);
             }
-            flags.push(added);
         }
         if any_branch {
             self.reconcile_branches()?;
@@ -646,37 +645,122 @@ impl Engine {
         // reopen skips re-hashing it.
         let mut aspignore_changed = false;
         let mut fs_updates: Vec<(String, i64, i64, String)> = Vec::new();
-        for (path, h) in &hashes {
-            let abs = self.root.join(path);
-            let unchanged = prev_hash.get(path).map(|ph| ph.as_deref() == Some(h.as_str())).unwrap_or(false);
-            if unchanged && abs.exists() {
-                continue;
-            }
-            let bytes = self.store.get_blob(h)?.unwrap_or_default();
-            let differs = match fs::read(&abs) {
-                Ok(cur) => cur != bytes,
-                Err(_) => true,
-            };
-            if differs {
-                if path == ".aspignore" {
-                    aspignore_changed = true;
+        // Decide which files even need consideration on this thread (cheap `exists`
+        // stat skips unchanged files without touching sqlite), and ensure every
+        // parent dir up front — deduped, so `create_dir_all`'s stat/mkdir syscalls
+        // aren't repeated per sibling on a big initial materialize (a 41k-file clone).
+        // A dir could be removed externally between materializes, so this dedup is
+        // per-call only and never persisted.
+        let mut to_process: Vec<(String, PathBuf, String)> = Vec::with_capacity(hashes.len());
+        {
+            let mut made_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+            for (path, h) in &hashes {
+                let abs = self.root.join(path);
+                let unchanged = prev_hash.get(path).map(|ph| ph.as_deref() == Some(h.as_str())).unwrap_or(false);
+                if unchanged && abs.exists() {
+                    continue;
                 }
                 if let Some(parent) = abs.parent() {
-                    fs::create_dir_all(parent)?;
+                    if !made_dirs.contains(parent) {
+                        fs::create_dir_all(parent)?;
+                        made_dirs.insert(parent.to_path_buf());
+                    }
                 }
-                let tmp = abs.with_extension(format!("asp-tmp-{}", now_unix()));
-                fs::write(&tmp, &bytes)?;
-                fs::rename(&tmp, &abs)?;
-                if let Ok(md) = fs::metadata(&abs) {
-                    let mtime_ns = md
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_nanos() as i64)
-                        .unwrap_or(0);
-                    fs_updates.push((path.clone(), mtime_ns, md.len() as i64, h.clone()));
-                }
+                to_process.push((path.clone(), abs, h.clone()));
             }
+        }
+
+        // Overlap sqlite blob reads with disk writes: this (the sqlite-owning) thread
+        // streams (path, abs, bytes, hash) tuples through a bounded channel to a pool
+        // of writer threads that do the differ-check + atomic tmp-write/rename + stat.
+        // Deterministic OUTCOME (same files, same contents, same skips); only the write
+        // ORDER varies. The engine's sqlite handle is `!Sync`, so reads stay on this
+        // thread; the bound gives backpressure so we never buffer the whole tree.
+        if !to_process.is_empty() {
+            use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+            use std::sync::mpsc::sync_channel;
+            use std::sync::Mutex;
+
+            const WRITER_THREADS: usize = 4;
+            let (tx, rx) = sync_channel::<(String, PathBuf, Vec<u8>, String)>(WRITER_THREADS * 4);
+            let rx = Mutex::new(rx);
+            let fs_updates_out: Mutex<Vec<(String, i64, i64, String)>> = Mutex::new(Vec::new());
+            let aspignore_hit = AtomicBool::new(false);
+            let writer_err: Mutex<Option<AspError>> = Mutex::new(None);
+            // Unique tmp suffix per write, so two siblings whose `with_extension` tmp
+            // names would otherwise collide (same second) can't clobber each other.
+            let tmp_seq = AtomicU64::new(0);
+
+            let read_err: AspResult<()> = std::thread::scope(|scope| {
+                for _ in 0..WRITER_THREADS {
+                    scope.spawn(|| {
+                        loop {
+                            let item = { rx.lock().expect("rx poisoned").recv() };
+                            let Ok((path, abs, bytes, h)) = item else { break };
+                            let differs = match fs::read(&abs) {
+                                Ok(cur) => cur != bytes,
+                                Err(_) => true,
+                            };
+                            if !differs {
+                                continue;
+                            }
+                            if path == ".aspignore" {
+                                aspignore_hit.store(true, Ordering::Relaxed);
+                            }
+                            let seq = tmp_seq.fetch_add(1, Ordering::Relaxed);
+                            let tmp = abs.with_extension(format!("asp-tmp-{}-{seq}", now_unix()));
+                            let write_res = fs::write(&tmp, &bytes).and_then(|_| fs::rename(&tmp, &abs));
+                            if let Err(e) = write_res {
+                                let mut slot = writer_err.lock().expect("err poisoned");
+                                if slot.is_none() {
+                                    *slot = Some(AspError::from(e));
+                                }
+                                continue;
+                            }
+                            if let Ok(md) = fs::metadata(&abs) {
+                                let mtime_ns = md
+                                    .modified()
+                                    .ok()
+                                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                    .map(|d| d.as_nanos() as i64)
+                                    .unwrap_or(0);
+                                fs_updates_out
+                                    .lock()
+                                    .expect("out poisoned")
+                                    .push((path, mtime_ns, md.len() as i64, h));
+                            }
+                        }
+                    });
+                }
+                // Producer: read blobs on this thread and feed the writers. Always drop
+                // `tx` before returning so the writers' `recv()` unblocks (else the
+                // scope join deadlocks).
+                let mut err: AspResult<()> = Ok(());
+                for (path, abs, h) in &to_process {
+                    match self.store.get_blob(h) {
+                        Ok(b) => {
+                            if tx.send((path.clone(), abs.clone(), b.unwrap_or_default(), h.clone())).is_err() {
+                                break; // all writers gone (they only exit on error)
+                            }
+                        }
+                        Err(e) => {
+                            err = Err(e);
+                            break;
+                        }
+                    }
+                }
+                drop(tx);
+                err
+            });
+
+            read_err?;
+            if let Some(e) = writer_err.into_inner().expect("err poisoned") {
+                return Err(e);
+            }
+            if aspignore_hit.load(Ordering::Relaxed) {
+                aspignore_changed = true;
+            }
+            fs_updates = fs_updates_out.into_inner().expect("out poisoned");
         }
         self.store.upsert_fs_stat(&fs_updates)?;
 

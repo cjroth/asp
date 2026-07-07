@@ -36,7 +36,7 @@
 //!   their resulting path (`to` for a rename, `path` otherwise). Paths are UTF-8
 //!   (lossily decoded); sorting is over the UTF-8 bytes (identical to git's bytewise
 //!   order for valid UTF-8 — see the open question in the module tests).
-//! * **Exact-rename pairing** ([`diff_trees`]): when one blob oid vanishes at several
+//! * **Exact-rename pairing** ([`finalize_diff_ops`]): when one blob oid vanishes at several
 //!   paths and appears at several, delete/create sides are paired in **bytewise path
 //!   order** (sorted deletes zipped with sorted creates); leftovers stay Delete/Create.
 
@@ -690,15 +690,35 @@ fn parse_merge_branch(s: &str) -> Option<String> {
 // Tree snapshots & first-parent diff
 // ===========================================================================
 
-/// A fully-expanded flat view of a commit's tree.
-#[derive(Default, Clone)]
-struct Snapshot {
-    /// path → (blob sha, mode) for Normal/Executable/Symlink leaves.
-    blobs: BTreeMap<String, (String, EntryMode)>,
-    /// path → gitlink target commit sha.
-    gitlinks: BTreeMap<String, String>,
-    /// every directory path in the tree.
-    dirs: BTreeSet<String>,
+/// The leaf [`EntryMode`] for a git tree entry kind, or `None` for trees / gitlinks
+/// (which are not blob leaves).
+fn leaf_mode(kind: gix_object::tree::EntryKind) -> Option<EntryMode> {
+    use gix_object::tree::EntryKind::*;
+    match kind {
+        Blob => Some(EntryMode::Normal),
+        BlobExecutable => Some(EntryMode::Executable),
+        Link => Some(EntryMode::Symlink),
+        Tree | Commit => None,
+    }
+}
+
+/// A tree entry's raw name as bytes (deref-coerced from `&BStr`), borrowed from the
+/// underlying object bytes so it can key a lookup map across the diff.
+fn entry_name<'a>(e: &gix_object::tree::EntryRef<'a>) -> &'a [u8] {
+    e.filename
+}
+
+/// Raw changed leaves accumulated by the recursive tree diff, before rename pairing.
+#[derive(Default)]
+struct DiffAccum {
+    /// (path, blob sha, mode) present only in the parent tree.
+    deletes: Vec<(String, String, EntryMode)>,
+    /// (path, blob sha, mode) present only in the child tree.
+    creates: Vec<(String, String, EntryMode)>,
+    /// Ready-made [`FileOp::Edit`]s (path in both, content and/or mode differ).
+    edits: Vec<FileOp>,
+    /// Paths of new, blob-less directories (a child subtree with no blob descendants).
+    dir_creates: Vec<String>,
 }
 
 fn join_path(prefix: &str, name: &[u8]) -> String {
@@ -711,71 +731,283 @@ fn join_path(prefix: &str, name: &[u8]) -> String {
 }
 
 impl GitObjectDb {
-    /// Recursively expand `tree_sha` into a flat [`Snapshot`].
-    fn snapshot_of_tree(&self, tree_sha: &str) -> Result<Snapshot, GitImportError> {
-        let mut snap = Snapshot::default();
-        self.walk_tree(tree_sha, "", &mut snap)?;
-        Ok(snap)
+    /// Record a child blob leaf as a create, plus an LFS notice if it is a pointer.
+    /// `is_lfs_pointer` is gated on the mode exactly as the old flat scan (symlinks are
+    /// never LFS-checked).
+    fn note_added_blob(
+        &self,
+        path: String,
+        sha: String,
+        mode: EntryMode,
+        creates: &mut Vec<(String, String, EntryMode)>,
+        lfs_paths: &mut BTreeSet<String>,
+    ) {
+        if matches!(mode, EntryMode::Normal | EntryMode::Executable) && is_lfs_pointer(self, &sha) {
+            lfs_paths.insert(path.clone());
+        }
+        creates.push((path, sha, mode));
     }
 
-    fn walk_tree(&self, tree_sha: &str, prefix: &str, snap: &mut Snapshot) -> Result<(), GitImportError> {
+    /// Walk a wholly-new child subtree (`tree_sha` at `prefix`): emit a create for every
+    /// blob leaf, a gitlink warning for every submodule, an LFS notice for every pointer
+    /// blob, and a [`FileOp::DirCreate`] for every blob-less directory strictly inside
+    /// it. Returns whether the subtree has any blob descendant, so the caller decides the
+    /// DirCreate for its root. This is the O(added-content) walk that fronts a root /
+    /// depth-cut snapshot / out-of-plan-parent commit.
+    fn walk_added_subtree(
+        &self,
+        tree_sha: &str,
+        prefix: &str,
+        acc: &mut DiffAccum,
+        gitlink_warns: &mut BTreeMap<String, String>,
+        lfs_paths: &mut BTreeSet<String>,
+    ) -> Result<bool, GitImportError> {
         let tree = self.tree(tree_sha)?;
-        for e in tree.entries {
+        let mut has_blob = false;
+        for e in &tree.entries {
             let path = join_path(prefix, e.filename);
+            let oid = e.oid.to_hex().to_string();
             use gix_object::tree::EntryKind::*;
             match e.mode.kind() {
                 Tree => {
-                    snap.dirs.insert(path.clone());
-                    self.walk_tree(&e.oid.to_hex().to_string(), &path, snap)?;
-                }
-                Blob => {
-                    snap.blobs.insert(path, (e.oid.to_hex().to_string(), EntryMode::Normal));
-                }
-                BlobExecutable => {
-                    snap.blobs.insert(path, (e.oid.to_hex().to_string(), EntryMode::Executable));
-                }
-                Link => {
-                    snap.blobs.insert(path, (e.oid.to_hex().to_string(), EntryMode::Symlink));
+                    let child_has = self.walk_added_subtree(&oid, &path, acc, gitlink_warns, lfs_paths)?;
+                    if !child_has {
+                        acc.dir_creates.push(path);
+                    }
+                    has_blob |= child_has;
                 }
                 Commit => {
-                    snap.gitlinks.insert(path, e.oid.to_hex().to_string());
+                    gitlink_warns.entry(path).or_insert(oid);
+                }
+                _ => {
+                    let mode = leaf_mode(e.mode.kind()).expect("blob leaf");
+                    self.note_added_blob(path, oid, mode, &mut acc.creates, lfs_paths);
+                    has_blob = true;
+                }
+            }
+        }
+        Ok(has_blob)
+    }
+
+    /// Walk a wholly-removed parent subtree: emit a delete for every blob leaf. Gitlinks
+    /// and directories produce no ops (ASP has no submodule / directory-delete op — an
+    /// emptied directory is implied by its files' deletes).
+    fn walk_removed_subtree(
+        &self,
+        tree_sha: &str,
+        prefix: &str,
+        acc: &mut DiffAccum,
+    ) -> Result<(), GitImportError> {
+        let tree = self.tree(tree_sha)?;
+        for e in &tree.entries {
+            let path = join_path(prefix, e.filename);
+            use gix_object::tree::EntryKind::*;
+            match e.mode.kind() {
+                Tree => self.walk_removed_subtree(&e.oid.to_hex().to_string(), &path, acc)?,
+                Commit => {}
+                _ => {
+                    let mode = leaf_mode(e.mode.kind()).expect("blob leaf");
+                    acc.deletes.push((path, e.oid.to_hex().to_string(), mode));
                 }
             }
         }
         Ok(())
     }
-}
 
-/// Diff `parent` → `child` into canonical-ordered [`FileOp`]s (git-bridge §3.1).
-/// Gitlinks produce no ops (surfaced as warnings by the caller).
-fn diff_trees(parent: &Snapshot, child: &Snapshot) -> Vec<FileOp> {
-    let mut ops: Vec<FileOp> = Vec::new();
+    /// Recursively diff two DIFFERING trees git-style — **skipping equal-oid subtrees** —
+    /// accumulating exactly the changed-entry set the old flat diff produced. Reads tree
+    /// objects straight from the db and recurses only into subtrees whose oid differs, so
+    /// the cost is O(changed entries × depth), never O(tree). Gitlink/LFS warnings are
+    /// collected from the child side of each change: this is equivalent to the old
+    /// full-tree scan because the earliest commit (canonical order) to contain an entry
+    /// is also the earliest whose first-parent diff introduces it (parents precede
+    /// children), and both use `or_insert` / set-membership semantics.
+    fn collect_tree_diff(
+        &self,
+        parent_tree: &str,
+        child_tree: &str,
+        prefix: &str,
+        acc: &mut DiffAccum,
+        gitlink_warns: &mut BTreeMap<String, String>,
+        lfs_paths: &mut BTreeSet<String>,
+    ) -> Result<(), GitImportError> {
+        use gix_object::tree::EntryKind::*;
+        let ptree = self.tree(parent_tree)?;
+        // Index parent entries by raw name; matched child entries consume them, and the
+        // leftovers are deletes. The `&[u8]` keys and `EntryRef` values borrow the tree
+        // object bytes (owned by the db), so they outlive this call.
+        let mut p_by_name: HashMap<&[u8], gix_object::tree::EntryRef<'_>> =
+            HashMap::with_capacity(ptree.entries.len());
+        for e in &ptree.entries {
+            p_by_name.insert(entry_name(e), *e);
+        }
 
-    // --- collect raw deletes / creates / edits over blob leaves ---
-    let mut deletes: Vec<(String, String, EntryMode)> = Vec::new(); // (path, sha, mode) — from parent side
-    let mut creates: Vec<(String, String, EntryMode)> = Vec::new(); // (path, sha, mode) — from child side
-
-    for (path, (sha, mode)) in &parent.blobs {
-        match child.blobs.get(path) {
-            None => deletes.push((path.clone(), sha.clone(), *mode)),
-            Some((csha, cmode)) => {
-                if csha != sha || cmode != mode {
-                    ops.push(FileOp::Edit {
-                        path: path.clone(),
-                        old_blob_sha: sha.clone(),
-                        blob_sha: csha.clone(),
-                        mode: *cmode,
-                        old_mode: *mode,
-                    });
+        let ctree = self.tree(child_tree)?;
+        for ce in &ctree.entries {
+            let path = join_path(prefix, ce.filename);
+            let coid = ce.oid.to_hex().to_string();
+            let ck = ce.mode.kind();
+            match p_by_name.remove(entry_name(ce)) {
+                None => match ck {
+                    // Brand-new name in the child.
+                    Tree => {
+                        let hb = self.walk_added_subtree(&coid, &path, acc, gitlink_warns, lfs_paths)?;
+                        if !hb {
+                            acc.dir_creates.push(path);
+                        }
+                    }
+                    Commit => {
+                        gitlink_warns.entry(path).or_insert(coid);
+                    }
+                    _ => {
+                        let mode = leaf_mode(ck).expect("blob leaf");
+                        self.note_added_blob(path, coid, mode, &mut acc.creates, lfs_paths);
+                    }
+                },
+                Some(pe) => {
+                    let poid = pe.oid.to_hex().to_string();
+                    match (pe.mode.kind(), ck) {
+                        (Tree, Tree) => {
+                            if poid != coid {
+                                self.collect_tree_diff(&poid, &coid, &path, acc, gitlink_warns, lfs_paths)?;
+                            }
+                        }
+                        (Commit, Commit) => {
+                            // Both gitlinks: a changed target re-notes (`or_insert` keeps
+                            // the earliest); an identical one was noted upstream already.
+                            if poid != coid {
+                                gitlink_warns.entry(path).or_insert(coid);
+                            }
+                        }
+                        (Tree, Commit) => {
+                            self.walk_removed_subtree(&poid, &path, acc)?;
+                            gitlink_warns.entry(path).or_insert(coid);
+                        }
+                        (Tree, _) => {
+                            // directory → blob leaf
+                            self.walk_removed_subtree(&poid, &path, acc)?;
+                            let mode = leaf_mode(ck).expect("blob leaf");
+                            self.note_added_blob(path, coid, mode, &mut acc.creates, lfs_paths);
+                        }
+                        (Commit, Tree) => {
+                            let hb = self.walk_added_subtree(&coid, &path, acc, gitlink_warns, lfs_paths)?;
+                            if !hb {
+                                acc.dir_creates.push(path);
+                            }
+                        }
+                        (_, Tree) => {
+                            // blob leaf → directory
+                            let mode = leaf_mode(pe.mode.kind()).expect("blob leaf");
+                            acc.deletes.push((path.clone(), poid, mode));
+                            let hb = self.walk_added_subtree(&coid, &path, acc, gitlink_warns, lfs_paths)?;
+                            if !hb {
+                                acc.dir_creates.push(path);
+                            }
+                        }
+                        (Commit, _) => {
+                            // gitlink → blob leaf: the vanished gitlink was noted where it
+                            // was introduced; the blob is a plain create.
+                            let mode = leaf_mode(ck).expect("blob leaf");
+                            self.note_added_blob(path, coid, mode, &mut acc.creates, lfs_paths);
+                        }
+                        (_, Commit) => {
+                            // blob leaf → gitlink: delete the blob, note the submodule.
+                            let mode = leaf_mode(pe.mode.kind()).expect("blob leaf");
+                            acc.deletes.push((path.clone(), poid, mode));
+                            gitlink_warns.entry(path).or_insert(coid);
+                        }
+                        (_, _) => {
+                            // both blob leaves (Normal / Executable / Symlink, any mix)
+                            let cmode = leaf_mode(ck).expect("blob leaf");
+                            let pmode = leaf_mode(pe.mode.kind()).expect("blob leaf");
+                            if poid != coid || pmode != cmode {
+                                acc.edits.push(FileOp::Edit {
+                                    path: path.clone(),
+                                    old_blob_sha: poid,
+                                    blob_sha: coid.clone(),
+                                    mode: cmode,
+                                    old_mode: pmode,
+                                });
+                                if matches!(cmode, EntryMode::Normal | EntryMode::Executable)
+                                    && is_lfs_pointer(self, &coid)
+                                {
+                                    lfs_paths.insert(path);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
-    }
-    for (path, (sha, mode)) in &child.blobs {
-        if !parent.blobs.contains_key(path) {
-            creates.push((path.clone(), sha.clone(), *mode));
+
+        // Parent entries with no child counterpart: removed.
+        for (name, pe) in p_by_name {
+            let path = join_path(prefix, name);
+            match pe.mode.kind() {
+                Tree => self.walk_removed_subtree(&pe.oid.to_hex().to_string(), &path, acc)?,
+                Commit => {}
+                _ => {
+                    let mode = leaf_mode(pe.mode.kind()).expect("blob leaf");
+                    acc.deletes.push((path, pe.oid.to_hex().to_string(), mode));
+                }
+            }
         }
+        Ok(())
     }
+
+    /// The first-parent tree diff for one commit. `parent_tree` is `None` for a root /
+    /// depth-cut snapshot / out-of-plan first parent (diff against the empty tree).
+    /// Produces [`FileOp`]s in the frozen canonical order (byte-identical to the old flat
+    /// diff for every input) and records gitlink/LFS warnings for the child.
+    fn diff_commit_trees(
+        &self,
+        parent_tree: Option<&str>,
+        child_tree: &str,
+        gitlink_warns: &mut BTreeMap<String, String>,
+        lfs_paths: &mut BTreeSet<String>,
+    ) -> Result<Vec<FileOp>, GitImportError> {
+        let mut acc = DiffAccum::default();
+        match parent_tree {
+            // Diff vs empty: the whole child tree is added. The root path "" was never a
+            // tracked dir in the flat model, so its DirCreate is intentionally not emitted.
+            None => {
+                self.walk_added_subtree(child_tree, "", &mut acc, gitlink_warns, lfs_paths)?;
+            }
+            // Identical trees → no changes and no warnings (already noted upstream).
+            Some(pt) if pt == child_tree => {}
+            Some(pt) => {
+                self.collect_tree_diff(pt, child_tree, "", &mut acc, gitlink_warns, lfs_paths)?;
+            }
+        }
+        let ops = finalize_diff_ops(acc);
+        // An exact rename moves a blob to a new path without a create/edit — but the old
+        // full-tree scan recorded the pointer's NEW path too, so post-scan the renames to
+        // keep the LfsPointers warning byte-identical (the `from` path was already
+        // recorded when the pointer was introduced).
+        for op in &ops {
+            if let FileOp::RenameExact { to, blob_sha, mode, .. } = op {
+                if matches!(mode, EntryMode::Normal | EntryMode::Executable)
+                    && is_lfs_pointer(self, blob_sha)
+                {
+                    lfs_paths.insert(to.clone());
+                }
+            }
+        }
+        Ok(ops)
+    }
+}
+
+/// Turn the accumulated changed leaves into canonical [`FileOp`]s (git-bridge §3.1):
+/// pair exact renames (same blob oid deleted at one path, created at another) in
+/// bytewise path order, emit leftovers as Delete/Create, append the new empty
+/// directories, then sort bytewise by result path. The push order (edits → renames →
+/// deletes → creates → dir-creates) plus the stable final sort reproduce the old flat
+/// `diff_trees` ordering byte-for-byte — in particular a `Delete(P)` still precedes a
+/// colliding `DirCreate(P)` (a blob replaced by an empty dir). Gitlinks produce no ops.
+fn finalize_diff_ops(acc: DiffAccum) -> Vec<FileOp> {
+    let DiffAccum { deletes, creates, mut edits, dir_creates } = acc;
+    let mut ops: Vec<FileOp> = Vec::new();
+    ops.append(&mut edits);
 
     // --- exact-rename pairing: same blob oid deleted at one path, created at another ---
     // Group by blob sha; within a sha, pair sorted-deletes with sorted-creates in
@@ -822,16 +1054,9 @@ fn diff_trees(parent: &Snapshot, child: &Snapshot) -> Vec<FileOp> {
         }
     }
 
-    // --- new empty directories (a tree with no blob descendants in the child) ---
-    for dir in &child.dirs {
-        if parent.dirs.contains(dir) {
-            continue;
-        }
-        let prefix = format!("{dir}/");
-        let has_blob = child.blobs.keys().any(|p| p.starts_with(&prefix));
-        if !has_blob {
-            ops.push(FileOp::DirCreate { path: dir.clone() });
-        }
+    // --- new empty directories (collected during the walk, blob-less child subtrees) ---
+    for dir in dir_creates {
+        ops.push(FileOp::DirCreate { path: dir });
     }
 
     ops.sort_by(|a, b| a.sort_key().cmp(b.sort_key()));
@@ -971,7 +1196,9 @@ pub fn plan_import(
     }
 
     // --- per-commit batches (phase 1) ---
-    let mut snap_cache: HashMap<String, Snapshot> = HashMap::new();
+    // No snapshot cache: each batch diffs its child tree against its first-parent tree
+    // straight out of the db, recursing only into differing subtrees. Memory scales with
+    // the pack, not commits × tree.
     let mut gitlink_warns: BTreeMap<String, String> = BTreeMap::new();
     let mut lfs_paths: BTreeSet<String> = BTreeSet::new();
 
@@ -979,7 +1206,7 @@ pub fn plan_import(
     for sha in &order {
         commits.push(build_commit_batch(
             db, sha, &meta, &included, depth_snapshot.as_deref(), &lane_of, &merges_of,
-            &mut snap_cache, &mut gitlink_warns, &mut lfs_paths,
+            &mut gitlink_warns, &mut lfs_paths,
         )?);
     }
 
@@ -1016,7 +1243,7 @@ pub fn plan_import(
             plan_open_branch(
                 db, ref_name, &btip, &mut emitted, &mut meta, &mut included, &mut lanes,
                 &mut lane_of, &mut merges_of, &mut name_counts, &mut order, &mut commits,
-                &mut snap_cache, &mut gitlink_warns, &mut lfs_paths,
+                &mut gitlink_warns, &mut lfs_paths,
             )?;
         }
     }
@@ -1194,15 +1421,19 @@ fn dedup_name(base: &str, counts: &mut HashMap<String, usize>) -> String {
     }
 }
 
-/// Build one commit's [`PlannedCommit`] batch: cache its tree snapshot, collect
-/// gitlink/LFS warnings, diff against the first parent's tree (empty for a root, a
-/// depth-cut snapshot, or an out-of-plan first parent), and reconstruct the message.
-/// Shared by phase 1 and phase 2 so their per-commit output is provably identical.
+/// Build one commit's [`PlannedCommit`] batch: diff its tree against the first parent's
+/// tree (empty for a root, a depth-cut snapshot, or an out-of-plan first parent),
+/// collecting gitlink/LFS warnings from the changed entries, and reconstruct the
+/// message. Shared by phase 1 and phase 2 so their per-commit output is provably
+/// identical.
 ///
 /// The diff base is the first parent **iff it is in `included`** (the planned set):
 /// this is what makes a phase-2 open-branch commit forking off a phase-1 commit diff
 /// against that real parent tree, while a commit whose first parent was cut by
 /// `--depth` (or is an unrelated/shallow root) snapshots against the empty tree.
+///
+/// The diff reads tree objects directly from the db and skips equal-oid subtrees, so it
+/// is O(changed entries × depth); no snapshot is materialized or cached.
 #[allow(clippy::too_many_arguments)]
 fn build_commit_batch(
     db: &GitObjectDb,
@@ -1212,7 +1443,6 @@ fn build_commit_batch(
     depth_snapshot: Option<&str>,
     lane_of: &HashMap<String, LaneId>,
     merges_of: &HashMap<String, Vec<MergeInfo>>,
-    snap_cache: &mut HashMap<String, Snapshot>,
     gitlink_warns: &mut BTreeMap<String, String>,
     lfs_paths: &mut BTreeSet<String>,
 ) -> Result<PlannedCommit, GitImportError> {
@@ -1220,42 +1450,18 @@ fn build_commit_batch(
     let commit = db.commit(sha)?;
     let tree_sha = commit.tree().to_hex().to_string();
 
-    // Cache expanded snapshots (a parent is reused by its children). Errors
-    // propagate — a missing/corrupt tree must fail the plan, never diff as empty.
-    if !snap_cache.contains_key(sha) {
-        let snap = db.snapshot_of_tree(&tree_sha)?;
-        snap_cache.insert(sha.to_string(), snap);
-    }
-    let child_snap = snap_cache[sha].clone();
-
-    // Collect warnings from this commit's tree.
-    for (p, target) in &child_snap.gitlinks {
-        gitlink_warns.entry(p.clone()).or_insert_with(|| target.clone());
-    }
-    for (p, (bsha, mode)) in &child_snap.blobs {
-        if matches!(mode, EntryMode::Normal | EntryMode::Executable) && is_lfs_pointer(db, bsha) {
-            lfs_paths.insert(p.clone());
-        }
-    }
-
-    // First-parent snapshot: empty for a root / snapshot / out-of-plan parent.
+    // First-parent tree: None (→ diff vs the empty tree) for a root / depth-cut snapshot
+    // / out-of-plan first parent; otherwise the first parent's tree sha.
     let parents = meta.get(sha).map(|(p, _)| p.clone()).unwrap_or_default();
-    let empty_snap = Snapshot::default();
-    let parent_snap: Snapshot = if is_snapshot {
-        empty_snap.clone()
+    let parent_tree: Option<String> = if is_snapshot {
+        None
     } else if let Some(p0) = parents.first().filter(|p| included.contains(*p)) {
-        let p0 = p0.clone();
-        if !snap_cache.contains_key(&p0) {
-            let p0_tree = db.commit(&p0)?.tree().to_hex().to_string();
-            let snap = db.snapshot_of_tree(&p0_tree)?;
-            snap_cache.insert(p0.clone(), snap);
-        }
-        snap_cache[&p0].clone()
+        Some(db.commit(p0)?.tree().to_hex().to_string())
     } else {
-        empty_snap.clone()
+        None
     };
 
-    let ops = diff_trees(&parent_snap, &child_snap);
+    let ops = db.diff_commit_trees(parent_tree.as_deref(), &tree_sha, gitlink_warns, lfs_paths)?;
 
     let author = commit.author().map_err(|e| GitImportError::Decode(e.to_string()))?;
     let committer = commit.committer().map_err(|e| GitImportError::Decode(e.to_string()))?;
@@ -1308,7 +1514,6 @@ fn plan_open_branch(
     name_counts: &mut HashMap<String, usize>,
     order: &mut Vec<String>,
     commits: &mut Vec<PlannedCommit>,
-    snap_cache: &mut HashMap<String, Snapshot>,
     gitlink_warns: &mut BTreeMap<String, String>,
     lfs_paths: &mut BTreeSet<String>,
 ) -> Result<(), GitImportError> {
@@ -1380,7 +1585,7 @@ fn plan_open_branch(
     }
     for sha in &branch_order {
         commits.push(build_commit_batch(
-            db, sha, meta, included, None, lane_of, merges_of, snap_cache, gitlink_warns, lfs_paths,
+            db, sha, meta, included, None, lane_of, merges_of, gitlink_warns, lfs_paths,
         )?);
         order.push(sha.clone());
     }
@@ -1621,21 +1826,21 @@ mod tests {
 
     // --- rename pairing ---------------------------------------------------
 
+    /// The recursive first-parent tree diff between two real git trees, discarding
+    /// warnings (exercised separately). Mirrors what `build_commit_batch` computes.
+    fn tree_diff(db: &GitObjectDb, parent_tree: &str, child_tree: &str) -> Vec<FileOp> {
+        let mut g: BTreeMap<String, String> = BTreeMap::new();
+        let mut l: BTreeSet<String> = BTreeSet::new();
+        db.diff_commit_trees(Some(parent_tree), child_tree, &mut g, &mut l).unwrap()
+    }
+
     #[test]
     fn single_exact_rename() {
         let mut db = GitObjectDb::new();
         let x = mk_blob(&mut db, "content-X");
-        let parent = {
-            let mut s = Snapshot::default();
-            s.blobs.insert("foo.txt".into(), (x.clone(), EntryMode::Normal));
-            s
-        };
-        let child = {
-            let mut s = Snapshot::default();
-            s.blobs.insert("bar.txt".into(), (x.clone(), EntryMode::Normal));
-            s
-        };
-        let ops = diff_trees(&parent, &child);
+        let parent = mk_tree(&mut db, &[("100644", "foo.txt", &x)]);
+        let child = mk_tree(&mut db, &[("100644", "bar.txt", &x)]);
+        let ops = tree_diff(&db, &parent, &child);
         assert_eq!(ops, vec![FileOp::RenameExact {
             from: "foo.txt".into(),
             to: "bar.txt".into(),
@@ -1650,19 +1855,9 @@ mod tests {
         // Pair sorted-deletes with sorted-creates: a->c, b->d.
         let mut db = GitObjectDb::new();
         let x = mk_blob(&mut db, "same");
-        let parent = {
-            let mut s = Snapshot::default();
-            s.blobs.insert("a".into(), (x.clone(), EntryMode::Normal));
-            s.blobs.insert("b".into(), (x.clone(), EntryMode::Normal));
-            s
-        };
-        let child = {
-            let mut s = Snapshot::default();
-            s.blobs.insert("c".into(), (x.clone(), EntryMode::Normal));
-            s.blobs.insert("d".into(), (x.clone(), EntryMode::Normal));
-            s
-        };
-        let ops = diff_trees(&parent, &child);
+        let parent = mk_tree(&mut db, &[("100644", "a", &x), ("100644", "b", &x)]);
+        let child = mk_tree(&mut db, &[("100644", "c", &x), ("100644", "d", &x)]);
+        let ops = tree_diff(&db, &parent, &child);
         let renames: Vec<_> = ops
             .iter()
             .filter_map(|o| match o {
@@ -1677,17 +1872,9 @@ mod tests {
     fn mode_flip_same_content_is_edit() {
         let mut db = GitObjectDb::new();
         let x = mk_blob(&mut db, "#!/bin/sh\n");
-        let parent = {
-            let mut s = Snapshot::default();
-            s.blobs.insert("run".into(), (x.clone(), EntryMode::Normal));
-            s
-        };
-        let child = {
-            let mut s = Snapshot::default();
-            s.blobs.insert("run".into(), (x.clone(), EntryMode::Executable));
-            s
-        };
-        let ops = diff_trees(&parent, &child);
+        let parent = mk_tree(&mut db, &[("100644", "run", &x)]);
+        let child = mk_tree(&mut db, &[("100755", "run", &x)]);
+        let ops = tree_diff(&db, &parent, &child);
         assert_eq!(ops, vec![FileOp::Edit {
             path: "run".into(),
             old_blob_sha: x.clone(),
@@ -1695,6 +1882,63 @@ mod tests {
             mode: EntryMode::Executable,
             old_mode: EntryMode::Normal,
         }]);
+    }
+
+    /// A renamed LFS pointer must surface its NEW path in the LfsPointers warning —
+    /// the old full-tree scan saw the pointer at `to` in the child tree; the recursive
+    /// diff pins that via the post-scan over RenameExact ops.
+    #[test]
+    fn renamed_lfs_pointer_warns_at_both_paths() {
+        let mut db = GitObjectDb::new();
+        let ptr = mk_blob(&mut db, "version https://git-lfs.github.com/spec/v1\noid sha256:aa\nsize 1\n");
+        let t0 = mk_tree(&mut db, &[("100644", "old.bin", &ptr)]);
+        let c0 = mk_commit(&mut db, &t0, &[], 1000, "add pointer");
+        let t1 = mk_tree(&mut db, &[("100644", "new.bin", &ptr)]);
+        let c1 = mk_commit(&mut db, &t1, &[&c0], 1060, "rename pointer");
+        let plan = plan_import(&db, &c1, &ImportOptions::default()).unwrap();
+        assert!(plan.commits.iter().any(|c| c.ops.iter().any(|o| matches!(o,
+            FileOp::RenameExact { from, to, .. } if from == "old.bin" && to == "new.bin"))));
+        assert_eq!(
+            plan.warnings,
+            vec![ImportWarning::LfsPointers {
+                paths: vec!["new.bin".to_string(), "old.bin".to_string()],
+            }]
+        );
+    }
+
+    /// Blob↔directory swaps at the same path: replacing a file with a directory (and
+    /// back) must emit the same delete/create/DirCreate set the flat diff produced.
+    #[test]
+    fn blob_dir_swaps_at_same_path() {
+        let mut db = GitObjectDb::new();
+        let f = mk_blob(&mut db, "file-content");
+        let inner = mk_blob(&mut db, "inner-content");
+        // parent: "x" is a blob. child: "x" is a dir with x/inner.txt.
+        let pt = mk_tree(&mut db, &[("100644", "x", &f)]);
+        let sub = mk_tree(&mut db, &[("100644", "inner.txt", &inner)]);
+        let ct = mk_tree(&mut db, &[("40000", "x", &sub)]);
+        let mut g: BTreeMap<String, String> = BTreeMap::new();
+        let mut l: BTreeSet<String> = BTreeSet::new();
+        let ops = db.diff_commit_trees(Some(&pt), &ct, &mut g, &mut l).unwrap();
+        assert_eq!(ops, vec![
+            FileOp::Delete { path: "x".into() },
+            FileOp::Create { path: "x/inner.txt".into(), blob_sha: inner.clone(), mode: EntryMode::Normal },
+        ]);
+        // dir → blob (the reverse) deletes the subtree's blobs and creates the file.
+        let ops = db.diff_commit_trees(Some(&ct), &pt, &mut g, &mut l).unwrap();
+        assert_eq!(ops, vec![
+            FileOp::Create { path: "x".into(), blob_sha: f.clone(), mode: EntryMode::Normal },
+            FileOp::Delete { path: "x/inner.txt".into() },
+        ]);
+        // blob → EMPTY dir: Delete precedes the colliding DirCreate at the same path
+        // (frozen op order: the flat diff pushed deletes before dir-creates).
+        let empty_tree = db.insert_loose(GitObjKind::Tree, b"").unwrap();
+        let ct_empty = mk_tree(&mut db, &[("40000", "x", &empty_tree)]);
+        let ops = db.diff_commit_trees(Some(&pt), &ct_empty, &mut g, &mut l).unwrap();
+        assert_eq!(ops, vec![
+            FileOp::Delete { path: "x".into() },
+            FileOp::DirCreate { path: "x".into() },
+        ]);
     }
 
     // --- root commit + empty dir -----------------------------------------

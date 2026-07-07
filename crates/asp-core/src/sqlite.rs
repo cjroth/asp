@@ -219,6 +219,56 @@ impl SqliteStore {
         Ok(n > 0)
     }
 
+    /// Append many rows idempotently (dedup by Merkle id) in ONE transaction,
+    /// returning a per-row flag (true = newly added). Mirrors `replace_files`'
+    /// single-transaction + cached-statement pattern: without it every INSERT
+    /// auto-commits its own WAL transaction, and at ~41k rows that per-row commit
+    /// overhead dominated a large git clone's "saving" phase. `unchecked_transaction`
+    /// is safe for the same reason it is there — the engine is single-threaded
+    /// behind its `Mutex`, so there is never a nested/concurrent transaction here.
+    pub fn append_rows<'a>(&self, rows: impl IntoIterator<Item = &'a LogRow>) -> AspResult<Vec<bool>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut flags = Vec::new();
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO log(id, site_id, lamport, seq, ts, file_id, kind, merge_class, parent, base_hash, result_hash, path, branch_id, merge_parent, sig)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            )?;
+            for row in rows {
+                let n = stmt.execute(params![
+                    row.id, row.site_id, row.lamport, row.seq, row.ts, row.file_id,
+                    row.kind.as_str(), row.merge_class.as_str(), row.parent, row.base_hash,
+                    row.result_hash, row.path, row.branch_id, row.merge_parent,
+                    if row.sig.is_empty() { None } else { Some(&row.sig) }
+                ])?;
+                flags.push(n > 0);
+            }
+        }
+        tx.commit()?;
+        Ok(flags)
+    }
+
+    /// Insert many content-addressed blobs in ONE transaction, verifying each
+    /// blob's bytes hash to its declared `hash` (the integrity check `integrate`
+    /// does per blob — preserved here, just batched). Same transaction rationale
+    /// as [`append_rows`](Self::append_rows). Errors `blob hash mismatch` on the
+    /// first blob whose bytes don't match, rolling the batch back.
+    pub fn put_blobs<'a>(&self, blobs: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> AspResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt =
+                tx.prepare_cached("INSERT OR IGNORE INTO blobs(content_hash, bytes) VALUES (?1, ?2)")?;
+            for (hash, bytes) in blobs {
+                if crate::oid::content_hash(bytes) != hash {
+                    return Err(crate::error::AspError::Protocol("blob hash mismatch".into()));
+                }
+                stmt.execute(params![hash, bytes])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn has_row(&self, id: &str) -> AspResult<bool> {
         Ok(self
             .conn

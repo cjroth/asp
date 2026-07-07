@@ -889,13 +889,29 @@ impl GitObjectKind {
             GitObjectKind::Tag => 4,
         }
     }
-    fn from_gix(k: gix_object::Kind) -> Self {
-        match k {
-            gix_object::Kind::Commit => GitObjectKind::Commit,
-            gix_object::Kind::Tree => GitObjectKind::Tree,
-            gix_object::Kind::Blob => GitObjectKind::Blob,
-            gix_object::Kind::Tag => GitObjectKind::Tag,
-        }
+}
+
+/// Map a bridge object kind to the import layer's kind (for feeding a [`GitObjectDb`]).
+///
+/// [`GitObjectDb`]: crate::gitimport::GitObjectDb
+fn import_obj_kind(k: GitObjectKind) -> crate::gitimport::GitObjKind {
+    use crate::gitimport::GitObjKind;
+    match k {
+        GitObjectKind::Commit => GitObjKind::Commit,
+        GitObjectKind::Tree => GitObjKind::Tree,
+        GitObjectKind::Blob => GitObjKind::Blob,
+        GitObjectKind::Tag => GitObjKind::Tag,
+    }
+}
+
+/// The inverse of [`import_obj_kind`].
+fn export_obj_kind(k: crate::gitimport::GitObjKind) -> GitObjectKind {
+    use crate::gitimport::GitObjKind;
+    match k {
+        GitObjKind::Commit => GitObjectKind::Commit,
+        GitObjKind::Tree => GitObjectKind::Tree,
+        GitObjKind::Blob => GitObjectKind::Blob,
+        GitObjKind::Tag => GitObjectKind::Tag,
     }
 }
 
@@ -979,13 +995,6 @@ fn pack_object_count(pack: &[u8]) -> Option<u32> {
 // Local bare object store (.asp/gitremote/<remote_id>/)
 // ===========================================================================
 
-/// Best-effort removal of a staged pack file on drop.
-struct StagedPack<'a>(&'a Path);
-impl Drop for StagedPack<'_> {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(self.0);
-    }
-}
 
 /// Derive the stable per-remote id: `hex(sha256("asp-git-remote/v1" || normalized_url))[..16]`.
 /// Normalization lowercases and strips a trailing `/` and `.git` so `…/repo`,
@@ -1009,22 +1018,36 @@ pub fn remote_id(url: &str) -> String {
 /// ## On-disk layout
 /// ```text
 /// .asp/gitremote/<remote_id>/
-///   objects/       loose objects (git `xx/yyy…`): every fetched commit/tree/blob/tag,
-///                  plus any objects push synthesis authors
+///   packs/         raw fetched packs, named `<seq>-<sha>.pack` in fetch order —
+///                  the durable form for every fetched commit/tree/blob/tag
+///   objects/       loose objects (git `xx/yyy…`): objects push synthesis authors,
+///                  plus any left over from an older (pre-pack) store (back-compat)
 ///   refs.json      { full_ref_name: oid } snapshot of the last-fetched ref state
 /// ```
-/// **Decode tradeoff.** The spec's preferred "store the pack verbatim + a gix-pack
-/// index" path is unavailable here: the pinned `gix-pack` feature set enables `wasm`
-/// (mandatory for the shared wasm build), which compiles out gix-pack's on-disk
-/// index-pack (`bundle::write`, gated `not(wasm)`). So on `record_fetch` we resolve
-/// deltas once via [`gix_pack::data::File::decode_entry`] (ofs-delta, in-pack — which
-/// is exactly what `build_fetch` negotiates) and materialize every object as loose.
-/// This keeps `open` O(1) and random access a plain filesystem read, at the cost of
-/// one inode per object (fine for v1; a verbatim-pack store can revisit this if the
-/// feature pinning ever changes).
+/// **Verbatim packs, decode-on-read.** The spec's preferred "store the pack verbatim
+/// with a gix-pack index" path can't build an index here: the pinned `gix-pack`
+/// feature set enables `wasm` (mandatory for the shared wasm build), which compiles
+/// out gix-pack's on-disk index-pack (`bundle::write`, gated `not(wasm)`). But we
+/// don't need an index. `record_fetch` writes each pack's raw bytes as one file (one
+/// inode per fetch instead of one per object), and random access
+/// ([`get_object`]/[`has`]/[`is_ancestor`]) lazily rebuilds an in-memory object db by
+/// decoding the stored packs in fetch order (thin incremental packs resolve against
+/// the accumulating db, then any loose objects). The clone critical path never touches
+/// that lazy db (it decodes the fetched pack once for import directly); only
+/// `pull`/`push` do, and they already hold the full DAG in memory. Back-compat: a store
+/// written by the old exploding path (loose objects, no `packs/`) still reads correctly.
+///
+/// [`get_object`]: RemoteStore::get_object
+/// [`has`]: RemoteStore::has
+/// [`is_ancestor`]: RemoteStore::is_ancestor
 pub struct RemoteStore {
     root: PathBuf,
     refs: BTreeMap<String, String>,
+    /// Lazily-decoded object db over `packs/` + `objects/`, built on first random
+    /// access and invalidated whenever a pack or loose object is written. `RefCell`
+    /// (not a lock): a `RemoteStore` is used single-threaded; it is `Send` (so it may
+    /// be held across an `.await` in the push driver) but never `Sync`.
+    cache: std::cell::RefCell<Option<crate::gitimport::GitObjectDb>>,
 }
 
 impl RemoteStore {
@@ -1039,7 +1062,7 @@ impl RemoteStore {
             Err(_) => BTreeMap::new(),
         };
 
-        Ok(Self { root, refs })
+        Ok(Self { root, refs, cache: std::cell::RefCell::new(None) })
     }
 
     /// The store's root directory.
@@ -1047,77 +1070,132 @@ impl RemoteStore {
         &self.root
     }
 
-    /// Decode a freshly fetched pack into loose objects and record the ref state it
-    /// corresponds to. An empty pack (0 objects, e.g. a have-covers-everything fetch)
-    /// is a no-op for objects; the refs are still updated.
+    /// Store a freshly fetched pack verbatim and record the ref state it corresponds
+    /// to. An empty pack (0 objects, e.g. a have-covers-everything fetch) is a no-op
+    /// for objects; the refs are still updated. Invalidates the lazy object db so the
+    /// next random access sees the new pack.
     pub fn record_fetch(&mut self, pack: &[u8], refs: &[(String, String)]) -> BridgeResult<()> {
         if pack_object_count(pack).unwrap_or(0) > 0 {
-            self.explode_pack(pack)?;
+            self.store_pack(pack)?;
         }
         for (name, oid) in refs {
             self.refs.insert(name.clone(), oid.clone());
         }
         self.persist_refs()?;
+        *self.cache.borrow_mut() = None;
         Ok(())
     }
 
-    /// Resolve every entry in `pack` and write it out as a loose object. Returns the
-    /// number of objects written.
-    fn explode_pack(&self, pack: &[u8]) -> BridgeResult<u32> {
-        use gix_pack::data;
-        use std::cell::RefCell;
-        use std::collections::HashMap;
+    fn packs_dir(&self) -> PathBuf {
+        self.root.join("packs")
+    }
 
-        // gix's `data::File` mmaps a real `.pack` file, so stage the bytes on the same
-        // filesystem, decode, then drop it (loose objects are the durable form). The
-        // staging name is fixed: `record_fetch` takes `&mut self`, so one store never
-        // decodes two packs at once, and different remotes have different roots.
-        let staged = self.root.join("staged.pack");
-        std::fs::write(&staged, pack)
-            .map_err(|e| GitBridgeError::Store(format!("writing staged pack: {e}")))?;
-        let _guard = StagedPack(&staged);
-        let file = data::File::at(&staged, gix_hash::Kind::Sha1)
-            .map_err(|e| GitBridgeError::Store(format!("opening staged pack: {e}")))?;
-
-        // oid(20-byte) → pack offset, so an in-pack ref-delta (rare; build_fetch asks
-        // for ofs-delta) can still be resolved: bases always precede their deltas.
-        let offsets: RefCell<HashMap<[u8; 20], u64>> = RefCell::new(HashMap::new());
-        let resolve = |id: &gix_hash::oid, _out: &mut Vec<u8>| -> Option<data::decode::entry::ResolvedBase> {
-            let key: [u8; 20] = id.as_bytes().try_into().ok()?;
-            let off = *offsets.borrow().get(&key)?;
-            file.entry(off)
-                .ok()
-                .map(data::decode::entry::ResolvedBase::InPack)
+    /// Write `pack`'s raw bytes as the next pack in fetch order (`<seq>-<sha>.pack`).
+    /// `seq` (zero-padded) preserves fetch order for decode; `<sha>` is the pack's own
+    /// trailing checksum, purely for human-legible uniqueness.
+    fn store_pack(&self, pack: &[u8]) -> BridgeResult<()> {
+        let dir = self.packs_dir();
+        std::fs::create_dir_all(&dir)?;
+        let seq = self.next_pack_seq()?;
+        let id = if pack.len() >= 20 {
+            hex::encode(&pack[pack.len() - 20..])
+        } else {
+            "short".to_string()
         };
+        let name = format!("{seq:08}-{id}.pack");
+        std::fs::write(dir.join(name), pack)?;
+        Ok(())
+    }
 
-        let mut inflate = gix_features::zlib::Inflate::default();
-        let mut count = 0u32;
-        let iter = data::input::BytesToEntriesIter::new_from_header(
-            std::io::BufReader::new(std::io::Cursor::new(pack)),
-            data::input::Mode::Verify,
-            data::input::EntryDataMode::Ignore,
-            gix_hash::Kind::Sha1,
-        )
-        .map_err(|e| GitBridgeError::Store(format!("reading pack header: {e}")))?;
-
-        for item in iter {
-            let input = item.map_err(|e| GitBridgeError::Store(format!("iterating pack: {e}")))?;
-            let offset = input.pack_offset;
-            let entry = file
-                .entry(offset)
-                .map_err(|e| GitBridgeError::Store(format!("pack entry: {e}")))?;
-            let mut out = Vec::new();
-            let mut cache = gix_pack::cache::Never;
-            let outcome = file
-                .decode_entry(entry, &mut out, &mut inflate, &resolve, &mut cache)
-                .map_err(|e| GitBridgeError::Store(format!("decoding pack entry: {e}")))?;
-            let kind = GitObjectKind::from_gix(outcome.kind);
-            let oid = git_oid_bytes(kind, &out);
-            offsets.borrow_mut().insert(oid, offset);
-            self.write_loose_object(kind, &out)?;
-            count += 1;
+    /// The stored pack paths in fetch (decode) order.
+    fn pack_paths(&self) -> Vec<PathBuf> {
+        let mut packs: Vec<(u64, PathBuf)> = Vec::new();
+        let Ok(entries) = std::fs::read_dir(self.packs_dir()) else {
+            return Vec::new();
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("pack") {
+                continue;
+            }
+            let seq = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.split('-').next())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            packs.push((seq, path));
         }
-        Ok(count)
+        packs.sort_by_key(|(seq, _)| *seq);
+        packs.into_iter().map(|(_, p)| p).collect()
+    }
+
+    /// One past the highest existing pack `seq` (0 for a fresh store).
+    fn next_pack_seq(&self) -> BridgeResult<u64> {
+        let next = self
+            .pack_paths()
+            .last()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.split('-').next())
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|s| s + 1)
+            .unwrap_or(0);
+        Ok(next)
+    }
+
+    /// Borrow the lazily-decoded object db (built from `packs/` in fetch order, then
+    /// `objects/` loose objects), building it on first access. A decode error is
+    /// surfaced; callers that return `Option`/`bool` degrade a build failure to
+    /// "absent" (a torn store already has bigger problems).
+    fn object_db(&self) -> BridgeResult<std::cell::Ref<'_, crate::gitimport::GitObjectDb>> {
+        if self.cache.borrow().is_none() {
+            let db = self.build_db()?;
+            *self.cache.borrow_mut() = Some(db);
+        }
+        Ok(std::cell::Ref::map(self.cache.borrow(), |o| o.as_ref().expect("db just built")))
+    }
+
+    /// Decode every stored pack (fetch order) plus every loose object into a fresh
+    /// [`GitObjectDb`]. Loose objects load first so an incremental pack that deltas
+    /// against a push-authored (loose) base resolves; packs then accumulate into the
+    /// same db so a thin pack resolves against earlier packs. This is the durable
+    /// rebuild the pull driver uses (replacing per-object loose reads).
+    ///
+    /// [`GitObjectDb`]: crate::gitimport::GitObjectDb
+    pub fn build_db(&self) -> BridgeResult<crate::gitimport::GitObjectDb> {
+        use crate::gitimport::{no_base_lookup, GitObjectDb};
+        let mut db = GitObjectDb::new();
+        // Loose objects first (push-authored + legacy pre-pack stores).
+        let objects = self.root.join("objects");
+        if let Ok(shards) = std::fs::read_dir(&objects) {
+            for shard in shards.flatten() {
+                let prefix = shard.file_name().to_string_lossy().to_string();
+                if prefix.len() != 2 {
+                    continue;
+                }
+                let Ok(files) = std::fs::read_dir(shard.path()) else { continue };
+                for f in files.flatten() {
+                    let rest = f.file_name().to_string_lossy().to_string();
+                    let sha = format!("{prefix}{rest}");
+                    if sha.len() != 40 {
+                        continue;
+                    }
+                    if let Some((kind, body)) = self.read_loose(&sha) {
+                        db.insert_loose(import_obj_kind(kind), &body)
+                            .map_err(|e| GitBridgeError::Store(format!("loose object {sha}: {e}")))?;
+                    }
+                }
+            }
+        }
+        // Packs in fetch order (thin packs resolve against the accumulating db).
+        for path in self.pack_paths() {
+            let bytes = std::fs::read(&path)
+                .map_err(|e| GitBridgeError::Store(format!("reading pack {}: {e}", path.display())))?;
+            db.absorb_pack(&bytes, no_base_lookup)
+                .map_err(|e| GitBridgeError::Store(format!("decoding pack {}: {e}", path.display())))?;
+        }
+        Ok(db)
     }
 
     fn persist_refs(&self) -> BridgeResult<()> {
@@ -1132,34 +1210,26 @@ impl RemoteStore {
         &self.refs
     }
 
-    /// Total number of loose objects held (used by tests to check a fetch decoded the
-    /// expected object set).
+    /// Total number of objects held across all stored packs + loose objects (used by
+    /// tests to check a fetch decoded the expected object set). Builds the lazy db.
     pub fn object_count(&self) -> u32 {
-        let objects = self.root.join("objects");
-        let mut n = 0u32;
-        let Ok(shards) = std::fs::read_dir(&objects) else {
-            return 0;
-        };
-        for shard in shards.flatten() {
-            if let Ok(files) = std::fs::read_dir(shard.path()) {
-                n += files.flatten().count() as u32;
-            }
-        }
-        n
+        self.object_db().map(|db| db.len() as u32).unwrap_or(0)
     }
 
-    /// Whether object `sha` (40-hex) is present.
+    /// Whether object `sha` (40-hex) is present in any stored pack or as loose.
     pub fn has(&self, sha: &str) -> bool {
-        sha.len() == 40 && self.loose_path(sha).exists()
+        sha.len() == 40 && self.object_db().map(|db| db.get(sha).is_some()).unwrap_or(false)
     }
 
     /// Fetch object `sha` (40-hex): its kind and *content* bytes (unframed).
     pub fn get_object(&self, sha: &str) -> Option<(GitObjectKind, Vec<u8>)> {
-        self.read_loose(sha)
+        let db = self.object_db().ok()?;
+        let (kind, body) = db.get(sha)?;
+        Some((export_obj_kind(kind), body.to_vec()))
     }
 
     /// Write a loose object (used by push synthesis to stage authored objects) and
-    /// return its 40-hex oid.
+    /// return its 40-hex oid. Invalidates the lazy db so a subsequent read sees it.
     pub fn write_loose_object(&self, kind: GitObjectKind, content: &[u8]) -> BridgeResult<String> {
         let framed = frame_object(kind, content);
         let sha = hex::encode(git_oid_bytes(kind, content));
@@ -1173,6 +1243,7 @@ impl RemoteStore {
             let compressed = enc.finish()?;
             std::fs::write(&path, compressed)?;
         }
+        *self.cache.borrow_mut() = None;
         Ok(sha)
     }
 

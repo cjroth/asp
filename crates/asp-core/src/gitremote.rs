@@ -25,7 +25,7 @@ use crate::branch::{reconcile_branches, Branch};
 use crate::engine::Engine;
 use crate::error::{AspError, AspResult};
 use crate::gitbridge::{
-    fetch_pack, ls_remote, remote_id, GitAuth, GitObjectKind, GitRemoteSpec, RemoteStore,
+    fetch_pack, ls_remote, remote_id, GitAuth, GitRemoteSpec, RemoteStore,
 };
 use crate::gitgenesis::{
     git_file_id, git_site_id, synthesize_genesis, synthesize_ingest_with_open_branches,
@@ -225,8 +225,17 @@ pub async fn clone_from_git(
         ));
     }
 
+    // Stage timings land on the debug log (`--debug` / `--log asp_core=debug`) so a
+    // slow clone of a big repo can be attributed to a phase without a profiler.
+    let mut stage = std::time::Instant::now();
+    let mut lap = move |name: &str| {
+        tracing::debug!(stage = name, ms = stage.elapsed().as_millis() as u64, "git clone stage");
+        stage = std::time::Instant::now();
+    };
+
     // 1. ls-remote → default-branch tip.
     let refs = ls_remote(spec).await?;
+    lap("ls_remote");
     let default_branch = refs
         .default_branch
         .clone()
@@ -260,6 +269,7 @@ pub async fn clone_from_git(
     // 2/3. Fetch the pack (§3.4 size guard is best-effort: warn on a large pack).
     progress("fetching", 0, 0);
     let outcome = fetch_pack(spec, &wants, &[], opts.depth, |_| {}).await?;
+    lap("fetch_pack");
     if outcome.pack.len() as u64 > SIZE_WARN_BYTES {
         tracing::warn!(
             bytes = outcome.pack.len(),
@@ -269,10 +279,12 @@ pub async fn clone_from_git(
     }
     let mut rstore = RemoteStore::open(&engine.asp_dir, &rid)?;
     rstore.record_fetch(&outcome.pack, &[(remote_ref.clone(), tip.clone())])?;
+    lap("record_fetch");
 
     // 4. Decode + plan.
     progress("replaying", 0, 0);
     let db = GitObjectDb::from_pack(&outcome.pack, no_base_lookup).map_err(imp)?;
+    lap("decode_pack");
     // Every candidate tip must be present in the fetched pack; a missing one (server
     // pruned the ref between ls-remote and fetch) is a clear error, not a silent drop.
     for (name, oid) in &open_candidates {
@@ -289,19 +301,23 @@ pub async fn clone_from_git(
         open_branch_tips: open_candidates,
     };
     let plan = plan_import(&db, &tip, &iopts).map_err(imp)?;
+    lap("plan_import");
 
     // 5. Deterministic genesis → paged integrate under batch.
     let scratch = MemBlobStore::new();
     let g = synthesize_genesis(&plan, &DbBlobSource::new(&db), &scratch)?;
+    lap("synthesize_genesis");
     let vault_id = if opts.new_identity { random_vault_id() } else { g.vault_id.clone() };
     engine.adopt_vault_id(&vault_id)?;
 
     progress("saving", 0, g.rows.len() as u64);
     engine.set_batch(true);
-    let res = integrate_paged(engine, &g.rows, &scratch, &|d, t| progress("saving", d, t));
+    let res = integrate_paged(engine, &g.rows, &scratch, true, &|d, t| progress("saving", d, t));
     engine.set_batch(false);
     res?;
+    lap("integrate");
     engine.materialize()?;
+    lap("materialize");
 
     // Persist the cursor + mode cache. A token (if any) goes to the keyring, only its
     // entry name to git_remotes (git-bridge §8).
@@ -399,19 +415,20 @@ pub async fn pull_once(
     let mut rstore = RemoteStore::open(&engine.asp_dir, remote_id_str)?;
     rstore.record_fetch(&outcome.pack, &[(remote_ref.clone(), new_tip.clone())])?;
 
-    // 3. Force-push detection (§4.4): the new tip must descend from the last-ingested.
+    // 3+4. Rebuild the full DAG from ALL accumulated packs (haves kept the *network*
+    //    fetch small; the delta's parents attach to history we already stored), then
+    //    plan the whole thing and let synthesize_ingest skip already-seen commits. The
+    //    force-push check (§4.4) walks the same db, so the store is decoded only once.
+    progress("replaying", 0, 0);
+    let db = load_db_from_store(&rstore)?;
+
+    // Force-push detection (§4.4): the new tip must descend from the last-ingested.
     if let Some(last_sha) = &last {
-        if !rstore.is_ancestor(last_sha, &new_tip)? {
+        if !db_is_ancestor(&db, last_sha, &new_tip) {
             engine.store.git_remote_set_frozen(remote_id_str, true)?;
             return Ok(PullReport::Frozen);
         }
     }
-
-    // 4. Rebuild the full DAG from ALL accumulated objects (haves kept the *network*
-    //    fetch small; the delta's parents attach to history we already exploded), plan
-    //    the whole thing, and let synthesize_ingest skip already-seen commits.
-    progress("replaying", 0, 0);
-    let db = load_db_from_store(&rstore)?;
     let plan = plan_import(&db, &new_tip, &ImportOptions::default()).map_err(imp)?;
 
     let site = git_site_id(&root_sha);
@@ -470,7 +487,7 @@ pub async fn pull_once(
     }
     progress("saving", 0, out.rows.len() as u64);
     engine.set_batch(true);
-    let res = integrate_paged(engine, &out.rows, &scratch, &|d, t| progress("saving", d, t));
+    let res = integrate_paged(engine, &out.rows, &scratch, false, &|d, t| progress("saving", d, t));
     engine.set_batch(false);
     res?;
     engine.materialize()?;
@@ -550,7 +567,7 @@ pub async fn rebaseline(engine: &Engine, remote_id_str: &str) -> AspResult<PullR
     let snap_store = MemBlobStore::new();
     let g = synthesize_genesis(&plan, &DbBlobSource::new(&db), &snap_store)?;
     let mem = MemEngine::create(Identity::from_seed(&[0u8; 32]), &g.vault_id);
-    mem.integrate_many(&to_wires(&g.rows, &snap_store))?;
+    mem.integrate_many(&to_wires(&g.rows, &snap_store, None))?;
     let new_files = mem.files_map()?; // path -> bytes at the rewritten tip
 
     // Author the diff vs the current imported main state as one synthetic batch.
@@ -635,7 +652,7 @@ pub async fn rebaseline(engine: &Engine, remote_id_str: &str) -> AspResult<PullR
     rows.push(build_ingest_row(&scratch, &ingest_ident, &ingest)?);
 
     engine.set_batch(true);
-    let res = integrate_paged(engine, &rows, &scratch, &|_, _| {});
+    let res = integrate_paged(engine, &rows, &scratch, false, &|_, _| {});
     engine.set_batch(false);
     res?;
     engine.materialize()?;
@@ -748,49 +765,55 @@ fn tip_for_ref(refs: &crate::gitbridge::RemoteRefs, remote_ref: &str) -> AspResu
         .ok_or_else(|| AspError::NotFound(format!("remote ref {remote_ref} not found")))
 }
 
-fn import_kind(k: GitObjectKind) -> GitObjKind {
-    match k {
-        GitObjectKind::Commit => GitObjKind::Commit,
-        GitObjectKind::Tree => GitObjKind::Tree,
-        GitObjectKind::Blob => GitObjKind::Blob,
-        GitObjectKind::Tag => GitObjKind::Tag,
-    }
+
+/// Rebuild an in-memory object db from everything the store holds (all
+/// previously-fetched packs, in fetch order, + any loose objects). Decodes the stored
+/// packs — the store keeps them verbatim rather than exploding to loose objects — so a
+/// thin incremental pack resolves against the objects that precede it.
+fn load_db_from_store(rstore: &RemoteStore) -> AspResult<GitObjectDb> {
+    rstore.build_db().map_err(AspError::from)
 }
 
-/// Rebuild an in-memory object db from every loose object the store holds (all
-/// previously-fetched objects + this fetch's delta). O(object count) reads; fine for
-/// M3 (a future optimization can inject only the boundary bases the delta attaches to).
-fn load_db_from_store(rstore: &RemoteStore) -> AspResult<GitObjectDb> {
-    let mut db = GitObjectDb::new();
-    let objects = rstore.root().join("objects");
-    let shards = match std::fs::read_dir(&objects) {
-        Ok(s) => s,
-        Err(_) => return Ok(db),
-    };
-    for shard in shards.flatten() {
-        let prefix = shard.file_name().to_string_lossy().to_string();
-        if prefix.len() != 2 {
+/// Is `ancestor` an ancestor of (or equal to) `descendant`, walking commit parents
+/// through `db`? Returns false on a missing/boundary object (a shallow edge), never an
+/// error — mirrors [`RemoteStore::is_ancestor`], but over the already-built db so pull
+/// never decodes the store twice.
+fn db_is_ancestor(db: &GitObjectDb, ancestor: &str, descendant: &str) -> bool {
+    if ancestor == descendant {
+        return true;
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack = vec![descendant.to_string()];
+    while let Some(cur) = stack.pop() {
+        if !seen.insert(cur.clone()) {
             continue;
         }
-        let Ok(files) = std::fs::read_dir(shard.path()) else { continue };
-        for f in files.flatten() {
-            let rest = f.file_name().to_string_lossy().to_string();
-            let sha = format!("{prefix}{rest}");
-            if sha.len() != 40 {
-                continue;
+        let Some((kind, body)) = db.get(&cur) else { continue };
+        if kind != GitObjKind::Commit {
+            continue;
+        }
+        for line in body.split(|&b| b == b'\n') {
+            if line.is_empty() {
+                break; // end of commit header block
             }
-            if let Some((k, body)) = rstore.get_object(&sha) {
-                db.insert_loose(import_kind(k), &body).map_err(imp)?;
+            if let Some(rest) = line.strip_prefix(b"parent ") {
+                if let Ok(p) = std::str::from_utf8(rest) {
+                    let p = p.trim().to_string();
+                    if p == ancestor {
+                        return true;
+                    }
+                    stack.push(p);
+                }
             }
         }
     }
-    Ok(db)
+    false
 }
 
 /// Bundle each row with its `base_hash`/`result_hash` blobs (from `store`) into a
 /// [`WireRow`], the shape `integrate_many` consumes (mirrors the memengine clone
 /// receiver + the gitgenesis fold test).
-fn to_wires(rows: &[LogRow], store: &dyn BlobStore) -> Vec<WireRow> {
+fn to_wires(rows: &[LogRow], store: &dyn BlobStore, mut seen: Option<&mut HashSet<String>>) -> Vec<WireRow> {
     rows.iter()
         .map(|r| {
             let mut blobs: Vec<WireBlob> = Vec::new();
@@ -798,7 +821,18 @@ fn to_wires(rows: &[LogRow], store: &dyn BlobStore) -> Vec<WireRow> {
                 if blobs.iter().any(|b| b.hash == h) {
                     continue;
                 }
+                // Cross-page dedup for the local clone feed: a blob we already
+                // bundled this run is durably in the engine store (integrate_many
+                // persisted it), so re-copying/re-hashing/re-verifying its bytes is
+                // pure waste. `seen` is only marked once a blob is actually bundled,
+                // so a hash absent from `store` is never spuriously suppressed.
+                if seen.as_deref().is_some_and(|s| s.contains(&h)) {
+                    continue;
+                }
                 if let Ok(Some(bytes)) = store.get_blob(&h) {
+                    if let Some(s) = seen.as_deref_mut() {
+                        s.insert(h.clone());
+                    }
                     blobs.push(WireBlob { hash: h, bytes });
                 }
             }
@@ -808,17 +842,23 @@ fn to_wires(rows: &[LogRow], store: &dyn BlobStore) -> Vec<WireRow> {
 }
 
 /// Integrate `rows` page-by-page under batch, folding once (the caller must have
-/// enabled `set_batch` and must `materialize()` afterwards).
+/// enabled `set_batch` and must `materialize()` afterwards). `dedup` enables
+/// cross-page blob-bundle dedup — safe only where every referenced blob lives in
+/// `store` (the pristine clone feed: `store` is the full-pack scratch). Incremental
+/// pulls leave it off (a base blob may already be in the engine, absent from the
+/// incremental-pack scratch — bundling stays a per-page no-op there anyway).
 fn integrate_paged(
     engine: &Engine,
     rows: &[LogRow],
     store: &dyn BlobStore,
+    dedup: bool,
     progress: &dyn Fn(u64, u64),
 ) -> AspResult<()> {
     let total = rows.len() as u64;
     let mut done = 0u64;
+    let mut seen: Option<HashSet<String>> = dedup.then(HashSet::new);
     for chunk in rows.chunks(INTEGRATE_PAGE) {
-        engine.integrate_many(&to_wires(chunk, store))?;
+        engine.integrate_many(&to_wires(chunk, store, seen.as_mut()))?;
         done += chunk.len() as u64;
         progress(done, total);
     }
