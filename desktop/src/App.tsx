@@ -270,6 +270,9 @@ export default function App() {
   const selectedRef = useRef<string | null>(null);
   const selectedPathsRef = useRef<Set<string>>(new Set());
   const bufferRef = useRef('');
+  // True while a connect-modal clone is running, so the shared `vault-scan-progress`
+  // event drives the clone bar (`cloneProg`) instead of the cold-start reconcile bar.
+  const cloningRef = useRef(false);
   const playheadRef = useRef<number | null>(null);
   const viewRef = useRef<View | null>(null);
   const nowRef = useRef(now);
@@ -543,7 +546,11 @@ export default function App() {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     void listen<{ done: number; total: number; phase: string }>('vault-scan-progress', (e) => {
-      setScanProgress(e.payload);
+      // A git clone reuses this event (phases fetching→replaying→saving→materialize).
+      // While a clone is in flight, drive the connect modal's determinate bar; otherwise
+      // it's the cold-start reconcile bar.
+      if (cloningRef.current) setCloneProg({ done: e.payload.done, total: e.payload.total, phase: e.payload.phase as ClonePhase });
+      else setScanProgress(e.payload);
     }).then((u) => (cancelled ? u() : (unlisten = u)));
     return () => {
       cancelled = true;
@@ -1457,6 +1464,7 @@ export default function App() {
       }
       setConnecting(true);
       setConnectError(null);
+      cloningRef.current = true;
       setCloneProg({ done: 0, total: 0, phase: scheme ? 'fetching' : 'receiving' });
       try {
         const onProg = (done: number, total: number, phase: ClonePhase) => setCloneProg({ done, total, phase });
@@ -1485,6 +1493,7 @@ export default function App() {
         console.error('clone failed', err);
         setConnectError(String((err as Error)?.message || err) || 'Connection failed. Please try again.');
       } finally {
+        cloningRef.current = false;
         setConnecting(false);
         setCloneProg(null);
       }
