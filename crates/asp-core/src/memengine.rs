@@ -1417,10 +1417,10 @@ mod tests {
         assert!(other.import_state(&snap).is_err(), "refuses a snapshot for another vault");
     }
 
-    /// Split web persistence (`export_rows_state` + per-blob `get_blob`/`put_blob`
-    /// + `load_rows_state`) must reconstruct a byte-identical engine — same rows,
-    /// same fold, same materialized files — while the rows snapshot carries NO
-    /// blob bytes (that one giant combined buffer is the browser-clone OOM this
+    /// Split web persistence (`export_rows_state` + per-blob `get_blob`/`put_blob`,
+    /// then `load_rows_state`) must reconstruct a byte-identical engine — same
+    /// rows, same fold, same materialized files — while the rows snapshot carries
+    /// NO blob bytes (that one giant combined buffer is the browser-clone OOM this
     /// splits apart).
     #[test]
     fn rows_state_split_persistence_round_trips() {
