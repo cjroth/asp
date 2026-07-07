@@ -11,7 +11,7 @@
 //! `authorized_keys` admission, and both are authenticated — no nonce/signature
 //! round-trip. Then they exchange version vectors and send exactly what's missing.
 
-use crate::authkeys::AdmitCtx;
+use crate::authkeys::{AdmitCtx, PeerPolicy};
 use crate::error::{AspError, AspResult};
 use crate::order::NodeId;
 use crate::wire::{Msg, WireRow, PROTO};
@@ -44,7 +44,10 @@ pub trait SessionVault {
     fn integrate_many(&self, rows: &[WireRow]) -> AspResult<Vec<bool>> {
         rows.iter().map(|wr| self.integrate(wr)).collect()
     }
-    fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<()>;
+    /// Admit `peer` and return its retained replication grant ([`PeerPolicy`],
+    /// scoped-sync §3.1) — `Err` denies the connection. The listener threads the
+    /// returned policy onto the `Session` (catch-up filter + read-only reject).
+    fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<PeerPolicy>;
     /// No authored rows yet — the vault has nothing of its own to lose, so it
     /// adopts a peer's vault on connect (like `clone`). A freshly-`init`'d folder
     /// that hasn't committed content is pristine.
@@ -94,6 +97,11 @@ pub struct Session {
     peer_node: Option<NodeId>,
     authed: bool,
     sent_vector: bool,
+    /// The admitted peer's replication grant (scoped-sync §3.1), set on the
+    /// listener when admission passes. Governs the catch-up send-filter (A —
+    /// `allowed_paths`) and the read-only push reject (B — `read_only`). Default
+    /// (full / read-write) on the connector and before admission — unchanged behavior.
+    policy: PeerPolicy,
 }
 
 /// Per-frame catch-up budget. A `Msg::Rows` frame accumulates rows until it
@@ -178,7 +186,14 @@ impl Session {
             peer_node: None,
             authed: false,
             sent_vector: false,
+            policy: PeerPolicy::default(),
         }
+    }
+
+    /// The admitted peer's replication grant (scoped-sync §3.1) — full/read-write
+    /// until a listener admits a scoped peer. Exposed for the drivers/tests.
+    pub fn policy(&self) -> &PeerPolicy {
+        &self.policy
     }
 
     /// The opening frame each side sends.
@@ -248,12 +263,17 @@ impl Session {
                 // listener applies the `authorized_keys` gate; the connector simply
                 // records the verified listener (which `clone` pins).
                 if self.role == Role::Listener {
-                    if let Err(e) = vault.admit(&peer, &self.admit) {
-                        let reason = format!("admission denied: {e}");
-                        return Ok(vec![
-                            Step::Send(Msg::Denied { reason: reason.clone() }),
-                            Step::Closed(reason),
-                        ]);
+                    match vault.admit(&peer, &self.admit) {
+                        // Retain the admitted grant (scoped-sync §3.1): the catch-up
+                        // filter (A) and read-only reject (B) read `self.policy`.
+                        Ok(policy) => self.policy = policy,
+                        Err(e) => {
+                            let reason = format!("admission denied: {e}");
+                            return Ok(vec![
+                                Step::Send(Msg::Denied { reason: reason.clone() }),
+                                Step::Closed(reason),
+                            ]);
+                        }
                     }
                 }
                 self.authed = true;

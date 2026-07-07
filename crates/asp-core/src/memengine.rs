@@ -9,7 +9,7 @@
 //! here as on native. Materialization is to an in-memory `path -> bytes` map
 //! (the host renders it to its vault), not to disk.
 
-use crate::authkeys::{decide_admission, expiry_from_ttl_days, AdmitCtx, AdmitDecision, AuthKey};
+use crate::authkeys::{decide_admission, expiry_from_ttl_days, AdmitCtx, AdmitDecision, AuthKey, PeerPolicy};
 use crate::error::{AspError, AspResult};
 use crate::fold::compute_files;
 use crate::identity::Identity;
@@ -1039,8 +1039,24 @@ impl MemEngine {
     // ----- auth -----
 
     pub fn authorize(&self, ssh_line: &str, expires_at: Option<u64>, never: bool, source: &str) -> AspResult<()> {
-        let k = AuthKey::from_ssh(ssh_line, expires_at, never, now_unix() as u64, source)
+        self.authorize_with_policy(ssh_line, expires_at, never, source, None, false)
+    }
+
+    /// Authorize with an explicit replication grant — wasm parity for
+    /// [`crate::engine::Engine::authorize_with_policy`] (scoped-sync §3.7).
+    pub fn authorize_with_policy(
+        &self,
+        ssh_line: &str,
+        expires_at: Option<u64>,
+        never: bool,
+        source: &str,
+        allowed_paths: Option<Vec<String>>,
+        read_only: bool,
+    ) -> AspResult<()> {
+        let mut k = AuthKey::from_ssh(ssh_line, expires_at, never, now_unix() as u64, source)
             .ok_or_else(|| AspError::Invalid("not an ssh-ed25519 key line".into()))?;
+        k.allowed_paths = allowed_paths;
+        k.read_only = read_only;
         let mut set = self.authorized.borrow_mut();
         set.retain(|x| x.node_id != k.node_id);
         set.push(k);
@@ -1090,19 +1106,25 @@ impl SessionVault for MemEngine {
     fn is_pristine(&self) -> bool {
         self.rows.borrow().is_empty()
     }
-    fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<()> {
+    fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<PeerPolicy> {
         let peer_hex = peer.to_hex();
         let set = self.authorized.borrow();
         let existing = set.iter().find(|k| k.node_id == peer_hex).cloned();
         let empty = set.is_empty();
         drop(set);
         match decide_admission(existing.as_ref(), empty, ctx) {
-            AdmitDecision::Admit => Ok(()),
+            AdmitDecision::Admit => Ok(existing.map(|k| k.policy()).unwrap_or_default()),
             AdmitDecision::Insert(source) => {
                 let exp = expiry_from_ttl_days(ctx.now_unix, ctx.default_ttl_days);
                 let line = crate::identity::ssh_pubkey_string(peer, source);
-                self.authorize(&line, Some(exp), false, source)?;
-                Ok(())
+                // Carry a prior grant forward on re-enroll — parity with Engine::admit
+                // (never silently widen a scoped/read-only peer, scoped-sync §6).
+                let (paths, ro) = existing
+                    .as_ref()
+                    .map(|k| (k.allowed_paths.clone(), k.read_only))
+                    .unwrap_or((None, false));
+                self.authorize_with_policy(&line, Some(exp), false, source, paths.clone(), ro)?;
+                Ok(PeerPolicy { allowed_paths: paths, read_only: ro })
             }
             AdmitDecision::Deny(why) => Err(AspError::AuthDenied(format!("{why}: {}", &peer_hex[..12.min(peer_hex.len())]))),
         }

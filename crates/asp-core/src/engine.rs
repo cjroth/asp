@@ -4,7 +4,7 @@
 //! `fold`/`merge`/`store` core — all convergence logic lives there. The native
 //! driver (the `asp` CLI) supplies file watching, debounce, and sockets.
 
-use crate::authkeys::{decide_admission, expiry_from_ttl_days, AdmitCtx, AdmitDecision, AuthKey};
+use crate::authkeys::{decide_admission, expiry_from_ttl_days, AdmitCtx, AdmitDecision, AuthKey, PeerPolicy};
 use crate::branch::{version_vector_of, Branch, BranchSet};
 use crate::config::VaultConfig;
 use crate::error::{AspError, AspResult};
@@ -1793,8 +1793,27 @@ impl Engine {
 
     /// Seed the admission set at `init`/`authorize`/env.
     pub fn authorize(&self, ssh_line: &str, expires_at: Option<u64>, never: bool, source: &str) -> AspResult<NodeId> {
-        let k = AuthKey::from_ssh(ssh_line, expires_at, never, now_unix(), source)
+        self.authorize_with_policy(ssh_line, expires_at, never, source, None, false)
+    }
+
+    /// Authorize a peer with an explicit replication grant (scoped-sync §3.7):
+    /// `allowed_paths` (a path-glob whitelist; `None` = full vault) and `read_only`
+    /// (forbid the peer pushing mutations). `asp authorize --subdir/--read-only`
+    /// funnels here; plain [`authorize`](Self::authorize) grants a full read-write
+    /// replica, byte-identical to before scoped sync.
+    pub fn authorize_with_policy(
+        &self,
+        ssh_line: &str,
+        expires_at: Option<u64>,
+        never: bool,
+        source: &str,
+        allowed_paths: Option<Vec<String>>,
+        read_only: bool,
+    ) -> AspResult<NodeId> {
+        let mut k = AuthKey::from_ssh(ssh_line, expires_at, never, now_unix(), source)
             .ok_or_else(|| AspError::Invalid("not an ssh-ed25519 key line".into()))?;
+        k.allowed_paths = allowed_paths;
+        k.read_only = read_only;
         let node = k.node().ok_or_else(|| AspError::Invalid("bad node id".into()))?;
         self.store.insert_authkey(&k)?;
         Ok(node)
@@ -1811,19 +1830,28 @@ impl Engine {
         self.store.migrate_fill_expiry(exp)
     }
 
-    /// Decide whether to admit `peer` and (if enrolling/TOFU) persist the row,
-    /// via the shared `decide_admission` logic (§Security).
-    pub fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<()> {
+    /// Decide whether to admit `peer` and (if enrolling/TOFU) persist the row, via
+    /// the shared `decide_admission` logic (§Security). Returns the peer's retained
+    /// replication grant ([`PeerPolicy`], scoped-sync §3.1) on admission, which the
+    /// `Session` threads into the catch-up filter (A) and read-only reject (B).
+    pub fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<PeerPolicy> {
         let peer_hex = peer.to_hex();
         let existing = self.store.authkey_by_node(&peer_hex)?;
         match decide_admission(existing.as_ref(), self.store.authkeys_empty()?, ctx) {
-            AdmitDecision::Admit => Ok(()),
+            AdmitDecision::Admit => Ok(existing.map(|k| k.policy()).unwrap_or_default()),
             AdmitDecision::Insert(source) => {
                 let exp = expiry_from_ttl_days(ctx.now_unix, ctx.default_ttl_days);
                 let line = crate::identity::ssh_pubkey_string(peer, source);
-                let k = AuthKey::from_ssh(&line, Some(exp), false, ctx.now_unix, source).unwrap();
+                let mut k = AuthKey::from_ssh(&line, Some(exp), false, ctx.now_unix, source).unwrap();
+                // Re-enrolling an expired key must NOT silently widen its grant: carry
+                // the prior scope/read-only forward (scoped-sync §6). A brand-new TOFU
+                // peer (no prior row) keeps the default full read-write grant.
+                if let Some(prev) = &existing {
+                    k.allowed_paths = prev.allowed_paths.clone();
+                    k.read_only = prev.read_only;
+                }
                 self.store.insert_authkey(&k)?;
-                Ok(())
+                Ok(k.policy())
             }
             AdmitDecision::Deny(why) => Err(AspError::AuthDenied(format!("{why}: {}", &peer_hex[..12]))),
         }
@@ -1853,7 +1881,7 @@ impl SessionVault for Engine {
     fn integrate_many(&self, rows: &[WireRow]) -> AspResult<Vec<bool>> {
         Engine::integrate_many(self, rows)
     }
-    fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<()> {
+    fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<PeerPolicy> {
         Engine::admit(self, peer, ctx)
     }
     fn is_pristine(&self) -> bool {
@@ -2334,6 +2362,45 @@ mod tests {
         e.authorize(&peer.to_ssh_string(), Some(10_000), false, "cli").unwrap();
         let ctx2 = AdmitCtx { now_unix: 5000, ..ctx };
         e.admit(&peer.node_id(), &ctx2).unwrap();
+    }
+
+    // scoped-sync §3.1/§6 (Phase 0): admission returns the peer's retained grant,
+    // and re-enrolling an EXPIRED scoped key must not silently widen it.
+    #[test]
+    fn admit_returns_grant_and_reenroll_preserves_scope() {
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 1);
+        let peer = Identity::from_seed(&[9; 32]);
+        // Grant a scoped, read-only key that has already expired.
+        e.authorize_with_policy(
+            &peer.to_ssh_string(),
+            Some(1000),
+            false,
+            "cli",
+            Some(vec!["work/**".into()]),
+            true,
+        )
+        .unwrap();
+
+        // Enrollment via a presented auth key (`auth_key_ok`) refreshes the TTL — but
+        // the returned policy must carry the ORIGINAL scope + read-only forward.
+        let ctx = AdmitCtx { no_tofu: true, auth_key_ok: true, auth_key_configured: true, default_ttl_days: 90, now_unix: 2000 };
+        let policy = e.admit(&peer.node_id(), &ctx).unwrap();
+        assert_eq!(policy.allowed_paths.as_deref(), Some(&["work/**".to_string()][..]), "re-enroll keeps the scope");
+        assert!(policy.read_only, "re-enroll keeps read-only");
+        // The persisted row reflects the same (no widen on disk).
+        let stored = e.store.authkey_by_node(&peer.node_id().to_hex()).unwrap().unwrap();
+        assert_eq!(stored.allowed_paths.as_deref(), Some(&["work/**".to_string()][..]));
+        assert!(stored.read_only);
+
+        // A fresh TOFU peer (empty set path is closed now, so use auth_key enroll)
+        // with no prior row gets the default full read-write grant.
+        let d2 = tempdir().unwrap();
+        let e2 = eng(d2.path(), 2);
+        let fresh = Identity::from_seed(&[11; 32]).node_id();
+        let ctx2 = AdmitCtx { no_tofu: false, auth_key_ok: false, auth_key_configured: false, default_ttl_days: 90, now_unix: now_unix() };
+        let policy2 = e2.admit(&fresh, &ctx2).unwrap(); // empty set → TOFU
+        assert_eq!(policy2, crate::authkeys::PeerPolicy::default(), "new peer = full read-write");
     }
 
     #[test]

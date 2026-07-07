@@ -59,7 +59,12 @@ CREATE TABLE IF NOT EXISTS peer_state(site_id TEXT PRIMARY KEY, last_seq INTEGER
 CREATE TABLE IF NOT EXISTS peers(url TEXT PRIMARY KEY, node_id TEXT, pinned_at INTEGER);
 CREATE TABLE IF NOT EXISTS authorized_keys(
   ssh_pubkey TEXT PRIMARY KEY, node_id TEXT NOT NULL, expires_at INTEGER, never INTEGER NOT NULL DEFAULT 0,
-  added_at INTEGER, source TEXT
+  added_at INTEGER, source TEXT,
+  -- Replication grant (scoped-sync §6). `allowed_paths` is a JSON array of path
+  -- globs (NULL = the whole vault); `read_only` forbids the peer pushing mutations.
+  -- Node-local, never synced. Added here for fresh DBs; `migrate_authz` back-fills
+  -- an existing table.
+  allowed_paths TEXT, read_only INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS git_blobs(content_hash TEXT PRIMARY KEY, git_oid TEXT NOT NULL);
@@ -171,7 +176,29 @@ impl SqliteStore {
         let store = SqliteStore { conn };
         store.migrate_branching()?;
         store.migrate_git_push()?;
+        store.migrate_authz()?;
         Ok(store)
+    }
+
+    /// Idempotent migration adding the replication-grant columns to an
+    /// `authorized_keys` table created before scoped sync (scoped-sync §6). New DBs
+    /// already have them (the `CREATE TABLE` above); existing rows take the defaults
+    /// (`allowed_paths=NULL` = full vault, `read_only=0`), so an un-migrated grant
+    /// reads back as today's full read-write replica — byte-identical behavior.
+    fn migrate_authz(&self) -> AspResult<()> {
+        let have: std::collections::HashSet<String> = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(authorized_keys)")?;
+            let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            cols.collect::<Result<_, _>>()?
+        };
+        if !have.contains("allowed_paths") {
+            self.conn.execute_batch("ALTER TABLE authorized_keys ADD COLUMN allowed_paths TEXT")?;
+        }
+        if !have.contains("read_only") {
+            self.conn
+                .execute_batch("ALTER TABLE authorized_keys ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0")?;
+        }
+        Ok(())
     }
 
     /// Idempotent migration to the branching schema (§9): add the `branch_id`/
@@ -985,19 +1012,34 @@ impl SqliteStore {
     // ----- authorized_keys -----
 
     pub fn insert_authkey(&self, k: &AuthKey) -> AspResult<()> {
+        // `allowed_paths` rides as a JSON array (NULL = full vault). The upsert
+        // updates the grant columns too, so `asp authorize --subdir/--read-only`
+        // re-scopes an existing key and the admit auto-enroll path (which carries the
+        // prior grant forward, engine.rs) re-writes the same values — never a silent
+        // widen.
+        let allowed_json = k
+            .allowed_paths
+            .as_ref()
+            .map(|v| serde_json::to_string(v))
+            .transpose()
+            .map_err(|e| crate::error::AspError::Invalid(format!("allowed_paths json: {e}")))?;
         self.conn.execute(
-            "INSERT INTO authorized_keys(ssh_pubkey, node_id, expires_at, never, added_at, source)
-             VALUES(?1,?2,?3,?4,?5,?6)
-             ON CONFLICT(ssh_pubkey) DO UPDATE SET expires_at=?3, never=?4, source=?6",
+            "INSERT INTO authorized_keys(ssh_pubkey, node_id, expires_at, never, added_at, source, allowed_paths, read_only)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(ssh_pubkey) DO UPDATE SET expires_at=?3, never=?4, source=?6, allowed_paths=?7, read_only=?8",
             params![
                 k.ssh_pubkey, k.node_id, k.expires_at.map(|x| x as i64),
-                k.never as i64, k.added_at as i64, k.source
+                k.never as i64, k.added_at as i64, k.source,
+                allowed_json, k.read_only as i64
             ],
         )?;
         Ok(())
     }
 
     fn authkey_from(r: &rusqlite::Row) -> rusqlite::Result<AuthKey> {
+        let allowed_paths = r
+            .get::<_, Option<String>>("allowed_paths")?
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
         Ok(AuthKey {
             ssh_pubkey: r.get("ssh_pubkey")?,
             node_id: r.get("node_id")?,
@@ -1005,6 +1047,8 @@ impl SqliteStore {
             never: r.get::<_, i64>("never")? != 0,
             added_at: r.get::<_, i64>("added_at")? as u64,
             source: r.get("source")?,
+            allowed_paths,
+            read_only: r.get::<_, i64>("read_only")? != 0,
         })
     }
 
@@ -1255,6 +1299,84 @@ mod tests {
         assert_eq!(s.head().unwrap(), crate::log::MAIN_BRANCH_ID);
         let branch: String = s.conn.query_row("SELECT branch_id FROM log WHERE id='r1'", [], |r| r.get(0)).unwrap();
         assert_eq!(branch, "main");
+        drop(s);
+        SqliteStore::open(&path).unwrap(); // idempotent second open
+    }
+
+    // scoped-sync §6 (Phase 0): the replication grant (`allowed_paths` JSON + the
+    // `read_only` flag) round-trips through `authorized_keys`, and re-inserting the
+    // same key re-scopes it (never leaves a stale grant).
+    #[test]
+    fn authz_grant_roundtrips_and_upsert_rescopes() {
+        use crate::identity::Identity;
+        let s = SqliteStore::open_memory().unwrap();
+        let ssh = Identity::from_seed(&[5; 32]).to_ssh_string();
+        let node = Identity::from_seed(&[5; 32]).node_id().to_hex();
+
+        // A scoped, read-only grant persists exactly.
+        let mut k = AuthKey::from_ssh(&ssh, Some(1000), false, 10, "cli").unwrap();
+        k.allowed_paths = Some(vec!["work/**".into(), "shared/notes.md".into()]);
+        k.read_only = true;
+        s.insert_authkey(&k).unwrap();
+        let got = s.authkey_by_node(&node).unwrap().unwrap();
+        assert_eq!(got.allowed_paths.as_deref(), Some(&["work/**".to_string(), "shared/notes.md".to_string()][..]));
+        assert!(got.read_only);
+        assert_eq!(got.policy().allowed_paths, k.allowed_paths);
+
+        // Re-authorizing the SAME key widens the grant (full / read-write) — the
+        // upsert must overwrite, not leave the old scope behind.
+        let widened = AuthKey::from_ssh(&ssh, Some(2000), false, 20, "cli").unwrap();
+        s.insert_authkey(&widened).unwrap();
+        let got = s.authkey_by_node(&node).unwrap().unwrap();
+        assert!(got.allowed_paths.is_none(), "upsert must clear a stale scope");
+        assert!(!got.read_only, "upsert must clear a stale read-only flag");
+
+        // A default (unscoped) key stores NULL allowed_paths — the full-replica grant.
+        let full = AuthKey::from_ssh(&Identity::from_seed(&[6; 32]).to_ssh_string(), None, false, 0, "cli").unwrap();
+        s.insert_authkey(&full).unwrap();
+        assert_eq!(full.policy(), crate::authkeys::PeerPolicy::default());
+    }
+
+    // scoped-sync §6 (Phase 0): a vault created BEFORE scoped sync (an
+    // `authorized_keys` table without the grant columns) must open, migrate, and
+    // read its existing rows back as full read-write replicas — byte-identical
+    // behavior. Mirrors `opens_pre_branching_db_and_migrates`.
+    #[test]
+    fn opens_pre_scoped_sync_db_and_migrates_authz() {
+        use crate::identity::Identity;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asp.db");
+        let ssh = Identity::from_seed(&[8; 32]).to_ssh_string();
+        let node = Identity::from_seed(&[8; 32]).node_id().to_hex();
+        {
+            let conn = Connection::open(&path).unwrap();
+            // The pre-scoped-sync authorized_keys shape (no allowed_paths/read_only),
+            // with one enrolled peer, exactly as an older build left it.
+            conn.execute_batch(
+                "CREATE TABLE authorized_keys(
+                   ssh_pubkey TEXT PRIMARY KEY, node_id TEXT NOT NULL, expires_at INTEGER,
+                   never INTEGER NOT NULL DEFAULT 0, added_at INTEGER, source TEXT
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO authorized_keys(ssh_pubkey, node_id, expires_at, never, added_at, source)
+                 VALUES(?1,?2,NULL,1,0,'cli')",
+                params![ssh, node],
+            )
+            .unwrap();
+        }
+        // Opening must succeed and add the grant columns.
+        let s = SqliteStore::open(&path).unwrap();
+        let have: std::collections::HashSet<String> = {
+            let mut stmt = s.conn.prepare("PRAGMA table_info(authorized_keys)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1)).unwrap().collect::<Result<_, _>>().unwrap()
+        };
+        assert!(have.contains("allowed_paths") && have.contains("read_only"), "grant columns added");
+        // The pre-existing peer reads back as a full read-write replica.
+        let got = s.authkey_by_node(&node).unwrap().unwrap();
+        assert!(got.allowed_paths.is_none() && !got.read_only, "old grant = full read-write");
+        assert!(got.never, "unrelated columns preserved");
         drop(s);
         SqliteStore::open(&path).unwrap(); // idempotent second open
     }

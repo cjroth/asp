@@ -25,6 +25,22 @@ pub struct AdmitCtx {
     pub now_unix: u64,
 }
 
+/// The replication grant a listener retains for an admitted peer (scoped-sync
+/// §3.1, §6). Derived from the peer's `authorized_keys` row and threaded onto the
+/// `Session` so the catch-up send-filter (A) and the read-only reject (B) can act
+/// on it. An empty policy (`allowed_paths = None`, `read_only = false`) is the
+/// full-replica, read-write grant every peer gets today — byte-identical behavior.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PeerPolicy {
+    /// Whitelist of path globs this peer may receive (A — partial subdir sync).
+    /// `None` = the whole vault (full replica). A `Some([..])` list is matched by
+    /// [`crate::scope::Scope::allowed`].
+    pub allowed_paths: Option<Vec<String>>,
+    /// This peer may not push file mutations to us (B — read-only subdir). Enforced
+    /// at integrate-entry in the sans-IO `Session`, so native and wasm reject alike.
+    pub read_only: bool,
+}
+
 /// The admission decision — pure logic shared by the native and wasm engines.
 pub enum AdmitDecision {
     /// Already enrolled and currently valid.
@@ -74,10 +90,18 @@ pub struct AuthKey {
     pub added_at: u64,
     /// `init` | `env` | `cli` | `tofu` | `enroll`.
     pub source: String,
+    /// Replication grant (scoped-sync §6): path-glob whitelist (`None` = full
+    /// vault) and read-only flag. Defaulted (full / read-write) for every existing
+    /// key and every auto-enrolled/TOFU peer, so behavior is unchanged unless an
+    /// admin scopes the grant explicitly (`asp authorize --subdir/--read-only`).
+    pub allowed_paths: Option<Vec<String>>,
+    pub read_only: bool,
 }
 
 impl AuthKey {
-    /// Build a row from an OpenSSH key line, resolving the NodeId.
+    /// Build a row from an OpenSSH key line, resolving the NodeId. Grant defaults
+    /// to full / read-write; set [`AuthKey::allowed_paths`]/[`AuthKey::read_only`]
+    /// after construction (or use [`crate::engine::Engine::authorize_with_policy`]).
     pub fn from_ssh(ssh_line: &str, expires_at: Option<u64>, never: bool, added_at: u64, source: &str) -> Option<AuthKey> {
         let node = parse_ssh_pubkey(ssh_line.trim())?;
         Some(AuthKey {
@@ -87,11 +111,18 @@ impl AuthKey {
             never,
             added_at,
             source: source.to_string(),
+            allowed_paths: None,
+            read_only: false,
         })
     }
 
     pub fn node(&self) -> Option<NodeId> {
         NodeId::from_hex(&self.node_id)
+    }
+
+    /// The replication grant this key carries (scoped-sync §3.1/§6).
+    pub fn policy(&self) -> PeerPolicy {
+        PeerPolicy { allowed_paths: self.allowed_paths.clone(), read_only: self.read_only }
     }
 
     /// Admission test at `now_unix`.
