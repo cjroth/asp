@@ -322,23 +322,27 @@ fn check_status(resp: &reqwest::Response) -> BridgeResult<()> {
 }
 
 async fn read_capped(resp: reqwest::Response, max: u64) -> BridgeResult<Vec<u8>> {
-    read_capped_progress(resp, max, |_| {}).await
+    read_capped_progress(resp, max, |_, _| {}).await
 }
 
-/// Like [`read_capped`], but invokes `on_bytes` with the **cumulative** byte count
-/// after each streamed chunk lands. Used by the clone driver to drive the "fetching"
-/// progress phase (git upload-pack sends no Content-Length, so only a live running
-/// total is available — the UI shows it as a byte count under a segment shimmer).
+/// Like [`read_capped`], but invokes `on_bytes(downloaded, total)` — cumulative bytes
+/// so far and the response's `Content-Length` — after each streamed chunk lands. Drives
+/// the clone "fetching" phase. `total` is `0` when the server omits Content-Length
+/// (GitHub smart-HTTP is chunked, so this is the common case — the phase then shows a
+/// live byte count under a segment shimmer rather than a determinate bar; the total is
+/// never faked).
 async fn read_capped_progress(
     resp: reqwest::Response,
     max: u64,
-    mut on_bytes: impl FnMut(u64),
+    mut on_bytes: impl FnMut(u64, u64),
 ) -> BridgeResult<Vec<u8>> {
-    if let Some(len) = resp.content_length() {
+    let content_len = resp.content_length();
+    if let Some(len) = content_len {
         if len > max {
             return Err(GitBridgeError::Http("response exceeds size cap".into()));
         }
     }
+    let announced = content_len.unwrap_or(0);
     let mut stream = resp.bytes_stream();
     let mut out = Vec::new();
     let mut total: u64 = 0;
@@ -349,7 +353,7 @@ async fn read_capped_progress(
             return Err(GitBridgeError::Http("response body exceeded size cap".into()));
         }
         out.extend_from_slice(&chunk);
-        on_bytes(total);
+        on_bytes(total, announced);
     }
     Ok(out)
 }
@@ -431,7 +435,7 @@ impl HttpsTransport {
     async fn upload_pack_progress(
         &self,
         body: Vec<u8>,
-        on_bytes: impl FnMut(u64),
+        on_bytes: impl FnMut(u64, u64),
     ) -> BridgeResult<Vec<u8>> {
         let url = upload_pack_url(&self.base);
         let rb = self
@@ -648,7 +652,7 @@ pub async fn fetch_pack(
     wants: &[String],
     haves: &[String],
     depth: Option<u32>,
-    mut on_bytes: impl FnMut(u64),
+    mut on_bytes: impl FnMut(u64, u64),
 ) -> BridgeResult<FetchOutcome> {
     let req = FetchRequest {
         wants: wants.to_vec(),
@@ -673,8 +677,9 @@ pub async fn fetch_pack(
                 .await
                 .map_err(|e| GitBridgeError::Ssh(format!("ssh task join: {e}")))??;
             // SSH reads the whole response before returning, so byte streaming isn't
-            // available — report the final size once so the phase still shows a count.
-            on_bytes(r.len() as u64);
+            // available — report the final size once (as both done and total, since the
+            // full length is now known) so the phase still shows a completed count.
+            on_bytes(r.len() as u64, r.len() as u64);
             r
         }
     };

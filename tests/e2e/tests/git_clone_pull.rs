@@ -175,7 +175,10 @@ fn clone_reports_determinate_progress_counts() {
     let max_done = |p: &str| ev.iter().filter(|(ph, _, _)| ph == p).map(|(_, d, _)| *d).max().unwrap_or(0);
     // Each heavy phase reports a real total and its done reaches that total (completes),
     // so the weighted UI bar fills each segment rather than sitting indeterminate.
-    for p in ["replaying", "saving", "materialize"] {
+    // `scanning` = the pack offset-enumeration sweep; `importing` = the genesis per-commit
+    // walk — both previously stalled the bar and now carry (done,total) from the pack
+    // header / commit count.
+    for p in ["scanning", "replaying", "importing", "saving", "materialize"] {
         assert!(ev.iter().any(|(ph, _, _)| ph == p), "{p} phase emitted");
         assert!(max_total(p) > 0, "{p} carries a real determinate total");
         assert_eq!(max_done(p), max_total(p), "{p} progress completes (done reaches total)");

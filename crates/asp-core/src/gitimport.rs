@@ -199,18 +199,20 @@ impl GitObjectDb {
         pack: &[u8],
         base_lookup: impl Fn(&str) -> Option<(GitObjKind, Vec<u8>)>,
     ) -> Result<Self, GitImportError> {
-        Self::from_pack_with_progress(pack, base_lookup, |_, _| {})
+        Self::from_pack_with_progress(pack, base_lookup, |_, _, _| {})
     }
 
-    /// Like [`from_pack`], but reports `(objects_decoded, num_objects)` to `progress`
-    /// as decoding proceeds — drives the clone "replaying" phase (the dominant visible
-    /// stretch). `num_objects` is the pack header's object count, known up front.
+    /// Like [`from_pack`], but reports `(phase, done, total)` to `progress` as the pack
+    /// is processed. Two sub-phases, each `(done, num_objects)` where `num_objects` is
+    /// the pack header's object count (known up front): `"scanning"` (the initial
+    /// offset-enumeration sweep) then `"replaying"` (the dominant decode stretch). The
+    /// clone driver forwards the phase string straight to its progress sink.
     ///
     /// [`from_pack`]: GitObjectDb::from_pack
     pub fn from_pack_with_progress(
         pack: &[u8],
         base_lookup: impl Fn(&str) -> Option<(GitObjKind, Vec<u8>)>,
-        progress: impl FnMut(u64, u64),
+        progress: impl FnMut(&str, u64, u64),
     ) -> Result<Self, GitImportError> {
         let mut db = GitObjectDb::new();
         db.absorb_pack_with_progress(pack, base_lookup, progress)?;
@@ -225,19 +227,31 @@ impl GitObjectDb {
         pack: &[u8],
         base_lookup: impl Fn(&str) -> Option<(GitObjKind, Vec<u8>)>,
     ) -> Result<(), GitImportError> {
-        self.absorb_pack_with_progress(pack, base_lookup, |_, _| {})
+        self.absorb_pack_with_progress(pack, base_lookup, |_, _, _| {})
     }
 
-    /// Like [`absorb_pack`], but reports `(objects_decoded, num_objects)` to `progress`
-    /// (cumulative decoded count vs the pack header's total).
+    /// Like [`absorb_pack`], but reports `(phase, done, total)` to `progress`: the
+    /// `"scanning"` offset-enumeration sweep then the `"replaying"` decode, each against
+    /// the pack header's object count. Coarse — emitted every ~1000 entries plus a final
+    /// tick — so a huge pack can't flood the sink (these are hot, just-optimized loops).
     ///
     /// [`absorb_pack`]: GitObjectDb::absorb_pack
     pub fn absorb_pack_with_progress(
         &mut self,
         pack: &[u8],
         base_lookup: impl Fn(&str) -> Option<(GitObjKind, Vec<u8>)>,
-        mut progress: impl FnMut(u64, u64),
+        mut progress: impl FnMut(&str, u64, u64),
     ) -> Result<(), GitImportError> {
+        // Object count lives in the pack header ("PACK"(4) + version(4) + count(4),
+        // big-endian) — known before the scan, so the "scanning" bar shows its
+        // denominator from the first tick. A truncated header yields 0 (indeterminate),
+        // and the stream parse below will surface the real corruption error.
+        const PROGRESS_STRIDE: u64 = 1000;
+        let header_objects: u64 = if pack.len() >= 12 {
+            u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]) as u64
+        } else {
+            0
+        };
         // Phase 1 — enumerate entry offsets (the pack has no index, so we stream the
         // header to learn where each entry begins). Data is ignored here; phase 2
         // re-reads each entry by offset with full delta resolution.
@@ -249,11 +263,16 @@ impl GitObjectDb {
         )
         .map_err(|e| GitImportError::Pack(e.to_string()))?;
 
+        progress("scanning", 0, header_objects);
         let mut offsets: Vec<u64> = Vec::new();
         for entry in iter {
             let entry = entry.map_err(|e| GitImportError::Pack(e.to_string()))?;
             offsets.push(entry.pack_offset);
+            if (offsets.len() as u64).is_multiple_of(PROGRESS_STRIDE) {
+                progress("scanning", offsets.len() as u64, header_objects);
+            }
         }
+        progress("scanning", offsets.len() as u64, header_objects);
         // Ascending offset order means non-delta bases and ofs-delta bases (which
         // always precede their deltas in the pack) are decoded before dependents,
         // so the fixpoint below usually converges in a single pass.
@@ -264,7 +283,7 @@ impl GitObjectDb {
         // shows its denominator immediately.
         let num_objects = offsets.len() as u64;
         let mut decoded: u64 = 0;
-        progress(0, num_objects);
+        progress("replaying", 0, num_objects);
 
         let file = data::File::from_data(pack.to_vec(), "<memory>".into(), gix_hash::Kind::Sha1)
             .map_err(|e| GitImportError::Pack(e.to_string()))?;
@@ -337,7 +356,10 @@ impl GitObjectDb {
                         self.objects.insert(id.to_hex().to_string(), (kind, out));
                         progressed = true;
                         decoded += 1;
-                        progress(decoded, num_objects);
+                        // Coarse: don't fire the sink per object (a big pack is 100k+).
+                        if decoded.is_multiple_of(PROGRESS_STRIDE) {
+                            progress("replaying", decoded, num_objects);
+                        }
                     }
                     Err(_) => {
                         if let Some(b) = missing_base.into_inner() {
@@ -355,6 +377,8 @@ impl GitObjectDb {
             }
             pending = still;
         }
+        // Final tick — the stride above can leave the last <1000 objects unreported.
+        progress("replaying", decoded, num_objects);
         Ok(())
     }
 

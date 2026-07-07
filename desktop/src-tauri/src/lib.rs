@@ -52,7 +52,7 @@ pub fn run() {
             });
             // Emit git clone/pull progress on the SAME `vault-scan-progress` event the
             // startup reconcile uses, so a git clone drives the UI's determinate bar
-            // (phases `fetching` → `replaying` → `saving` → `materialize`).
+            // (phases `fetching` → `scanning` → `replaying` → `importing` → `saving` → `materialize`).
             let ph = app.handle().clone();
             app.state::<AppState>().engine.set_scan_progress_listener(move |path, done, total, phase| {
                 let _ = ph.emit(

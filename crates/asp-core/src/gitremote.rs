@@ -28,8 +28,9 @@ use crate::gitbridge::{
     fetch_pack, ls_remote, remote_id, GitAuth, GitRemoteSpec, RemoteStore,
 };
 use crate::gitgenesis::{
-    git_file_id, git_site_id, synthesize_genesis, synthesize_ingest_with_open_branches,
-    DbBlobSource, ImportedBranchSeed, ImportedFile, IngestContext,
+    git_file_id, git_site_id, synthesize_genesis, synthesize_genesis_with_progress,
+    synthesize_ingest_with_open_branches, DbBlobSource, ImportedBranchSeed, ImportedFile,
+    IngestContext,
 };
 use crate::gitimport::{
     no_base_lookup, plan_import, GitImportError, GitObjKind, GitObjectDb, ImportOptions,
@@ -267,10 +268,14 @@ pub async fn clone_from_git(
     }
 
     // 2/3. Fetch the pack (§3.4 size guard is best-effort: warn on a large pack).
-    // upload-pack sends no Content-Length, so the "fetching" bar is a live byte
-    // count (total 0 → the UI shows "X.X MB" under a segment shimmer).
+    // We forward the response's Content-Length as the fetch total when the server
+    // sends one; upload-pack is usually chunked (no Content-Length → total 0), so the
+    // "fetching" bar then stays a live byte count under a segment shimmer.
     progress("fetching", 0, 0);
-    let outcome = fetch_pack(spec, &wants, &[], opts.depth, |bytes| progress("fetching", bytes, 0)).await?;
+    let outcome = fetch_pack(spec, &wants, &[], opts.depth, |done, total| {
+        progress("fetching", done, total)
+    })
+    .await?;
     lap("fetch_pack");
     if outcome.pack.len() as u64 > SIZE_WARN_BYTES {
         tracing::warn!(
@@ -283,11 +288,11 @@ pub async fn clone_from_git(
     rstore.record_fetch(&outcome.pack, &[(remote_ref.clone(), tip.clone())])?;
     lap("record_fetch");
 
-    // 4. Decode + plan. Object decode is the dominant visible stretch — report
-    // (objects_done, num_objects) from the pack header for a determinate bar.
-    progress("replaying", 0, 0);
-    let db = GitObjectDb::from_pack_with_progress(&outcome.pack, no_base_lookup, |d, t| {
-        progress("replaying", d, t)
+    // 4. Decode + plan. The pack scan then object decode are the dominant visible
+    // stretch — from_pack_with_progress emits the "scanning" then "replaying" phases
+    // (each (done, num_objects) from the pack header) which we forward straight through.
+    let db = GitObjectDb::from_pack_with_progress(&outcome.pack, no_base_lookup, |ph, d, t| {
+        progress(ph, d, t)
     })
     .map_err(imp)?;
     lap("decode_pack");
@@ -309,9 +314,13 @@ pub async fn clone_from_git(
     let plan = plan_import(&db, &tip, &iopts).map_err(imp)?;
     lap("plan_import");
 
-    // 5. Deterministic genesis → paged integrate under batch.
+    // 5. Deterministic genesis → paged integrate under batch. Genesis walks every
+    // commit synthesizing sealed rows — report (commits_done, commit_count) as the
+    // "importing" phase so the bar advances instead of stalling on a big history.
     let scratch = MemBlobStore::new();
-    let g = synthesize_genesis(&plan, &DbBlobSource::new(&db), &scratch)?;
+    let g = synthesize_genesis_with_progress(&plan, &DbBlobSource::new(&db), &scratch, |d, t| {
+        progress("importing", d, t)
+    })?;
     lap("synthesize_genesis");
     let vault_id = if opts.new_identity { random_vault_id() } else { g.vault_id.clone() };
     engine.adopt_vault_id(&vault_id)?;
@@ -429,7 +438,10 @@ pub async fn pull_once(
     // 2. Fetch the delta (haves = last), exploding it into the object store.
     progress("fetching", 0, 0);
     let haves: Vec<String> = last.iter().cloned().collect();
-    let outcome = fetch_pack(&spec, std::slice::from_ref(&new_tip), &haves, None, |_| {}).await?;
+    let outcome = fetch_pack(&spec, std::slice::from_ref(&new_tip), &haves, None, |done, total| {
+        progress("fetching", done, total)
+    })
+    .await?;
     let mut rstore = RemoteStore::open(&engine.asp_dir, remote_id_str)?;
     rstore.record_fetch(&outcome.pack, &[(remote_ref.clone(), new_tip.clone())])?;
 
@@ -574,7 +586,7 @@ pub async fn rebaseline(engine: &Engine, remote_id_str: &str) -> AspResult<PullR
     let remote_ref = row.remote_ref.clone().unwrap_or_else(|| format!("refs/heads/{default_branch}"));
     let new_tip = tip_for_ref(&refs, &remote_ref)?;
 
-    let outcome = fetch_pack(&spec, std::slice::from_ref(&new_tip), &[], None, |_| {}).await?;
+    let outcome = fetch_pack(&spec, std::slice::from_ref(&new_tip), &[], None, |_, _| {}).await?;
     let mut rstore = RemoteStore::open(&engine.asp_dir, remote_id_str)?;
     rstore.record_fetch(&outcome.pack, &[(remote_ref.clone(), new_tip.clone())])?;
     let db = GitObjectDb::from_pack(&outcome.pack, no_base_lookup).map_err(imp)?;

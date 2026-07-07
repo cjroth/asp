@@ -140,7 +140,7 @@ fn fetch_pack_full_clone_decodes_all_objects() {
         let server = GitHttpServer::spawn(repo.repo_root());
         let spec = http_spec(&server.repo_url(name), GitAuth::Anonymous);
 
-        let outcome = block(fetch_pack(&spec, std::slice::from_ref(&head), &[], None, |_| {}))
+        let outcome = block(fetch_pack(&spec, std::slice::from_ref(&head), &[], None, |_, _| {}))
             .unwrap_or_else(|e| panic!("{name}: fetch_pack: {e}"));
 
         let tmp = tempfile::tempdir().unwrap();
@@ -172,7 +172,7 @@ fn fetch_pack_with_haves_at_tip_yields_no_new_objects() {
     let spec = http_spec(&server.repo_url("linear_basic"), GitAuth::Anonymous);
 
     // Fetch again advertising the tip as a have → server has nothing new to send.
-    let outcome = block(fetch_pack(&spec, std::slice::from_ref(&head), std::slice::from_ref(&head), None, |_| {}))
+    let outcome = block(fetch_pack(&spec, std::slice::from_ref(&head), std::slice::from_ref(&head), None, |_, _| {}))
         .expect("incremental fetch");
 
     let tmp = tempfile::tempdir().unwrap();
@@ -305,7 +305,7 @@ fn remote_store_records_and_answers_ancestry() {
     let server = GitHttpServer::spawn(repo.repo_root());
     let spec = http_spec(&server.repo_url("linear_basic"), GitAuth::Anonymous);
 
-    let outcome = block(fetch_pack(&spec, std::slice::from_ref(&head), &[], None, |_| {})).unwrap();
+    let outcome = block(fetch_pack(&spec, std::slice::from_ref(&head), &[], None, |_, _| {})).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut store = RemoteStore::open(tmp.path(), "ancestry").unwrap();
     store
@@ -332,7 +332,7 @@ fn force_rewrite_breaks_ancestry() {
     let spec = http_spec(&server.repo_url("linear_basic"), GitAuth::Anonymous);
 
     // Clone the current history into the store.
-    let out1 = block(fetch_pack(&spec, std::slice::from_ref(&old_tip), &[], None, |_| {})).unwrap();
+    let out1 = block(fetch_pack(&spec, std::slice::from_ref(&old_tip), &[], None, |_, _| {})).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut store = RemoteStore::open(tmp.path(), "forcepush").unwrap();
     store
@@ -344,7 +344,7 @@ fn force_rewrite_breaks_ancestry() {
     assert_ne!(new_tip, old_tip);
 
     // Fetch the rewritten history and record it into the same store.
-    let out2 = block(fetch_pack(&spec, std::slice::from_ref(&new_tip), &[], None, |_| {})).unwrap();
+    let out2 = block(fetch_pack(&spec, std::slice::from_ref(&new_tip), &[], None, |_, _| {})).unwrap();
     store
         .record_fetch(&out2.pack, &[("refs/heads/main".into(), new_tip.clone())])
         .unwrap();
@@ -417,7 +417,7 @@ fn ssh_ls_remote_and_fetch_via_shim() {
     );
 
     // fetch over the pipe decodes to the full object set.
-    let outcome = block(fetch_pack(&spec, std::slice::from_ref(&head), &[], None, |_| {})).expect("ssh fetch");
+    let outcome = block(fetch_pack(&spec, std::slice::from_ref(&head), &[], None, |_, _| {})).expect("ssh fetch");
     let tmp = tempfile::tempdir().unwrap();
     let mut store = RemoteStore::open(tmp.path(), "ssh").unwrap();
     store

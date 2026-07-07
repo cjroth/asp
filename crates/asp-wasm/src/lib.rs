@@ -598,7 +598,8 @@ impl WasmEngine {
     /// Steps: GET info/refs → parse caps → POST ls-refs (HEAD symref → default branch
     /// + tip) → POST fetch `{want tip, done}` → pack → decode → plan → deterministic
     /// genesis → paged integrate under batch. `on_progress(phase, done, total)` fires
-    /// with `phase ∈ {"fetching","replaying","saving","materialize"}`. Resolves to JSON
+    /// with `phase ∈ {"fetching","scanning","replaying","importing","saving",
+    /// "materialize"}` (in that order). Resolves to JSON
     /// `{vault_id, commits, branches, warnings, tip_sha, root_sha, remote_ref,
     /// default_branch, open_branches, refs_skipped}`.
     ///
@@ -846,9 +847,10 @@ fn apply_clone_pack(
     if !eng.is_pristine() {
         return Err("cannot clone a git remote into a non-empty vault".into());
     }
-    progress("replaying", 0, 0);
-    let db = gitimport::GitObjectDb::from_pack_with_progress(pack, gitimport::no_base_lookup, |d, t| {
-        progress("replaying", d, t)
+    // from_pack_with_progress emits the "scanning" then "replaying" phases (each
+    // (done, num_objects) from the pack header); forward the phase string through.
+    let db = gitimport::GitObjectDb::from_pack_with_progress(pack, gitimport::no_base_lookup, |ph, d, t| {
+        progress(ph, d, t)
     })
     .map_err(|e| e.to_string())?;
     // Every open-branch candidate tip must be in the fetched pack; a missing one (the
@@ -868,8 +870,15 @@ fn apply_clone_pack(
     let plan = gitimport::plan_import(&db, tip, &iopts).map_err(|e| e.to_string())?;
 
     let scratch = MemBlobStore::new();
-    let g = gitgenesis::synthesize_genesis(&plan, &gitgenesis::DbBlobSource::new(&db), &scratch)
-        .map_err(|e| e.to_string())?;
+    // Genesis walks every commit; report (commits_done, commit_count) as "importing"
+    // so the bar advances through a big history instead of stalling.
+    let g = gitgenesis::synthesize_genesis_with_progress(
+        &plan,
+        &gitgenesis::DbBlobSource::new(&db),
+        &scratch,
+        |d, t| progress("importing", d, t),
+    )
+    .map_err(|e| e.to_string())?;
     eng.adopt_vault_id(&g.vault_id).map_err(|e| e.to_string())?;
 
     progress("saving", 0, g.rows.len() as u64);

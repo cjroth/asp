@@ -2364,10 +2364,12 @@ export default function App() {
               // slice; total==0 → the fill sits at the slice floor + a shimmer plays
               // within the slice while a live count ticks.
               const seg: Record<ClonePhase, [number, number]> = {
-                fetching: [0, 0.25],
-                replaying: [0.25, 0.6],
-                saving: [0.6, 0.8],
-                materialize: [0.8, 1],
+                fetching: [0, 0.2],
+                scanning: [0.2, 0.28],
+                replaying: [0.28, 0.55],
+                importing: [0.55, 0.66],
+                saving: [0.66, 0.82],
+                materialize: [0.82, 1],
                 receiving: [0, 1],
               };
               const [lo, hi] = seg[phase] ?? [0, 1];
@@ -2379,14 +2381,18 @@ export default function App() {
                 phase === 'saving' ? 'Saving to this device…'
                   : phase === 'materialize' ? 'Writing files to this device…'
                     : phase === 'fetching' ? 'Fetching from git…'
-                      : phase === 'replaying' ? 'Replaying history…'
-                        : 'Receiving notes…';
+                      : phase === 'scanning' ? 'Scanning the pack…'
+                        : phase === 'replaying' ? 'Replaying history…'
+                          : phase === 'importing' ? 'Importing commits…'
+                            : 'Receiving notes…';
               const sub =
                 phase === 'saving' ? 'Almost done — writing everything to local storage.'
                   : phase === 'materialize' ? 'Saving the working tree locally.'
                     : phase === 'fetching' ? 'Downloading the repository over a secure connection.'
-                      : phase === 'replaying' ? 'Rebuilding the note history from the repository.'
-                        : 'Pulling the vault over a direct connection. Hang tight.';
+                      : phase === 'scanning' ? 'Indexing the objects in the downloaded pack.'
+                        : phase === 'replaying' ? 'Rebuilding the note history from the repository.'
+                          : phase === 'importing' ? 'Turning commits into synced note history.'
+                            : 'Pulling the vault over a direct connection. Hang tight.';
               // Right-aligned count: determinate → done/total; fetching-while-coarse →
               // live MB (bytes); other coarse phases → a running count if we have one.
               const count = determinate

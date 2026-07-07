@@ -245,6 +245,19 @@ pub fn synthesize_genesis(
     objects: &dyn GitBlobSource,
     out_store: &dyn BlobStore,
 ) -> AspResult<GenesisOutput> {
+    synthesize_genesis_with_progress(plan, objects, out_store, |_, _| {})
+}
+
+/// Like [`synthesize_genesis`], but reports `(commits_done, commit_count)` to
+/// `progress` as the emission loop walks `plan.commits` — drives the clone
+/// "importing" phase. Coarse (every ~1000 commits + a final tick), a pure side
+/// channel: emission order and row bytes are identical to [`synthesize_genesis`].
+pub fn synthesize_genesis_with_progress(
+    plan: &ImportPlan,
+    objects: &dyn GitBlobSource,
+    out_store: &dyn BlobStore,
+    progress: impl FnMut(u64, u64),
+) -> AspResult<GenesisOutput> {
     let site_id = git_site_id(&plan.root_sha);
     let vault_id = git_vault_id(&plan.root_sha);
 
@@ -260,7 +273,7 @@ pub fn synthesize_genesis(
     {
         em.precomp = Some(precompute_blobs(objects, plan, out_store)?);
     }
-    em.run(plan)?;
+    em.run_with_progress(plan, progress)?;
 
     // `.aspignore` seeding (git-bridge §3.3): generated from the tip's .gitignores,
     // emitted as an ordinary `main` file row authored last (so it syncs + is editable).
@@ -503,12 +516,34 @@ impl<'a> Emitter<'a> {
     }
 
     fn run(&mut self, plan: &ImportPlan) -> AspResult<()> {
+        self.run_with_progress(plan, |_, _| {})
+    }
+
+    /// [`run`], reporting `(commits_done, commit_count)` coarsely (every ~1000 commits
+    /// plus a final tick). Progress is a side channel — it never touches emission order
+    /// or row bytes. `done` counts every commit walked (skipped-as-`seen` included), so
+    /// the bar reaches its total even on a mostly-already-ingested plan.
+    ///
+    /// [`run`]: Emitter::run
+    fn run_with_progress(
+        &mut self,
+        plan: &ImportPlan,
+        mut progress: impl FnMut(u64, u64),
+    ) -> AspResult<()> {
+        const PROGRESS_STRIDE: u64 = 1000;
+        let total = plan.commits.len() as u64;
+        progress(0, total);
+        let mut done: u64 = 0;
         for c in &plan.commits {
-            if self.seen.contains(&c.sha) {
-                continue; // already ingested (git-bridge §4.2 step 1)
+            if !self.seen.contains(&c.sha) {
+                self.emit_commit_batch(plan, c)?; // else already ingested (§4.2 step 1)
             }
-            self.emit_commit_batch(plan, c)?;
+            done += 1;
+            if done.is_multiple_of(PROGRESS_STRIDE) {
+                progress(done, total);
+            }
         }
+        progress(total, total);
         Ok(())
     }
 
