@@ -58,7 +58,10 @@ async function main() {
     ok(`vite (fresh wasm bundle) on ${WEB_URL}`);
 
     const engine = browserName === 'firefox' ? firefox : chromium;
-    browser = await engine.launch({ headless: true });
+    // --unlimited-storage lifts headless Chromium's tiny throwaway-profile OPFS quota
+    // (a real user profile gets a disk-proportional quota); irrelevant for firefox.
+    const launchArgs = browserName === 'firefox' ? [] : ['--unlimited-storage'];
+    browser = await engine.launch({ headless: true, args: launchArgs });
     const page = await browser.newPage();
     const errors = [];
     page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
@@ -83,8 +86,49 @@ async function main() {
     const t0 = Date.now();
     await page.getByRole('button', { name: /^Connect$/i }).click();
 
-    const opened = await page.locator('[data-testid="live-editor"]').first().waitFor({ timeout: 180000 }).then(() => true).catch(() => false);
+    // Sample the progress bar while the clone runs — prove it goes DETERMINATE and
+    // advances (not a stuck spinner). Reads the progress block's phase title, count
+    // text, and the fill-bar width.
+    const cloneTimeout = Number(process.env.CLONE_TIMEOUT_MS || 180000);
+    let sampling = true;
+    const samples = [];
+    const samplePromise = (async () => {
+      while (sampling) {
+        try {
+          const s = await page.evaluate(() => {
+            const el = document.querySelector('[data-testid="clone-progress"]');
+            if (!el) return null;
+            return { phase: el.getAttribute('data-phase') || '', done: +(el.getAttribute('data-done') || 0), total: +(el.getAttribute('data-total') || 0), pct: +(el.getAttribute('data-pct') || 0) };
+          });
+          if (s) {
+            const key = `${s.phase}|${s.done}|${s.total}|${s.pct}`;
+            if (!samples.length || samples[samples.length - 1].key !== key) samples.push({ ...s, key });
+          }
+        } catch { /* navigation/teardown */ }
+        await sleep(120);
+      }
+    })();
+
+    const opened = await page.locator('[data-testid="live-editor"]').first().waitFor({ timeout: cloneTimeout }).then(() => true).catch(() => false);
+    sampling = false; await samplePromise;
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
+
+    // Progress-bar assertions (WEB reality): the web clone runs the wasm synchronously
+    // on the main thread, so the DOM only repaints at phase boundaries (the CSS shimmer
+    // still animates on the compositor thread during the blocking compute). So we assert
+    // the bar RENDERS and STEPS THROUGH the weighted phases (pct advances past 0) — NOT
+    // in-phase count increments (that's the native path, covered by the Rust test
+    // `clone_reports_determinate_progress_counts`). The msgpack-free + persistence checks
+    // above are the load-bearing ones for the OOM fix.
+    const phases = [...new Set(samples.map((s) => s.phase).filter(Boolean))];
+    const pctValues = [...new Set(samples.map((s) => s.pct))].sort((a, b) => a - b);
+    const rendered = samples.length > 0 && phases.length > 0;
+    const advanced = pctValues.length >= 2 && pctValues[pctValues.length - 1] > 0;
+    console.log(`  progress phases seen: ${JSON.stringify(phases)}`);
+    console.log(`  pct values seen: ${JSON.stringify(pctValues)}`);
+    console.log(`  samples: ${samples.length}  (web repaints at phase boundaries only — main-thread wasm)`);
+    if (rendered && advanced) ok('progress bar rendered and stepped through weighted phases');
+    else fail(`progress bar did not render/advance (phases=${JSON.stringify(phases)} pcts=${JSON.stringify(pctValues)})`);
 
     const msgpack = errors.find((e) => /multi-byte MessagePack|invalid value write/i.test(e));
     if (msgpack) fail(`MSGPACK/OOM ERROR still present: ${msgpack}`);
@@ -97,9 +141,19 @@ async function main() {
     }
     ok(`vault cloned + editor opened in ${secs}s`);
 
-    const body = await page.locator('body').innerText();
-    if (!body.includes(expectFile)) fail(`expected file "${expectFile}" not visible after clone`);
-    else ok(`imported file "${expectFile}" present`);
+    if (expectFile) {
+      const body = await page.locator('body').innerText();
+      if (!body.includes(expectFile)) fail(`expected file "${expectFile}" not visible after clone`);
+      else ok(`imported file "${expectFile}" present`);
+    }
+
+    // The OOM/msgpack error fired during PERSIST (coalesced ~700ms after the editor
+    // opens, in the background) — so wait for persist to run, THEN re-check the console.
+    const persistWait = Number(process.env.PERSIST_WAIT_MS || 2000);
+    await sleep(persistWait);
+    const msgpackPersist = errors.find((e) => /multi-byte MessagePack|invalid value write/i.test(e));
+    if (msgpackPersist) fail(`MSGPACK/OOM error during persist: ${msgpackPersist}`);
+    else ok(`no msgpack/OOM error during persist (waited ${persistWait}ms)`);
 
     // Persistence: reload and confirm the vault is still there (OPFS round-trip).
     await page.reload();

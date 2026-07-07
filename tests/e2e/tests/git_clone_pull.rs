@@ -144,6 +144,44 @@ fn clone_linear_basic_folds_to_tip_and_persists_config() {
     assert!(tmp.path().join(".aspignore").exists(), ".aspignore materialized to disk");
 }
 
+// ── clone: the progress callback carries real, completing determinate counts ──
+// This is the native/desktop progress path (ProgressFn → Tauri `vault-scan-progress`
+// → the React clone bar). The browser can't be asserted this way — the web clone runs
+// the wasm synchronously on the main thread, so the bar there only repaints at phase
+// boundaries — but the native path reports each phase's real (done,total).
+#[test]
+fn clone_reports_determinate_progress_counts() {
+    if !git_available() {
+        eprintln!("SKIP: system git not found");
+        return;
+    }
+    no_keyring();
+    let repo = linear_basic();
+    let server = GitHttpServer::spawn(repo.repo_root());
+    let url = server.repo_url(repo.name());
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = open_engine(tmp.path(), 1);
+    let spec = https(&url, GitAuth::Anonymous);
+
+    let events = std::sync::Mutex::new(Vec::<(String, u64, u64)>::new());
+    let cb = |phase: &str, done: u64, total: u64| {
+        events.lock().unwrap().push((phase.to_string(), done, total));
+    };
+    let opts = CloneOptions { on_progress: Some(&cb), ..Default::default() };
+    block(clone_from_git(&engine, &spec, &opts)).expect("clone");
+
+    let ev = events.lock().unwrap();
+    let max_total = |p: &str| ev.iter().filter(|(ph, _, _)| ph == p).map(|(_, _, t)| *t).max().unwrap_or(0);
+    let max_done = |p: &str| ev.iter().filter(|(ph, _, _)| ph == p).map(|(_, d, _)| *d).max().unwrap_or(0);
+    // Each heavy phase reports a real total and its done reaches that total (completes),
+    // so the weighted UI bar fills each segment rather than sitting indeterminate.
+    for p in ["replaying", "saving", "materialize"] {
+        assert!(ev.iter().any(|(ph, _, _)| ph == p), "{p} phase emitted");
+        assert!(max_total(p) > 0, "{p} carries a real determinate total");
+        assert_eq!(max_done(p), max_total(p), "{p} progress completes (done reaches total)");
+    }
+}
+
 // ── clone: merged_prs → pull an upstream advance ─────────────────────────────
 
 #[test]

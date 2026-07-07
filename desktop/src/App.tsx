@@ -2386,7 +2386,7 @@ export default function App() {
                   ? (done > 0 ? `${(done / 1048576).toFixed(1)} MB` : '')
                   : done > 0 ? done.toLocaleString() : '';
               return (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 9, background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 15px' }}>
+                <div data-testid="clone-progress" data-phase={phase} data-done={done} data-total={total} data-pct={pct} style={{ display: 'flex', flexDirection: 'column', gap: 9, background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 15px' }}>
                   <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 10 }}>
                     <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>{title}</span>
                     <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, color: 'var(--faint)' }}>{count}</span>
