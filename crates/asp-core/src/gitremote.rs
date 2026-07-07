@@ -318,9 +318,20 @@ pub async fn clone_from_git(
 
     progress("saving", 0, g.rows.len() as u64);
     engine.set_batch(true);
-    let res = integrate_paged(engine, &g.rows, &scratch, true, &|d, t| progress("saving", d, t));
+    // Bulk-load the pristine clone: drop the log's secondary indexes + relax
+    // durability for the insert, rebuild the indexes once at the end (far cheaper
+    // than N incremental index updates). `set_bulk` defers the per-page branch
+    // reconcile (its index is dropped) until after the rebuild, below.
+    engine.set_bulk(true);
+    let res = engine
+        .store
+        .bulk_load(|| integrate_paged(engine, &g.rows, &scratch, true, &|d, t| progress("saving", d, t)));
+    engine.set_bulk(false);
     engine.set_batch(false);
     res?;
+    // Indexes are back — run the deferred branch reconcile once (idempotent LWW),
+    // before the materialize below folds HEAD (which needs the branch set in scope).
+    engine.reconcile_branches_now()?;
     lap("integrate");
     progress("materialize", 0, 0);
     engine.materialize_with_progress(Some(&|d, t| progress("materialize", d, t)))?;

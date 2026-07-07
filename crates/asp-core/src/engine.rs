@@ -42,6 +42,15 @@ pub struct Engine {
     /// (`Engine` is `!Sync` and only ever touched behind a `Mutex`, so a `Cell`
     /// is safe here.)
     batch: std::cell::Cell<bool>,
+    /// When set (the pristine-clone bulk load: `set_bulk(true)`), `integrate_many`
+    /// suppresses its per-page `reconcile_branches`. That reconcile queries the
+    /// `log_kind_branch` partial index, which `SqliteStore::bulk_load` drops for the
+    /// duration — running it mid-load would full-scan the growing log. The clone
+    /// driver runs it ONCE after the bulk load rebuilds the index (and before the
+    /// deferred materialize), which is byte-equivalent since `reconcile_branches` is
+    /// an idempotent LWW over *all* branch rows. Like `batch`, a `Cell` is safe:
+    /// `Engine` is `!Sync` and only touched behind its `Mutex`.
+    bulk: std::cell::Cell<bool>,
     /// Incremental fold cache: the per-file_id states, so `materialize` re-folds
     /// only the files a change touched instead of the whole log. `None` until the
     /// first materialize builds it (and after anything that can't name what it
@@ -196,6 +205,7 @@ impl Engine {
             scope: std::cell::RefCell::new(scope),
             site,
             batch: std::cell::Cell::new(false),
+            bulk: std::cell::Cell::new(false),
             fold: std::cell::RefCell::new(None),
             fold_cache: std::cell::RefCell::new(Vec::new()),
             dirty: std::cell::RefCell::new(std::collections::HashSet::new()),
@@ -500,7 +510,10 @@ impl Engine {
                 self.note_dirty(&wr.row.file_id);
             }
         }
-        if any_branch {
+        // In bulk-load mode (pristine clone) the `log_kind_branch` index is dropped,
+        // so defer the reconcile until the clone driver runs it once after the index
+        // is rebuilt (see `set_bulk` / `reconcile_branches_now`).
+        if any_branch && !self.bulk.get() {
             self.reconcile_branches()?;
         }
         if any {
@@ -528,6 +541,24 @@ impl Engine {
     /// `batch` guard `capture_rescan` already uses for a whole-disk diff.
     pub fn set_batch(&self, on: bool) {
         self.batch.set(on);
+    }
+
+    /// Enable/disable pristine-clone bulk-load mode. While enabled,
+    /// [`integrate_many`](Self::integrate_many) suppresses its per-page
+    /// `reconcile_branches` (the `log_kind_branch` index is dropped for the bulk
+    /// load — see `SqliteStore::bulk_load`). The clone driver MUST call
+    /// [`reconcile_branches_now`](Self::reconcile_branches_now) once after disabling
+    /// bulk mode (index rebuilt) and before materialize.
+    pub fn set_bulk(&self, on: bool) {
+        self.bulk.set(on);
+    }
+
+    /// Reconcile the branch set from the synced `Kind::Branch` records — the public
+    /// entry point the clone bulk load calls once after the bulk insert (having
+    /// suppressed the per-page reconcile via [`set_bulk`](Self::set_bulk)).
+    /// Idempotent LWW over all branch rows.
+    pub fn reconcile_branches_now(&self) -> AspResult<()> {
+        self.reconcile_branches()
     }
 
     /// One page of a site's rows (as wire rows, blobs bundled) after `after`,

@@ -88,6 +88,31 @@ CREATE TABLE IF NOT EXISTS git_remotes(
 CREATE TABLE IF NOT EXISTS git_modes(path TEXT PRIMARY KEY, mode INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'file');
 "#;
 
+/// The `log` table's SECONDARY indexes, as a single source of truth. Each string
+/// is byte-identical to how the index is first created (SCHEMA for `log_file`/
+/// `log_site`; `migrate_branching` for the three branch/tag ones) — SQLite stores
+/// the CREATE text verbatim in `sqlite_master.sql`, so [`SqliteStore::bulk_load`]
+/// can drop these and recreate them with the EXACT same definitions. The
+/// `bulk_load_rebuilds_the_exact_index_set` test pins that equality against a
+/// freshly-opened store, so a definition can never silently drift here.
+///
+/// NOTE: this deliberately excludes the `id` PRIMARY KEY and the
+/// `UNIQUE(site_id, seq)` constraint index — both are identity/dedup-bearing and
+/// are kept during the bulk load (a pristine clone has no dups, so maintaining the
+/// PK costs almost nothing).
+const LOG_SECONDARY_INDEXES: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS log_file ON log(file_id)",
+    "CREATE INDEX IF NOT EXISTS log_site ON log(site_id, seq)",
+    "CREATE INDEX IF NOT EXISTS log_branch ON log(branch_id)",
+    "CREATE INDEX IF NOT EXISTS log_kind_branch ON log(kind) WHERE kind='branch'",
+    "CREATE INDEX IF NOT EXISTS log_kind_tag ON log(kind) WHERE kind='tag'",
+];
+
+/// The `log` secondary index names (for `DROP INDEX`), in the same order as
+/// [`LOG_SECONDARY_INDEXES`].
+const LOG_SECONDARY_INDEX_NAMES: &[&str] =
+    &["log_file", "log_site", "log_branch", "log_kind_branch", "log_kind_tag"];
+
 pub struct SqliteStore {
     conn: Connection,
 }
@@ -266,6 +291,59 @@ impl SqliteStore {
             }
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Run `f` as a **pristine-clone bulk load**: drop the `log` table's SECONDARY
+    /// indexes and switch to bulk-load PRAGMAs first, then rebuild the exact same
+    /// indexes and restore the PRAGMAs afterward. Building each index once over the
+    /// finished N-row table is far cheaper than N incremental b-tree updates (five
+    /// secondary indexes per INSERT dominated a big clone's insert phase). Returns
+    /// `f`'s value.
+    ///
+    /// SAFETY — only for the pristine git-clone path:
+    /// - Single-threaded: `Engine` is `!Sync` and only ever touched behind its
+    ///   `Mutex`, so nothing reads the (index-less) `log` concurrently. The one
+    ///   thing that *would* query a dropped index mid-load — `reconcile_branches`
+    ///   (via the `log_kind_branch` partial index) — is deferred by the clone
+    ///   driver (`Engine::set_bulk`) until after this returns and the index is back.
+    /// - Durability: a clone is all-or-nothing (git-bridge §9) — a torn clone's
+    ///   half-built vault is discarded — so `synchronous=OFF` strictly during the
+    ///   bulk insert is safe. It is restored to `NORMAL` here before returning.
+    /// - The indexes are rebuilt and PRAGMAs restored even if `f` returns `Err`, so
+    ///   a *caught* clone error still leaves a schema-consistent db. (`f`'s error
+    ///   takes precedence over a rebuild error in the return.)
+    pub fn bulk_load<T>(&self, f: impl FnOnce() -> AspResult<T>) -> AspResult<T> {
+        self.begin_bulk_load()?;
+        let out = f();
+        let finish = self.end_bulk_load();
+        // `f`'s error dominates (the indexes are already rebuilt regardless); a
+        // rebuild/restore error only surfaces if `f` itself succeeded.
+        match out {
+            Ok(v) => finish.map(|()| v),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Drop the secondary indexes + apply bulk-load PRAGMAs. See [`bulk_load`](Self::bulk_load).
+    fn begin_bulk_load(&self) -> AspResult<()> {
+        // `synchronous=OFF` (safe: a failed clone is discarded) + more scratch/cache
+        // room for the index rebuild. `cache_size` negative = KiB; `mmap_size` bytes.
+        self.conn.execute_batch(
+            "PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-262144; PRAGMA mmap_size=1073741824;",
+        )?;
+        for name in LOG_SECONDARY_INDEX_NAMES {
+            self.conn.execute_batch(&format!("DROP INDEX IF EXISTS {name}"))?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild the exact secondary index set + restore durability. See [`bulk_load`](Self::bulk_load).
+    fn end_bulk_load(&self) -> AspResult<()> {
+        for stmt in LOG_SECONDARY_INDEXES {
+            self.conn.execute_batch(stmt)?;
+        }
+        self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         Ok(())
     }
 
@@ -1179,6 +1257,52 @@ mod tests {
         assert_eq!(branch, "main");
         drop(s);
         SqliteStore::open(&path).unwrap(); // idempotent second open
+    }
+
+    #[test]
+    fn bulk_load_rebuilds_the_exact_index_set() {
+        // The clone bulk load drops the log's secondary indexes and rebuilds them
+        // from LOG_SECONDARY_INDEXES. Pin that the rebuilt set is byte-identical to
+        // a freshly-opened store's — the strongest guarantee the rebuild definitions
+        // never drift from SCHEMA + migrate_branching (a mismatch would silently
+        // change query plans or the index semantics).
+        let index_sql = |s: &SqliteStore| -> Vec<(String, Option<String>)> {
+            let mut stmt = s
+                .conn
+                .prepare("SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name='log' ORDER BY name")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let s = SqliteStore::open_memory().unwrap();
+        let before = index_sql(&s);
+        // Sanity: all five named secondary indexes are present to begin with.
+        for name in LOG_SECONDARY_INDEX_NAMES {
+            assert!(before.iter().any(|(n, _)| n == name), "expected index {name} on a fresh store");
+        }
+        // A no-op bulk load must leave the index set exactly as it found it.
+        s.bulk_load(|| Ok(())).unwrap();
+        assert_eq!(before, index_sql(&s), "bulk_load must rebuild the identical index set");
+        // synchronous restored to NORMAL (1), not left OFF (0).
+        let sync: i64 = s.conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        assert_eq!(sync, 1, "synchronous must be restored to NORMAL after bulk_load");
+    }
+
+    #[test]
+    fn bulk_load_rebuilds_indexes_even_on_error() {
+        let s = SqliteStore::open_memory().unwrap();
+        let r: AspResult<()> = s.bulk_load(|| Err(crate::error::AspError::Protocol("boom".into())));
+        assert!(r.is_err(), "f's error propagates");
+        // Indexes must still be back despite the error.
+        let has: bool = s
+            .conn
+            .query_row("SELECT 1 FROM sqlite_master WHERE type='index' AND name='log_kind_branch'", [], |_| Ok(()))
+            .optional()
+            .unwrap()
+            .is_some();
+        assert!(has, "log_kind_branch rebuilt even after f errored");
     }
 
     #[test]
