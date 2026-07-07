@@ -7,6 +7,9 @@
 //! `Arc<Mutex<Engine>>` and locked **briefly around each synchronous call**
 //! (never across an `.await`).
 
+use crate::authkeys::PeerPolicy;
+use crate::log::Kind;
+use crate::wire::WireRow;
 use crate::AdmitCtx;
 use crate::{Engine, Msg};
 use anyhow::{Context, Result};
@@ -39,22 +42,73 @@ impl AuthOpts {
     }
 }
 
+/// A live peer connection: its outbound queue plus the replication grant the
+/// listener admitted it with (scoped-sync §3.5). The grant governs the realtime
+/// send-filter; it is filled in after the handshake authenticates (default
+/// full/read-write until then).
+pub struct ConnEntry {
+    pub tx: mpsc::UnboundedSender<Msg>,
+    pub policy: PeerPolicy,
+}
+
 /// Registry of live peer connections for real-time fan-out (hub forward-then-
 /// merge + the watcher's live push). Transport-agnostic — shared by the iroh
 /// driver. Keyed by a process-unique connection id.
-pub(crate) type Conns = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Msg>>>>;
+pub(crate) type Conns = Arc<Mutex<HashMap<u64, ConnEntry>>>;
 pub(crate) static CONN_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// Push `msg` to every live connection except `except` (real-time fan-out).
-pub(crate) async fn fanout(conns: &Conns, except: u64, msg: &Msg) {
+/// Fan out a newly-integrated file row to every live peer except `except`,
+/// applying each peer's scope grant (A — scoped-sync §3.5). This is the realtime
+/// twin of the catch-up filter and MUST live here, not only in catch-up: the hub
+/// re-forward is the leak path a catch-up-only filter would miss.
+///
+/// - **Unscoped peer** → the lone `Push` (today's behavior, no engine work).
+/// - **Non-file row** (Branch/Tag/Merge/Git*) → always shipped as a lone `Push`.
+/// - **Scoped peer, in-scope file** → normally the lone `Push`; but a **`Rename`**
+///   that brings a file into scope ships the file's WHOLE `file_id` chain as
+///   `Msg::Rows` — a lone Push of the Rename would arrive without the below-
+///   watermark `Create` and orphan the fold (§3.3 the subtle realtime bug).
+///   Idempotent (INSERT-OR-IGNORE), so it is also safe for rename-within-scope.
+/// - **Scoped peer, out-of-scope file** → skipped.
+pub(crate) async fn fanout_row(conns: &Conns, except: u64, engine: &EngineRef, wr: &WireRow) {
     let map = conns.lock().await;
-    for (id, tx) in map.iter() {
-        if *id != except {
-            let _ = tx.send(msg.clone());
+    for (id, e) in map.iter() {
+        if *id == except {
+            continue;
+        }
+        let allowed = match &e.policy.allowed_paths {
+            None => {
+                let _ = e.tx.send(Msg::Push { row: Box::new(wr.clone()) });
+                continue;
+            }
+            Some(a) => a,
+        };
+        if !crate::session::is_file_mutation(&wr.row) {
+            let _ = e.tx.send(Msg::Push { row: Box::new(wr.clone()) });
+            continue;
+        }
+        // Compute membership (and, for a Rename, the reship chain) under one brief
+        // engine lock — no await is held across it.
+        let (member, chain) = {
+            let eng = engine.lock().unwrap();
+            let member = eng.file_in_scope(&wr.row.file_id, allowed).unwrap_or(false);
+            let chain = if member && wr.row.kind == Kind::Rename { eng.wire_chain(&wr.row.file_id).ok() } else { None };
+            (member, chain)
+        };
+        if !member {
+            continue;
+        }
+        match chain {
+            Some(rows) => {
+                let _ = e.tx.send(Msg::Rows { rows });
+            }
+            None => {
+                let _ = e.tx.send(Msg::Push { row: Box::new(wr.clone()) });
+            }
         }
     }
 }
@@ -93,7 +147,7 @@ pub fn spawn_watcher(engine: EngineRef, conns: Conns, debounce_ms: u64) -> Resul
             match rows {
                 Ok(rows) => {
                     for wr in rows {
-                        fanout(&conns, 0, &Msg::Push { row: Box::new(wr) }).await;
+                        fanout_row(&conns, 0, &engine, &wr).await;
                     }
                 }
                 Err(e) => tracing::warn!("capture error: {e}"),
@@ -109,6 +163,45 @@ mod tests {
     use crate::engine::Engine;
     use crate::identity::Identity;
     use tempfile::tempdir;
+
+    /// A — realtime rename-into-scope reships the whole chain (scoped-sync §3.3,
+    /// §10 risk 3). A lone Push of a boundary-crossing Rename would arrive at a
+    /// scoped peer without the below-watermark Create and orphan the fold; the
+    /// fan-out must instead ship the file's whole `file_id` chain. An unscoped peer
+    /// keeps getting lone Pushes; an out-of-scope file never reaches a scoped peer.
+    #[tokio::test]
+    async fn fanout_reships_whole_chain_on_rename_into_scope() {
+        let dir = tempdir().unwrap();
+        let e = Engine::init(dir.path(), Identity::from_seed(&[5; 32])).unwrap();
+        let engine: EngineRef = Arc::new(StdMutex::new(e));
+
+        let (stx, mut srx) = mpsc::unbounded_channel::<Msg>();
+        let (utx, mut urx) = mpsc::unbounded_channel::<Msg>();
+        let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
+        conns.lock().await.insert(
+            1,
+            ConnEntry { tx: stx, policy: PeerPolicy { allowed_paths: Some(vec!["work".into()]), read_only: false } },
+        );
+        conns.lock().await.insert(2, ConnEntry { tx: utx, policy: PeerPolicy::default() });
+
+        // Create OUT of scope: the scoped peer must NOT receive it; the unscoped one does.
+        let create = { engine.lock().unwrap().record_write("personal/x.md", b"hi\n").unwrap().unwrap() };
+        fanout_row(&conns, 0, &engine, &create).await;
+        assert!(srx.try_recv().is_err(), "out-of-scope create is not sent to the scoped peer");
+        assert!(matches!(urx.try_recv(), Ok(Msg::Push { .. })), "unscoped peer gets the create");
+
+        // Rename INTO scope: the scoped peer must get the WHOLE chain as Msg::Rows.
+        let rename = { engine.lock().unwrap().record_rename("personal/x.md", "work/x.md").unwrap().unwrap() };
+        fanout_row(&conns, 0, &engine, &rename).await;
+        match srx.try_recv() {
+            Ok(Msg::Rows { rows }) => {
+                assert!(rows.iter().any(|w| w.row.kind == Kind::Create), "chain includes the below-watermark Create");
+                assert!(rows.iter().any(|w| w.row.kind == Kind::Rename), "chain includes the Rename");
+            }
+            other => panic!("expected Msg::Rows whole-chain reship, got {other:?}"),
+        }
+        assert!(matches!(urx.try_recv(), Ok(Msg::Push { .. })), "unscoped peer gets the lone rename push");
+    }
 
     #[tokio::test]
     async fn watcher_captures_a_disk_write() {

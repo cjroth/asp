@@ -437,6 +437,19 @@ impl SqliteStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Every `(file_id, path)` a `Create`/`Rename` row ever assigned — the raw path
+    /// history used to compute scope membership (scoped-sync §3.3 SYNC membership:
+    /// "the file_id EVER resolved under X"). Reads the LOG, not the `files` table, so
+    /// tombstoned files are inherently included (an in-scope Delete must still ship);
+    /// no `deleted=0` trap. A file_id appears once per distinct assigned path.
+    pub fn scope_path_history(&self) -> AspResult<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_id, path FROM log WHERE kind IN ('create','rename') AND path IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Max Lamport across the log (0 if empty) — the derived-git commit time.
     pub fn max_lamport(&self) -> AspResult<u64> {
         let m: i64 = self.conn.query_row("SELECT COALESCE(MAX(lamport),0) FROM log", [], |r| r.get(0))?;

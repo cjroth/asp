@@ -80,6 +80,31 @@ impl Scope {
     }
 }
 
+/// Whitelist membership for scoped sync (scoped-sync §3.6). `allowed` is a peer's
+/// grant (`authorized_keys.allowed_paths`): each entry is a **directory prefix**
+/// (`work` admits `work` itself and everything under `work/…`) or a **glob**
+/// (`work/**`, `notes/*.md`) delegated to the same DoS-hardened [`glob_match`].
+/// The always-ignored dirs (`.git`/`.asp`/…) are never in scope, mirroring
+/// [`Scope::ignored`]. `scope.rs` is std-only and always-compiled, so this runs
+/// byte-identically in wasm.
+pub fn allows(allowed: &[String], rel_path: &str) -> bool {
+    if rel_path.split('/').any(|seg| ALWAYS_IGNORE_DIRS.contains(&seg)) {
+        return false;
+    }
+    allowed.iter().any(|raw| {
+        let p = raw.trim_matches('/');
+        if p.is_empty() {
+            return false;
+        }
+        // Directory-prefix membership: `work` admits `work` and `work/**`.
+        if rel_path == p || rel_path.starts_with(&format!("{p}/")) {
+            return true;
+        }
+        // Glob membership (e.g. `notes/*.md`, `work/**`).
+        glob_match(p, rel_path)
+    })
+}
+
 impl Pattern {
     fn matches(&self, path: &str) -> bool {
         if self.anchored {
@@ -277,6 +302,32 @@ mod tests {
         let hit = s.ignored(&text);
         assert!(!hit, "pattern requires a trailing 'b' the text lacks");
         assert!(start.elapsed().as_secs() < 2, "glob matcher backtracked (took {:?})", start.elapsed());
+    }
+
+    #[test]
+    fn scope_allows_dir_prefix_and_globs() {
+        // Directory-prefix grant: `work` admits the dir itself and everything under it.
+        let g = ["work".to_string()];
+        assert!(allows(&g, "work"));
+        assert!(allows(&g, "work/a.md"));
+        assert!(allows(&g, "work/sub/deep.md"));
+        assert!(!allows(&g, "personal/a.md"));
+        assert!(!allows(&g, "workshop/a.md"), "prefix must be a path boundary, not a substring");
+        // Multiple prefixes.
+        let g2 = ["work".to_string(), "shared/notes.md".to_string()];
+        assert!(allows(&g2, "shared/notes.md"));
+        assert!(!allows(&g2, "shared/other.md"));
+        // Glob grant.
+        let g3 = ["notes/*.md".to_string()];
+        assert!(allows(&g3, "notes/a.md"));
+        assert!(!allows(&g3, "notes/sub/a.md"));
+        let g4 = ["work/**".to_string()];
+        assert!(allows(&g4, "work/x/y.md"));
+        // Trailing/leading slashes on the grant are tolerated (CLI normalizes, but be safe).
+        assert!(allows(&["/work/".to_string()], "work/a.md"));
+        // Always-ignored dirs are never in scope even if a grant would match.
+        assert!(!allows(&["**".to_string()], "proj/.git/config"));
+        assert!(!allows(&["".to_string()], "anything"), "an empty grant entry admits nothing");
     }
 
     #[test]

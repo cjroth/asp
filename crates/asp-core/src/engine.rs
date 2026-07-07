@@ -1823,6 +1823,41 @@ impl Engine {
         self.store.delete_authkey_by_node(node_hex)
     }
 
+    /// Is `file_id` a scope member (§3.3): did any of its `Create`/`Rename` rows
+    /// assign a path in `allowed`? O(chain length), not O(whole log) — the per-row
+    /// realtime fan-out check (`fanout_row`).
+    pub fn file_in_scope(&self, file_id: &str, allowed: &[String]) -> AspResult<bool> {
+        for r in self.store.rows_for_file(file_id)? {
+            if matches!(r.kind, Kind::Create | Kind::Rename) {
+                if let Some(p) = &r.path {
+                    if crate::scope::allows(allowed, p) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// The whole wire chain for a `file_id` (all its rows, blobs bundled) — the
+    /// rename-into-scope reship (§3.3), shipped as one idempotent `Msg::Rows`.
+    pub fn wire_chain(&self, file_id: &str) -> AspResult<Vec<WireRow>> {
+        self.store.rows_for_file(file_id)?.into_iter().map(|r| self.wire(r)).collect()
+    }
+
+    /// The `file_id`s that EVER resolved under `allowed` (scoped-sync §3.3 SYNC
+    /// membership) — the scope send-filter (A) ships exactly these file rows.
+    /// Includes tombstoned files (queries the log, not the live `files` table).
+    pub fn scope_members(&self, allowed: &[String]) -> AspResult<std::collections::HashSet<String>> {
+        let mut members = std::collections::HashSet::new();
+        for (file_id, path) in self.store.scope_path_history()? {
+            if crate::scope::allows(allowed, &path) {
+                members.insert(file_id);
+            }
+        }
+        Ok(members)
+    }
+
     /// Listen-start migration: fill `expires_at` on unset rows with
     /// `today + default_ttl`. Idempotent. Returns rows filled.
     pub fn migrate_keys(&self, default_ttl_days: u64) -> AspResult<usize> {
@@ -1883,6 +1918,9 @@ impl SessionVault for Engine {
     }
     fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<PeerPolicy> {
         Engine::admit(self, peer, ctx)
+    }
+    fn scope_members(&self, allowed: &[String]) -> AspResult<std::collections::HashSet<String>> {
+        Engine::scope_members(self, allowed)
     }
     fn is_pristine(&self) -> bool {
         self.store.row_count().map(|c| c == 0).unwrap_or(false)

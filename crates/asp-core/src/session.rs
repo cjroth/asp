@@ -49,6 +49,15 @@ pub trait SessionVault {
     /// scoped-sync §3.1) — `Err` denies the connection. The listener threads the
     /// returned policy onto the `Session` (catch-up filter + read-only reject).
     fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<PeerPolicy>;
+    /// The set of `file_id`s that EVER resolved under `allowed` (scoped-sync §3.3
+    /// SYNC membership). The catch-up / fanout send-filter ships exactly these file
+    /// rows (plus all non-file rows). Includes tombstoned files, so an in-scope
+    /// Delete still ships. Only called when a peer carries a scope grant. The
+    /// default is **fail-closed** (empty = nothing in scope); the real engines
+    /// override it — a vault that forgets to must never leak the whole log.
+    fn scope_members(&self, _allowed: &[String]) -> AspResult<std::collections::HashSet<String>> {
+        Ok(std::collections::HashSet::new())
+    }
     /// No authored rows yet — the vault has nothing of its own to lose, so it
     /// adopts a peer's vault on connect (like `clone`). A freshly-`init`'d folder
     /// that hasn't committed content is pristine.
@@ -73,7 +82,7 @@ pub enum Step {
     /// idle timeout the peer closes with 0 rows. Streaming keeps frames flowing
     /// (idle stays reset) and memory bounded. Only the native driver (net.rs)
     /// produces real streaming; see also `catchup_rows` for the inline fallback.
-    CatchUp { peer_vv: std::collections::BTreeMap<String, i64> },
+    CatchUp { peer_vv: std::collections::BTreeMap<String, i64>, policy: PeerPolicy },
     /// The peer signalled it has sent all our missing rows (`Msg::Synced`). A
     /// oneshot driver closes on this; a persistent `watch` ignores it and stays
     /// connected for live pushes.
@@ -119,17 +128,38 @@ pub struct Session {
 const CATCHUP_CHUNK_BYTES: usize = 1024 * 1024;
 const CATCHUP_CHUNK_ROWS: usize = 256;
 
-/// Every row the peer (`peer_vv`) is missing, built up front. Used by the
-/// connector (small push-back) and by non-streaming drivers (the in-process
-/// test); the native listener streams via `Engine::rows_after_wire_page` instead.
+/// A row admitted to a scoped peer's feed (scoped-sync §3.2/§3.4): every non-file
+/// row ships wholesale (Branch/Tag/Merge/Git* — few, load-bearing, path-overloaded),
+/// and a file row ships iff its `file_id` is a scope member (its whole chain is
+/// present, so the fold never orphans, §3.3). `None` members = no scoping (full).
+pub(crate) fn scope_admits(wr: &WireRow, members: Option<&std::collections::HashSet<String>>) -> bool {
+    match members {
+        None => true,
+        Some(m) => !is_file_mutation(&wr.row) || m.contains(&wr.row.file_id),
+    }
+}
+
+/// Every row the peer (`peer_vv`) is missing, built up front, **filtered to the
+/// peer's `policy`** (scoped-sync §3.2). Used by the connector (small push-back)
+/// and by non-streaming drivers (the in-process test); the native listener streams
+/// via `Engine::rows_after_wire_page` + the same filter in `stream_catchup` instead.
 pub(crate) fn catchup_rows(
     vault: &dyn SessionVault,
     peer_vv: &std::collections::BTreeMap<String, i64>,
+    policy: &PeerPolicy,
 ) -> AspResult<Vec<WireRow>> {
+    let members = match &policy.allowed_paths {
+        Some(allowed) => Some(vault.scope_members(allowed)?),
+        None => None,
+    };
     let mut rows = Vec::new();
     for (site, _max) in vault.version_vector()? {
         let peer_seq = peer_vv.get(&site).copied().unwrap_or(-1);
-        rows.extend(vault.rows_after_wire(&site, peer_seq)?);
+        for wr in vault.rows_after_wire(&site, peer_seq)? {
+            if scope_admits(&wr, members.as_ref()) {
+                rows.push(wr);
+            }
+        }
     }
     Ok(rows)
 }
@@ -312,8 +342,12 @@ impl Session {
                 // edits pushed back) is small, and the wasm/browser connector can't
                 // stream across its feed() boundary, so it builds inline.
                 match self.role {
-                    Role::Listener => out.push(Step::CatchUp { peer_vv: vv }),
-                    Role::Connector => push_rows_chunked(&mut out, catchup_rows(vault, &vv)?),
+                    // The listener streams the catch-up in pages (Step::CatchUp),
+                    // carrying the admitted grant so the driver applies the scope
+                    // send-filter (A, scoped-sync §3.2). The connector's own push-back
+                    // is unscoped (its policy is default) and built inline.
+                    Role::Listener => out.push(Step::CatchUp { peer_vv: vv, policy: self.policy.clone() }),
+                    Role::Connector => push_rows_chunked(&mut out, catchup_rows(vault, &vv, &self.policy)?),
                 }
                 Ok(out)
             }
@@ -568,6 +602,203 @@ mod tests {
         assert!(!b.files_map().unwrap().contains_key("m.md"), "no data leaks to a denied peer");
     }
 
+    // ---------------- Feature A: partial subdir sync (scoped-sync §3, §9) ----------------
+
+    /// Drive a full catch-up from `source` (listener) to a fresh `replica`
+    /// (connector) that the source admitted with a `--subdir` grant of `allowed`
+    /// (empty = full). Exercises the real `catchup_rows` scope filter via the
+    /// in-process pump (Step::CatchUp → msgs_of). Re-runnable (authorize is
+    /// idempotent) to simulate a reconnect.
+    fn scoped_pump(source: &crate::MemEngine, replica: &crate::MemEngine, allowed: &[&str]) {
+        let paths: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+        let grant = if paths.is_empty() { None } else { Some(paths) };
+        source
+            .authorize_with_policy(&Identity::from_seed(&[2; 32]).to_ssh_string(), None, true, "test", grant, false)
+            .unwrap();
+        let mut ls = Session::new(Role::Listener, source, ctx(), nid(2), Vec::new());
+        let mut cr = Session::new(Role::Connector, replica, ctx(), nid(1), Vec::new());
+        pump(source, &mut ls, replica, &mut cr);
+        assert!(ls.authed() && cr.authed(), "scoped session authenticated");
+    }
+
+    /// A — ground-truth invariant (load-bearing, §9). Over a deterministic LCG
+    /// history of create/edit/within-scope-rename/delete across in-scope (`work/`)
+    /// and out-of-scope (`personal/`) files, a subdir-scoped replica's fold equals
+    /// the source's fold restricted to the in-scope files — byte-for-byte, nothing
+    /// out of scope. (Cross-boundary renames are covered by the dedicated monotonic
+    /// test below, where membership ≠ current path.)
+    #[test]
+    fn scoped_replica_fold_equals_source_restricted_to_scope() {
+        use crate::MemEngine;
+        let source = MemEngine::create(Identity::from_seed(&[1; 32]), "v");
+        let mut lcg: u64 = 0x1234_5678_9abc_def0;
+        let mut rnd = || {
+            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (lcg >> 33) as u32
+        };
+        for i in 0..40u32 {
+            let dir = if rnd() % 2 == 0 { "work" } else { "personal" };
+            source.record_write(&format!("{dir}/f{i:02}.md"), format!("v0/{i}\n").as_bytes()).unwrap();
+        }
+        let mut ren = 0u32;
+        for _ in 0..150 {
+            let files: Vec<String> = source.files_map().unwrap().keys().cloned().collect();
+            if files.is_empty() {
+                break;
+            }
+            let f = files[(rnd() as usize) % files.len()].clone();
+            let top = f.split('/').next().unwrap().to_string();
+            match rnd() % 4 {
+                0 | 1 => {
+                    source.record_write(&f, format!("edit-{}\n", rnd()).as_bytes()).unwrap();
+                }
+                2 => {
+                    // within-scope rename (unique target keeps the top dir, no collision)
+                    ren += 1;
+                    source.record_rename(&f, &format!("{top}/r{ren}.md")).unwrap();
+                }
+                _ => {
+                    source.record_remove(&f).unwrap();
+                }
+            }
+        }
+
+        let replica = MemEngine::create(Identity::from_seed(&[2; 32]), "v");
+        scoped_pump(&source, &replica, &["work"]);
+
+        let src_scoped: std::collections::BTreeMap<String, Vec<u8>> =
+            source.files_map().unwrap().into_iter().filter(|(p, _)| p.starts_with("work/")).collect();
+        assert!(!src_scoped.is_empty(), "fixture must produce in-scope files");
+        assert_eq!(replica.files_map().unwrap(), src_scoped, "scoped fold == source restricted to scope");
+    }
+
+    /// A — rename across the scope boundary is monotonic (§3.3). SYNC membership is
+    /// "ever resolved under X", so a file that entered X ships its WHOLE chain
+    /// (incl. the out-of-scope Create) and a file that LEFT X still ships (the
+    /// replica learns it left — no stale ghost). A file that never touched X never
+    /// ships.
+    #[test]
+    fn scoped_rename_across_boundary_is_monotonic() {
+        use crate::MemEngine;
+        let source = MemEngine::create(Identity::from_seed(&[1; 32]), "v");
+        source.record_write("personal/a.md", b"A body\n").unwrap();
+        source.record_rename("personal/a.md", "work/a.md").unwrap(); // INTO scope
+        source.record_write("work/b.md", b"B body\n").unwrap();
+        source.record_rename("work/b.md", "personal/b.md").unwrap(); // OUT of scope
+        source.record_write("personal/c.md", b"C body\n").unwrap(); // never in scope
+
+        let replica = MemEngine::create(Identity::from_seed(&[2; 32]), "v");
+        scoped_pump(&source, &replica, &["work"]);
+
+        let files = replica.files_map().unwrap();
+        assert_eq!(files.get("work/a.md").map(|v| v.as_slice()), Some(&b"A body\n"[..]), "rename-into-scope ships the whole chain");
+        assert!(!files.contains_key("work/b.md"), "no stale ghost at the old in-scope path");
+        assert_eq!(files.get("personal/b.md").map(|v| v.as_slice()), Some(&b"B body\n"[..]), "renamed-out file folds at its new path (monotonic membership)");
+        assert!(!files.contains_key("personal/c.md"), "a file that never touched the scope never ships");
+    }
+
+    /// A — dense-seq regression (§3.2). The filter drops a mid-sequence slice, so the
+    /// scoped replica holds a gapped seq set ({0,2,4} with 1,3 out of scope). It must
+    /// converge within scope AND, on reconnect, never re-request the dropped seqs
+    /// (its `MAX(seq)` watermark advertises 4; nothing below is requestable).
+    #[test]
+    fn scoped_dense_seq_holes_converge_and_stay_converged() {
+        use crate::MemEngine;
+        let source = MemEngine::create(Identity::from_seed(&[1; 32]), "v");
+        source.record_write("work/0.md", b"0\n").unwrap(); // seq 0
+        source.record_write("personal/1.md", b"1\n").unwrap(); // seq 1 (out)
+        source.record_write("work/2.md", b"2\n").unwrap(); // seq 2
+        source.record_write("personal/3.md", b"3\n").unwrap(); // seq 3 (out)
+        source.record_write("work/4.md", b"4\n").unwrap(); // seq 4
+
+        let replica = MemEngine::create(Identity::from_seed(&[2; 32]), "v");
+        scoped_pump(&source, &replica, &["work"]);
+        assert_eq!(
+            replica.files_map().unwrap().keys().cloned().collect::<Vec<_>>(),
+            vec!["work/0.md".to_string(), "work/2.md".to_string(), "work/4.md".to_string()],
+        );
+        let before = replica.row_count();
+        scoped_pump(&source, &replica, &["work"]); // reconnect
+        assert_eq!(replica.row_count(), before, "no re-request loop for the dropped out-of-scope seqs");
+    }
+
+    /// A — tombstone membership (§3.3). An in-scope Delete must ship (membership is
+    /// computed over the log, not the `deleted=0` live view), so the replica shows no
+    /// ghost of a deleted in-scope file.
+    #[test]
+    fn scoped_in_scope_delete_ships_no_ghost() {
+        use crate::MemEngine;
+        let source = MemEngine::create(Identity::from_seed(&[1; 32]), "v");
+        source.record_write("work/keep.md", b"keep\n").unwrap();
+        source.record_write("work/gone.md", b"gone\n").unwrap();
+        source.record_remove("work/gone.md").unwrap();
+
+        let replica = MemEngine::create(Identity::from_seed(&[2; 32]), "v");
+        scoped_pump(&source, &replica, &["work"]);
+        let files = replica.files_map().unwrap();
+        assert!(files.contains_key("work/keep.md"));
+        assert!(!files.contains_key("work/gone.md"), "in-scope delete ships → no ghost on the replica");
+    }
+
+    /// A — N-vs-2N scaling (§9). A scoped clone of N in-scope + N out-of-scope files
+    /// transfers ~N rows/blobs, not ~2N.
+    #[test]
+    fn scoped_clone_transfers_only_in_scope_rows() {
+        use crate::MemEngine;
+        const N: usize = 50;
+        let source = MemEngine::create(Identity::from_seed(&[1; 32]), "v");
+        for i in 0..N {
+            source.record_write(&format!("work/w{i}.md"), format!("w{i}\n").as_bytes()).unwrap();
+        }
+        for i in 0..N {
+            source.record_write(&format!("personal/p{i}.md"), format!("p{i}\n").as_bytes()).unwrap();
+        }
+        assert_eq!(source.row_count(), 2 * N, "source holds 2N rows");
+
+        let replica = MemEngine::create(Identity::from_seed(&[2; 32]), "v");
+        scoped_pump(&source, &replica, &["work"]);
+        assert_eq!(replica.row_count(), N, "scoped clone transfers exactly the in-scope rows");
+        assert_eq!(replica.files_map().unwrap().len(), N);
+    }
+
+    /// A — native-Engine parity for the ground-truth invariant (§10 risk 5). The
+    /// filter lives in the shared sans-IO path, so the native SQLite engine must
+    /// produce the identical scoped fold.
+    #[test]
+    fn scoped_replica_native_engine_parity() {
+        let ds = tempdir().unwrap();
+        let dr = tempdir().unwrap();
+        let source = Engine::init(ds.path(), Identity::from_seed(&[1; 32])).unwrap();
+        let replica = Engine::init(dr.path(), Identity::from_seed(&[2; 32])).unwrap();
+        // Same vault (clone scenario).
+        let vid = source.store.get_config("vault_id").unwrap().unwrap();
+        replica.store.set_config("vault_id", &vid).unwrap();
+        for i in 0..12 {
+            source.record_write(&format!("work/w{i}.md"), format!("w{i}\n").as_bytes()).unwrap();
+            source.record_write(&format!("personal/p{i}.md"), format!("p{i}\n").as_bytes()).unwrap();
+        }
+        source.record_remove("work/w3.md").unwrap();
+
+        source
+            .authorize_with_policy(&Identity::from_seed(&[2; 32]).to_ssh_string(), None, true, "test", Some(vec!["work".into()]), false)
+            .unwrap();
+        let mut ls = Session::new(Role::Listener, &source, ctx(), nid(2), Vec::new());
+        let mut cr = Session::new(Role::Connector, &replica, ctx(), nid(1), Vec::new());
+        pump(&source, &mut ls, &replica, &mut cr);
+
+        // The replica materialized exactly the live in-scope files, nothing else.
+        for i in 0..12 {
+            let w = dr.path().join(format!("work/w{i}.md"));
+            let p = dr.path().join(format!("personal/p{i}.md"));
+            assert!(!p.exists(), "out-of-scope file must not materialize");
+            if i == 3 {
+                assert!(!w.exists(), "deleted in-scope file must not materialize");
+            } else {
+                assert_eq!(std::fs::read(&w).unwrap(), format!("w{i}\n").as_bytes(), "in-scope file materialized");
+            }
+        }
+    }
+
     #[test]
     fn proto_mismatch_closes_the_session() {
         let d = tempdir().unwrap();
@@ -666,9 +897,9 @@ mod tests {
     fn msgs_of(vault: &dyn SessionVault, s: Step) -> Vec<Msg> {
         match s {
             Step::Send(m) => vec![m],
-            Step::CatchUp { peer_vv } => {
+            Step::CatchUp { peer_vv, policy } => {
                 let mut out = Vec::new();
-                push_rows_chunked(&mut out, catchup_rows(vault, &peer_vv).unwrap());
+                push_rows_chunked(&mut out, catchup_rows(vault, &peer_vv, &policy).unwrap());
                 out.into_iter().filter_map(send_of).collect()
             }
             _ => vec![],

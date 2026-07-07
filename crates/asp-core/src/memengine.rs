@@ -1106,6 +1106,21 @@ impl SessionVault for MemEngine {
     fn is_pristine(&self) -> bool {
         self.rows.borrow().is_empty()
     }
+    fn scope_members(&self, allowed: &[String]) -> AspResult<HashSet<String>> {
+        // wasm parity for Engine::scope_members (scoped-sync §3.3): a file_id is a
+        // member iff any of its Create/Rename rows assigned an in-scope path.
+        let mut members = HashSet::new();
+        for r in self.rows.borrow().iter() {
+            if matches!(r.kind, Kind::Create | Kind::Rename) {
+                if let Some(p) = &r.path {
+                    if crate::scope::allows(allowed, p) {
+                        members.insert(r.file_id.clone());
+                    }
+                }
+            }
+        }
+        Ok(members)
+    }
     fn admit(&self, peer: &NodeId, ctx: &AdmitCtx) -> AspResult<PeerPolicy> {
         let peer_hex = peer.to_hex();
         let set = self.authorized.borrow();

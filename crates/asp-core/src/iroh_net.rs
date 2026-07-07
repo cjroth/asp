@@ -12,8 +12,9 @@
 //! the handshake / catch-up / integrate state machine is byte-for-byte the same
 //! as every other surface — only the bytes' carrier changed.
 
-use crate::net::{fanout, AuthOpts, Conns, EngineRef, CONN_SEQ};
+use crate::net::{fanout_row, AuthOpts, ConnEntry, Conns, EngineRef, CONN_SEQ};
 use crate::session::Step;
+use crate::wire::WireRow;
 use crate::{Msg, NodeId, Role, Session};
 use anyhow::{anyhow, Result};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -263,7 +264,7 @@ async fn drive(
 ) -> Result<()> {
     let conn_id = CONN_SEQ.fetch_add(1, Ordering::SeqCst);
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
-    conns.lock().await.insert(conn_id, tx);
+    conns.lock().await.insert(conn_id, ConnEntry { tx, policy: crate::authkeys::PeerPolicy::default() });
 
     // Reader task: owns `recv`, ships each whole frame over `inbound`.
     let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -332,15 +333,21 @@ async fn drive(
                 }
                 Step::Authenticated(node) => {
                     tracing::info!(peer = %&node.to_hex()[..12], "iroh handshake ok");
+                    // Retain the admitted grant on this live connection so the
+                    // realtime fan-out applies the peer's scope filter (A, §3.5).
+                    if let Some(entry) = conns.lock().await.get_mut(&conn_id) {
+                        entry.policy = session.policy().clone();
+                    }
                     if let Some(s) = &on_auth {
                         let _ = s.send(node);
                     }
                 }
                 Step::Integrated(rows) => {
                     // Hub forward-then-merge: push newly-integrated rows to every
-                    // other live peer so a relay propagates without re-folding.
+                    // other live peer so a relay propagates without re-folding —
+                    // each peer's scope grant applied (fanout_row, §3.5).
                     for wr in rows {
-                        fanout(&conns, conn_id, &Msg::Push { row: Box::new(wr) }).await;
+                        fanout_row(&conns, conn_id, &engine, &wr).await;
                     }
                 }
                 Step::Closed(reason) => {
@@ -357,8 +364,8 @@ async fn drive(
                     tracing::info!(reason, "closing");
                     closing = true;
                 }
-                Step::CatchUp { peer_vv } => {
-                    if stream_catchup(&mut send, &engine, &peer_vv).await.is_err() {
+                Step::CatchUp { peer_vv, policy } => {
+                    if stream_catchup(&mut send, &engine, &peer_vv, &policy).await.is_err() {
                         closing = true;
                         break;
                     }
@@ -401,13 +408,27 @@ async fn stream_catchup(
     send: &mut SendStream,
     engine: &EngineRef,
     peer_vv: &std::collections::BTreeMap<String, i64>,
+    policy: &crate::authkeys::PeerPolicy,
 ) -> Result<()> {
-    let our_vv = { engine.lock().unwrap().store.version_vector()? };
+    // Scope send-filter (A, scoped-sync §3.2): resolve the peer's whole-`file_id`
+    // membership ONCE up front (SYNC membership over the full history), then retain
+    // only in-scope rows in each page — CRUCIALLY between the cursor advance and the
+    // blob dedup (below), so the examined frontier still moves across dropped seqs
+    // (the dense-seq story) and a dropped out-of-scope row can't mark a shared blob
+    // "sent" and starve a later in-scope row of its bytes.
+    let (our_vv, members) = {
+        let eng = engine.lock().unwrap();
+        let members = match &policy.allowed_paths {
+            Some(allowed) => Some(eng.scope_members(allowed)?),
+            None => None,
+        };
+        (eng.store.version_vector()?, members)
+    };
     let mut sent_blobs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (site, _max) in our_vv {
         let mut cursor = peer_vv.get(&site).copied().unwrap_or(-1);
         loop {
-            let mut page = {
+            let page = {
                 let eng = engine.lock().unwrap();
                 eng.rows_after_wire_page(&site, cursor, CATCHUP_PAGE_ROWS)?
             };
@@ -415,10 +436,8 @@ async fn stream_catchup(
                 break;
             }
             cursor = page.last().map(|w| w.row.seq as i64).unwrap_or(cursor);
-            // Keep each blob only on its first occurrence across the catch-up.
-            for wr in &mut page {
-                wr.blobs.retain(|b| sent_blobs.insert(b.hash.clone()));
-            }
+            // Scope filter THEN blob dedup, in that order (§3.2) — see the helper.
+            let page = scope_and_dedup_page(page, members.as_ref(), &mut sent_blobs);
             let mut sends = Vec::new();
             crate::session::push_rows_chunked(&mut sends, page);
             for s in sends {
@@ -429,6 +448,26 @@ async fn stream_catchup(
         }
     }
     send_msg(send, &Msg::Synced).await
+}
+
+/// Apply the scope send-filter, then the cross-catch-up blob dedup, to one already
+/// cursor-advanced page — **in that order** (scoped-sync §3.2). Filtering AFTER the
+/// dedup would let a dropped out-of-scope row mark a *shared* content blob "sent",
+/// so a later in-scope row referencing that hash would ship blob-less and the
+/// receiver would fold empty bytes and silently diverge. `members = None` disables
+/// scoping (full replica). Pure, so the ordering is unit-tested without a socket.
+fn scope_and_dedup_page(
+    mut page: Vec<WireRow>,
+    members: Option<&std::collections::HashSet<String>>,
+    sent_blobs: &mut std::collections::HashSet<String>,
+) -> Vec<WireRow> {
+    if members.is_some() {
+        page.retain(|wr| crate::session::scope_admits(wr, members));
+    }
+    for wr in &mut page {
+        wr.blobs.retain(|b| sent_blobs.insert(b.hash.clone()));
+    }
+    page
 }
 
 // ---------------- listener (hub) ----------------
@@ -540,6 +579,43 @@ mod tests {
     use crate::identity::Identity;
     use std::sync::{Arc, Mutex as StdMutex};
     use tempfile::tempdir;
+
+    /// A — the scope filter MUST precede the blob dedup in `stream_catchup`
+    /// (scoped-sync §3.2, §9). Two files share one content blob; the OUT-of-scope
+    /// one sorts first. If we deduped before filtering, the dropped out-of-scope row
+    /// would mark the shared blob "sent" and the surviving in-scope row would ship
+    /// blob-less — the receiver would fold empty bytes and diverge. `scope_and_dedup_page`
+    /// does it in the safe order; this pins that the in-scope row keeps its blob.
+    #[test]
+    fn scope_filter_precedes_blob_dedup() {
+        use crate::log::{Kind, LogRow, MergeClass};
+        use crate::wire::WireBlob;
+        let h = crate::oid::content_hash(b"shared body\n");
+        let blob = WireBlob { hash: h.clone(), bytes: b"shared body\n".to_vec() };
+        let mk = |file_id: &str, seq: u64, path: &str| WireRow {
+            row: LogRow {
+                site_id: "s".into(),
+                seq,
+                lamport: seq + 1,
+                file_id: file_id.into(),
+                kind: Kind::Create,
+                merge_class: MergeClass::Text,
+                result_hash: Some(h.clone()),
+                path: Some(path.into()),
+                ..LogRow::default()
+            }
+            .seal(),
+            blobs: vec![blob.clone()],
+        };
+        // Page order: the OUT-of-scope file (seq 0) precedes the in-scope one (seq 1).
+        let page = vec![mk("fB", 0, "personal/b.md"), mk("fA", 1, "work/a.md")];
+        let members: std::collections::HashSet<String> = ["fA".to_string()].into_iter().collect();
+        let mut sent = std::collections::HashSet::new();
+        let out = scope_and_dedup_page(page, Some(&members), &mut sent);
+        assert_eq!(out.len(), 1, "only the in-scope row survives");
+        assert_eq!(out[0].row.file_id, "fA");
+        assert!(out[0].blobs.iter().any(|b| b.hash == h), "the in-scope row keeps its shared blob (not stolen by the dropped out-of-scope row)");
+    }
 
     /// REAL iroh loopback: two engines, two endpoints keyed by their device
     /// identities, a clone over a live QUIC connection (relays disabled — direct
@@ -690,7 +766,7 @@ mod tests {
         };
         for wr in pushed {
             if wr.row.path.as_deref() == Some("live.md") {
-                fanout(&srv_conns, 0, &Msg::Push { row: Box::new(wr) }).await;
+                fanout_row(&srv_conns, 0, &srv_engine, &wr).await;
             }
         }
 
