@@ -13,7 +13,7 @@
 
 use crate::authkeys::{AdmitCtx, PeerPolicy};
 use crate::error::{AspError, AspResult};
-use crate::log::{Kind, LogRow};
+use crate::log::LogRow;
 use crate::order::NodeId;
 use crate::rbsr::{self, Bound, Fingerprint, RangePart};
 use crate::wire::{Msg, WireRow, PROTO};
@@ -63,6 +63,18 @@ pub trait SessionVault {
     /// adopts a peer's vault on connect (like `clone`). A freshly-`init`'d folder
     /// that hasn't committed content is pristine.
     fn is_pristine(&self) -> bool;
+
+    // ---- Verified security profile (scoped-sync §4.4) ----
+
+    /// This vault's `(profile, signing_epoch)` advertised in `Hello`, so a pristine
+    /// clone inherits it and stays Verified fleet-wide. Default: Trust.
+    fn security_advert(&self) -> (Option<String>, u64) {
+        (None, 0)
+    }
+    /// Adopt a peer's security profile on clone (a pristine node inheriting it).
+    fn adopt_security(&self, _profile: &str, _epoch: u64) -> AspResult<()> {
+        Ok(())
+    }
 
     // ---- RBSR anti-entropy (scoped-sync §2) ----
 
@@ -149,6 +161,10 @@ pub struct Session {
     /// §2.5) — computed once so the reconcile advertises/ships only in-scope rows.
     /// `None` on a full replica (no filtering).
     recon_scope: Option<std::collections::HashSet<String>>,
+    /// Our security-profile advert (scoped-sync §4.4), snapshotted at construction
+    /// so `start()` (no vault) can send it in the `Hello`.
+    our_security: Option<String>,
+    our_epoch: u64,
 }
 
 /// Per-frame catch-up budget. A `Msg::Rows` frame accumulates rows until it
@@ -222,13 +238,10 @@ pub(crate) fn push_rows_chunked(out: &mut Vec<Step>, rows: Vec<WireRow>) {
 }
 
 /// A row that mutates file CONTENT — the kinds a read-only peer (B) may not push
-/// (scoped-sync §4.2). Metadata rows (`Branch`/`Tag`/`Merge`/`GitCommit`/
-/// `GitIngest`/`GitPlan`) are not file mutations and are never gated by read-only.
+/// (scoped-sync §4.2). Metadata rows are not file mutations and are never gated by
+/// read-only. Thin wrapper over [`Kind::is_file_mutation`].
 pub(crate) fn is_file_mutation(row: &LogRow) -> bool {
-    matches!(
-        row.kind,
-        Kind::Create | Kind::Edit | Kind::Rename | Kind::Delete | Kind::Reclass
-    )
+    row.kind.is_file_mutation()
 }
 
 impl Session {
@@ -253,6 +266,7 @@ impl Session {
         // fresh hub/relay adopts the first connector's vault. A populated vault
         // advertises its real id, so two unrelated vaults never silently merge.
         let vault_id = if vault.is_pristine() { String::new() } else { vault.vault_id() };
+        let security_advert = vault.security_advert();
         Session {
             role,
             our_node: vault.node_id(),
@@ -269,6 +283,8 @@ impl Session {
             peer_caps: Vec::new(),
             sent_recon: false,
             recon_scope: None,
+            our_security: security_advert.0,
+            our_epoch: security_advert.1,
         }
     }
 
@@ -295,13 +311,20 @@ impl Session {
             is_listener: self.role == Role::Listener,
             auth_key: self.present_auth_key.clone(),
             caps: self.our_caps.clone(),
+            security: self.our_security.clone(),
+            signing_epoch: self.our_epoch,
         })]
     }
 
     pub fn on_msg(&mut self, vault: &dyn SessionVault, msg: Msg) -> AspResult<Vec<Step>> {
         match msg {
-            Msg::Hello { proto, node_id, vault_id, is_listener: _, auth_key, caps } => {
+            Msg::Hello { proto, node_id, vault_id, is_listener: _, auth_key, caps, security, signing_epoch } => {
                 self.peer_caps = caps;
+                // A pristine node inherits a Verified peer's profile on clone
+                // (scoped-sync §4.4), so it enforces signatures from the first row.
+                if vault.is_pristine() && crate::security::is_verified(security.as_deref()) {
+                    vault.adopt_security(crate::security::VERIFIED, signing_epoch)?;
+                }
                 if proto != PROTO {
                     // Both numbers, plus a direction + action hint. A proto-3 peer
                     // meeting a proto-4 (git-bridge) node lands here and gets a clear
@@ -573,6 +596,7 @@ mod tests {
     use super::*;
     use crate::engine::Engine;
     use crate::identity::Identity;
+    use crate::log::Kind;
     use tempfile::tempdir;
 
     /// A node id from a deterministic seed — the transport-verified peer key the
@@ -763,6 +787,124 @@ mod tests {
         assert!(!b.files_map().unwrap().contains_key("m.md"), "no data leaks to a denied peer");
     }
 
+    // ---------------- Phase 3.5: Verified security profile (scoped-sync §4.4, §9) ----------------
+
+    /// Verified — signs its own rows, and REJECTS an unsigned copy fleet-wide (the
+    /// downgrade attack: a stripped-signature row has the identical Merkle id but is
+    /// unsigned). A Trust vault accepts the same unsigned row — proving the mode is
+    /// the boundary, not the row.
+    #[test]
+    fn verified_signs_rows_and_rejects_stripped_signature() {
+        use crate::MemEngine;
+        let a = MemEngine::create(Identity::from_seed(&[1; 32]), "v");
+        a.set_verified(0); // Verified-at-genesis: every mutating row signed
+        let wr = a.record_write("doc.md", b"signed content\n").unwrap().unwrap();
+        assert!(!wr.row.sig.is_empty(), "a Verified vault signs its authored rows");
+        assert!(crate::security::row_signature_valid(&wr.row), "the author signature verifies");
+
+        let b = MemEngine::create(Identity::from_seed(&[2; 32]), "v");
+        b.set_verified(0);
+        assert!(b.integrate(&wr).unwrap(), "Verified accepts a validly-signed row");
+        assert!(b.files_map().unwrap().contains_key("doc.md"));
+
+        // The DOWNGRADE ATTACK: the same row, signature stripped (id unchanged), is
+        // rejected by a Verified vault — but accepted by a Trust vault.
+        let mut stripped = wr.clone();
+        stripped.row.sig = vec![];
+        assert_eq!(stripped.row.id, wr.row.id, "stripping sig does not change the id");
+        let c = MemEngine::create(Identity::from_seed(&[3; 32]), "v");
+        c.set_verified(0);
+        assert!(!c.integrate(&stripped).unwrap(), "Verified rejects the unsigned copy");
+        assert!(!c.files_map().unwrap().contains_key("doc.md"), "no unsigned content materializes");
+
+        let t = MemEngine::create(Identity::from_seed(&[4; 32]), "v"); // Trust (default)
+        assert!(t.integrate(&stripped).unwrap(), "a Trust vault accepts the unsigned row (the MODE is the boundary)");
+    }
+
+    /// Verified — a pristine clone INHERITS the profile from the source's Hello
+    /// (scoped-sync §4.4), so it enforces signatures from the first row and cannot be
+    /// silently downgraded.
+    #[test]
+    fn verified_clone_inherits_profile_and_enforces() {
+        use crate::MemEngine;
+        let source = MemEngine::create(Identity::from_seed(&[1; 32]), "v");
+        source.set_verified(0);
+        source.record_write("a.md", b"signed A\n").unwrap();
+        source.authorize(&Identity::from_seed(&[2; 32]).to_ssh_string(), None, true, "test").unwrap();
+
+        let clone = MemEngine::create(Identity::from_seed(&[2; 32]), "v");
+        assert!(!clone.is_verified(), "the clone starts as Trust");
+        let mut ls = Session::new(Role::Listener, &source, ctx(), nid(2), Vec::new());
+        let mut cc = Session::new(Role::Connector, &clone, ctx(), nid(1), Vec::new());
+        pump(&source, &mut ls, &clone, &mut cc);
+
+        assert!(clone.is_verified(), "the pristine clone inherited Verified from the source");
+        assert!(clone.files_map().unwrap().contains_key("a.md"), "and pulled the signed content");
+        // It now enforces: an unsigned row is refused.
+        let forged = LogRow {
+            site_id: Identity::from_seed(&[7; 32]).node_id().to_hex(),
+            lamport: 999,
+            seq: 999,
+            file_id: "evil".into(),
+            kind: Kind::Create,
+            result_hash: Some(crate::oid::content_hash(b"evil\n")),
+            path: Some("evil.md".into()),
+            ..LogRow::default()
+        }
+        .seal();
+        assert!(!clone.integrate(&WireRow { row: forged, blobs: vec![] }).unwrap(), "inherited Verified rejects an unsigned row");
+    }
+
+    /// Verified — the author→path write-ACL (scoped-sync §4.4): a validly-signed row
+    /// from an author whose local grant does NOT cover the path is rejected; the same
+    /// author's in-scope create is accepted.
+    #[test]
+    fn verified_author_path_acl_rejects_out_of_scope_create() {
+        use crate::MemEngine;
+        let author = Identity::from_seed(&[5; 32]);
+        let node = MemEngine::create(Identity::from_seed(&[1; 32]), "v");
+        node.set_verified(0);
+        node.authorize_with_policy(&author.to_ssh_string(), None, true, "test", Some(vec!["work".into()]), false).unwrap();
+
+        let mk = |path: &str| {
+            let mut r = LogRow {
+                site_id: author.node_id().to_hex(),
+                lamport: 1,
+                seq: 0,
+                file_id: format!("f-{path}"),
+                kind: Kind::Create,
+                result_hash: Some(crate::oid::content_hash(b"x\n")),
+                path: Some(path.into()),
+                ..LogRow::default()
+            }
+            .seal();
+            r.sig = author.sign(&r.signing_payload());
+            WireRow { row: r, blobs: vec![crate::wire::WireBlob { hash: crate::oid::content_hash(b"x\n"), bytes: b"x\n".to_vec() }] }
+        };
+        assert!(!node.integrate(&mk("personal/secret.md")).unwrap(), "out-of-scope signed create rejected by the author→path ACL");
+        assert!(node.integrate(&mk("work/ok.md")).unwrap(), "in-scope signed create accepted");
+    }
+
+    /// Verified — native-Engine parity (scoped-sync §10 risk 5): the native SQLite
+    /// engine signs at its builders and rejects an unsigned row identically.
+    #[test]
+    fn verified_native_engine_parity() {
+        let d = tempdir().unwrap();
+        let e = Engine::init(d.path(), Identity::from_seed(&[1; 32])).unwrap();
+        e.set_verified(0).unwrap();
+        let wr = e.record_write("n.md", b"native signed\n").unwrap().unwrap();
+        assert!(!wr.row.sig.is_empty() && crate::security::row_signature_valid(&wr.row), "native builder signs");
+
+        let d2 = tempdir().unwrap();
+        let e2 = Engine::init(d2.path(), Identity::from_seed(&[2; 32])).unwrap();
+        e2.set_verified(0).unwrap();
+        let mut stripped = wr.clone();
+        stripped.row.sig = vec![];
+        assert!(!e2.integrate(&stripped).unwrap(), "native Verified rejects the unsigned row");
+        assert!(e2.integrate(&wr).unwrap(), "native Verified accepts the signed row");
+        assert_eq!(std::fs::read(d2.path().join("n.md")).unwrap(), b"native signed\n");
+    }
+
     // ---------------- Phase R: RBSR anti-entropy (scoped-sync §2, §9) ----------------
 
     /// Drive two RBSR sessions to quiescence, returning the number of message
@@ -931,7 +1073,6 @@ mod tests {
     fn rbsr_falls_back_to_vector_for_a_non_rbsr_peer() {
         use crate::MemEngine;
         let a = MemEngine::create(Identity::from_seed(&[1; 32]), "v");
-        let b = MemEngine::create(Identity::from_seed(&[2; 32]), "v");
         a.authorize(&Identity::from_seed(&[2; 32]).to_ssh_string(), None, true, "test").unwrap();
         a.record_write("only-on-a.md", b"hi\n").unwrap();
 
@@ -944,6 +1085,8 @@ mod tests {
             is_listener: false,
             auth_key: None,
             caps: Vec::new(), // <-- no "rbsr"
+            security: None,
+            signing_epoch: 0,
         };
         let steps = la.on_msg(&a, legacy_hello).unwrap();
         assert!(
@@ -1224,6 +1367,8 @@ mod tests {
             is_listener: false,
             auth_key: None,
             caps: Vec::new(),
+            security: None,
+            signing_epoch: 0,
         };
         let steps = s.on_msg(&e, hello).unwrap();
         assert!(steps.iter().any(|st| matches!(st, Step::Closed(m) if m.contains("proto"))), "proto mismatch must close");
@@ -1244,6 +1389,8 @@ mod tests {
             is_listener: false,
             auth_key: None,
             caps: Vec::new(),
+            security: None,
+            signing_epoch: 0,
         };
         let steps = s.on_msg(&e, hello).unwrap();
         assert!(

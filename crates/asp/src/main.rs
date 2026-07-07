@@ -96,7 +96,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Create a new scoped vault and this node's identity.
-    Init { path: Option<PathBuf> },
+    Init {
+        path: Option<PathBuf>,
+        /// Create a VERIFIED vault (scoped-sync §4.4): every mutating row is signed
+        /// by its author and each node rejects unsigned/unauthorized rows, so
+        /// read-only + subdir-read hold in a true P2P mesh (not just a star). The
+        /// mode is genesis-set and inherited by every clone; it cannot be downgraded.
+        #[arg(long)]
+        verified: bool,
+    },
     /// Bootstrap a new node from a listening peer OR clone a git remote.
     /// `<source>` is auto-detected: an iroh ticket / 64-hex node id, or a git URL
     /// (`https://…`, `ssh://…`, `git@host:path`, or a path ending `.git`).
@@ -384,13 +392,18 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     match &cli.cmd {
-        Cmd::Init { path } => {
+        Cmd::Init { path, verified } => {
             let dir = path.clone().or_else(|| cli.dir.clone()).unwrap_or_else(|| std::env::current_dir().unwrap());
             let id = idstore::load_or_generate(&dir, cli.no_home_key)?;
             let engine = Engine::init(&dir, id).map_err(|e| anyhow!("init: {e}"))?;
+            // Verified-at-genesis (epoch 0): every mutating row must be signed.
+            if *verified {
+                engine.set_verified(0).map_err(|e| anyhow!("enable verified: {e}"))?;
+            }
             seed_authorized_keys(&cli, &engine)?;
             let vid = VaultConfig::new(&engine.store).vault_id()?.unwrap_or_default();
-            println!("initialized vault at {} (vault {})", dir.display(), &vid[..8.min(vid.len())]);
+            let mode = if *verified { " [verified]" } else { "" };
+            println!("initialized vault at {} (vault {}){}", dir.display(), &vid[..8.min(vid.len())], mode);
             println!("device key: {}", engine.identity.to_ssh_string());
             Ok(())
         }

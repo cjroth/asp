@@ -239,7 +239,16 @@ impl Engine {
 
     /// The authoring identity (per-vault, distinct from the device connection key).
     pub fn site_id(&self) -> String {
-        self.site.clone()
+        // A Verified vault (scoped-sync §4.4) authors under the DEVICE key, so a
+        // row's `site_id` IS the author's ed25519 NodeId and its signature verifies
+        // against it (the spec's authorship model). A Trust vault keeps the random
+        // per-vault site (single-writer protection). Genesis-set, so `site_id` is
+        // constant for the vault's whole life — `seq` stays dense per author.
+        if self.is_verified() {
+            self.identity.node_id().to_hex()
+        } else {
+            self.site.clone()
+        }
     }
 
     // ---------------- branches (§2) ----------------
@@ -359,6 +368,7 @@ impl Engine {
                 .seal()
             }
         };
+        let row = self.sign_if_verified(row);
         self.store.append_row(&row)?;
         self.note_dirty(&row.file_id);
         // Fast path: a local linear edit on the tip changed exactly one file's
@@ -397,6 +407,7 @@ impl Engine {
             sig: vec![],
         }
         .seal();
+        let row = self.sign_if_verified(row);
         self.store.append_row(&row)?;
         self.note_dirty(&row.file_id);
         self.materialize_unless_batched()?;
@@ -425,6 +436,7 @@ impl Engine {
             sig: vec![],
         }
         .seal();
+        let row = self.sign_if_verified(row);
         self.store.append_row(&row)?;
         self.note_dirty(&row.file_id);
         self.materialize_unless_batched()?;
@@ -463,6 +475,13 @@ impl Engine {
         if !wr.row.id_valid() {
             return Err(AspError::Protocol("row id does not match its contents".into()));
         }
+        // Verified admission (scoped-sync §4.4): a Verified vault drops an unsigned or
+        // author-unauthorized mutating row at entry, so the stored log is
+        // "already trusted" and every later fold pays zero crypto. Silent drop (not
+        // an error) — a mesh may legitimately mix a rejected forgery with good rows.
+        if self.is_verified() && !self.verified_admits(&wr.row, true, self.signing_epoch()) {
+            return Ok(false);
+        }
         for b in &wr.blobs {
             let h = self.store.put_blob(&b.bytes)?;
             if h != b.hash {
@@ -493,14 +512,35 @@ impl Engine {
                 return Err(AspError::Protocol("row id does not match its contents".into()));
             }
         }
+        // Verified admission (scoped-sync §4.4): compute a keep-mask up front so a
+        // Verified vault never persists an unsigned/unauthorized mutating row, then
+        // integrate only the survivors. Dropped rows get a `false` flag (not newly
+        // added), aligned to the input so callers' zip stays correct. Trust mode
+        // keeps everything (mask all true) — unchanged behavior.
+        let verified = self.is_verified();
+        let epoch = if verified { self.signing_epoch() } else { 0 };
+        let keep: Vec<bool> =
+            wrs.iter().map(|wr| !verified || self.verified_admits(&wr.row, verified, epoch)).collect();
+        let kept: Vec<&WireRow> = wrs.iter().zip(&keep).filter_map(|(w, k)| k.then_some(w)).collect();
         // Persist bundled blobs (content-hash verified) then append rows, each in
         // ONE transaction — without it every INSERT auto-commits its own WAL
         // transaction, and at ~41k rows + ~41k blobs those ~82k fsync'd commits
         // dominated a large git clone's "saving" phase (see SqliteStore::append_rows
         // / put_blobs, and replace_files for the same pattern).
         self.store
-            .put_blobs(wrs.iter().flat_map(|wr| wr.blobs.iter().map(|b| (b.hash.as_str(), b.bytes.as_slice()))))?;
-        let flags = self.store.append_rows(wrs.iter().map(|wr| &wr.row))?;
+            .put_blobs(kept.iter().flat_map(|wr| wr.blobs.iter().map(|b| (b.hash.as_str(), b.bytes.as_slice()))))?;
+        let kept_added = self.store.append_rows(kept.iter().map(|wr| &wr.row))?;
+        // Re-expand the per-kept flags to a per-input flag vector (dropped → false).
+        let mut flags = Vec::with_capacity(wrs.len());
+        let mut ki = 0;
+        for k in &keep {
+            if *k {
+                flags.push(kept_added[ki]);
+                ki += 1;
+            } else {
+                flags.push(false);
+            }
+        }
         let mut any = false;
         let mut any_branch = false;
         for (wr, &added) in wrs.iter().zip(flags.iter()) {
@@ -1837,6 +1877,72 @@ impl Engine {
         self.store.delete_authkey_by_node(node_hex)
     }
 
+    // ---- Verified security profile (scoped-sync §4.4) ----
+
+    /// This vault's security profile string (`"verified"` ⇒ Verified; else Trust).
+    /// Genesis-set, inherited by every clone (adopted from the source's `Hello`).
+    pub fn security_profile(&self) -> Option<String> {
+        self.store.get_config(crate::security::PROFILE_KEY).ok().flatten()
+    }
+    /// Is this a Verified vault (every mutating row signed + verified)?
+    pub fn is_verified(&self) -> bool {
+        crate::security::is_verified(self.security_profile().as_deref())
+    }
+    /// The Trust→Verified signing-epoch cutoff (a `lamport` watermark); `0` =
+    /// Verified-at-genesis (no grandfathering).
+    pub fn signing_epoch(&self) -> u64 {
+        self.store.get_config(crate::security::EPOCH_KEY).ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(0)
+    }
+    /// Turn on Verified mode (scoped-sync §4.4). `epoch`=0 is Verified-at-genesis
+    /// (every mutating row signed); a nonzero `lamport` cutoff grandfathers the
+    /// pre-cutoff history when migrating an existing Trust vault.
+    pub fn set_verified(&self, epoch: u64) -> AspResult<()> {
+        self.store.set_config(crate::security::PROFILE_KEY, crate::security::VERIFIED)?;
+        self.store.set_config(crate::security::EPOCH_KEY, &epoch.to_string())?;
+        Ok(())
+    }
+    /// Adopt a peer's security profile on clone (a pristine node inherits it via the
+    /// `Hello` advert, so a Verified vault stays Verified fleet-wide).
+    pub fn adopt_security_profile(&self, profile: &str, epoch: u64) -> AspResult<()> {
+        self.store.set_config(crate::security::PROFILE_KEY, profile)?;
+        self.store.set_config(crate::security::EPOCH_KEY, &epoch.to_string())?;
+        Ok(())
+    }
+
+    /// Sign a freshly-sealed mutating row with our author key when Verified
+    /// (scoped-sync §4.4). `sig` is excluded from the Merkle id, so this never
+    /// changes it (no vault fork).
+    fn sign_if_verified(&self, mut row: LogRow) -> LogRow {
+        if self.is_verified() && row.kind.is_file_mutation() {
+            row.sig = self.identity.sign(&row.signing_payload());
+        }
+        row
+    }
+
+    /// The author→path write-ACL (scoped-sync §4.4): a `Create`/`Rename`'s path must
+    /// be admitted by the author's LOCAL grant (`authorized_keys.allowed_paths`), if
+    /// any. Unrestricted authors and non-path rows pass. Only consulted in Verified
+    /// mode; as strong as the node's local admission set (honest v1).
+    fn author_path_ok(&self, row: &LogRow) -> bool {
+        if !matches!(row.kind, Kind::Create | Kind::Rename) {
+            return true;
+        }
+        let Some(path) = &row.path else { return true };
+        match self.store.authkey_by_node(&row.site_id) {
+            Ok(Some(k)) => match &k.allowed_paths {
+                Some(allowed) => crate::scope::allows(allowed, path),
+                None => true,
+            },
+            _ => true,
+        }
+    }
+
+    /// Verified admission for one row (scoped-sync §4.4): signed + author-authorized,
+    /// or grandfathered / non-file / Trust mode.
+    fn verified_admits(&self, row: &LogRow, verified: bool, epoch: u64) -> bool {
+        crate::security::row_admissible(row, verified, epoch) && (!verified || self.author_path_ok(row))
+    }
+
     /// The local partial-replica scope (scoped-sync §3.1), or `None` for a full
     /// replica. `Some(paths)` means this node was `clone --subdir`'d: it hides
     /// out-of-scope files (view filter) and is a pull-only LEAF (refuses to listen,
@@ -1960,6 +2066,12 @@ impl SessionVault for Engine {
     }
     fn is_pristine(&self) -> bool {
         self.store.row_count().map(|c| c == 0).unwrap_or(false)
+    }
+    fn security_advert(&self) -> (Option<String>, u64) {
+        (self.security_profile(), self.signing_epoch())
+    }
+    fn adopt_security(&self, profile: &str, epoch: u64) -> AspResult<()> {
+        self.adopt_security_profile(profile, epoch)
     }
     fn item_ids(&self, lo: &crate::rbsr::Bound, hi: &crate::rbsr::Bound) -> AspResult<Vec<String>> {
         self.store.ids_in_range(&lo.0, &hi.0)

@@ -65,6 +65,14 @@ pub enum Msg {
         /// pre-RBSR proto-4 peer omits it and still deserializes — **no PROTO bump**.
         #[serde(default)]
         caps: Vec<String>,
+        /// Security profile advert (scoped-sync §4.4): `Some("verified")` on a
+        /// Verified vault, so a pristine clone inherits the mode. `#[serde(default)]`
+        /// (absent = Trust) — additive, no PROTO bump.
+        #[serde(default)]
+        security: Option<String>,
+        /// The Trust→Verified signing-epoch cutoff that rides with the profile.
+        #[serde(default)]
+        signing_epoch: u64,
     },
     /// Version vector: site_id -> highest seq held.
     Vector { vv: BTreeMap<String, i64> },

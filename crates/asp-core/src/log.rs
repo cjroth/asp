@@ -88,6 +88,13 @@ impl Kind {
             _ => return None,
         })
     }
+
+    /// A row that mutates file CONTENT — the kinds a read-only peer (B) may not push
+    /// and a Verified vault (scoped-sync §4.4) requires signed. Metadata rows
+    /// (`Merge`/`Branch`/`Tag` and the git kinds) are not file mutations.
+    pub fn is_file_mutation(&self) -> bool {
+        matches!(self, Kind::Create | Kind::Edit | Kind::Rename | Kind::Delete | Kind::Reclass)
+    }
 }
 
 /// How a file's rows are merged. Set at create, constant for the `file_id`

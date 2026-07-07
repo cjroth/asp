@@ -149,7 +149,13 @@ impl MemEngine {
 
     /// The authoring identity (per-vault, distinct from the device connection key).
     pub fn site_id(&self) -> String {
-        self.site.clone()
+        // A Verified vault authors under the DEVICE key so signatures verify against
+        // `site_id` (scoped-sync §4.4); a Trust vault keeps its random per-vault site.
+        if self.is_verified() {
+            self.identity.node_id().to_hex()
+        } else {
+            self.site.clone()
+        }
     }
 
     // ----- counters -----
@@ -503,6 +509,7 @@ impl MemEngine {
             }
             .seal(),
         };
+        let row = self.sign_if_verified(row);
         self.rows.borrow_mut().push(row.clone());
         self.row_ids.borrow_mut().insert(row.id.clone());
         Ok(Some(row))
@@ -530,6 +537,7 @@ impl MemEngine {
             sig: vec![],
         }
         .seal();
+        let row = self.sign_if_verified(row);
         self.rows.borrow_mut().push(row.clone());
         self.row_ids.borrow_mut().insert(row.id.clone());
         Ok(Some(row))
@@ -630,6 +638,7 @@ impl MemEngine {
             sig: vec![],
         }
         .seal();
+        let row = self.sign_if_verified(row);
         self.rows.borrow_mut().push(row.clone());
         self.row_ids.borrow_mut().insert(row.id.clone());
         self.materialize()?;
@@ -680,6 +689,10 @@ impl MemEngine {
         if !wr.row.id_valid() {
             return Err(AspError::Protocol("row id does not match its contents".into()));
         }
+        // Verified admission (scoped-sync §4.4) — wasm parity with Engine::integrate.
+        if self.is_verified() && !self.verified_admits(&wr.row, true, self.signing_epoch()) {
+            return Ok(false);
+        }
         for b in &wr.blobs {
             let h = self.blobs.put_blob(&b.bytes)?;
             if h != b.hash {
@@ -718,6 +731,8 @@ impl MemEngine {
         // Dedup against the maintained id-set (and repeats within the batch) in
         // O(1) per row — the old code rebuilt the set from the whole log on every
         // call, which over a paged catch-up was O(N·pages).
+        let verified = self.is_verified();
+        let epoch = if verified { self.signing_epoch() } else { 0 };
         let mut flags = Vec::with_capacity(wrs.len());
         let mut added = 0usize;
         let mut any_branch = false;
@@ -725,6 +740,11 @@ impl MemEngine {
             let mut ids = self.row_ids.borrow_mut();
             let mut store = self.rows.borrow_mut();
             for wr in wrs {
+                // Verified vault drops an unsigned/unauthorized mutating row at entry.
+                if verified && !self.verified_admits(&wr.row, verified, epoch) {
+                    flags.push(false);
+                    continue;
+                }
                 let is_new = ids.insert(wr.row.id.clone());
                 if is_new {
                     store.push(wr.row.clone());
@@ -1084,6 +1104,49 @@ impl MemEngine {
         set.push(k);
         Ok(())
     }
+
+    // ---- Verified security profile (scoped-sync §4.4), wasm parity with Engine ----
+
+    pub fn security_profile(&self) -> Option<String> {
+        self.config.borrow().get(crate::security::PROFILE_KEY).cloned()
+    }
+    pub fn is_verified(&self) -> bool {
+        crate::security::is_verified(self.security_profile().as_deref())
+    }
+    pub fn signing_epoch(&self) -> u64 {
+        self.config.borrow().get(crate::security::EPOCH_KEY).and_then(|s| s.parse().ok()).unwrap_or(0)
+    }
+    pub fn set_verified(&self, epoch: u64) {
+        self.config.borrow_mut().insert(crate::security::PROFILE_KEY.into(), crate::security::VERIFIED.into());
+        self.config.borrow_mut().insert(crate::security::EPOCH_KEY.into(), epoch.to_string());
+    }
+    pub fn adopt_security_profile(&self, profile: &str, epoch: u64) {
+        self.config.borrow_mut().insert(crate::security::PROFILE_KEY.into(), profile.into());
+        self.config.borrow_mut().insert(crate::security::EPOCH_KEY.into(), epoch.to_string());
+    }
+    fn sign_if_verified(&self, mut row: LogRow) -> LogRow {
+        if self.is_verified() && row.kind.is_file_mutation() {
+            row.sig = self.identity.sign(&row.signing_payload());
+        }
+        row
+    }
+    fn author_path_ok(&self, row: &LogRow) -> bool {
+        if !matches!(row.kind, Kind::Create | Kind::Rename) {
+            return true;
+        }
+        let Some(path) = &row.path else { return true };
+        let set = self.authorized.borrow();
+        match set.iter().find(|k| k.node_id == row.site_id) {
+            Some(k) => match &k.allowed_paths {
+                Some(allowed) => crate::scope::allows(allowed, path),
+                None => true,
+            },
+            None => true,
+        }
+    }
+    fn verified_admits(&self, row: &LogRow, verified: bool, epoch: u64) -> bool {
+        crate::security::row_admissible(row, verified, epoch) && (!verified || self.author_path_ok(row))
+    }
 }
 
 impl SessionVault for MemEngine {
@@ -1127,6 +1190,13 @@ impl SessionVault for MemEngine {
     }
     fn is_pristine(&self) -> bool {
         self.rows.borrow().is_empty()
+    }
+    fn security_advert(&self) -> (Option<String>, u64) {
+        (self.security_profile(), self.signing_epoch())
+    }
+    fn adopt_security(&self, profile: &str, epoch: u64) -> AspResult<()> {
+        self.adopt_security_profile(profile, epoch);
+        Ok(())
     }
     fn item_ids(&self, lo: &crate::rbsr::Bound, hi: &crate::rbsr::Bound) -> AspResult<Vec<String>> {
         let mut ids: Vec<String> = self

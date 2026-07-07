@@ -27,6 +27,7 @@ pub mod oid;
 pub mod order;
 pub mod rbsr;
 pub mod scope;
+pub mod security;
 pub mod session;
 pub mod store;
 pub mod tag;
