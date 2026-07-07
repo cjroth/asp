@@ -477,6 +477,54 @@ impl SqliteStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// The merkle `id`s in the half-open range `[lo, hi)`, sorted ascending — the
+    /// RBSR reconcile set for a range (scoped-sync §2.1). `None` bounds are open
+    /// (−∞ / +∞). Index-backed by the `id` PRIMARY KEY, no new index.
+    pub fn ids_in_range(&self, lo: &Option<String>, hi: &Option<String>) -> AspResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM log WHERE (?1 IS NULL OR id >= ?1) AND (?2 IS NULL OR id < ?2) ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![lo, hi], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The merkle `id`s of rows that are IN SCOPE for a scoped peer (scoped-sync
+    /// §2.5): every non-file row (Branch/Tag/Merge/Git* — always shipped) plus every
+    /// file row whose `file_id` is a scope member. Lets RBSR reconcile the *scoped*
+    /// id-set so a partial replica converges without over-receiving.
+    pub fn in_scope_ids(&self, members: &std::collections::HashSet<String>) -> AspResult<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT id, kind, file_id FROM log")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut out = std::collections::HashSet::new();
+        for r in rows {
+            let (id, kind, file_id) = r?;
+            let is_file = matches!(kind.as_str(), "create" | "edit" | "rename" | "delete" | "reclass");
+            if !is_file || members.contains(&file_id) {
+                out.insert(id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The rows for a set of merkle `id`s (RBSR leaf shipping, scoped-sync §2.3).
+    /// Chunked so a large id list never exceeds SQLite's bound-parameter limit.
+    pub fn rows_by_ids(&self, ids: &[String]) -> AspResult<Vec<LogRow>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(400) {
+            let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT * FROM log WHERE id IN ({placeholders})");
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params = rusqlite::params_from_iter(chunk.iter());
+            let rows = stmt.query_map(params, Self::row_from)?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        Ok(out)
+    }
+
     /// Version vector across all known devices: site_id -> max seq held.
     pub fn version_vector(&self) -> AspResult<BTreeMap<String, i64>> {
         let mut stmt = self.conn.prepare("SELECT site_id, MAX(seq) FROM log GROUP BY site_id")?;

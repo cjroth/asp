@@ -59,6 +59,12 @@ pub enum Msg {
         /// from a listener and from already-enrolled connectors.
         #[serde(default)]
         auth_key: Option<String>,
+        /// Capability advertisement (scoped-sync §2.2). `"rbsr"` opts into
+        /// range-based set reconciliation; both sides must advertise it or the
+        /// exchange falls back to the `Vector` path. `#[serde(default)]` so a
+        /// pre-RBSR proto-4 peer omits it and still deserializes — **no PROTO bump**.
+        #[serde(default)]
+        caps: Vec<String>,
     },
     /// Version vector: site_id -> highest seq held.
     Vector { vv: BTreeMap<String, i64> },
@@ -77,6 +83,12 @@ pub enum Msg {
     /// waiting out an idle timeout — so completion is explicit (no per-sync tail)
     /// and independent of how long any single (large) frame took to arrive.
     Synced,
+    /// Range-based set reconciliation (scoped-sync §2.2), gated behind `caps="rbsr"`
+    /// on BOTH sides. A batch of range fingerprints / leaf id-sets driving the
+    /// multi-round anti-entropy; actual rows still travel as `Msg::Rows`. An
+    /// un-upgraded peer never receives this (we send it only after seeing `"rbsr"`
+    /// in its `Hello.caps`), so its decoder never meets an unknown variant.
+    Reconcile { parts: Vec<crate::rbsr::RangePart> },
 }
 
 impl Msg {

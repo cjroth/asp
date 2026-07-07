@@ -1128,6 +1128,33 @@ impl SessionVault for MemEngine {
     fn is_pristine(&self) -> bool {
         self.rows.borrow().is_empty()
     }
+    fn item_ids(&self, lo: &crate::rbsr::Bound, hi: &crate::rbsr::Bound) -> AspResult<Vec<String>> {
+        let mut ids: Vec<String> = self
+            .rows
+            .borrow()
+            .iter()
+            .map(|r| r.id.clone())
+            .filter(|id| crate::rbsr::in_range(id, lo, hi))
+            .collect();
+        ids.sort(); // merkle ids are unique; a stable sorted set for the reconcile
+        Ok(ids)
+    }
+    fn rows_by_ids(&self, ids: &[String]) -> AspResult<Vec<WireRow>> {
+        let want: HashSet<&String> = ids.iter().collect();
+        let rows: Vec<LogRow> = self.rows.borrow().iter().filter(|r| want.contains(&r.id)).cloned().collect();
+        rows.into_iter().map(|r| self.wire(r)).collect()
+    }
+    fn in_scope_ids(&self, allowed: &[String]) -> AspResult<HashSet<String>> {
+        let members = SessionVault::scope_members(self, allowed)?;
+        let mut out = HashSet::new();
+        for r in self.rows.borrow().iter() {
+            let is_file = matches!(r.kind, Kind::Create | Kind::Edit | Kind::Rename | Kind::Delete | Kind::Reclass);
+            if !is_file || members.contains(&r.file_id) {
+                out.insert(r.id.clone());
+            }
+        }
+        Ok(out)
+    }
     fn scope_members(&self, allowed: &[String]) -> AspResult<HashSet<String>> {
         // wasm parity for Engine::scope_members (scoped-sync §3.3): a file_id is a
         // member iff any of its Create/Rename rows assigned an in-scope path.

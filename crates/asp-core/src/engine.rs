@@ -1961,6 +1961,16 @@ impl SessionVault for Engine {
     fn is_pristine(&self) -> bool {
         self.store.row_count().map(|c| c == 0).unwrap_or(false)
     }
+    fn item_ids(&self, lo: &crate::rbsr::Bound, hi: &crate::rbsr::Bound) -> AspResult<Vec<String>> {
+        self.store.ids_in_range(&lo.0, &hi.0)
+    }
+    fn rows_by_ids(&self, ids: &[String]) -> AspResult<Vec<WireRow>> {
+        self.store.rows_by_ids(ids)?.into_iter().map(|r| self.wire(r)).collect()
+    }
+    fn in_scope_ids(&self, allowed: &[String]) -> AspResult<std::collections::HashSet<String>> {
+        let members = Engine::scope_members(self, allowed)?;
+        self.store.in_scope_ids(&members)
+    }
 }
 
 /// Parse a restore time argument: a unix-seconds integer or `YYYY-MM-DD`.

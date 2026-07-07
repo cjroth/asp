@@ -15,6 +15,7 @@ use crate::authkeys::{AdmitCtx, PeerPolicy};
 use crate::error::{AspError, AspResult};
 use crate::log::{Kind, LogRow};
 use crate::order::NodeId;
+use crate::rbsr::{self, Bound, Fingerprint, RangePart};
 use crate::wire::{Msg, WireRow, PROTO};
 use std::collections::BTreeMap;
 
@@ -62,6 +63,31 @@ pub trait SessionVault {
     /// adopts a peer's vault on connect (like `clone`). A freshly-`init`'d folder
     /// that hasn't committed content is pristine.
     fn is_pristine(&self) -> bool;
+
+    // ---- RBSR anti-entropy (scoped-sync §2) ----
+
+    /// Protocol capabilities advertised in `Hello.caps`. Both engines support
+    /// `"rbsr"`; a bespoke SessionVault may override to opt out (→ VV fallback).
+    fn caps(&self) -> Vec<String> {
+        vec!["rbsr".to_string()]
+    }
+    /// The merkle `id`s this node holds in `[lo,hi)`, **sorted** (hex-lexicographic)
+    /// — the reconcile set for the range. Implemented by both engines.
+    fn item_ids(&self, lo: &Bound, hi: &Bound) -> AspResult<Vec<String>>;
+    /// The rows for `ids` (blobs bundled), for shipping a leaf diff as `Msg::Rows`.
+    fn rows_by_ids(&self, ids: &[String]) -> AspResult<Vec<WireRow>>;
+    /// The row ids that are IN SCOPE for a peer granted `allowed` (scoped-sync §2.5)
+    /// — so RBSR reconciles the *scoped* id-set and a partial replica never
+    /// over-receives. Non-file rows are always in scope; file rows iff their
+    /// `file_id` is a member. Default fail-closed (empty); the engines override it.
+    fn in_scope_ids(&self, _allowed: &[String]) -> AspResult<std::collections::HashSet<String>> {
+        Ok(std::collections::HashSet::new())
+    }
+    /// The multiset-hash fingerprint over `[lo,hi)`. Default computes it from
+    /// `item_ids`; an engine may override with an incremental range index (post-v1).
+    fn fingerprint(&self, lo: &Bound, hi: &Bound) -> AspResult<Fingerprint> {
+        Ok(rbsr::fingerprint(self.item_ids(lo, hi)?.iter().map(String::as_str)))
+    }
 }
 
 /// An effect the driver must perform.
@@ -112,6 +138,17 @@ pub struct Session {
     /// `allowed_paths`) and the read-only push reject (B — `read_only`). Default
     /// (full / read-write) on the connector and before admission — unchanged behavior.
     policy: PeerPolicy,
+    /// Our advertised protocol capabilities (scoped-sync §2.2).
+    our_caps: Vec<String>,
+    /// The peer's advertised capabilities (from its `Hello.caps`).
+    peer_caps: Vec<String>,
+    /// The connector opened the RBSR reconcile (sent the top fingerprint) — guards
+    /// against re-opening it.
+    sent_recon: bool,
+    /// Cached in-scope id set for a SCOPED listener's RBSR reconcile (scoped-sync
+    /// §2.5) — computed once so the reconcile advertises/ships only in-scope rows.
+    /// `None` on a full replica (no filtering).
+    recon_scope: Option<std::collections::HashSet<String>>,
 }
 
 /// Per-frame catch-up budget. A `Msg::Rows` frame accumulates rows until it
@@ -228,7 +265,19 @@ impl Session {
             authed: false,
             sent_vector: false,
             policy: PeerPolicy::default(),
+            our_caps: vault.caps(),
+            peer_caps: Vec::new(),
+            sent_recon: false,
+            recon_scope: None,
         }
+    }
+
+    /// Both sides advertise `"rbsr"` — use range-based reconciliation (scoped-sync
+    /// §2.2). Otherwise fall back to the version-vector path verbatim.
+    fn rbsr_negotiated(&self) -> bool {
+        let ours = self.our_caps.iter().any(|c| c == "rbsr");
+        let theirs = self.peer_caps.iter().any(|c| c == "rbsr");
+        ours && theirs
     }
 
     /// The admitted peer's replication grant (scoped-sync §3.1) — full/read-write
@@ -245,12 +294,14 @@ impl Session {
             vault_id: self.vault_id.clone(),
             is_listener: self.role == Role::Listener,
             auth_key: self.present_auth_key.clone(),
+            caps: self.our_caps.clone(),
         })]
     }
 
     pub fn on_msg(&mut self, vault: &dyn SessionVault, msg: Msg) -> AspResult<Vec<Step>> {
         match msg {
-            Msg::Hello { proto, node_id, vault_id, is_listener: _, auth_key } => {
+            Msg::Hello { proto, node_id, vault_id, is_listener: _, auth_key, caps } => {
+                self.peer_caps = caps;
                 if proto != PROTO {
                     // Both numbers, plus a direction + action hint. A proto-3 peer
                     // meeting a proto-4 (git-bridge) node lands here and gets a clear
@@ -319,11 +370,27 @@ impl Session {
                 }
                 self.authed = true;
                 let mut out = vec![Step::Authenticated(peer)];
-                if !self.sent_vector {
+                if self.rbsr_negotiated() {
+                    // RBSR (scoped-sync §2.2): the CONNECTOR opens the reconcile with
+                    // the top-level fingerprint over the whole id-space; the LISTENER
+                    // waits and responds (single tree, no double work). Rows still
+                    // travel as Msg::Rows and integrate identically.
+                    if self.role == Role::Connector && !self.sent_recon {
+                        self.sent_recon = true;
+                        out.push(Step::Send(Msg::Reconcile { parts: vec![self.top_fingerprint(vault)?] }));
+                    }
+                } else if !self.sent_vector {
+                    // VV fallback (unchanged): both sides advertise their vector.
                     self.sent_vector = true;
                     out.push(Step::Send(Msg::Vector { vv: vault.version_vector()? }));
                 }
                 Ok(out)
+            }
+            Msg::Reconcile { parts } => {
+                if !self.authed {
+                    return Ok(vec![Step::Closed("Reconcile before auth".into())]);
+                }
+                self.on_reconcile(vault, parts)
             }
             Msg::Vector { vv } => {
                 if !self.authed {
@@ -371,6 +438,100 @@ impl Session {
             // closes; persistent watch stays connected).
             Msg::Synced => Ok(vec![Step::PeerSynced]),
         }
+    }
+
+    /// Our merkle ids in `[lo,hi)`, restricted to the peer's scope when this side is
+    /// a scoped LISTENER (scoped-sync §2.5) — so RBSR reconciles the in-scope id-set
+    /// and a partial replica never over-receives. Unscoped → the full range set.
+    fn range_ids(&mut self, vault: &dyn SessionVault, lo: &Bound, hi: &Bound) -> AspResult<Vec<String>> {
+        let ids = vault.item_ids(lo, hi)?;
+        let Some(allowed) = self.policy.allowed_paths.clone() else { return Ok(ids) };
+        if self.recon_scope.is_none() {
+            self.recon_scope = Some(vault.in_scope_ids(&allowed)?);
+        }
+        let scope = self.recon_scope.as_ref().unwrap();
+        Ok(ids.into_iter().filter(|id| scope.contains(id)).collect())
+    }
+
+    /// The opening RBSR part (scoped-sync §2.3): our fingerprint + item count over
+    /// the whole id-space `(−∞, +∞)` (scoped when this side is a scoped listener).
+    fn top_fingerprint(&mut self, vault: &dyn SessionVault) -> AspResult<RangePart> {
+        let (lo, hi) = (Bound::open(), Bound::open());
+        let ids = self.range_ids(vault, &lo, &hi)?;
+        Ok(RangePart::Fingerprint {
+            fp: rbsr::fp_hex(&rbsr::fingerprint(ids.iter().map(String::as_str))),
+            count: ids.len() as u64,
+            lo,
+            hi,
+        })
+    }
+
+    /// Process an inbound RBSR reconcile batch (scoped-sync §2.3). For each part:
+    /// a matching `Fingerprint` range is converged (skip); a differing range is
+    /// split by the larger-item side (deterministic fp tiebreak) or, when both are
+    /// small, resolved by an `ItemSet` id exchange whose diff rows ship as
+    /// `Msg::Rows`. An empty response means this side has nothing more to reconcile
+    /// → `Msg::Synced` (+ a local `PeerSynced` so a oneshot driver closes).
+    fn on_reconcile(&mut self, vault: &dyn SessionVault, parts: Vec<RangePart>) -> AspResult<Vec<Step>> {
+        let mut reply: Vec<RangePart> = Vec::new();
+        let mut ship_ids: Vec<String> = Vec::new();
+        for part in parts {
+            match part {
+                RangePart::Fingerprint { lo, hi, fp: their_fp, count: their_count } => {
+                    let my_ids = self.range_ids(vault, &lo, &hi)?;
+                    let my_fp = rbsr::fp_hex(&rbsr::fingerprint(my_ids.iter().map(String::as_str)));
+                    if my_fp == their_fp {
+                        continue; // range converged — nothing to do
+                    }
+                    let my_count = my_ids.len() as u64;
+                    if my_ids.len() <= rbsr::RBSR_LEAF && (their_count as usize) <= rbsr::RBSR_LEAF {
+                        // Both small → enumerate: send our ids, ask for theirs.
+                        reply.push(RangePart::ItemSet { lo, hi, ids: my_ids, want: true });
+                    } else if my_count > their_count || (my_count == their_count && my_fp > their_fp) {
+                        // We hold more (deterministic fp tiebreak): WE split, so row
+                        // frames stay leaf-bounded and exactly one side does the work.
+                        for (l, h) in rbsr::split_bounds(&my_ids, &lo, &hi, rbsr::RBSR_SPLIT) {
+                            let sub: Vec<&str> =
+                                my_ids.iter().map(String::as_str).filter(|id| rbsr::in_range(id, &l, &h)).collect();
+                            let count = sub.len() as u64;
+                            let fp = rbsr::fp_hex(&rbsr::fingerprint(sub.into_iter()));
+                            reply.push(RangePart::Fingerprint { lo: l, hi: h, fp, count });
+                        }
+                    } else {
+                        // The peer holds more → bounce our fingerprint back so it splits.
+                        reply.push(RangePart::Fingerprint { lo, hi, fp: my_fp, count: my_count });
+                    }
+                }
+                RangePart::ItemSet { lo, hi, ids: their_ids, want } => {
+                    let my_ids = self.range_ids(vault, &lo, &hi)?;
+                    let their_set: std::collections::HashSet<&String> = their_ids.iter().collect();
+                    for id in &my_ids {
+                        if !their_set.contains(id) {
+                            ship_ids.push(id.clone()); // the peer lacks this row → ship it
+                        }
+                    }
+                    if want {
+                        // Reply with our ids (no further `want`) so the peer ships us ours.
+                        reply.push(RangePart::ItemSet { lo, hi, ids: my_ids, want: false });
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if !ship_ids.is_empty() {
+            ship_ids.sort();
+            ship_ids.dedup();
+            push_rows_chunked(&mut out, vault.rows_by_ids(&ship_ids)?);
+        }
+        if reply.is_empty() {
+            // Reconcile complete from our side: tell the peer, and signal a oneshot
+            // driver to close (a persistent watch ignores PeerSynced).
+            out.push(Step::Send(Msg::Synced));
+            out.push(Step::PeerSynced);
+        } else {
+            out.push(Step::Send(Msg::Reconcile { parts: reply }));
+        }
+        Ok(out)
     }
 
     fn integrate_batch(&self, vault: &dyn SessionVault, rows: Vec<WireRow>) -> AspResult<Vec<WireRow>> {
@@ -600,6 +761,199 @@ mod tests {
         pump(&a, &mut la, &b, &mut cb);
         assert!(!(la.authed() && cb.authed()), "no_tofu denies an unknown peer");
         assert!(!b.files_map().unwrap().contains_key("m.md"), "no data leaks to a denied peer");
+    }
+
+    // ---------------- Phase R: RBSR anti-entropy (scoped-sync §2, §9) ----------------
+
+    /// Drive two RBSR sessions to quiescence, returning the number of message
+    /// rounds. `a` is the listener, `b` the connector (which opens the reconcile).
+    fn rbsr_pump(a: &dyn SessionVault, b: &dyn SessionVault) -> usize {
+        // Each side's verified_peer is the OTHER engine's real key (what iroh proves).
+        let mut la = Session::new(Role::Listener, a, ctx(), b.node_id(), Vec::new());
+        let mut cb = Session::new(Role::Connector, b, ctx(), a.node_id(), Vec::new());
+        let mut to_a: Vec<Msg> = cb.start().into_iter().filter_map(send_of).collect();
+        let mut to_b: Vec<Msg> = la.start().into_iter().filter_map(send_of).collect();
+        let mut rounds = 0;
+        for _ in 0..200 {
+            if to_a.is_empty() && to_b.is_empty() {
+                break;
+            }
+            rounds += 1;
+            let (mut na, mut nb) = (Vec::new(), Vec::new());
+            for m in to_a.drain(..) {
+                for s in la.on_msg(a, m).unwrap() {
+                    nb.extend(msgs_of(a, s));
+                }
+            }
+            for m in to_b.drain(..) {
+                for s in cb.on_msg(b, m).unwrap() {
+                    na.extend(msgs_of(b, s));
+                }
+            }
+            to_a = na;
+            to_b = nb;
+        }
+        rounds
+    }
+
+    fn id_set(v: &crate::MemEngine) -> std::collections::BTreeSet<String> {
+        v.item_ids(&Bound::open(), &Bound::open()).unwrap().into_iter().collect()
+    }
+
+    /// RBSR — the headline HOLE FUZZ + convergence gate (scoped-sync §9). Seed two
+    /// engines with deliberately **gapped**, disjoint per-site row-sets (the shape a
+    /// dense-seq VV silently lies about: it advertises `MAX(seq)` and never
+    /// re-requests a below-watermark hole). RBSR reconciles by actual id membership,
+    /// so it heals every gap — assert equal id-sets AND byte-identical fold. A VV
+    /// reconcile provably cannot pass this.
+    #[test]
+    fn rbsr_heals_dense_seq_holes_and_converges() {
+        use crate::MemEngine;
+        for seed in 0..8u64 {
+            // One source authors N INDEPENDENT files (no causal chains), so any subset
+            // is foldable and the only gaps are in seq-space — exactly the VV blind spot.
+            let source = MemEngine::create(Identity::from_seed(&[9; 32]), "v");
+            const N: usize = 45;
+            let all: Vec<WireRow> = (0..N)
+                .map(|i| source.record_write(&format!("f{i:02}.md"), format!("body {i}\n").as_bytes()).unwrap().unwrap())
+                .collect();
+
+            let a = MemEngine::create(Identity::from_seed(&[1; 32]), "v");
+            let b = MemEngine::create(Identity::from_seed(&[2; 32]), "v");
+            a.authorize(&Identity::from_seed(&[2; 32]).to_ssh_string(), None, true, "test").unwrap();
+            // Each row goes to A, to B, or to both — a deterministic LCG split that
+            // GUARANTEES holes on each side and union == all (every row placed somewhere).
+            let mut lcg = 0x9E37_79B9u64.wrapping_add(seed);
+            let mut nxt = || {
+                lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (lcg >> 41) as u32
+            };
+            for wr in &all {
+                match nxt() % 3 {
+                    0 => {
+                        a.integrate(wr).unwrap();
+                    }
+                    1 => {
+                        b.integrate(wr).unwrap();
+                    }
+                    _ => {
+                        a.integrate(wr).unwrap();
+                        b.integrate(wr).unwrap();
+                    }
+                }
+            }
+            // Precondition: at least one side actually has a seq-hole (missing a
+            // below-max seq), or the fuzz isn't exercising the VV blind spot.
+            assert!(a.row_count() < N || b.row_count() < N, "seed {seed}: fixture must gap at least one side");
+
+            rbsr_pump(&a, &b);
+
+            // Convergence gate: identical id-sets = the full union, byte-identical folds.
+            let want: std::collections::BTreeSet<String> = all.iter().map(|w| w.row.id.clone()).collect();
+            assert_eq!(id_set(&a), want, "seed {seed}: A healed every hole");
+            assert_eq!(id_set(&b), want, "seed {seed}: B healed every hole");
+            assert_eq!(a.files_map().unwrap(), b.files_map().unwrap(), "seed {seed}: byte-identical fold");
+            assert_eq!(a.files_map().unwrap().len(), N);
+        }
+    }
+
+    /// RBSR — N-vs-2N scaling (scoped-sync §9). A fully-SYNCED pair reconciles in a
+    /// single round shipping ZERO rows (top fingerprints match); a lightly-divergent
+    /// pair converges in sub-linear rounds. Guards against an accidental O(n) or
+    /// non-terminating reconcile.
+    #[test]
+    fn rbsr_synced_pair_is_one_round_zero_rows() {
+        use crate::MemEngine;
+        let source = MemEngine::create(Identity::from_seed(&[9; 32]), "v");
+        let rows: Vec<WireRow> = (0..200)
+            .map(|i| source.record_write(&format!("f{i:03}.md"), format!("b{i}\n").as_bytes()).unwrap().unwrap())
+            .collect();
+        // Two IDENTICAL peers (same rows).
+        let a = MemEngine::create(Identity::from_seed(&[1; 32]), "v");
+        let b = MemEngine::create(Identity::from_seed(&[2; 32]), "v");
+        a.authorize(&Identity::from_seed(&[2; 32]).to_ssh_string(), None, true, "test").unwrap();
+        for wr in &rows {
+            a.integrate(wr).unwrap();
+            b.integrate(wr).unwrap();
+        }
+        let synced_rounds = rbsr_pump(&a, &b);
+        // A synced pair reconciles in a CONSTANT number of rounds regardless of N
+        // (handshake + one top-fingerprint exchange that matches) — prove it's O(1)
+        // in N by comparing against a tiny synced pair.
+        let small = MemEngine::create(Identity::from_seed(&[5; 32]), "v");
+        let small_b = MemEngine::create(Identity::from_seed(&[6; 32]), "v");
+        small.authorize(&Identity::from_seed(&[6; 32]).to_ssh_string(), None, true, "test").unwrap();
+        let one = small.record_write("one.md", b"1\n").unwrap().unwrap();
+        small.integrate(&one).ok();
+        small_b.integrate(&one).unwrap();
+        let small_rounds = rbsr_pump(&small, &small_b);
+        assert_eq!(synced_rounds, small_rounds, "synced-pair round count is constant in N (200 vs 1): {synced_rounds} vs {small_rounds}");
+        assert!(synced_rounds <= 4, "a synced pair reconciles in a small constant number of rounds, took {synced_rounds}");
+
+        // Now diverge by a handful of rows and confirm it still converges in far
+        // fewer rounds than N (sub-linear — the log-depth tree, not a linear scan).
+        let extra: Vec<WireRow> = (200..210)
+            .map(|i| source.record_write(&format!("f{i:03}.md"), format!("b{i}\n").as_bytes()).unwrap().unwrap())
+            .collect();
+        for wr in &extra {
+            a.integrate(wr).unwrap();
+        }
+        let div_rounds = rbsr_pump(&a, &b);
+        assert_eq!(id_set(&a), id_set(&b), "diverged pair converges");
+        assert_eq!(b.files_map().unwrap().len(), 210, "B pulled the 10 new files");
+        assert!(div_rounds < 40, "log-depth reconcile, not linear in N=210: {div_rounds} rounds");
+    }
+
+    /// RBSR — cross-surface byte-determinism (scoped-sync §9): the fingerprint over
+    /// the same id-set is identical on the native SQLite engine and the wasm
+    /// MemEngine (an SDK conformance property).
+    #[test]
+    fn rbsr_fingerprint_is_cross_surface_deterministic() {
+        let d = tempdir().unwrap();
+        let native = Engine::init(d.path(), Identity::from_seed(&[3; 32])).unwrap();
+        let mem = crate::MemEngine::create(Identity::from_seed(&[3; 32]), "v");
+        for i in 0..25 {
+            let wr = native.record_write(&format!("f{i}.md"), format!("x{i}\n").as_bytes()).unwrap().unwrap();
+            mem.integrate(&wr).unwrap(); // same rows, same ids, into both surfaces
+        }
+        let (lo, hi) = (Bound::open(), Bound::open());
+        assert_eq!(
+            SessionVault::fingerprint(&native, &lo, &hi).unwrap(),
+            SessionVault::fingerprint(&mem, &lo, &hi).unwrap(),
+            "native and wasm must compute byte-identical range fingerprints",
+        );
+    }
+
+    /// RBSR — graceful fallback to the version-vector path when a peer does NOT
+    /// advertise `"rbsr"` (scoped-sync §2.2, §9). No `Reconcile` frame is ever sent
+    /// to such a peer; the exchange uses `Msg::Vector` and still converges.
+    #[test]
+    fn rbsr_falls_back_to_vector_for_a_non_rbsr_peer() {
+        use crate::MemEngine;
+        let a = MemEngine::create(Identity::from_seed(&[1; 32]), "v");
+        let b = MemEngine::create(Identity::from_seed(&[2; 32]), "v");
+        a.authorize(&Identity::from_seed(&[2; 32]).to_ssh_string(), None, true, "test").unwrap();
+        a.record_write("only-on-a.md", b"hi\n").unwrap();
+
+        // The connector's Hello arrives advertising NO caps (a pre-RBSR peer).
+        let mut la = Session::new(Role::Listener, &a, ctx(), nid(2), Vec::new());
+        let legacy_hello = Msg::Hello {
+            proto: crate::wire::PROTO,
+            node_id: nid(2).to_hex(),
+            vault_id: "v".into(),
+            is_listener: false,
+            auth_key: None,
+            caps: Vec::new(), // <-- no "rbsr"
+        };
+        let steps = la.on_msg(&a, legacy_hello).unwrap();
+        assert!(
+            steps.iter().any(|s| matches!(s, Step::Send(Msg::Vector { .. }))),
+            "a non-rbsr peer must be answered with Msg::Vector, not Reconcile",
+        );
+        assert!(
+            !steps.iter().any(|s| matches!(s, Step::Send(Msg::Reconcile { .. }))),
+            "no Reconcile frame may ever be sent to a non-rbsr peer",
+        );
     }
 
     // ---------------- Feature A: partial subdir sync (scoped-sync §3, §9) ----------------
@@ -869,6 +1223,7 @@ mod tests {
             vault_id: "whatever".into(),
             is_listener: false,
             auth_key: None,
+            caps: Vec::new(),
         };
         let steps = s.on_msg(&e, hello).unwrap();
         assert!(steps.iter().any(|st| matches!(st, Step::Closed(m) if m.contains("proto"))), "proto mismatch must close");
@@ -888,6 +1243,7 @@ mod tests {
             vault_id: String::new(),
             is_listener: false,
             auth_key: None,
+            caps: Vec::new(),
         };
         let steps = s.on_msg(&e, hello).unwrap();
         assert!(

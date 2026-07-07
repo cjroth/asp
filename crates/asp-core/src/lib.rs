@@ -25,6 +25,7 @@ pub mod memengine;
 pub mod merge;
 pub mod oid;
 pub mod order;
+pub mod rbsr;
 pub mod scope;
 pub mod session;
 pub mod store;
