@@ -87,9 +87,10 @@ export interface TagInfo {
   at_ts: number;
   branch_id: string;
 }
-// 'receiving'|'saving' cover an ASP peer clone; 'fetching'|'replaying' are the extra
-// git-bridge phases (fetch the pack over the proxy, then replay it into rows).
-export type ClonePhase = 'receiving' | 'saving' | 'fetching' | 'replaying';
+// 'receiving'|'saving' cover an ASP peer clone; 'fetching'|'replaying'|'materialize'
+// are the extra git-bridge phases (fetch the pack over the proxy, replay it into rows,
+// then write the working tree to this device).
+export type ClonePhase = 'receiving' | 'saving' | 'fetching' | 'replaying' | 'materialize';
 export type CloneProgress = (done: number, total: number, phase: ClonePhase) => void;
 
 // The git-bridge status chip DTO (git-bridge §7.2). Shared verbatim by both

@@ -598,7 +598,7 @@ impl WasmEngine {
     /// Steps: GET info/refs → parse caps → POST ls-refs (HEAD symref → default branch
     /// + tip) → POST fetch `{want tip, done}` → pack → decode → plan → deterministic
     /// genesis → paged integrate under batch. `on_progress(phase, done, total)` fires
-    /// with `phase ∈ {"fetching","replaying","saving"}`. Resolves to JSON
+    /// with `phase ∈ {"fetching","replaying","saving","materialize"}`. Resolves to JSON
     /// `{vault_id, commits, branches, warnings, tip_sha, root_sha, remote_ref,
     /// default_branch, open_branches, refs_skipped}`.
     ///
@@ -847,7 +847,10 @@ fn apply_clone_pack(
         return Err("cannot clone a git remote into a non-empty vault".into());
     }
     progress("replaying", 0, 0);
-    let db = gitimport::GitObjectDb::from_pack(pack, gitimport::no_base_lookup).map_err(|e| e.to_string())?;
+    let db = gitimport::GitObjectDb::from_pack_with_progress(pack, gitimport::no_base_lookup, |d, t| {
+        progress("replaying", d, t)
+    })
+    .map_err(|e| e.to_string())?;
     // Every open-branch candidate tip must be in the fetched pack; a missing one (the
     // server pruned the ref between ls-refs and fetch) is a clear error (mirrors the
     // native `gitremote::clone_from_git` guard).
@@ -874,7 +877,12 @@ fn apply_clone_pack(
     let res = integrate_paged(eng, &g.rows, &scratch, &|d, t| progress("saving", d, t));
     eng.set_batch(false);
     res?;
+    // MemEngine materialize is a single in-memory fold (OPFS writes happen host-side
+    // after), so emit the file count once to fill the "materialize" segment.
+    progress("materialize", 0, 0);
     eng.materialize().map_err(|e| e.to_string())?;
+    let mat_files = eng.files_detail().iter().filter(|f| !f.deleted).count() as u64;
+    progress("materialize", mat_files, mat_files);
 
     let branches: Vec<String> = plan
         .lanes

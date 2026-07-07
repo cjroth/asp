@@ -267,8 +267,10 @@ pub async fn clone_from_git(
     }
 
     // 2/3. Fetch the pack (§3.4 size guard is best-effort: warn on a large pack).
+    // upload-pack sends no Content-Length, so the "fetching" bar is a live byte
+    // count (total 0 → the UI shows "X.X MB" under a segment shimmer).
     progress("fetching", 0, 0);
-    let outcome = fetch_pack(spec, &wants, &[], opts.depth, |_| {}).await?;
+    let outcome = fetch_pack(spec, &wants, &[], opts.depth, |bytes| progress("fetching", bytes, 0)).await?;
     lap("fetch_pack");
     if outcome.pack.len() as u64 > SIZE_WARN_BYTES {
         tracing::warn!(
@@ -281,9 +283,13 @@ pub async fn clone_from_git(
     rstore.record_fetch(&outcome.pack, &[(remote_ref.clone(), tip.clone())])?;
     lap("record_fetch");
 
-    // 4. Decode + plan.
+    // 4. Decode + plan. Object decode is the dominant visible stretch — report
+    // (objects_done, num_objects) from the pack header for a determinate bar.
     progress("replaying", 0, 0);
-    let db = GitObjectDb::from_pack(&outcome.pack, no_base_lookup).map_err(imp)?;
+    let db = GitObjectDb::from_pack_with_progress(&outcome.pack, no_base_lookup, |d, t| {
+        progress("replaying", d, t)
+    })
+    .map_err(imp)?;
     lap("decode_pack");
     // Every candidate tip must be present in the fetched pack; a missing one (server
     // pruned the ref between ls-remote and fetch) is a clear error, not a silent drop.
@@ -316,7 +322,8 @@ pub async fn clone_from_git(
     engine.set_batch(false);
     res?;
     lap("integrate");
-    engine.materialize()?;
+    progress("materialize", 0, 0);
+    engine.materialize_with_progress(Some(&|d, t| progress("materialize", d, t)))?;
     lap("materialize");
 
     // Persist the cursor + mode cache. A token (if any) goes to the keyring, only its

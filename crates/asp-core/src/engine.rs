@@ -572,6 +572,18 @@ impl Engine {
     /// re-reading it; the git export is skipped entirely on a host that turned it
     /// off (the desktop app never reads `.asp/git`).
     pub fn materialize(&self) -> AspResult<BTreeMap<String, String>> {
+        self.materialize_with_progress(None)
+    }
+
+    /// Like [`materialize`](Self::materialize), but reports `(files_written, total)`
+    /// to `progress` as content files stream to disk — drives the clone "materialize"
+    /// phase (writing a big working tree is otherwise ~20s of invisible time). `total`
+    /// is the number of files that need (re)writing this pass; on a fresh clone that's
+    /// every file. All other callers pass `None` and pay nothing.
+    pub fn materialize_with_progress(
+        &self,
+        progress: Option<&dyn Fn(u64, u64)>,
+    ) -> AspResult<BTreeMap<String, String>> {
         // Previous materialized live state: path -> content_hash, and the set of
         // all previously-live paths (content + dir) for stale removal.
         let prev = self.store.live_files()?;
@@ -734,13 +746,24 @@ impl Engine {
                 }
                 // Producer: read blobs on this thread and feed the writers. Always drop
                 // `tx` before returning so the writers' `recv()` unblocks (else the
-                // scope join deadlocks).
+                // scope join deadlocks). Progress is emitted here (single-threaded, in
+                // stable order) as each blob is enqueued — the sqlite reads are the
+                // bottleneck, so "enqueued" tracks real work closely enough for a bar.
                 let mut err: AspResult<()> = Ok(());
+                let total = to_process.len() as u64;
+                if let Some(p) = progress {
+                    p(0, total);
+                }
+                let mut done: u64 = 0;
                 for (path, abs, h) in &to_process {
                     match self.store.get_blob(h) {
                         Ok(b) => {
                             if tx.send((path.clone(), abs.clone(), b.unwrap_or_default(), h.clone())).is_err() {
                                 break; // all writers gone (they only exit on error)
+                            }
+                            done += 1;
+                            if let Some(p) = progress {
+                                p(done, total);
                             }
                         }
                         Err(e) => {

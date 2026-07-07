@@ -322,6 +322,18 @@ fn check_status(resp: &reqwest::Response) -> BridgeResult<()> {
 }
 
 async fn read_capped(resp: reqwest::Response, max: u64) -> BridgeResult<Vec<u8>> {
+    read_capped_progress(resp, max, |_| {}).await
+}
+
+/// Like [`read_capped`], but invokes `on_bytes` with the **cumulative** byte count
+/// after each streamed chunk lands. Used by the clone driver to drive the "fetching"
+/// progress phase (git upload-pack sends no Content-Length, so only a live running
+/// total is available — the UI shows it as a byte count under a segment shimmer).
+async fn read_capped_progress(
+    resp: reqwest::Response,
+    max: u64,
+    mut on_bytes: impl FnMut(u64),
+) -> BridgeResult<Vec<u8>> {
     if let Some(len) = resp.content_length() {
         if len > max {
             return Err(GitBridgeError::Http("response exceeds size cap".into()));
@@ -337,6 +349,7 @@ async fn read_capped(resp: reqwest::Response, max: u64) -> BridgeResult<Vec<u8>>
             return Err(GitBridgeError::Http("response body exceeded size cap".into()));
         }
         out.extend_from_slice(&chunk);
+        on_bytes(total);
     }
     Ok(out)
 }
@@ -407,6 +420,40 @@ impl GitTransport for HttpsTransport {
             .map_err(|e| GitBridgeError::Http(format!("receive-pack request failed: {e}")))?;
         check_status(&resp)?;
         read_capped(resp, self.max_body).await
+    }
+}
+
+impl HttpsTransport {
+    /// Like the trait [`upload_pack`](GitTransport::upload_pack), but reports the
+    /// cumulative downloaded byte count to `on_bytes` as the response body streams
+    /// in (drives the clone "fetching" phase). Off the trait so the browser-shaped
+    /// seam stays a plain buffered round-trip.
+    async fn upload_pack_progress(
+        &self,
+        body: Vec<u8>,
+        on_bytes: impl FnMut(u64),
+    ) -> BridgeResult<Vec<u8>> {
+        let url = upload_pack_url(&self.base);
+        let rb = self
+            .client
+            .post(&url)
+            .header("Git-Protocol", "version=2")
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-git-upload-pack-request",
+            )
+            .header(
+                reqwest::header::ACCEPT,
+                "application/x-git-upload-pack-result",
+            )
+            .body(body);
+        let rb = self.auth_header(rb);
+        let resp = rb
+            .send()
+            .await
+            .map_err(|e| GitBridgeError::Http(format!("upload-pack request failed: {e}")))?;
+        check_status(&resp)?;
+        read_capped_progress(resp, self.max_body, on_bytes).await
     }
 }
 
@@ -601,7 +648,7 @@ pub async fn fetch_pack(
     wants: &[String],
     haves: &[String],
     depth: Option<u32>,
-    on_progress: impl FnMut(&[u8]),
+    mut on_bytes: impl FnMut(u64),
 ) -> BridgeResult<FetchOutcome> {
     let req = FetchRequest {
         wants: wants.to_vec(),
@@ -618,17 +665,23 @@ pub async fn fetch_pack(
     let resp = match &spec.url {
         GitUrl::Https { base } => {
             let t = HttpsTransport::new(base.clone(), spec.auth.clone())?;
-            t.upload_pack(body).await?
+            t.upload_pack_progress(body, &mut on_bytes).await?
         }
         GitUrl::Ssh { .. } => {
             let url = spec.url.clone();
-            tokio::task::spawn_blocking(move || ssh_upload_pack(&url, &body))
+            let r = tokio::task::spawn_blocking(move || ssh_upload_pack(&url, &body))
                 .await
-                .map_err(|e| GitBridgeError::Ssh(format!("ssh task join: {e}")))??
+                .map_err(|e| GitBridgeError::Ssh(format!("ssh task join: {e}")))??;
+            // SSH reads the whole response before returning, so byte streaming isn't
+            // available — report the final size once so the phase still shows a count.
+            on_bytes(r.len() as u64);
+            r
         }
     };
 
-    let parsed = FetchResponseParser::parse_with(&resp, on_progress)?;
+    // Band-2 progress text is still collected into `FetchResponse::progress`; the
+    // clone driver drives its "fetching" bar from downloaded bytes (above) instead.
+    let parsed = FetchResponseParser::parse_with(&resp, |_| {})?;
     if !parsed.saw_packfile {
         return Err(GitBridgeError::Remote(
             "server returned no packfile section for a done=true fetch".into(),

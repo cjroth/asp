@@ -2348,35 +2348,58 @@ export default function App() {
             )}
             {cloneProg && (() => {
               const { done, total, phase } = cloneProg;
-              // 'receiving' (peer clone) and 'fetching' (git pack download) can
-              // report a real count → determinate bar; 'replaying'/'saving' are
-              // indeterminate work phases.
-              const determinate = (phase === 'receiving' || phase === 'fetching') && total > 0;
-              const pct = determinate ? Math.min(100, Math.round((done / total) * 100)) : 0;
+              // ONE monotonic weighted bar across the whole clone. Each git phase owns a
+              // fixed slice of [0,1]; the fill never resets between phases because the
+              // slice floor is the previous phase's ceiling. An ASP peer clone
+              // ('receiving') owns the whole bar. total>0 → determinate within the
+              // slice; total==0 → the fill sits at the slice floor + a shimmer plays
+              // within the slice while a live count ticks.
+              const seg: Record<ClonePhase, [number, number]> = {
+                fetching: [0, 0.25],
+                replaying: [0.25, 0.6],
+                saving: [0.6, 0.8],
+                materialize: [0.8, 1],
+                receiving: [0, 1],
+              };
+              const [lo, hi] = seg[phase] ?? [0, 1];
+              const determinate = total > 0;
+              const frac = determinate ? Math.min(1, done / total) : 0;
+              const pct = Math.round((lo + (hi - lo) * frac) * 100);
               // Git phases get their own copy; the ASP peer path keeps its wording.
               const title =
                 phase === 'saving' ? 'Saving to this device…'
-                  : phase === 'fetching' ? 'Fetching from git…'
-                    : phase === 'replaying' ? 'Replaying history…'
-                      : 'Receiving notes…';
+                  : phase === 'materialize' ? 'Writing files to this device…'
+                    : phase === 'fetching' ? 'Fetching from git…'
+                      : phase === 'replaying' ? 'Replaying history…'
+                        : 'Receiving notes…';
               const sub =
                 phase === 'saving' ? 'Almost done — writing everything to local storage.'
-                  : phase === 'fetching' ? 'Downloading the repository over a secure connection.'
-                    : phase === 'replaying' ? 'Rebuilding the note history from the repository.'
-                      : 'Pulling the vault over a direct connection. Hang tight.';
+                  : phase === 'materialize' ? 'Saving the working tree locally.'
+                    : phase === 'fetching' ? 'Downloading the repository over a secure connection.'
+                      : phase === 'replaying' ? 'Rebuilding the note history from the repository.'
+                        : 'Pulling the vault over a direct connection. Hang tight.';
+              // Right-aligned count: determinate → done/total; fetching-while-coarse →
+              // live MB (bytes); other coarse phases → a running count if we have one.
+              const count = determinate
+                ? `${done.toLocaleString()} / ${total.toLocaleString()}`
+                : phase === 'fetching'
+                  ? (done > 0 ? `${(done / 1048576).toFixed(1)} MB` : '')
+                  : done > 0 ? done.toLocaleString() : '';
               return (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 9, background: 'var(--bg-input)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 15px' }}>
                   <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 10 }}>
                     <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>{title}</span>
-                    <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, color: 'var(--faint)' }}>
-                      {determinate ? `${done.toLocaleString()} / ${total.toLocaleString()}` : done > 0 ? done.toLocaleString() : ''}
-                    </span>
+                    <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, color: 'var(--faint)' }}>{count}</span>
                   </div>
                   <div style={{ position: 'relative', height: 6, borderRadius: 3, background: 'var(--faint2)', overflow: 'hidden' }}>
-                    {determinate ? (
-                      <div style={{ height: '100%', borderRadius: 3, background: accent, width: `${pct}%`, transition: 'width 0.25s ease' }} />
-                    ) : (
-                      <div style={{ position: 'absolute', top: 0, bottom: 0, width: '40%', borderRadius: 3, background: accent, animation: 'aspIndet 1.1s ease-in-out infinite' }} />
+                    {/* Always render the filled bar to pct (slice floor when coarse), so it
+                        only ever grows. */}
+                    <div style={{ height: '100%', borderRadius: 3, background: accent, width: `${pct}%`, transition: 'width 0.25s ease' }} />
+                    {/* Coarse phase: overlay a shimmer confined to the current slice. */}
+                    {!determinate && (
+                      <div style={{ position: 'absolute', top: 0, bottom: 0, left: `${lo * 100}%`, width: `${(hi - lo) * 100}%`, borderRadius: 3, overflow: 'hidden' }}>
+                        <div style={{ position: 'absolute', top: 0, bottom: 0, width: '40%', borderRadius: 3, background: accent, animation: 'aspIndet 1.1s ease-in-out infinite' }} />
+                      </div>
                     )}
                   </div>
                   <span style={{ fontSize: 11.5, color: 'var(--faint)' }}>{sub}</span>
