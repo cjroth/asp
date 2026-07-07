@@ -91,6 +91,14 @@ CREATE TABLE IF NOT EXISTS git_remotes(
 -- ASP doesn't model the +x bit, so push synthesis replays these. Rebuildable from
 -- the GitIngest rows in the fold; node-private, like git_blobs.
 CREATE TABLE IF NOT EXISTS git_modes(path TEXT PRIMARY KEY, mode INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'file');
+-- Thin-client attribution side table (scoped-sync §5.3/§6). A thin client can't
+-- author under its own site_id (frozen canonical_fields), so the source authors the
+-- row and records who really submitted it here — the client's node_id + its signed
+-- envelope. NODE-LOCAL, NEVER synced (other replicas + the derived git author line
+-- legitimately see "the source authored it"); crypto attribution is source-local.
+CREATE TABLE IF NOT EXISTS remote_edits(
+  row_id TEXT PRIMARY KEY, client_node_id TEXT, envelope_sig BLOB, submitted_at INTEGER
+);
 "#;
 
 /// The `log` table's SECONDARY indexes, as a single source of truth. Each string
@@ -1135,6 +1143,30 @@ impl SqliteStore {
 
     pub fn authkeys_empty(&self) -> AspResult<bool> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM authorized_keys", [], |r| r.get::<_, i64>(0))? == 0)
+    }
+
+    // ----- remote_edits (thin-client attribution, scoped-sync §5.3/§6) -----
+
+    /// Record who really submitted a source-authored row (node-local, never synced).
+    pub fn record_remote_edit(&self, row_id: &str, client_node_id: &str, sig: &[u8], submitted_at: i64) -> AspResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO remote_edits(row_id, client_node_id, envelope_sig, submitted_at) VALUES(?1,?2,?3,?4)",
+            params![row_id, client_node_id, sig, submitted_at],
+        )?;
+        Ok(())
+    }
+
+    /// The `(client_node_id, envelope_sig, submitted_at)` attribution for a row, if
+    /// it was a thin-client submit.
+    pub fn remote_edit(&self, row_id: &str) -> AspResult<Option<(String, Vec<u8>, i64)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT client_node_id, envelope_sig, submitted_at FROM remote_edits WHERE row_id=?1",
+                params![row_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, i64>(2)?)),
+            )
+            .optional()?)
     }
 
     /// Listen-start migration: fill `expires_at` on any unset (NULL, never=0) row

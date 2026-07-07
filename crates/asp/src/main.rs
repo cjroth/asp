@@ -158,6 +158,20 @@ enum Cmd {
     /// One-shot: capture local changes, sync with a peer, exit. With no peer, uses
     /// the saved peer (from `clone`). `peer` is an iroh ticket or node id.
     Sync { peer: Option<String> },
+    /// Serve this vault to THIN clients over the query ALPN (scoped-sync §5): reads
+    /// are a server-side fold, writes are authored by this node on the client's
+    /// behalf. Clients keep no local log. Prints a ticket for `asp view`.
+    Serve,
+    /// Thin remote-view client (scoped-sync §5): read/list/write a vault served by
+    /// `asp serve`, keeping NO local copy. `peer` is the serve node's ticket.
+    View {
+        peer: String,
+        /// `ls <path>` (default, path optional), `read <path>`, or `write <path>`
+        /// (content from stdin).
+        #[arg(default_value = "ls")]
+        op: String,
+        path: Option<String>,
+    },
     /// Run a pure iroh relay (forwards encrypted packets, stores/sees nothing).
     Relay {
         /// HTTP bind address for the relay (default 0.0.0.0:8080).
@@ -506,6 +520,20 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Clone { peer, into, watch, depth, new_identity, all_branches, token, subdir } => {
             clone_cmd(&cli, peer, into.clone(), *watch, *depth, *new_identity, *all_branches, token.clone(), subdir.clone()).await
         }
+        Cmd::Serve => {
+            let engine = open_engine(&cli)?;
+            seed_authorized_keys(&cli, &engine)?;
+            let ttl_days = default_ttl_days(&cli, &engine);
+            let _ = engine.migrate_keys(ttl_days);
+            let auth = auth_opts(&cli, &engine);
+            let ep = iroh_net::bind_query_endpoint(&engine.identity.seed(), !cli.no_relay, cli.relay_url.as_deref()).await?;
+            let ticket = iroh_net::ticket(&ep, !cli.no_relay).await?;
+            println!("asp serve — thin remote-view (query ALPN). Clients keep no local copy.");
+            print_ticket(&ticket, &engine.site_id());
+            println!("connect a thin client: `asp view <ticket> read <path>`");
+            iroh_net::serve_queries(Arc::new(Mutex::new(engine)), ep, auth).await
+        }
+        Cmd::View { peer, op, path } => view_cmd(&cli, peer, op, path.clone()).await,
         Cmd::Watch { listen, relay, relay_listen_addr, peers } => {
             watch_cmd(&cli, *listen, *relay, relay_listen_addr.clone(), peers.clone()).await
         }
@@ -1174,6 +1202,77 @@ async fn git_bridge_cmd(cli: &Cli, args: &[String]) -> Result<()> {
         }
         other => Err(anyhow!("unknown git bridge verb: {other}")),
     }
+}
+
+/// Thin remote-view client (scoped-sync §5): dial a source's query ALPN and run one
+/// read/list/write, keeping no local copy of the vault.
+async fn view_cmd(cli: &Cli, peer: &str, op: &str, path: Option<String>) -> Result<()> {
+    use asp_core::thin::{QueryOp, QueryResult, SubmitOp, SubmitResult, ThinReq, ThinResp};
+    // The device identity signs write envelopes and authenticates the QUIC link.
+    let engine = open_engine(cli)?;
+    let id = engine.identity.clone();
+    let addr = iroh_net::parse_peer(peer)?;
+    let ep = iroh_net::bind_endpoint_relay(&id.seed(), !cli.no_relay, cli.relay_url.as_deref()).await?;
+    let mut client = iroh_net::QueryClient::connect(&ep, addr).await?;
+    let result = async {
+        match op {
+            "ls" => {
+                let r = client.request(&ThinReq::Query { id: 1, op: QueryOp::ListDir { path: path.clone().unwrap_or_default() } }).await?;
+                match r {
+                    ThinResp::QueryResp { result: QueryResult::Dir(entries), .. } => {
+                        for e in entries {
+                            println!("{}{}", e.name, if e.is_dir { "/" } else { "" });
+                        }
+                        Ok(())
+                    }
+                    ThinResp::Denied { reason, .. } => Err(anyhow!("denied: {reason}")),
+                    other => Err(anyhow!("unexpected response: {other:?}")),
+                }
+            }
+            "read" => {
+                let p = path.clone().ok_or_else(|| anyhow!("`view <ticket> read <path>` needs a path"))?;
+                let r = client.request(&ThinReq::Query { id: 1, op: QueryOp::ReadFile { path: p } }).await?;
+                match r {
+                    ThinResp::QueryResp { result: QueryResult::File(Some(bytes)), .. } => {
+                        use std::io::Write;
+                        std::io::stdout().write_all(&bytes)?;
+                        Ok(())
+                    }
+                    ThinResp::QueryResp { result: QueryResult::File(None), .. } => Err(anyhow!("no such file")),
+                    ThinResp::Denied { reason, .. } => Err(anyhow!("denied: {reason}")),
+                    other => Err(anyhow!("unexpected response: {other:?}")),
+                }
+            }
+            "write" => {
+                let p = path.clone().ok_or_else(|| anyhow!("`view <ticket> write <path>` needs a path (content from stdin)"))?;
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                std::io::stdin().read_to_end(&mut bytes)?;
+                let sop = SubmitOp::Write { path: p, bytes, base_hash: None };
+                let nonce = now_unix();
+                let sig = id.sign(&asp_core::thin::submit_envelope(&sop, nonce));
+                let r = client.request(&ThinReq::Submit { id: 1, op: sop, nonce, envelope_sig: sig }).await?;
+                match r {
+                    ThinResp::SubmitResp { result: SubmitResult::Ok { row_id }, .. } => {
+                        println!("submitted (row {})", &row_id[..12.min(row_id.len())]);
+                        Ok(())
+                    }
+                    ThinResp::SubmitResp { result: SubmitResult::Conflict, .. } => Err(anyhow!("conflict — the tip moved; re-read and retry")),
+                    ThinResp::SubmitResp { result: SubmitResult::NoOp, .. } => {
+                        println!("no-op (ignored path or unchanged content)");
+                        Ok(())
+                    }
+                    ThinResp::Denied { reason, .. } => Err(anyhow!("denied: {reason}")),
+                    other => Err(anyhow!("unexpected response: {other:?}")),
+                }
+            }
+            other => Err(anyhow!("unknown view op '{other}' (ls | read | write)")),
+        }
+    }
+    .await;
+    client.close().await;
+    ep.close().await;
+    result
 }
 
 async fn watch_cmd(

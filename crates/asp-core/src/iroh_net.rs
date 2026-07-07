@@ -516,6 +516,140 @@ async fn accept_one(
     drive(send, recv, engine, session, false, conns, None).await
 }
 
+// ---------------- thin remote-view query server (C, scoped-sync §5) ----------------
+
+/// Bind an endpoint that serves the thin-client QUERY ALPN (`asp/query/1`) —
+/// `asp serve`. Distinct ALPN from sync, so `Msg`/`PROTO` are untouched.
+pub async fn bind_query_endpoint(seed: &[u8; 32], relays: bool, relay_url: Option<&str>) -> Result<Endpoint> {
+    use std::str::FromStr;
+    let sk = secret_key(seed);
+    let builder = if let Some(u) = relay_url {
+        let url = iroh::RelayUrl::from_str(u.trim()).map_err(|e| anyhow!("bad relay url: {e}"))?;
+        let map: iroh::RelayMap = [url].into_iter().collect();
+        Endpoint::builder(iroh::endpoint::presets::Empty).relay_mode(RelayMode::Custom(map))
+    } else if relays {
+        Endpoint::builder(iroh::endpoint::presets::N0)
+    } else {
+        Endpoint::builder(iroh::endpoint::presets::Empty).relay_mode(RelayMode::Disabled)
+    };
+    builder
+        .crypto_provider(iroh::tls::default_provider())
+        .secret_key(sk)
+        .alpns(vec![crate::thin::QUERY_ALPN.to_vec()])
+        .bind()
+        .await
+        .map_err(|e| anyhow!("binding query endpoint: {e}"))
+}
+
+/// Serve the thin-client query protocol (scoped-sync §5): each connection is a
+/// request/response stream driving a [`crate::thin::ThinSession`] against the
+/// source engine, filtered to the client's `authorized_keys` grant. One broadcast
+/// change-signal feeds every subscriber (signal-then-pull), so multiple clients'
+/// subscriptions all fire.
+pub async fn serve_queries(engine: EngineRef, ep: Endpoint, auth: AuthOpts) -> Result<()> {
+    use tokio::sync::broadcast;
+    let (chg_tx, _) = broadcast::channel::<String>(256);
+    {
+        // The engine's single change listener fans out to the broadcast. `notify`
+        // fires per integrate/author; we signal all subscribers (they re-query).
+        let tx = chg_tx.clone();
+        engine.lock().unwrap().set_change_listener(Arc::new(move || {
+            let _ = tx.send(String::new());
+        }));
+    }
+    tracing::info!(endpoint = %ep.id().fmt_short(), "asp serve: thin query ALPN listening");
+    while let Some(incoming) = ep.accept().await {
+        let engine = engine.clone();
+        let auth = auth.clone();
+        let chg_rx = chg_tx.subscribe();
+        tokio::spawn(async move {
+            if let Err(e) = accept_query(incoming, engine, auth, chg_rx).await {
+                tracing::debug!("query accept error: {e}");
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn accept_query(
+    incoming: iroh::endpoint::Incoming,
+    engine: EngineRef,
+    auth: AuthOpts,
+    mut chg_rx: tokio::sync::broadcast::Receiver<String>,
+) -> Result<()> {
+    use crate::thin::{ThinReq, ThinResp, ThinSession};
+    let conn = incoming.await.map_err(|e| anyhow!("accept: {e}"))?;
+    let client = node_id_of(&conn);
+    // The query ALPN reuses A's/B's grant directly: admit the client and retain its
+    // policy (allowed_paths / read_only). Denied → close.
+    let policy = {
+        let eng = engine.lock().unwrap();
+        eng.admit(&client, &auth.admit_ctx(false)).map_err(|e| anyhow!("admission denied: {e}"))?
+    };
+    let session = ThinSession::new(client, policy);
+    let (mut send, mut recv) = conn.accept_bi().await.map_err(|e| anyhow!("accept_bi: {e}"))?;
+
+    let mut subs: Vec<u64> = Vec::new();
+    loop {
+        tokio::select! {
+            biased;
+            // A vault change → signal every active subscriber (signal-then-pull).
+            chg = chg_rx.recv() => {
+                if chg.is_err() { continue; }
+                for sub_id in &subs {
+                    let ev = ThinResp::Event { sub_id: *sub_id };
+                    if write_frame(&mut send, &ev.to_bytes()?).await.is_err() { return Ok(()); }
+                }
+            }
+            frame = read_frame(&mut recv) => {
+                let frame = match frame? { Some(f) => f, None => break };
+                let req = match ThinReq::from_bytes(&frame) { Ok(r) => r, Err(_) => continue };
+                if let ThinReq::Subscribe { sub_id, .. } = &req { if !subs.contains(sub_id) { subs.push(*sub_id); } }
+                if let ThinReq::Unsubscribe { sub_id } = &req { subs.retain(|s| s != sub_id); }
+                let resp = { let eng = engine.lock().unwrap(); session.on_req(&eng, req)? };
+                if write_frame(&mut send, &resp.to_bytes()?).await.is_err() { break; }
+            }
+        }
+    }
+    let _ = send.finish();
+    Ok(())
+}
+
+/// A thin-client connection (`asp view`): dial the source's query ALPN and drive a
+/// request/response stream. Holds the bi-stream so multiple requests reuse it.
+pub struct QueryClient {
+    conn: Connection,
+    send: SendStream,
+    recv: RecvStream,
+}
+
+impl QueryClient {
+    /// Dial `addr`'s query ALPN and open the request stream.
+    pub async fn connect(ep: &Endpoint, addr: EndpointAddr) -> Result<QueryClient> {
+        let conn = ep
+            .connect(addr, crate::thin::QUERY_ALPN)
+            .await
+            .map_err(|e| anyhow!("query connect: {e}"))?;
+        let (send, recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
+        Ok(QueryClient { conn, send, recv })
+    }
+
+    /// Send one request, await its response.
+    pub async fn request(&mut self, req: &crate::thin::ThinReq) -> Result<crate::thin::ThinResp> {
+        write_frame(&mut self.send, &req.to_bytes()?).await?;
+        let frame = read_frame(&mut self.recv)
+            .await?
+            .ok_or_else(|| anyhow!("query stream closed before a response"))?;
+        crate::thin::ThinResp::from_bytes(&frame).map_err(|e| anyhow!("{e}"))
+    }
+
+    pub async fn close(self) {
+        let mut send = self.send;
+        let _ = send.finish();
+        self.conn.close(0u32.into(), b"bye");
+    }
+}
+
 // ---------------- connector (sync / clone / watch) ----------------
 
 /// Dial a peer by address and drive a connector `Session`. `oneshot` ends on the
@@ -699,6 +833,53 @@ mod tests {
             .iter()
             .any(|r| r.path.as_deref() == Some("personal/secret.md"));
         assert!(!has_out, "no out-of-scope row reached the scoped replica's log");
+        server.abort();
+    }
+
+    /// C — the thin remote-view client over the REAL query ALPN (scoped-sync §5, §9).
+    /// A source serves reads + a write-through over `asp/query/1`; the client reads a
+    /// file, submits a signed write, and the source authors it (attributed in
+    /// `remote_edits`). Exercises the whole native query stack end to end.
+    #[tokio::test]
+    async fn iroh_thin_query_and_submit_over_query_alpn() {
+        use crate::thin::{QueryOp, QueryResult, SubmitOp, SubmitResult, ThinReq, ThinResp};
+        let srv_dir = tempdir().unwrap();
+        let srv_id = Identity::from_seed(&[41; 32]);
+        let cli_id = Identity::from_seed(&[42; 32]);
+        let srv = Engine::init(srv_dir.path(), srv_id.clone()).unwrap();
+        srv.record_write("notes/hello.md", b"hi from source\n").unwrap();
+        srv.authorize(&cli_id.to_ssh_string(), None, true, "test").unwrap();
+
+        let srv_ep = bind_query_endpoint(&srv_id.seed(), false, None).await.unwrap();
+        let cli_ep = bind_endpoint(&cli_id.seed(), false).await.unwrap();
+        let dial = loopback_addr(&srv_ep);
+        let srv_engine: EngineRef = Arc::new(StdMutex::new(srv));
+        let server = tokio::spawn(serve_queries(srv_engine.clone(), srv_ep, AuthOpts::default()));
+
+        let mut client = QueryClient::connect(&cli_ep, dial).await.expect("connect over query ALPN");
+
+        // Read a file server-side (no local log on the client).
+        let r = client.request(&ThinReq::Query { id: 1, op: QueryOp::ReadFile { path: "notes/hello.md".into() } }).await.unwrap();
+        assert!(matches!(r, ThinResp::QueryResp { result: QueryResult::File(Some(ref b)), .. } if b == b"hi from source\n"), "got {r:?}");
+
+        // Submit a signed write-through; the SOURCE authors it.
+        let op = SubmitOp::Write { path: "notes/new.md".into(), bytes: b"authored via thin\n".to_vec(), base_hash: None };
+        let nonce = 3;
+        let sig = cli_id.sign(&crate::thin::submit_envelope(&op, nonce));
+        let r = client.request(&ThinReq::Submit { id: 2, op, nonce, envelope_sig: sig }).await.unwrap();
+        let ThinResp::SubmitResp { result: SubmitResult::Ok { row_id }, .. } = r else { panic!("expected Ok, got {r:?}") };
+
+        {
+            let eng = srv_engine.lock().unwrap();
+            assert_eq!(
+                eng.store.live_file_by_path("notes/new.md").unwrap().unwrap().result_hash,
+                Some(crate::oid::content_hash(b"authored via thin\n")),
+                "the write-through materialized on the source",
+            );
+            let attr = eng.store.remote_edit(&row_id).unwrap().expect("attribution recorded");
+            assert_eq!(attr.0, cli_id.node_id().to_hex(), "attributed to the thin client");
+        }
+        client.close().await;
         server.abort();
     }
 

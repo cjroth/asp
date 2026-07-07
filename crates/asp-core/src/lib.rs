@@ -36,6 +36,9 @@ pub mod wire;
 // Native-only: on-disk SQLite, fs-backed engine + git export, TLS.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod config;
+// Thin remote-view client (C) — server-side, native (folds the SQLite store).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod thin;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod engine;
 #[cfg(not(target_arch = "wasm32"))]
