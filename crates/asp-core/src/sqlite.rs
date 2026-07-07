@@ -521,7 +521,7 @@ impl SqliteStore {
     pub fn rows_by_ids(&self, ids: &[String]) -> AspResult<Vec<LogRow>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(400) {
-            let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+            let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
             let sql = format!("SELECT * FROM log WHERE id IN ({placeholders})");
             let mut stmt = self.conn.prepare(&sql)?;
             let params = rusqlite::params_from_iter(chunk.iter());
@@ -1089,7 +1089,7 @@ impl SqliteStore {
         let allowed_json = k
             .allowed_paths
             .as_ref()
-            .map(|v| serde_json::to_string(v))
+            .map(serde_json::to_string)
             .transpose()
             .map_err(|e| crate::error::AspError::Invalid(format!("allowed_paths json: {e}")))?;
         self.conn.execute(
