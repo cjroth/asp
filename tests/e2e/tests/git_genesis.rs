@@ -17,7 +17,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use asp_core::gitgenesis::{
-    git_site_id, git_vault_id, synthesize_genesis, DbBlobSource, GenesisOutput,
+    git_site_id, git_vault_id, synthesize_genesis, synthesize_genesis_with_meta, DbBlobSource,
+    GenesisOutput,
 };
 use asp_core::gitimport::{
     no_base_lookup, plan_import, GitObjectDb, ImportOptions, ImportPlan, LaneId,
@@ -219,6 +220,47 @@ fn genesis_is_byte_deterministic_across_pack_layouts() {
         assert_eq!(g1.rows, g2.rows, "rebuild determinism");
         assert_eq!(g1.rows, g3.rows, "pack-layout independence");
         assert_eq!(g1.vault_id, g3.vault_id);
+    }
+}
+
+/// The pristine clone decodes with [`GitObjectDb::from_pack_spilling`] (blob bytes
+/// stream to disk, out of the db) + [`synthesize_genesis_with_meta`] (reads each
+/// blob's precomputed `content_hash`/`is_binary` from the decode-time meta map). That
+/// is a DISJOINT lane from the in-memory `from_pack` + `synthesize_genesis` every
+/// other test here exercises — yet ALL production clones take the spill path. Pin that
+/// the two paths synthesize byte-identical genesis output over every fixture (so the
+/// spill locator, the meta map, and the shared `is_binary` predicate can't drift the
+/// synthesized rows / vault id / mode tables). git-bridge §3.1 byte-determinism.
+#[test]
+fn genesis_spilling_path_matches_in_memory_path_all_fixtures() {
+    if !git_available() {
+        eprintln!("skipping: system git not available");
+        return;
+    }
+    for (name, mk) in all_fixtures() {
+        let repo = mk();
+        let tip = git_str(&repo.bare, &["rev-parse", "HEAD"]);
+        let pack = pack_via_revs(&repo.bare, &tip);
+        let opts = ImportOptions::default();
+
+        // In-memory path (blobs stay in the db).
+        let db_mem = GitObjectDb::from_pack(&pack, no_base_lookup).expect("pack decodes");
+        let plan_mem = plan_import(&db_mem, &tip, &opts).expect("plan_import (mem)");
+        let s_mem = MemBlobStore::new();
+        let g_mem = synthesize_genesis(&plan_mem, &DbBlobSource::new(&db_mem), &s_mem).unwrap();
+
+        // Spill path (blob bytes stream into `spill`, db keeps byte-free locators; the
+        // decode-time meta map feeds genesis). `from_pack_spilling` consumes the pack.
+        let spill = MemBlobStore::new();
+        let db_spill =
+            GitObjectDb::from_pack_spilling(pack, no_base_lookup, &spill, |_, _, _| {}).expect("spill decode");
+        let plan_spill = plan_import(&db_spill, &tip, &opts).expect("plan_import (spill)");
+        let meta = db_spill.spilled_blob_meta().unwrap_or_default();
+        let g_spill =
+            synthesize_genesis_with_meta(&plan_spill, &DbBlobSource::new(&db_spill), &spill, meta, |_, _| {})
+                .unwrap();
+
+        assert_eq!(g_mem, g_spill, "[{name}] spilling genesis != in-memory genesis (full output)");
     }
 }
 

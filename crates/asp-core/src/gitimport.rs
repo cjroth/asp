@@ -489,8 +489,7 @@ impl GitObjectDb {
                             // the byte-free locator. Commits/trees still live in `objects`.
                             (GitObjKind::Blob, Some(_)) => {
                                 let content_hash = content_hash(&out);
-                                let is_binary =
-                                    std::str::from_utf8(&out).is_err() || out.contains(&0);
+                                let is_binary = crate::log::is_binary(&out);
                                 let is_lfs = out.starts_with(LFS_POINTER_PREFIX);
                                 self.blob_meta.insert(
                                     hex,

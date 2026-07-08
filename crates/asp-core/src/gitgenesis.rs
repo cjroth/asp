@@ -1156,8 +1156,9 @@ struct BlobMeta {
 fn hash_meta(bytes: &[u8]) -> BlobMeta {
     BlobMeta {
         content_hash: content_hash(bytes),
-        // Must mirror `crate::log::classify`'s binary test exactly (identity-bearing).
-        is_binary: std::str::from_utf8(bytes).is_err() || bytes.contains(&0),
+        // The identity-bearing binary sniff — the single source of truth (`classify`
+        // consults the same predicate, so `mode_class_pre` stays byte-identical).
+        is_binary: crate::log::is_binary(bytes),
     }
 }
 
@@ -1437,7 +1438,7 @@ mod tests {
             ("empty.rs", b""),
         ];
         for (path, bytes) in cases {
-            let is_bin = std::str::from_utf8(bytes).is_err() || bytes.contains(&0);
+            let is_bin = crate::log::is_binary(bytes);
             for mode in [EntryMode::Normal, EntryMode::Executable, EntryMode::Symlink] {
                 assert_eq!(
                     mode_class(mode, path, bytes),

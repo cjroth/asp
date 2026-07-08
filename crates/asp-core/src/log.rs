@@ -124,11 +124,21 @@ impl MergeClass {
     }
 }
 
+/// The identity-bearing binary sniff: a blob is "binary" iff it isn't valid UTF-8
+/// or it contains a NUL byte. FROZEN — this exact predicate decides `MergeClass`,
+/// gates the merge runtime's 3-way text merge, and is baked into the git-import and
+/// genesis `is_binary` facts. Every surface MUST agree byte-for-byte, or two nodes
+/// would classify the same blob differently and fork the vault. The single source of
+/// truth (route every copy here; do not inline it).
+pub(crate) fn is_binary(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).is_err() || bytes.contains(&0)
+}
+
 /// Classify a path's merge behavior (§The merge model). Constant per `file_id`
 /// from creation; changes only via an explicit `reclass`. Surface-independent
 /// (used identically by the native engine and the wasm node).
 pub fn classify(path: &str, bytes: &[u8]) -> MergeClass {
-    if std::str::from_utf8(bytes).is_err() || bytes.contains(&0) {
+    if is_binary(bytes) {
         return MergeClass::Binary;
     }
     let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();

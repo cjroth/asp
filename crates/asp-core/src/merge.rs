@@ -13,12 +13,8 @@
 //! `theirs` is always the operand later in the global fold order, so "theirs
 //! wins" *is* the deterministic fold-order tiebreak, identical on every node.
 
-use crate::log::MergeClass;
+use crate::log::{is_binary, MergeClass};
 use std::collections::BTreeMap;
-
-fn is_binary(b: &[u8]) -> bool {
-    std::str::from_utf8(b).is_err() || b.contains(&0)
-}
 
 /// Split keeping line terminators so a join is byte-exact.
 fn split_lines(s: &str) -> Vec<&str> {
