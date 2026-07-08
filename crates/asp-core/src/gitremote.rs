@@ -287,6 +287,11 @@ pub async fn clone_from_git(
     let mut rstore = RemoteStore::open(&engine.asp_dir, &rid)?;
     rstore.record_fetch(&outcome.pack, &[(remote_ref.clone(), tip.clone())])?;
     lap("record_fetch");
+    // Relax vault durability for the whole clone: decode below streams the repo's blobs
+    // straight onto disk (the memory fix), so fsync-per-batch under the default
+    // `synchronous=NORMAL` would dominate decode. Safe — a torn clone is discarded
+    // (git-bridge §9); the `bulk_load` around integrate restores `synchronous=NORMAL`.
+    engine.store.set_bulk_pragmas()?;
 
     // 4. Decode + plan. The pack scan then object decode are the dominant visible
     // stretch — from_pack_spilling emits the "scanning" then "replaying" phases (each

@@ -325,6 +325,18 @@ impl SqliteStore {
         }
     }
 
+    /// Apply the bulk-load durability PRAGMAs **without** touching indexes — used by the
+    /// pristine git clone to cover its pack-decode blob spill (which streams the repo's
+    /// blobs onto disk before the `bulk_load` insert window). `synchronous=OFF` is safe
+    /// for the same reason as [`bulk_load`](Self::bulk_load): a torn clone is discarded.
+    /// The matching `end_bulk_load` (run after integrate) restores `synchronous=NORMAL`.
+    pub fn set_bulk_pragmas(&self) -> AspResult<()> {
+        self.conn.execute_batch(
+            "PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-262144; PRAGMA mmap_size=1073741824;",
+        )?;
+        Ok(())
+    }
+
     /// Drop the secondary indexes + apply bulk-load PRAGMAs. See [`bulk_load`](Self::bulk_load).
     fn begin_bulk_load(&self) -> AspResult<()> {
         // `synchronous=OFF` (safe: a failed clone is discarded) + more scratch/cache
