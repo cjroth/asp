@@ -86,17 +86,19 @@ fn file_at_matches_state_as_of_across_edits_renames_and_merges() {
     for t in [t1, t2, t3, i64::MAX] {
         let snap = e.state_as_of(t).unwrap();
         for path in ["a.md", "b.md", "renamed.md", "missing.md"] {
-            let via_file_at = e.file_at(path, t).unwrap();
+            // Present(bytes)→Some, Absent→None; all blobs are local here so
+            // ContentMissing can't occur — normalize file_at to the snapshot shape.
+            let via_file_at = e.file_at(path, t).unwrap().bytes().map(|b| b.to_vec());
             let via_snapshot = snap.get(path).cloned();
             assert_eq!(via_file_at, via_snapshot, "file_at != state_as_of for {path} @ {t}");
         }
     }
     // Spot-check the semantics the equivalence rides on.
-    assert_eq!(e.file_at("a.md", t1).unwrap().as_deref(), Some(&b"one\n"[..]));
-    assert_eq!(e.file_at("renamed.md", t1).unwrap(), None, "renamed name didn't exist yet at t1");
-    assert_eq!(e.file_at("a.md", t3).unwrap(), None, "old name gone after rename");
-    assert_eq!(e.file_at("renamed.md", t3).unwrap().as_deref(), Some(&b"one\ntwo\n"[..]));
-    assert_eq!(e.file_at("b.md", t3).unwrap(), None, "deleted file is absent");
+    assert_eq!(e.file_at("a.md", t1).unwrap().bytes(), Some(&b"one\n"[..]));
+    assert!(e.file_at("renamed.md", t1).unwrap().is_absent(), "renamed name didn't exist yet at t1");
+    assert!(e.file_at("a.md", t3).unwrap().is_absent(), "old name gone after rename");
+    assert_eq!(e.file_at("renamed.md", t3).unwrap().bytes(), Some(&b"one\ntwo\n"[..]));
+    assert!(e.file_at("b.md", t3).unwrap().is_absent(), "deleted file is absent");
 }
 
 // materialize is O(changed): it skips re-writing a file whose hash is unchanged.

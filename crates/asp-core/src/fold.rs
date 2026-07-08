@@ -213,6 +213,129 @@ pub fn compute_files(store: &dyn BlobStore, rows: &[LogRow]) -> crate::error::As
     Ok(resolve_paths(&states))
 }
 
+/// Outcome of a point-in-time single-file read (§4.6 time travel), the return of
+/// [`resolve_file_at`]. Distinguishes a file that was **absent** at `t` from one
+/// that existed but whose historical content blob is **not present on this node**
+/// (a partial/thin replica, or a blob that hasn't synced yet) — so the UI can show
+/// "content unavailable" instead of silently rendering a blank/empty file (BUG B).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileAtContent {
+    /// No live (non-deleted) file occupied `path` at time `t`.
+    Absent,
+    /// The file existed; here are its bytes (empty for a content-free dir entity).
+    Present(Vec<u8>),
+    /// The file existed at `t`, but its content blob is missing from this store.
+    ContentMissing,
+}
+
+impl FileAtContent {
+    /// The bytes if `Present`, else `None` — read-only ergonomics for tests/callers
+    /// that only care about content.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            FileAtContent::Present(b) => Some(b),
+            _ => None,
+        }
+    }
+    /// True when no file occupied `path` at `t`.
+    pub fn is_absent(&self) -> bool {
+        matches!(self, FileAtContent::Absent)
+    }
+}
+
+/// Strip exactly one trailing live-path collision suffix (`" (n)"`, the shape
+/// [`unique_path`] appends) from `path`, if present — e.g. `todo (1).md` →
+/// `todo.md`, `notes/x (12)` → `notes/x`. `None` when `path` carries no such
+/// suffix. Used by [`resolve_file_at`] to enumerate the (at most two) recorded
+/// paths a file could have that resolve to `path`.
+fn desuffix_once(path: &str) -> Option<String> {
+    // Split into (stem, ext) EXACTLY as unique_path does, so the reverse is exact.
+    let (stem, ext) = match path.rfind('.') {
+        Some(i) if i > 0 && !path[i + 1..].contains('/') => (&path[..i], &path[i..]),
+        _ => (path, ""),
+    };
+    // stem must end with " (<digits>)".
+    let inner = stem.strip_suffix(')')?;
+    let open = inner.rfind('(')?;
+    let digits = &inner[open + 1..];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // The char before '(' must be the single space unique_path inserts.
+    let base_stem = inner[..open].strip_suffix(' ')?;
+    Some(format!("{base_stem}{ext}"))
+}
+
+/// Point-in-time content of a single `path`, folding **only** the files that could
+/// occupy that path — the scale fix for the history slider (BUG A), replacing a
+/// whole-vault `compute_files` on every scrub tick.
+///
+/// Correctness vs `compute_files`: a file's resolved path is always its own
+/// recorded path with at most one `" (n)"` collision suffix ([`unique_path`] only
+/// ever appends one group), so the only files that can resolve to `path` are those
+/// that ever recorded `path` itself (n=0) or its single de-suffixed base (n≥1).
+/// Folding just those — and running the ordinary `resolve_paths` collision pass
+/// over that subset — reproduces `compute_files`'s result for `path` exactly,
+/// including live-path `" (n)"` suffixing (all same-base claimers are gathered,
+/// ordered by their intrinsic `path_claim`) and renames (Rename rows carry the new
+/// path, so a file reached via rename is found under that path key; a file renamed
+/// AWAY from `path` folds to a different path and is correctly reported Absent).
+///
+/// `keep` is the row filter the caller applies to scope the fold (branch
+/// visibility ∧ `ts ≤ t`). `file_ids_for_path(p)` returns every file_id that ever
+/// recorded path `p` (a create/rename); `rows_for_file(fid)` returns all of that
+/// file's rows.
+pub fn resolve_file_at(
+    store: &dyn BlobStore,
+    path: &str,
+    keep: impl Fn(&LogRow) -> bool,
+    file_ids_for_path: impl Fn(&str) -> crate::error::AspResult<Vec<String>>,
+    rows_for_file: impl Fn(&str) -> crate::error::AspResult<Vec<LogRow>>,
+) -> crate::error::AspResult<FileAtContent> {
+    // Candidate recorded paths that can resolve to `path`: the path itself and, if
+    // it carries a collision suffix, its single de-suffixed base.
+    let mut cand_paths: Vec<String> = vec![path.to_string()];
+    if let Some(base) = desuffix_once(path) {
+        if base != path {
+            cand_paths.push(base);
+        }
+    }
+    // Gather the (usually one) candidate file_ids, de-duplicated.
+    let mut fids: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for p in &cand_paths {
+        for fid in file_ids_for_path(p)? {
+            if seen.insert(fid.clone()) {
+                fids.push(fid);
+            }
+        }
+    }
+    // Fetch + scope their rows.
+    let mut rows: Vec<LogRow> = Vec::new();
+    for fid in &fids {
+        for r in rows_for_file(fid)? {
+            if keep(&r) {
+                rows.push(r);
+            }
+        }
+    }
+    // Fold ONLY these files; resolve_paths over the subset is exact (only same-/
+    // de-suffixed-path files can contend for `path`'s slot).
+    let files = compute_files(store, &rows)?;
+    for f in files {
+        if !f.deleted && f.path == path {
+            return Ok(match f.result_hash {
+                Some(h) => match store.get_blob(&h)? {
+                    Some(bytes) => FileAtContent::Present(bytes),
+                    None => FileAtContent::ContentMissing,
+                },
+                None => FileAtContent::Present(Vec::new()),
+            });
+        }
+    }
+    Ok(FileAtContent::Absent)
+}
+
 /// An incrementally-maintained fold: the per-`file_id` states plus a way to
 /// re-fold only the files a new batch of rows touched, instead of re-folding the
 /// whole log. Because each file's state is independent (above), re-folding just

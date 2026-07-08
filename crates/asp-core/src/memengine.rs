@@ -983,30 +983,38 @@ impl MemEngine {
     // web node can scrub history + fork-on-edit-in-the-past exactly like desktop -----
 
     /// Content of `path` as the vault was at wall-clock `t` on the checked-out
-    /// branch (`None` if it didn't exist then). Folds visible rows with `ts <= t`.
-    pub fn file_at(&self, path: &str, t: i64) -> AspResult<Option<Vec<u8>>> {
+    /// branch. Path-scoped (folds only the file(s) that could occupy `path`, not
+    /// the whole log — parity with the native `Engine::file_at`, BUG A) and
+    /// distinguishes a missing content blob from an empty file (BUG B):
+    /// [`crate::fold::FileAtContent`].
+    pub fn file_at(&self, path: &str, t: i64) -> AspResult<crate::fold::FileAtContent> {
         let bs = self.branch_set();
         let vis = bs.visibility(&self.head_branch());
-        let rows: Vec<LogRow> = self.rows.borrow().iter().filter(|r| vis.sees(r) && r.ts <= t).cloned().collect();
-        let files = crate::fold::compute_files(&self.blobs, &rows)?;
-        for f in files {
-            if !f.deleted && f.path == path {
-                let bytes = match f.result_hash {
-                    Some(h) => self.blobs.get_blob(&h)?.unwrap_or_default(),
-                    None => Vec::new(),
-                };
-                return Ok(Some(bytes));
-            }
-        }
-        Ok(None)
+        crate::fold::resolve_file_at(
+            &self.blobs,
+            path,
+            |r| vis.sees(r) && r.ts <= t,
+            |p| {
+                let mut ids = Vec::new();
+                let mut seen = HashSet::new();
+                for r in self.rows.borrow().iter() {
+                    if r.path.as_deref() == Some(p) && seen.insert(r.file_id.clone()) {
+                        ids.push(r.file_id.clone());
+                    }
+                }
+                Ok(ids)
+            },
+            |fid| Ok(self.rows.borrow().iter().filter(|r| r.file_id == fid).cloned().collect()),
+        )
     }
 
     /// Restore `path` to its content as of `t` by recording it as a new edit on the
-    /// current branch (the log stays append-only). No-op if it didn't exist then.
+    /// current branch (the log stays append-only). No-op if it didn't exist then or
+    /// its historical content isn't available on this node.
     pub fn restore_file_at(&self, path: &str, t: i64) -> AspResult<Option<WireRow>> {
         match self.file_at(path, t)? {
-            Some(bytes) => self.record_write(path, &bytes),
-            None => Ok(None),
+            crate::fold::FileAtContent::Present(bytes) => self.record_write(path, &bytes),
+            _ => Ok(None),
         }
     }
 
@@ -1197,9 +1205,9 @@ mod tests {
 
         // file_at folds as-of the timestamp. (Both writes land in the same wall-clock
         // second in-test, so we assert existence boundaries, not sub-second ordering.)
-        assert!(e.file_at("a.md", t1 - 1).unwrap().is_none(), "file didn't exist before its create");
-        assert!(e.file_at("a.md", i64::MAX).unwrap().is_some(), "file exists at/after its history");
-        assert_eq!(e.file_at("a.md", i64::MAX).unwrap().as_deref(), Some(&b"v2\n"[..]));
+        assert!(e.file_at("a.md", t1 - 1).unwrap().is_absent(), "file didn't exist before its create");
+        assert!(!e.file_at("a.md", i64::MAX).unwrap().is_absent(), "file exists at/after its history");
+        assert_eq!(e.file_at("a.md", i64::MAX).unwrap().bytes(), Some(&b"v2\n"[..]));
 
         // Fork-on-edit-in-the-past: fork at the tagged instant; edits on the branch
         // don't touch main (the core isolation the auto-branch UX relies on).

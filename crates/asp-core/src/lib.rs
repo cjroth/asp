@@ -63,7 +63,7 @@ pub use branch::{
     BranchSet, Graph, GraphBranch, GraphNode, GraphTag, VersionVector, Visibility,
 };
 pub use error::{AspError, AspResult};
-pub use fold::{compute_files, fold_order, FoldState};
+pub use fold::{compute_files, fold_order, resolve_file_at, FileAtContent, FoldState};
 pub use gitrecord::{
     build_commit_marker_row, build_ingest_row, build_plan_row, GitCommitMarker, GitIngestRecord,
     GitPlanRecord, GitRowIdentity,

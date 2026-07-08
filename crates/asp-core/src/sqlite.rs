@@ -29,6 +29,12 @@ CREATE TABLE IF NOT EXISTS log(
 );
 CREATE INDEX IF NOT EXISTS log_file ON log(file_id);
 CREATE INDEX IF NOT EXISTS log_site ON log(site_id, seq);
+-- Path lookup for the point-in-time single-file read (`file_ids_for_path`, the
+-- history-slider scale fix). Partial over just create/rename rows (the only ones
+-- that carry a path) so it stays tiny — ~one entry per file, not per log row —
+-- and a `WHERE path=?` (a non-null literal) still uses it. `path` predates
+-- branching, so this is safe in SCHEMA (unlike the branch_id indexes).
+CREATE INDEX IF NOT EXISTS log_path ON log(path) WHERE path IS NOT NULL;
 -- NOTE: the `log_branch` index on log(branch_id) is created in `migrate_branching`,
 -- NOT here. On a pre-branching DB the `log` table already exists (so the CREATE
 -- TABLE above is a no-op) and still lacks `branch_id`; indexing it before the
@@ -103,6 +109,7 @@ CREATE TABLE IF NOT EXISTS git_modes(path TEXT PRIMARY KEY, mode INTEGER NOT NUL
 const LOG_SECONDARY_INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS log_file ON log(file_id)",
     "CREATE INDEX IF NOT EXISTS log_site ON log(site_id, seq)",
+    "CREATE INDEX IF NOT EXISTS log_path ON log(path) WHERE path IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS log_branch ON log(branch_id)",
     "CREATE INDEX IF NOT EXISTS log_kind_branch ON log(kind) WHERE kind='branch'",
     "CREATE INDEX IF NOT EXISTS log_kind_tag ON log(kind) WHERE kind='tag'",
@@ -111,7 +118,7 @@ const LOG_SECONDARY_INDEXES: &[&str] = &[
 /// The `log` secondary index names (for `DROP INDEX`), in the same order as
 /// [`LOG_SECONDARY_INDEXES`].
 const LOG_SECONDARY_INDEX_NAMES: &[&str] =
-    &["log_file", "log_site", "log_branch", "log_kind_branch", "log_kind_tag"];
+    &["log_file", "log_site", "log_path", "log_branch", "log_kind_branch", "log_kind_tag"];
 
 pub struct SqliteStore {
     conn: Connection,
@@ -419,6 +426,16 @@ impl SqliteStore {
     pub fn rows_for_file(&self, file_id: &str) -> AspResult<Vec<LogRow>> {
         let mut stmt = self.conn.prepare("SELECT * FROM log WHERE file_id=?1")?;
         let rows = stmt.query_map(params![file_id], Self::row_from)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Every `file_id` that ever recorded `path` on a create or rename (uses the
+    /// `log_path` partial index) — the candidate set for the point-in-time
+    /// single-file read (`Engine::file_at` / `fold::resolve_file_at`). Distinct so
+    /// a file that was renamed back and forth to `path` is returned once.
+    pub fn file_ids_for_path(&self, path: &str) -> AspResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT file_id FROM log WHERE path=?1")?;
+        let rows = stmt.query_map(params![path], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 

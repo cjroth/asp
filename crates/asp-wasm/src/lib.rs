@@ -395,19 +395,29 @@ impl WasmEngine {
         serde_json::to_string(&out).map_err(to_err)
     }
 
-    /// Content of `path` as of wall-clock `t` (unix seconds) as JSON `{exists, content}`.
+    /// Content of `path` as of wall-clock `t` (unix seconds) as JSON
+    /// `{exists, content, contentMissing}`. `contentMissing` is true when the file
+    /// existed at `t` but its historical blob isn't present on this node (a thin/
+    /// partial replica) — the UI shows "content unavailable" rather than a blank
+    /// pane (BUG B).
     pub fn file_at_json(&self, path: &str, t: f64) -> Result<String, JsError> {
         if !t.is_finite() {
             return Err(JsError::new("time must be a finite number"));
         }
         #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
         struct FA {
             exists: bool,
             content: String,
+            content_missing: bool,
         }
+        use asp_core::fold::FileAtContent;
         let fa = match self.eng.file_at(path, t as i64).map_err(to_err)? {
-            Some(bytes) => FA { exists: true, content: String::from_utf8_lossy(&bytes).into_owned() },
-            None => FA { exists: false, content: String::new() },
+            FileAtContent::Present(bytes) => {
+                FA { exists: true, content: String::from_utf8_lossy(&bytes).into_owned(), content_missing: false }
+            }
+            FileAtContent::ContentMissing => FA { exists: true, content: String::new(), content_missing: true },
+            FileAtContent::Absent => FA { exists: false, content: String::new(), content_missing: false },
         };
         serde_json::to_string(&fa).map_err(to_err)
     }

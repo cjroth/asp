@@ -1520,27 +1520,25 @@ impl Engine {
         Ok(m)
     }
 
-    /// Content of a single `path` as the vault was at wall-clock `t` — `None` if
-    /// it didn't exist (non-deleted) then. The history-slider read: it still
-    /// folds the log as-of `t` for correct path resolution (renames / ` (n)`
-    /// collisions), but reads exactly **one** blob (the target), not every live
-    /// file's blob like `state_as_of`. On a large vault that is the difference
-    /// between a snappy scrub and reading the whole vault on every tick.
-    pub fn file_at(&self, path: &str, t: i64) -> AspResult<Option<Vec<u8>>> {
+    /// Content of a single `path` as the vault was at wall-clock `t` — the
+    /// history-slider read (§4.6). **Path-scoped**: it folds only the files that
+    /// could occupy `path` (looked up via the `log_path` index), NOT the whole
+    /// vault, so per-call work scales with that one file's history rather than the
+    /// total row count (BUG A — on a 1.26M-row clone the old full-fold made every
+    /// scrub tick read the entire log). Correctness matches a whole-vault
+    /// `compute_files` for `path` exactly — see [`crate::fold::resolve_file_at`]
+    /// (renames and live-path ` (n)` collisions included). Distinguishes a
+    /// missing content blob from an empty file (BUG B): [`FileAtContent`].
+    pub fn file_at(&self, path: &str, t: i64) -> AspResult<crate::fold::FileAtContent> {
         let bs = self.branch_set()?;
         let vis = bs.visibility(&self.head_branch());
-        let rows: Vec<LogRow> = self.store.all_rows()?.into_iter().filter(|r| vis.sees(r) && r.ts <= t).collect();
-        let files = compute_files(&self.store, &rows)?;
-        for f in files {
-            if !f.deleted && f.path == path {
-                let bytes = match f.result_hash {
-                    Some(h) => self.store.get_blob(&h)?.unwrap_or_default(),
-                    None => Vec::new(),
-                };
-                return Ok(Some(bytes));
-            }
-        }
-        Ok(None)
+        crate::fold::resolve_file_at(
+            &self.store,
+            path,
+            |r| vis.sees(r) && r.ts <= t,
+            |p| self.store.file_ids_for_path(p),
+            |fid| self.store.rows_for_file(fid),
+        )
     }
 
     /// Bring the working set to `desired` by recording the necessary edits.
@@ -2181,11 +2179,11 @@ mod tests {
         e.record_write("a.md", b"m2\n").unwrap().unwrap(); // divergent edit on main
 
         // On main, the slider sees main's line.
-        assert_eq!(e.file_at("a.md", i64::MAX).unwrap().as_deref(), Some(&b"m2\n"[..]));
+        assert_eq!(e.file_at("a.md", i64::MAX).unwrap().bytes(), Some(&b"m2\n"[..]));
         // On the branch, it sees ONLY the branch's line — main's post-fork edit is
         // invisible (pre-fix this folded both → a 3-way merge, not "b2").
         e.checkout(&b).unwrap();
-        assert_eq!(e.file_at("a.md", i64::MAX).unwrap().as_deref(), Some(&b"b2\n"[..]));
+        assert_eq!(e.file_at("a.md", i64::MAX).unwrap().bytes(), Some(&b"b2\n"[..]));
         let st = e.state_as_of(i64::MAX).unwrap();
         assert_eq!(st.get("a.md").map(|v| v.as_slice()), Some(&b"b2\n"[..]));
     }
@@ -2221,13 +2219,13 @@ mod tests {
 
         // main: only shared.md=base, no only-b.md.
         e.checkout(MAIN_BRANCH_ID).unwrap();
-        assert_eq!(e.file_at("shared.md", i64::MAX).unwrap().as_deref(), Some(&b"base\n"[..]));
-        assert!(e.file_at("only-b.md", i64::MAX).unwrap().is_none());
+        assert_eq!(e.file_at("shared.md", i64::MAX).unwrap().bytes(), Some(&b"base\n"[..]));
+        assert!(e.file_at("only-b.md", i64::MAX).unwrap().is_absent());
 
         // Back to feature via the LRU (warm): must equal the branch's real state.
         e.checkout(&b).unwrap();
-        assert_eq!(e.file_at("shared.md", i64::MAX).unwrap().as_deref(), Some(&b"b-edit\n"[..]));
-        assert_eq!(e.file_at("only-b.md", i64::MAX).unwrap().as_deref(), Some(&b"b\n"[..]));
+        assert_eq!(e.file_at("shared.md", i64::MAX).unwrap().bytes(), Some(&b"b-edit\n"[..]));
+        assert_eq!(e.file_at("only-b.md", i64::MAX).unwrap().bytes(), Some(&b"b\n"[..]));
 
         // Cold reference: a freshly-opened engine (empty LRU) checked out to feature.
         let cold = Engine::open(d.path(), Identity::from_seed(&[1; 32])).unwrap();
@@ -2478,5 +2476,236 @@ mod tests {
         // A `never` key is never rewritten by migration.
         e.authorize(&Identity::from_seed(&[7; 32]).to_ssh_string(), None, true, "cli").unwrap();
         assert_eq!(e.migrate_keys(90).unwrap(), 0, "never=1 rows are left untouched");
+    }
+
+    // ---------------- file_at path-scoped fold (BUG A / BUG B) ----------------
+
+    use crate::fold::FileAtContent;
+
+    /// Append a raw sealed row straight to the log (bypassing authoring) so a test
+    /// can synthesize a history with fully-controlled `ts`/identity/parents.
+    #[allow(clippy::too_many_arguments)]
+    fn raw(
+        e: &Engine,
+        site: &str,
+        lamport: u64,
+        seq: u64,
+        ts: i64,
+        file_id: &str,
+        kind: Kind,
+        parent: Option<&str>,
+        base: Option<&str>,
+        result: Option<&str>,
+        path: Option<&str>,
+        mc: MergeClass,
+    ) -> LogRow {
+        let row = LogRow {
+            id: String::new(),
+            site_id: site.into(),
+            lamport,
+            seq,
+            ts,
+            file_id: file_id.into(),
+            kind,
+            merge_class: mc,
+            parent: parent.map(|s| s.to_string()),
+            base_hash: base.map(|s| s.to_string()),
+            result_hash: result.map(|s| s.to_string()),
+            path: path.map(|s| s.to_string()),
+            branch_id: MAIN_BRANCH_ID.to_string(),
+            merge_parent: None,
+            sig: vec![],
+        }
+        .seal();
+        e.store.append_row(&row).unwrap();
+        row
+    }
+
+    /// Ground truth: `file_at(path, t)` (path-scoped) must equal, for every sampled
+    /// (path, t), what a whole-vault `compute_files` fold as-of `t` produces for
+    /// that path — across edits, renames, path reuse, a delete, and a concurrent
+    /// same-path collision (` (n)` suffix). This is the invariant the scale fix
+    /// must not break (verification-playbook pattern #1).
+    #[test]
+    fn file_at_scoped_matches_full_fold_ground_truth() {
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 7);
+        let put = |b: &[u8]| e.store.put_blob(b).unwrap();
+
+        // File F1 "a.md": create(v1)@10, edit(v2)@20, rename→"b.md"@30, edit(v3)@40, delete@50.
+        let v1 = put(b"a-v1\n");
+        let v2 = put(b"a-v2\n");
+        let v3 = put(b"b-v3\n");
+        let c1 = raw(&e, "s1", 1, 0, 10, "F1", Kind::Create, None, None, Some(&v1), Some("a.md"), MergeClass::Text);
+        let e1 = raw(&e, "s1", 2, 1, 20, "F1", Kind::Edit, Some(&c1.id), Some(&v1), Some(&v2), None, MergeClass::Text);
+        let r1 = raw(&e, "s1", 3, 2, 30, "F1", Kind::Rename, Some(&e1.id), None, None, Some("b.md"), MergeClass::Text);
+        let e2 = raw(&e, "s1", 4, 3, 40, "F1", Kind::Edit, Some(&r1.id), Some(&v2), Some(&v3), None, MergeClass::Text);
+        let _d1 = raw(&e, "s1", 5, 4, 50, "F1", Kind::Delete, Some(&e2.id), Some(&v3), None, None, MergeClass::Text);
+
+        // File F2 "c.md": create@15, edit@25, rename c.md→a.md@35 (reuses the path F1 freed at 30).
+        let w1 = put(b"c-v1\n");
+        let w2 = put(b"c-v2\n");
+        let cc = raw(&e, "s1", 6, 5, 15, "F2", Kind::Create, None, None, Some(&w1), Some("c.md"), MergeClass::Text);
+        let ce = raw(&e, "s1", 7, 6, 25, "F2", Kind::Edit, Some(&cc.id), Some(&w1), Some(&w2), None, MergeClass::Text);
+        let _cr = raw(&e, "s1", 8, 7, 35, "F2", Kind::Rename, Some(&ce.id), None, None, Some("a.md"), MergeClass::Text);
+
+        // Concurrent same-path create → collision (F3 keeps "d.md", F4 gets "d (1).md",
+        // ordered by (lamport, site_id, id)). Distinct sites so they're concurrent.
+        let dblob = put(b"d3\n");
+        let dblob4 = put(b"d4\n");
+        raw(&e, "s1", 9, 8, 12, "F3", Kind::Create, None, None, Some(&dblob), Some("d.md"), MergeClass::Text);
+        raw(&e, "s2", 9, 0, 12, "F4", Kind::Create, None, None, Some(&dblob4), Some("d.md"), MergeClass::Text);
+
+        // Reference: the full whole-vault fold as-of t, read exactly like resolve_file_at.
+        let reference = |path: &str, t: i64| -> FileAtContent {
+            let bs = e.branch_set().unwrap();
+            let vis = bs.visibility(&e.head_branch());
+            let rows: Vec<LogRow> =
+                e.store.all_rows().unwrap().into_iter().filter(|r| vis.sees(r) && r.ts <= t).collect();
+            for f in compute_files(&e.store, &rows).unwrap() {
+                if !f.deleted && f.path == path {
+                    return match f.result_hash {
+                        Some(h) => match e.store.get_blob(&h).unwrap() {
+                            Some(b) => FileAtContent::Present(b),
+                            None => FileAtContent::ContentMissing,
+                        },
+                        None => FileAtContent::Present(Vec::new()),
+                    };
+                }
+            }
+            FileAtContent::Absent
+        };
+
+        let paths = ["a.md", "b.md", "c.md", "d.md", "d (1).md", "e.md"];
+        let times = [5i64, 10, 12, 15, 20, 25, 30, 35, 40, 45, 50, 55, i64::MAX];
+        for p in paths {
+            for t in times {
+                let got = e.file_at(p, t).unwrap();
+                let want = reference(p, t);
+                assert_eq!(got, want, "file_at({p:?}, {t}) diverged from the full fold");
+            }
+        }
+        // Spot checks pinning intent (not just self-consistency):
+        assert_eq!(e.file_at("a.md", 15).unwrap(), FileAtContent::Present(b"a-v1\n".to_vec()), "a.md is F1 v1 before its edit");
+        assert_eq!(e.file_at("a.md", 25).unwrap(), FileAtContent::Present(b"a-v2\n".to_vec()), "a.md is F1 v2 before its rename away");
+        assert!(e.file_at("a.md", 32).unwrap().is_absent(), "a.md is free between F1's rename (30) and F2's rename-in (35)");
+        assert_eq!(e.file_at("a.md", 38).unwrap(), FileAtContent::Present(b"c-v2\n".to_vec()), "a.md is F2 (renamed in) after t=35");
+        assert_eq!(e.file_at("b.md", 45).unwrap(), FileAtContent::Present(b"b-v3\n".to_vec()), "b.md is F1 v3 after rename, before delete");
+        assert!(e.file_at("b.md", 55).unwrap().is_absent(), "b.md deleted at 50");
+        assert_eq!(e.file_at("d.md", 20).unwrap(), FileAtContent::Present(b"d3\n".to_vec()), "collision winner keeps d.md");
+        assert_eq!(e.file_at("d (1).md", 20).unwrap(), FileAtContent::Present(b"d4\n".to_vec()), "collision loser gets the ` (n)` suffix");
+    }
+
+    /// BUG B: a file that existed at `t` but whose content blob is absent from this
+    /// node must report `ContentMissing`, not a blank/empty `Present` — so the UI
+    /// can say "content unavailable" instead of showing an empty pane.
+    #[test]
+    fn file_at_reports_content_missing_when_blob_absent() {
+        let d = tempdir().unwrap();
+        let e = eng(d.path(), 8);
+        // A create whose result_hash points at a blob we never stored.
+        let phantom = crate::oid::content_hash(b"never-stored\n");
+        raw(&e, "s1", 1, 0, 10, "G1", Kind::Create, None, None, Some(&phantom), Some("ghost.md"), MergeClass::Text);
+        assert_eq!(
+            e.file_at("ghost.md", i64::MAX).unwrap(),
+            FileAtContent::ContentMissing,
+            "missing historical blob is a typed signal, not an empty file"
+        );
+        assert!(e.file_at("ghost.md", 5).unwrap().is_absent(), "before its create it's simply absent");
+    }
+
+    /// N-vs-2N scaling (verification-playbook pattern #3): per-call `file_at` work
+    /// must NOT grow with total vault size — the whole point of the path scoping.
+    /// We hold ONE target file's history fixed and double the number of unrelated
+    /// files, then assert the scoped read stays ~flat while a whole-vault
+    /// `state_as_of` grows roughly linearly (the old cost).
+    #[test]
+    fn file_at_does_not_scale_with_total_rows() {
+        use std::time::Instant;
+
+        fn build(n_unrelated: usize) -> (tempfile::TempDir, Engine) {
+            let d = tempdir().unwrap();
+            let e = eng(d.path(), 9);
+            // Target file with a small fixed history.
+            let a = e.store.put_blob(b"target-v1\n").unwrap();
+            let b = e.store.put_blob(b"target-v2\n").unwrap();
+            let c = raw(&e, "s1", 1, 0, 100, "T", Kind::Create, None, None, Some(&a), Some("target.md"), MergeClass::Text);
+            raw(&e, "s1", 2, 1, 200, "T", Kind::Edit, Some(&c.id), Some(&a), Some(&b), None, MergeClass::Text);
+            // n_unrelated files, one create row each, appended in one transaction.
+            let blob = e.store.put_blob(b"x\n").unwrap();
+            let rows: Vec<LogRow> = (0..n_unrelated)
+                .map(|i| {
+                    LogRow {
+                        id: String::new(),
+                        site_id: "s1".into(),
+                        lamport: 3 + i as u64,
+                        seq: 2 + i as u64,
+                        ts: 100,
+                        file_id: format!("U{i}"),
+                        kind: Kind::Create,
+                        merge_class: MergeClass::Text,
+                        parent: None,
+                        base_hash: None,
+                        result_hash: Some(blob.clone()),
+                        path: Some(format!("dir{}/u{i}.md", i % 64)),
+                        branch_id: MAIN_BRANCH_ID.to_string(),
+                        merge_parent: None,
+                        sig: vec![],
+                    }
+                    .seal()
+                })
+                .collect();
+            e.store.append_rows(rows.iter()).unwrap();
+            (d, e)
+        }
+
+        let time_file_at = |e: &Engine, iters: u32| -> f64 {
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let got = e.file_at("target.md", i64::MAX).unwrap();
+                assert!(matches!(got, FileAtContent::Present(_)));
+            }
+            t0.elapsed().as_secs_f64() * 1e3 / iters as f64
+        };
+        let time_state_as_of = |e: &Engine, iters: u32| -> f64 {
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let _ = e.state_as_of(i64::MAX).unwrap();
+            }
+            t0.elapsed().as_secs_f64() * 1e3 / iters as f64
+        };
+
+        let n = 4000usize;
+        let (_da, ea) = build(n);
+        let (_db, eb) = build(n * 2);
+
+        // Warm up (index/query-plan caches) then measure.
+        let _ = time_file_at(&ea, 20);
+        let fa_n = time_file_at(&ea, 400);
+        let fa_2n = time_file_at(&eb, 400);
+        let sa_n = time_state_as_of(&ea, 10);
+        let sa_2n = time_state_as_of(&eb, 10);
+
+        println!(
+            "file_at: N={n} {fa_n:.4}ms  2N={} {fa_2n:.4}ms  (ratio {:.2}x)",
+            n * 2,
+            fa_2n / fa_n.max(1e-9)
+        );
+        println!(
+            "state_as_of (old full-fold cost): N {sa_n:.3}ms  2N {sa_2n:.3}ms  (ratio {:.2}x)",
+            sa_2n / sa_n.max(1e-9)
+        );
+
+        // Scoped read is far cheaper than a whole-vault fold at 2N — the concrete win
+        // (robust vs tiny-time ratio noise near the signal floor).
+        assert!(
+            fa_2n < sa_2n * 0.25,
+            "scoped file_at ({fa_2n:.4}ms) should be far cheaper than a full fold ({sa_2n:.3}ms)"
+        );
+        // And it must not scale with total rows: doubling unrelated files keeps the
+        // per-call cost ~flat (linear would be ~2x). Only assert above the ~2ms floor.
+        if fa_n > 2.0 {
+            assert!(fa_2n < 3.0 * fa_n, "file_at scaled with total rows: {fa_n:.4} → {fa_2n:.4}ms");
+        }
     }
 }
