@@ -28,7 +28,7 @@ use crate::gitbridge::{
     fetch_pack, ls_remote, remote_id, GitAuth, GitRemoteSpec, RemoteStore,
 };
 use crate::gitgenesis::{
-    git_file_id, git_site_id, synthesize_genesis, synthesize_genesis_with_progress,
+    git_file_id, git_site_id, synthesize_genesis, synthesize_genesis_with_meta,
     synthesize_ingest_with_open_branches, DbBlobSource, ImportedBranchSeed, ImportedFile,
     IngestContext,
 };
@@ -289,9 +289,13 @@ pub async fn clone_from_git(
     lap("record_fetch");
 
     // 4. Decode + plan. The pack scan then object decode are the dominant visible
-    // stretch — from_pack_with_progress emits the "scanning" then "replaying" phases
-    // (each (done, num_objects) from the pack header) which we forward straight through.
-    let db = GitObjectDb::from_pack_with_progress(&outcome.pack, no_base_lookup, |ph, d, t| {
+    // stretch — from_pack_spilling emits the "scanning" then "replaying" phases (each
+    // (done, num_objects) from the pack header) which we forward straight through. It
+    // **streams blob bytes onto disk** (into the vault's content-addressed blob store)
+    // as it decodes, so the object db keeps only commits/trees + a byte-free locator per
+    // blob — a full-history clone's multi-GB of decompressed blobs never pile up in RAM
+    // (the OOM this path used to hit). The pack itself moves in (no second ~600 MB copy).
+    let db = GitObjectDb::from_pack_spilling(outcome.pack, no_base_lookup, &engine.store, |ph, d, t| {
         progress(ph, d, t)
     })
     .map_err(imp)?;
@@ -317,11 +321,25 @@ pub async fn clone_from_git(
     // 5. Deterministic genesis → paged integrate under batch. Genesis walks every
     // commit synthesizing sealed rows — report (commits_done, commit_count) as the
     // "importing" phase so the bar advances instead of stalling on a big history.
-    let scratch = MemBlobStore::new();
-    let g = synthesize_genesis_with_progress(&plan, &DbBlobSource::new(&db), &scratch, |d, t| {
-        progress("importing", d, t)
-    })?;
+    //
+    // The blob bytes already live in the vault's blob store (decode spilled them there),
+    // and decode also computed each blob's content_hash + is_binary, so genesis reads
+    // those from `spilled_blob_meta` instead of re-hashing / re-reading a single byte.
+    // `out_store` IS the vault store, so genesis writes its record blobs (markers,
+    // ingests, branch records, .aspignore) there too — leaving every blob a synthesized
+    // row references already durable, which is why integrate below bundles nothing.
+    let blob_meta = db.spilled_blob_meta().unwrap_or_default();
+    let g = synthesize_genesis_with_meta(
+        &plan,
+        &DbBlobSource::new(&db),
+        &engine.store,
+        blob_meta,
+        |d, t| progress("importing", d, t),
+    )?;
     lap("synthesize_genesis");
+    // The object db (commits/trees + blob locators) is dead once genesis returns — free
+    // it before integrate + materialize so it isn't co-resident with the fold's working set.
+    drop(db);
     let vault_id = if opts.new_identity { random_vault_id() } else { g.vault_id.clone() };
     engine.adopt_vault_id(&vault_id)?;
 
@@ -332,9 +350,13 @@ pub async fn clone_from_git(
     // than N incremental index updates). `set_bulk` defers the per-page branch
     // reconcile (its index is dropped) until after the rebuild, below.
     engine.set_bulk(true);
+    // `bundle: false` — every referenced blob is already durable in the vault store
+    // (content blobs spilled during decode, record blobs written by genesis above), so
+    // re-reading each into a WireRow just to re-insert it would waste time AND undo the
+    // memory win (pulling multi-GB back into RAM). Rows carry the hashes; the blobs stay put.
     let res = engine
         .store
-        .bulk_load(|| integrate_paged(engine, &g.rows, &scratch, true, &|d, t| progress("saving", d, t)));
+        .bulk_load(|| integrate_paged(engine, &g.rows, &engine.store, false, false, &|d, t| progress("saving", d, t)));
     engine.set_bulk(false);
     engine.set_batch(false);
     res?;
@@ -517,7 +539,7 @@ pub async fn pull_once(
     }
     progress("saving", 0, out.rows.len() as u64);
     engine.set_batch(true);
-    let res = integrate_paged(engine, &out.rows, &scratch, false, &|d, t| progress("saving", d, t));
+    let res = integrate_paged(engine, &out.rows, &scratch, false, true, &|d, t| progress("saving", d, t));
     engine.set_batch(false);
     res?;
     engine.materialize()?;
@@ -597,7 +619,7 @@ pub async fn rebaseline(engine: &Engine, remote_id_str: &str) -> AspResult<PullR
     let snap_store = MemBlobStore::new();
     let g = synthesize_genesis(&plan, &DbBlobSource::new(&db), &snap_store)?;
     let mem = MemEngine::create(Identity::from_seed(&[0u8; 32]), &g.vault_id);
-    mem.integrate_many(&to_wires(&g.rows, &snap_store, None))?;
+    mem.integrate_many(&to_wires(&g.rows, &snap_store, true, None))?;
     let new_files = mem.files_map()?; // path -> bytes at the rewritten tip
 
     // Author the diff vs the current imported main state as one synthetic batch.
@@ -682,7 +704,7 @@ pub async fn rebaseline(engine: &Engine, remote_id_str: &str) -> AspResult<PullR
     rows.push(build_ingest_row(&scratch, &ingest_ident, &ingest)?);
 
     engine.set_batch(true);
-    let res = integrate_paged(engine, &rows, &scratch, false, &|_, _| {});
+    let res = integrate_paged(engine, &rows, &scratch, false, true, &|_, _| {});
     engine.set_batch(false);
     res?;
     engine.materialize()?;
@@ -843,10 +865,22 @@ fn db_is_ancestor(db: &GitObjectDb, ancestor: &str, descendant: &str) -> bool {
 /// Bundle each row with its `base_hash`/`result_hash` blobs (from `store`) into a
 /// [`WireRow`], the shape `integrate_many` consumes (mirrors the memengine clone
 /// receiver + the gitgenesis fold test).
-fn to_wires(rows: &[LogRow], store: &dyn BlobStore, mut seen: Option<&mut HashSet<String>>) -> Vec<WireRow> {
+/// Bundle rows with their referenced blobs, read from `store`. When `bundle` is false
+/// the blobs are left out entirely — the caller guarantees every referenced blob is
+/// already durable in the engine store (the pristine clone spills them during decode),
+/// so re-reading them here would waste time and defeat the clone's memory ceiling.
+fn to_wires(
+    rows: &[LogRow],
+    store: &dyn BlobStore,
+    bundle: bool,
+    mut seen: Option<&mut HashSet<String>>,
+) -> Vec<WireRow> {
     rows.iter()
         .map(|r| {
             let mut blobs: Vec<WireBlob> = Vec::new();
+            if !bundle {
+                return WireRow { row: r.clone(), blobs };
+            }
             for h in [r.base_hash.clone(), r.result_hash.clone()].into_iter().flatten() {
                 if blobs.iter().any(|b| b.hash == h) {
                     continue;
@@ -882,13 +916,14 @@ fn integrate_paged(
     rows: &[LogRow],
     store: &dyn BlobStore,
     dedup: bool,
+    bundle: bool,
     progress: &dyn Fn(u64, u64),
 ) -> AspResult<()> {
     let total = rows.len() as u64;
     let mut done = 0u64;
     let mut seen: Option<HashSet<String>> = dedup.then(HashSet::new);
     for chunk in rows.chunks(INTEGRATE_PAGE) {
-        engine.integrate_many(&to_wires(chunk, store, seen.as_mut()))?;
+        engine.integrate_many(&to_wires(chunk, store, bundle, seen.as_mut()))?;
         done += chunk.len() as u64;
         progress(done, total);
     }

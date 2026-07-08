@@ -37,6 +37,20 @@ pub trait BlobStore {
     fn put_blob_with_hash_owned(&self, hash: &str, bytes: Vec<u8>) -> AspResult<()> {
         self.put_blob_with_hash(hash, &bytes)
     }
+
+    /// Insert a **batch** of already-hashed blobs, moving the bytes in. The clone's
+    /// pack-decode spill hands blobs over in batches so a disk-backed store can commit
+    /// one transaction per batch instead of one per blob (millions of autocommits
+    /// otherwise dominate a full-history clone). Each `hash` MUST equal
+    /// `content_hash(bytes)` — the caller (decode) already computed it, so no re-hash.
+    /// Default loops the owned single insert; [`crate::sqlite::SqliteStore`] overrides
+    /// it with a single transaction.
+    fn put_blobs_with_hash_owned(&self, batch: Vec<(String, Vec<u8>)>) -> AspResult<()> {
+        for (h, b) in batch {
+            self.put_blob_with_hash_owned(&h, b)?;
+        }
+        Ok(())
+    }
 }
 
 /// A materialized file row (§files) — the fold's output, surface-independent.

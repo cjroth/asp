@@ -258,20 +258,63 @@ pub fn synthesize_genesis_with_progress(
     out_store: &dyn BlobStore,
     progress: impl FnMut(u64, u64),
 ) -> AspResult<GenesisOutput> {
+    genesis_inner(plan, objects, out_store, None, progress)
+}
+
+/// Like [`synthesize_genesis_with_progress`], but the caller supplies the per-blob
+/// `git sha -> (content_hash, is_binary)` map **already computed by pack decode** (the
+/// full-history clone spill path — see [`GitObjectDb::spilled_blob_meta`]). The blob
+/// bytes already live in `out_store` (decode spilled them there), so this skips the
+/// parallel hashing pre-pass AND every blob-byte read: the emitter reads each blob's
+/// `content_hash` / `is_binary` straight from the map. Byte-identical output to the
+/// hashing path (the map only relocates where the SHA-256 ran).
+///
+/// [`GitObjectDb::spilled_blob_meta`]: crate::gitimport::GitObjectDb::spilled_blob_meta
+pub fn synthesize_genesis_with_meta(
+    plan: &ImportPlan,
+    objects: &dyn GitBlobSource,
+    out_store: &dyn BlobStore,
+    blob_meta: HashMap<String, (String, bool)>,
+    progress: impl FnMut(u64, u64),
+) -> AspResult<GenesisOutput> {
+    genesis_inner(plan, objects, out_store, Some(blob_meta), progress)
+}
+
+fn genesis_inner(
+    plan: &ImportPlan,
+    objects: &dyn GitBlobSource,
+    out_store: &dyn BlobStore,
+    precomputed: Option<HashMap<String, (String, bool)>>,
+    progress: impl FnMut(u64, u64),
+) -> AspResult<GenesisOutput> {
     let site_id = git_site_id(&plan.root_sha);
     let vault_id = git_vault_id(&plan.root_sha);
 
     let mut em = Emitter::new(objects, out_store, plan, site_id, 0, 1, DEFAULT_REMOTE_REF.to_string());
     // The `main` lane exists from the start, seeded empty (git-bridge §3.2).
     em.lanes.insert(MAIN_LANE, LaneState::main());
-    // Native: hash every referenced blob in parallel up front (see `precompute_blobs`),
-    // pre-populating `out_store` and the `blob sha -> content_hash/is_binary` map the
-    // sequential emission loop then consults — moving the SHA-256 work off the single
-    // thread while keeping emission order + row bytes identical. wasm has no threads,
-    // so it keeps the inline sequential path (`precomp` stays `None`).
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        em.precomp = Some(precompute_blobs(objects, plan, out_store)?);
+    match precomputed {
+        // Decode already hashed + binary-sniffed every blob and spilled its bytes into
+        // `out_store`; adopt that map directly (no re-hash, no byte read).
+        Some(map) => {
+            em.precomp = Some(
+                map.into_iter()
+                    .map(|(sha, (content_hash, is_binary))| (sha, BlobMeta { content_hash, is_binary }))
+                    .collect(),
+            );
+        }
+        // Native (no spill): hash every referenced blob in parallel up front (see
+        // `precompute_blobs`), pre-populating `out_store` and the `blob sha ->
+        // content_hash/is_binary` map the sequential emission loop then consults —
+        // moving the SHA-256 work off the single thread while keeping emission order +
+        // row bytes identical. wasm has no threads, so it keeps the inline sequential
+        // path (`precomp` stays `None`).
+        None => {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                em.precomp = Some(precompute_blobs(objects, plan, out_store)?);
+            }
+        }
     }
     em.run_with_progress(plan, progress)?;
 

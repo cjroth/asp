@@ -1137,6 +1137,22 @@ impl BlobStore for SqliteStore {
         self.conn.execute("INSERT OR IGNORE INTO blobs(content_hash, bytes) VALUES (?1, ?2)", params![h, bytes])?;
         Ok(h)
     }
+    /// One transaction over the whole batch (like [`put_blobs`](Self::put_blobs)),
+    /// **trusting** the caller-supplied content hash — the pack-decode spill already
+    /// computed `content_hash(bytes)` for every blob, so re-hashing here would just
+    /// re-pay the SHA-256 we moved off the decode path. See the trait method docs.
+    fn put_blobs_with_hash_owned(&self, batch: Vec<(String, Vec<u8>)>) -> AspResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt =
+                tx.prepare_cached("INSERT OR IGNORE INTO blobs(content_hash, bytes) VALUES (?1, ?2)")?;
+            for (hash, bytes) in &batch {
+                stmt.execute(params![hash, bytes])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
     fn get_blob(&self, hash: &str) -> AspResult<Option<Vec<u8>>> {
         Ok(self
             .conn

@@ -769,19 +769,35 @@ async fn git_clone_cmd(
 
     let auth = resolve_git_auth(&url, token.as_deref(), None);
     let spec = asp_core::gitbridge::GitRemoteSpec::new(url, auth);
-    let last_phase = std::sync::Mutex::new(String::new());
+    // Determinate per-phase progress for every phase the clone driver emits. On a phase
+    // change we print its label; then, whenever the driver knows a total, we print a
+    // percentage each time it crosses a new 10% step — non-spammy (≤10 lines/phase) and
+    // safe for non-TTY output (the phases with no known total just show the label).
+    let prog_state = std::sync::Mutex::new((String::new(), u64::MAX));
     let on_progress = move |phase: &str, done: u64, total: u64| {
-        let mut lp = last_phase.lock().unwrap();
-        if *lp != phase {
-            *lp = phase.to_string();
-            match phase {
-                "fetching" => eprintln!("fetching git objects…"),
-                "replaying" => eprintln!("replaying commit history…"),
-                "saving" => eprintln!("saving {total} rows…"),
-                _ => {}
+        let label = match phase {
+            "fetching" => "fetching git objects",
+            "scanning" => "scanning pack",
+            "replaying" => "replaying commit history",
+            "importing" => "importing history",
+            "saving" => "saving rows",
+            "materialize" => "writing working tree",
+            other => other,
+        };
+        let mut st = prog_state.lock().unwrap();
+        if st.0 != phase {
+            st.0 = phase.to_string();
+            st.1 = 0;
+            eprintln!("{label}…");
+        }
+        // `checked_div` is `None` for the phases with no known total (chunked fetch) —
+        // those show only the label line, never a bogus percentage.
+        if let Some(decile) = (done.min(total) * 10).checked_div(total).map(|d| d.min(10)) {
+            if decile > st.1 {
+                st.1 = decile;
+                eprintln!("  {label}: {}%", decile * 10);
             }
         }
-        let _ = done;
     };
     let opts = CloneOptions { depth, new_identity, all_branches, on_progress: Some(&on_progress) };
     let report = clone_from_git(&engine, &spec, &opts)

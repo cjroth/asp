@@ -48,6 +48,12 @@ use gix_pack::cache;
 use gix_pack::data;
 use gix_pack::data::input;
 
+use crate::oid::content_hash;
+
+/// The byte prefix that marks a git-LFS pointer file (git-bridge §3.3). Checked once at
+/// decode time (for a spilled blob) and by [`is_lfs_pointer`] (non-spilled path).
+const LFS_POINTER_PREFIX: &[u8] = b"version https://git-lfs.github.com/spec/v1";
+
 // ===========================================================================
 // Errors
 // ===========================================================================
@@ -158,13 +164,44 @@ impl EntryMode {
 // GitObjectDb — in-memory object database from pack bytes
 // ===========================================================================
 
+/// The small, byte-free locator kept for a **spilled** blob: its content lives in an
+/// external [`BlobStore`](crate::store::BlobStore) (keyed by `content_hash`), and these
+/// three facts — everything the downstream import + row synthesis need — are computed
+/// once at decode time so no consumer ever re-reads or re-hashes the blob bytes.
+#[derive(Debug, Clone)]
+pub struct BlobLoc {
+    /// The blob's `content_hash` (SHA-256 hex) — the key its bytes live under in the
+    /// spill store, and the `result_hash` row synthesis stamps for it.
+    pub content_hash: String,
+    /// Whether the blob classifies as binary (`!utf8 || contains(0)`) — the one bit
+    /// row synthesis needs from the bytes to pick a `MergeClass`.
+    pub is_binary: bool,
+    /// Whether the blob is a git-LFS pointer (git-bridge §3.3) — consulted by the
+    /// tree diff to raise an `LfsPointers` warning.
+    pub is_lfs: bool,
+}
+
 /// An in-memory git object database: `sha (40-hex) → (kind, decompressed payload)`.
 ///
 /// The payload is the *object body* (the bytes after the `"<kind> <len>\0"` loose
 /// header), i.e. exactly what [`gix_object::CommitRef::from_bytes`] &co. expect.
+///
+/// ## Blob spill (full-history clone memory ceiling)
+///
+/// A full clone's decompressed blob content dwarfs its commits+trees (multi-GB for a
+/// big repo) and used to sit here in `objects`, OOMing the decode. When
+/// [`from_pack_spilling`](GitObjectDb::from_pack_spilling) is given a spill store, blob
+/// bytes stream straight into it during decode and only a byte-free [`BlobLoc`] stays in
+/// `blob_meta`; `objects` then holds just commits/trees/tags. The tree diff never reads
+/// blob bytes (it only records their oids), and row synthesis reads `content_hash` /
+/// `is_binary` from the locator — so no consumer needs the bytes back except the (rare,
+/// full-pack-absent) ref-delta whose base is a spilled blob, which reads it back from
+/// the spill store. Without a spill store every object stays in `objects` as before
+/// (tests, wasm, incremental pulls) — `blob_meta` stays empty.
 #[derive(Debug, Default, Clone)]
 pub struct GitObjectDb {
     objects: HashMap<String, (GitObjKind, Vec<u8>)>,
+    blob_meta: HashMap<String, BlobLoc>,
 }
 
 /// A `base_lookup` that never resolves anything — the common case for a
@@ -176,7 +213,7 @@ pub fn no_base_lookup(_sha: &str) -> Option<(GitObjKind, Vec<u8>)> {
 impl GitObjectDb {
     /// An empty db (used by incremental builds and tests).
     pub fn new() -> Self {
-        GitObjectDb { objects: HashMap::new() }
+        GitObjectDb { objects: HashMap::new(), blob_meta: HashMap::new() }
     }
 
     /// Insert a loose object by kind + body, returning its computed sha (40-hex).
@@ -219,6 +256,26 @@ impl GitObjectDb {
         Ok(db)
     }
 
+    /// Like [`from_pack_with_progress`], but **spills blob bytes** into `spill` (a
+    /// content-addressed store) as the pack decodes, keeping only a byte-free
+    /// [`BlobLoc`] per blob in the db (git-bridge full-history clone memory ceiling —
+    /// see [`GitObjectDb`] docs). Takes the pack **by value** so it moves straight into
+    /// the decoder with no second copy (the old `from_data(pack.to_vec())` doubled a
+    /// ~600 MB pack). Commits/trees/tags stay in memory as before; the resulting plan +
+    /// synthesized rows are byte-identical to the non-spilling path.
+    ///
+    /// [`from_pack_with_progress`]: GitObjectDb::from_pack_with_progress
+    pub fn from_pack_spilling(
+        pack: Vec<u8>,
+        base_lookup: impl Fn(&str) -> Option<(GitObjKind, Vec<u8>)>,
+        spill: &dyn crate::store::BlobStore,
+        progress: impl FnMut(&str, u64, u64),
+    ) -> Result<Self, GitImportError> {
+        let mut db = GitObjectDb::new();
+        db.decode_pack(pack, base_lookup, Some(spill), progress)?;
+        Ok(db)
+    }
+
     /// Decode `pack` into an existing db (incremental fetch). See [`from_pack`].
     ///
     /// [`from_pack`]: GitObjectDb::from_pack
@@ -240,6 +297,24 @@ impl GitObjectDb {
         &mut self,
         pack: &[u8],
         base_lookup: impl Fn(&str) -> Option<(GitObjKind, Vec<u8>)>,
+        progress: impl FnMut(&str, u64, u64),
+    ) -> Result<(), GitImportError> {
+        // No spill store: every object (blobs included) stays in `objects`, as before.
+        // A borrowed slice must be owned for gix's random-access decoder, so this path
+        // pays one `to_vec` (fine for the small packs its callers pass — tests and
+        // incremental pulls); the full-clone path uses `from_pack_spilling` (by value).
+        self.decode_pack(pack.to_vec(), base_lookup, None, progress)
+    }
+
+    /// The single pack-decode implementation, shared by the spilling and non-spilling
+    /// entry points. Owns `pack` so it moves into the decoder with no copy. When
+    /// `spill` is `Some`, blob bodies stream into it (keyed by `content_hash`) and only
+    /// a [`BlobLoc`] is kept in `blob_meta`; otherwise every object stays in `objects`.
+    fn decode_pack(
+        &mut self,
+        pack: Vec<u8>,
+        base_lookup: impl Fn(&str) -> Option<(GitObjKind, Vec<u8>)>,
+        spill: Option<&dyn crate::store::BlobStore>,
         mut progress: impl FnMut(&str, u64, u64),
     ) -> Result<(), GitImportError> {
         // Object count lives in the pack header ("PACK"(4) + version(4) + count(4),
@@ -256,7 +331,7 @@ impl GitObjectDb {
         // header to learn where each entry begins). Data is ignored here; phase 2
         // re-reads each entry by offset with full delta resolution.
         let iter = input::BytesToEntriesIter::new_from_header(
-            std::io::Cursor::new(pack),
+            std::io::Cursor::new(pack.as_slice()),
             input::Mode::AsIs,
             input::EntryDataMode::Ignore,
             gix_hash::Kind::Sha1,
@@ -285,7 +360,9 @@ impl GitObjectDb {
         let mut decoded: u64 = 0;
         progress("replaying", 0, num_objects);
 
-        let file = data::File::from_data(pack.to_vec(), "<memory>".into(), gix_hash::Kind::Sha1)
+        // Move the pack straight into the decoder (`iter` above borrowed it only for the
+        // scan and is now dropped) — no second full copy of a ~600 MB pack.
+        let file = data::File::from_data(pack, "<memory>".into(), gix_hash::Kind::Sha1)
             .map_err(|e| GitImportError::Pack(e.to_string()))?;
         let mut inflate = zlib::Inflate::default();
 
@@ -311,6 +388,17 @@ impl GitObjectDb {
         const DELTA_CACHE_CAP_BYTES: usize = 128 * 1024 * 1024;
         let mut cache = cache::lru::MemoryCappedHashmap::new(DELTA_CACHE_CAP_BYTES);
 
+        // Spill buffer (only used when `spill` is Some): decoded blob bodies accumulate
+        // here as `(content_hash, bytes)` and flush to the store in batches, so a
+        // disk-backed store commits ONE transaction per ~32 MB instead of one per blob
+        // (millions of autocommits would otherwise dominate a full-history clone). A
+        // ref-delta whose base is an already-spilled blob (rare — full packs use
+        // ofs-deltas) reads the base back through `resolve` below (from the buffer if it
+        // hasn't flushed yet, else from the store).
+        const SPILL_FLUSH_BYTES: usize = 32 * 1024 * 1024;
+        let mut spill_buf: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut spill_buf_bytes: usize = 0;
+
         // Phase 2 — decode each entry, retrying deltas whose (ref-)base isn't decoded
         // yet, until either everything resolves or a pass makes no progress.
         let mut pending = offsets;
@@ -327,6 +415,8 @@ impl GitObjectDb {
                 // Interior mutability so `resolve` stays `Fn` (decode_entry requires it).
                 let missing_base: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
                 let decoded_ref = &self.objects;
+                let blob_meta_ref = &self.blob_meta;
+                let spill_buf_ref = &spill_buf;
                 let resolve = |id: &gix_hash::oid, buf: &mut Vec<u8>| -> Option<data::decode::entry::ResolvedBase> {
                     let hex = id.to_hex().to_string();
                     if let Some((k, bytes)) = decoded_ref.get(&hex) {
@@ -335,6 +425,26 @@ impl GitObjectDb {
                             kind: (*k).into(),
                             end: buf.len(),
                         });
+                    }
+                    // A spilled blob base (its bytes are no longer in `objects`): serve it
+                    // from the unflushed buffer if still there, else read it back from the
+                    // spill store. Only reached for a ref-delta onto a blob — negligible on
+                    // a full pack, so the linear buffer scan here is not hot.
+                    if let (Some(loc), Some(store)) = (blob_meta_ref.get(&hex), spill) {
+                        if let Some((_, bytes)) = spill_buf_ref.iter().find(|(h, _)| *h == loc.content_hash) {
+                            buf.extend_from_slice(bytes);
+                            return Some(data::decode::entry::ResolvedBase::OutOfPack {
+                                kind: GixKind::Blob,
+                                end: buf.len(),
+                            });
+                        }
+                        if let Ok(Some(bytes)) = store.get_blob(&loc.content_hash) {
+                            buf.extend_from_slice(&bytes);
+                            return Some(data::decode::entry::ResolvedBase::OutOfPack {
+                                kind: GixKind::Blob,
+                                end: buf.len(),
+                            });
+                        }
                     }
                     if let Some((k, bytes)) = base_lookup(&hex) {
                         buf.extend_from_slice(&bytes);
@@ -353,7 +463,28 @@ impl GitObjectDb {
                         let kind: GitObjKind = outcome.kind.into();
                         let id = gix_object::compute_hash(gix_hash::Kind::Sha1, outcome.kind, &out)
                             .map_err(|e| GitImportError::Decode(e.to_string()))?;
-                        self.objects.insert(id.to_hex().to_string(), (kind, out));
+                        let hex = id.to_hex().to_string();
+                        match (kind, spill) {
+                            // Spill blob bytes out of RAM: compute the three facts
+                            // consumers need (content_hash / is_binary / is_lfs) once,
+                            // buffer the bytes for a batched store write, and keep only
+                            // the byte-free locator. Commits/trees still live in `objects`.
+                            (GitObjKind::Blob, Some(_)) => {
+                                let content_hash = content_hash(&out);
+                                let is_binary =
+                                    std::str::from_utf8(&out).is_err() || out.contains(&0);
+                                let is_lfs = out.starts_with(LFS_POINTER_PREFIX);
+                                self.blob_meta.insert(
+                                    hex,
+                                    BlobLoc { content_hash: content_hash.clone(), is_binary, is_lfs },
+                                );
+                                spill_buf_bytes += out.len();
+                                spill_buf.push((content_hash, out));
+                            }
+                            _ => {
+                                self.objects.insert(hex, (kind, out));
+                            }
+                        }
                         progressed = true;
                         decoded += 1;
                         // Coarse: don't fire the sink per object (a big pack is 100k+).
@@ -368,6 +499,18 @@ impl GitObjectDb {
                         still.push(off);
                     }
                 }
+
+                // Flush the spill buffer once it crosses the batch threshold. Safe here:
+                // `resolve` (which borrows `spill_buf`) was dropped when `decode_entry`
+                // returned above, so the buffer is free to drain.
+                if spill_buf_bytes >= SPILL_FLUSH_BYTES {
+                    if let Some(store) = spill {
+                        store
+                            .put_blobs_with_hash_owned(std::mem::take(&mut spill_buf))
+                            .map_err(|e| GitImportError::Pack(e.to_string()))?;
+                        spill_buf_bytes = 0;
+                    }
+                }
             }
 
             if !progressed {
@@ -376,6 +519,14 @@ impl GitObjectDb {
                 ));
             }
             pending = still;
+        }
+        // Drain any remaining spilled blobs.
+        if let Some(store) = spill {
+            if !spill_buf.is_empty() {
+                store
+                    .put_blobs_with_hash_owned(std::mem::take(&mut spill_buf))
+                    .map_err(|e| GitImportError::Pack(e.to_string()))?;
+            }
         }
         // Final tick — the stride above can leave the last <1000 objects unreported.
         progress("replaying", decoded, num_objects);
@@ -387,14 +538,37 @@ impl GitObjectDb {
         self.objects.get(sha).map(|(k, v)| (*k, v.as_slice()))
     }
 
-    /// Number of objects held.
+    /// Number of objects held (commits/trees/tags; spilled blobs are counted in
+    /// [`blob_count`](GitObjectDb::blob_count) instead).
     pub fn len(&self) -> usize {
         self.objects.len()
     }
 
     /// Whether the db is empty.
     pub fn is_empty(&self) -> bool {
-        self.objects.is_empty()
+        self.objects.is_empty() && self.blob_meta.is_empty()
+    }
+
+    /// Number of spilled blobs (empty on the non-spilling path — those blobs sit in
+    /// `objects` and count toward [`len`](GitObjectDb::len)).
+    pub fn blob_count(&self) -> usize {
+        self.blob_meta.len()
+    }
+
+    /// The precomputed `git blob sha -> (content_hash, is_binary)` map for **spilled**
+    /// blobs, or `None` when nothing was spilled (non-spilling decode). Row synthesis
+    /// consumes this to stamp `result_hash` / pick `MergeClass` without touching a
+    /// single blob byte (the bytes already live, content-addressed, in the spill store).
+    pub fn spilled_blob_meta(&self) -> Option<HashMap<String, (String, bool)>> {
+        if self.blob_meta.is_empty() {
+            return None;
+        }
+        Some(
+            self.blob_meta
+                .iter()
+                .map(|(sha, loc)| (sha.clone(), (loc.content_hash.clone(), loc.is_binary)))
+                .collect(),
+        )
     }
 
     /// Iterate all `(sha, kind)` pairs (sha-sorted for deterministic traversal).
@@ -1358,12 +1532,15 @@ pub fn plan_import(
     Ok(ImportPlan { commits, lanes, root_sha, tip_sha: tip, warnings, skipped_reachable })
 }
 
-/// True if a blob's content is a git-LFS pointer (git-bridge §3.3).
+/// True if a blob's content is a git-LFS pointer (git-bridge §3.3). For a spilled blob
+/// the answer was computed at decode time and read from the locator (no byte access);
+/// otherwise it sniffs the bytes still held in `objects`.
 fn is_lfs_pointer(db: &GitObjectDb, blob_sha: &str) -> bool {
+    if let Some(loc) = db.blob_meta.get(blob_sha) {
+        return loc.is_lfs;
+    }
     match db.get(blob_sha) {
-        Some((GitObjKind::Blob, bytes)) => {
-            bytes.starts_with(b"version https://git-lfs.github.com/spec/v1")
-        }
+        Some((GitObjKind::Blob, bytes)) => bytes.starts_with(LFS_POINTER_PREFIX),
         _ => false,
     }
 }
