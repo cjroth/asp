@@ -191,14 +191,40 @@ export function createWebApi(): Api {
       // the rows (branch reconciliation + the fold read blob bytes), then import.
       const hashes = JSON.parse(eng.blob_hashes_of_rows(rows)) as string[];
       const present = new Set<string>();
+      const missing: string[] = [];
       for (const h of hashes) {
         const b = await readBytes(blobName(id, h));
         if (b) {
           eng.put_blob(b);
           present.add(h);
+        } else {
+          missing.push(h);
         }
       }
       eng.load_rows_state(rows);
+      // A referenced blob absent from OPFS is DATA LOSS, not a cache miss: the row
+      // is already integrated, so version-vector anti-entropy will never re-deliver
+      // its WireRow — peers consider it delivered. The fold materializes the
+      // affected file(s) as EMPTY (indistinguishable from intentionally-empty), and
+      // any edit on top makes that permanent. This should never happen given the
+      // persist write-order invariant (blobs before rows); if it does, something
+      // truncated OPFS out from under us. Surface it loudly with the affected paths
+      // (cheap: files' result_hash is in the fold detail) — see webApi persist().
+      if (missing.length > 0) {
+        let affected: string[] = [];
+        try {
+          const detail = JSON.parse(eng.files_detail_json()) as { path: string; result_hash: string | null }[];
+          const miss = new Set(missing);
+          affected = detail.filter((f) => f.result_hash && miss.has(f.result_hash)).map((f) => f.path);
+        } catch {
+          /* best-effort path derivation — the count + hashes below still land */
+        }
+        console.error(
+          `[asp] vault ${entry?.vault_id ?? id}: ${missing.length} referenced blob(s) missing from OPFS — ` +
+            `these file(s) restored EMPTY and will NOT re-sync from peers (already-integrated rows are never re-sent): ` +
+            `${affected.length ? affected.join(', ') : '(paths undetermined)'} [hashes: ${missing.join(', ')}]`,
+        );
+      }
       writtenBlobs.set(id, present); // already on disk — persist won't rewrite these
       clearedOldState.add(id); // this vault is already split; no legacy state to clear
     } else {
@@ -214,10 +240,22 @@ export function createWebApi(): Api {
   // blob (immutable ⇒ never rewritten). This both fixes the browser-clone OOM (no
   // single giant buffer holding every blob) and the per-keystroke cost the old
   // comment flagged — an edit writes `.rows` + only the one new blob it created.
-  // Durability is the live peer sync; OPFS is a cache a reload re-syncs. We flush
-  // on page-hide so nothing pending is lost.
+  //
+  // Durability note: for locally-authored edits, OPFS is the ONLY copy until a peer
+  // pulls the row — it is NOT a "reload re-syncs" cache. Once a row is integrated,
+  // version-vector anti-entropy considers it delivered, so a lost blob is never
+  // re-fetched from peers (see engineFor's missing-blob diagnostic). We flush on
+  // page-hide so nothing pending is lost, and the write order below guards the rest.
+  //
+  // WRITE ORDER IS A DURABILITY INVARIANT: the rows snapshot references blobs by
+  // hash, and OPFS createWritable/write/close is atomic per file. If a tab is
+  // killed mid-persist (the ~700ms coalescer window fires after every edit), a
+  // durable `.rows` must never point at a blob that isn't on disk yet. So we write
+  // every NEW blob and the blob index FIRST, and the rows snapshot LAST — a crash
+  // between the two just drops the latest edit (recovered on the next sync), never
+  // leaves durable rows referencing an absent blob (which would materialize the
+  // file as permanently EMPTY — see the missing-blob handling in engineFor).
   const persist = async (id: string, eng: WasmEngine): Promise<void> => {
-    await writeBytes(rowsName(id), eng.export_rows_state());
     const written = writtenBlobs.get(id) ?? new Set<string>();
     const hashes = JSON.parse(eng.blob_hashes()) as string[];
     let changed = false;
@@ -232,6 +270,8 @@ export function createWebApi(): Api {
     }
     writtenBlobs.set(id, written);
     if (changed) await writeJson(blobIndexName(id), [...written]);
+    // Rows LAST: every blob it references is now durable (invariant above).
+    await writeBytes(rowsName(id), eng.export_rows_state());
     // Reclaim the legacy combined blob once (a no-op if this vault never had one).
     if (!clearedOldState.has(id)) {
       clearedOldState.add(id);
