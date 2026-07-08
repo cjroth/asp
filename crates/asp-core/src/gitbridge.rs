@@ -1520,8 +1520,9 @@ impl RemoteStore {
 }
 
 /// Parse the `parent <sha>` lines out of a commit object's content (the header block
-/// before the first blank line).
-fn commit_parents(content: &[u8]) -> Vec<String> {
+/// before the first blank line). Shared by [`RemoteStore::is_ancestor`] and
+/// `gitremote::db_is_ancestor` (force-push detection) so both walk parents identically.
+pub(crate) fn commit_parents(content: &[u8]) -> Vec<String> {
     let mut parents = Vec::new();
     for line in content.split(|&b| b == b'\n') {
         if line.is_empty() {

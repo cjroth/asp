@@ -292,6 +292,19 @@ pub async fn clone_from_git(
     // `synchronous=NORMAL` would dominate decode. Safe — a torn clone is discarded
     // (git-bridge §9); the `bulk_load` around integrate restores `synchronous=NORMAL`.
     engine.store.set_bulk_pragmas()?;
+    // RAII: if any step between here and the `bulk_load` below early-returns (a caught
+    // decode/plan/genesis error), restore the vault's normal PRAGMAs so a hypothetically
+    // retained connection isn't left on the bulk ceilings. The happy path's
+    // `end_bulk_load` restores + checkpoints first; this guard's later drop just
+    // re-applies the same (idempotent) values. Callers drop the engine on a failed
+    // clone anyway — this is cheap belt-and-braces.
+    struct PragmaGuard<'a>(&'a crate::sqlite::SqliteStore);
+    impl Drop for PragmaGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.restore_normal_pragmas();
+        }
+    }
+    let _pragma_guard = PragmaGuard(&engine.store);
 
     // 4. Decode + plan. The pack scan then object decode are the dominant visible
     // stretch — from_pack_spilling emits the "scanning" then "replaying" phases (each
@@ -361,7 +374,7 @@ pub async fn clone_from_git(
     // memory win (pulling multi-GB back into RAM). Rows carry the hashes; the blobs stay put.
     let res = engine
         .store
-        .bulk_load(|| integrate_paged(engine, &g.rows, &engine.store, false, false, &|d, t| progress("saving", d, t)));
+        .bulk_load(|| integrate_paged(engine, &g.rows, &engine.store, false, &|d, t| progress("saving", d, t)));
     engine.set_bulk(false);
     engine.set_batch(false);
     res?;
@@ -548,7 +561,7 @@ pub async fn pull_once(
     }
     progress("saving", 0, out.rows.len() as u64);
     engine.set_batch(true);
-    let res = integrate_paged(engine, &out.rows, &scratch, false, true, &|d, t| progress("saving", d, t));
+    let res = integrate_paged(engine, &out.rows, &scratch, true, &|d, t| progress("saving", d, t));
     engine.set_batch(false);
     res?;
     engine.materialize()?;
@@ -628,7 +641,7 @@ pub async fn rebaseline(engine: &Engine, remote_id_str: &str) -> AspResult<PullR
     let snap_store = MemBlobStore::new();
     let g = synthesize_genesis(&plan, &DbBlobSource::new(&db), &snap_store)?;
     let mem = MemEngine::create(Identity::from_seed(&[0u8; 32]), &g.vault_id);
-    mem.integrate_many(&to_wires(&g.rows, &snap_store, true, None))?;
+    mem.integrate_many(&to_wires(&g.rows, &snap_store, true))?;
     let new_files = mem.files_map()?; // path -> bytes at the rewritten tip
 
     // Author the diff vs the current imported main state as one synthetic batch.
@@ -713,7 +726,7 @@ pub async fn rebaseline(engine: &Engine, remote_id_str: &str) -> AspResult<PullR
     rows.push(build_ingest_row(&scratch, &ingest_ident, &ingest)?);
 
     engine.set_batch(true);
-    let res = integrate_paged(engine, &rows, &scratch, false, true, &|_, _| {});
+    let res = integrate_paged(engine, &rows, &scratch, true, &|_, _| {});
     engine.set_batch(false);
     res?;
     engine.materialize()?;
@@ -882,19 +895,11 @@ fn db_is_ancestor(db: &GitObjectDb, ancestor: &str, descendant: &str) -> bool {
         if kind != GitObjKind::Commit {
             continue;
         }
-        for line in body.split(|&b| b == b'\n') {
-            if line.is_empty() {
-                break; // end of commit header block
+        for parent in crate::gitbridge::commit_parents(body) {
+            if parent == ancestor {
+                return true;
             }
-            if let Some(rest) = line.strip_prefix(b"parent ") {
-                if let Ok(p) = std::str::from_utf8(rest) {
-                    let p = p.trim().to_string();
-                    if p == ancestor {
-                        return true;
-                    }
-                    stack.push(p);
-                }
-            }
+            stack.push(parent);
         }
     }
     false
@@ -907,12 +912,7 @@ fn db_is_ancestor(db: &GitObjectDb, ancestor: &str, descendant: &str) -> bool {
 /// the blobs are left out entirely — the caller guarantees every referenced blob is
 /// already durable in the engine store (the pristine clone spills them during decode),
 /// so re-reading them here would waste time and defeat the clone's memory ceiling.
-fn to_wires(
-    rows: &[LogRow],
-    store: &dyn BlobStore,
-    bundle: bool,
-    mut seen: Option<&mut HashSet<String>>,
-) -> Vec<WireRow> {
+fn to_wires(rows: &[LogRow], store: &dyn BlobStore, bundle: bool) -> Vec<WireRow> {
     rows.iter()
         .map(|r| {
             let mut blobs: Vec<WireBlob> = Vec::new();
@@ -923,18 +923,7 @@ fn to_wires(
                 if blobs.iter().any(|b| b.hash == h) {
                     continue;
                 }
-                // Cross-page dedup for the local clone feed: a blob we already
-                // bundled this run is durably in the engine store (integrate_many
-                // persisted it), so re-copying/re-hashing/re-verifying its bytes is
-                // pure waste. `seen` is only marked once a blob is actually bundled,
-                // so a hash absent from `store` is never spuriously suppressed.
-                if seen.as_deref().is_some_and(|s| s.contains(&h)) {
-                    continue;
-                }
                 if let Ok(Some(bytes)) = store.get_blob(&h) {
-                    if let Some(s) = seen.as_deref_mut() {
-                        s.insert(h.clone());
-                    }
                     blobs.push(WireBlob { hash: h, bytes });
                 }
             }
@@ -944,24 +933,21 @@ fn to_wires(
 }
 
 /// Integrate `rows` page-by-page under batch, folding once (the caller must have
-/// enabled `set_batch` and must `materialize()` afterwards). `dedup` enables
-/// cross-page blob-bundle dedup — safe only where every referenced blob lives in
-/// `store` (the pristine clone feed: `store` is the full-pack scratch). Incremental
-/// pulls leave it off (a base blob may already be in the engine, absent from the
-/// incremental-pack scratch — bundling stays a per-page no-op there anyway).
+/// enabled `set_batch` and must `materialize()` afterwards). `bundle` controls whether
+/// each row's `base_hash`/`result_hash` blobs travel inline (see [`to_wires`]); the
+/// pristine clone leaves it off (blobs already durable from the decode spill), the
+/// incremental pull turns it on (blobs read from the fetch scratch).
 fn integrate_paged(
     engine: &Engine,
     rows: &[LogRow],
     store: &dyn BlobStore,
-    dedup: bool,
     bundle: bool,
     progress: &dyn Fn(u64, u64),
 ) -> AspResult<()> {
     let total = rows.len() as u64;
     let mut done = 0u64;
-    let mut seen: Option<HashSet<String>> = dedup.then(HashSet::new);
     for chunk in rows.chunks(INTEGRATE_PAGE) {
-        engine.integrate_many(&to_wires(chunk, store, bundle, seen.as_mut()))?;
+        engine.integrate_many(&to_wires(chunk, store, bundle))?;
         done += chunk.len() as u64;
         progress(done, total);
     }
