@@ -1049,6 +1049,48 @@ fn pack_object_count(pack: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]))
 }
 
+/// Cheaply verify a fetched packfile's structural integrity **before** it is persisted:
+/// the `"PACK"` magic, a supported version, and — the load-bearing check — that the
+/// trailing 20 bytes equal the SHA-1 of everything preceding them (git's pack trailer).
+///
+/// This is the only integrity gate a fetched pack gets before its refs are recorded, so
+/// it must catch the two ways a pack arrives broken: a **truncated** transfer (the
+/// pkt-line parser accepts a framed-but-short pack, returning `Ok` on a mid-stream flush)
+/// and a **bit-flipped** body. Both fail the trailer comparison (a truncation loses the
+/// real trailer; a flip changes the digest), so `record_fetch` can reject them and leave
+/// `refs.json` + `packs/` untouched instead of wedging every future pull on a bad pack
+/// that only fails much later, deep inside `build_db`.
+fn verify_pack_integrity(pack: &[u8]) -> BridgeResult<()> {
+    // 12-byte header + 20-byte SHA-1 trailer is the minimum a real pack can be.
+    if pack.len() < 32 {
+        return Err(GitBridgeError::Store(format!(
+            "fetched pack is too short to be valid ({} bytes)",
+            pack.len()
+        )));
+    }
+    if &pack[0..4] != b"PACK" {
+        return Err(GitBridgeError::Store(
+            "fetched pack missing PACK magic (corrupt or truncated transfer)".into(),
+        ));
+    }
+    let version = u32::from_be_bytes([pack[4], pack[5], pack[6], pack[7]]);
+    if version != 2 && version != 3 {
+        return Err(GitBridgeError::Store(format!(
+            "fetched pack has unsupported version {version}"
+        )));
+    }
+    let (body, trailer) = pack.split_at(pack.len() - 20);
+    let mut h = Sha1::new();
+    h.update(body);
+    let digest = h.finalize();
+    if digest.as_slice() != trailer {
+        return Err(GitBridgeError::Store(
+            "fetched pack checksum mismatch (truncated or corrupt transfer) — refusing to store".into(),
+        ));
+    }
+    Ok(())
+}
+
 // ===========================================================================
 // Local bare object store (.asp/gitremote/<remote_id>/)
 // ===========================================================================
@@ -1134,6 +1176,11 @@ impl RemoteStore {
     /// next random access sees the new pack.
     pub fn record_fetch(&mut self, pack: &[u8], refs: &[(String, String)]) -> BridgeResult<()> {
         if pack_object_count(pack).unwrap_or(0) > 0 {
+            // Integrity gate BEFORE any persistence: a truncated/corrupt pack errors here
+            // so neither the pack nor the advanced refs are written — the fetch fails
+            // cleanly and a retry re-fetches, rather than wedging every future pull on a
+            // bad pack that would only blow up later inside `build_db`.
+            verify_pack_integrity(pack)?;
             self.store_pack(pack)?;
         }
         for (name, oid) in refs {
@@ -1250,8 +1297,22 @@ impl RemoteStore {
         for path in self.pack_paths() {
             let bytes = std::fs::read(&path)
                 .map_err(|e| GitBridgeError::Store(format!("reading pack {}: {e}", path.display())))?;
-            db.absorb_pack(&bytes, no_base_lookup)
-                .map_err(|e| GitBridgeError::Store(format!("decoding pack {}: {e}", path.display())))?;
+            if let Err(e) = db.absorb_pack(&bytes, no_base_lookup) {
+                // Self-heal: a stored pack that passed the fetch-time trailer check but
+                // still fails to decode (a rare semantic corruption a checksum can't
+                // catch) would otherwise wedge every future pull AND push, since build_db
+                // decodes all packs on every access. Quarantine it (rename `.pack` →
+                // `.bad`, so `pack_paths` skips it) and surface an actionable error; a
+                // subsequent pull re-fetches the missing objects instead of hitting the
+                // same wall.
+                let bad = path.with_extension("bad");
+                let _ = std::fs::rename(&path, &bad);
+                return Err(GitBridgeError::Store(format!(
+                    "decoding stored pack {} failed ({e}); quarantined it as {} — re-run the pull to re-fetch",
+                    path.display(),
+                    bad.display()
+                )));
+            }
         }
         Ok(db)
     }
@@ -1506,6 +1567,70 @@ mod tests {
 
     fn blob_oid_hex(content: &[u8]) -> String {
         git_oid(GitObjectKind::Blob, content)
+    }
+
+    /// A minimal valid pack (one blob) plus the commit oid its refs would point at.
+    fn sample_pack() -> (Vec<u8>, String) {
+        let blob = b"hello asp\n".to_vec();
+        let pack = write_pack(&[(GitObjectKind::Blob, blob.clone())]);
+        (pack, blob_oid_hex(&blob))
+    }
+
+    #[test]
+    fn truncated_pack_rejected_and_store_untouched() {
+        let (pack, _) = sample_pack();
+        // Drop the trailing bytes (incl. the SHA-1 trailer) — exactly what the pkt parser
+        // hands back for a transfer that flushed mid-pack.
+        let truncated = pack[..pack.len() - 8].to_vec();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = RemoteStore::open(tmp.path(), "trunc").unwrap();
+        let err = store
+            .record_fetch(&truncated, &[("refs/heads/main".into(), "a".repeat(40))])
+            .unwrap_err();
+        assert!(matches!(err, GitBridgeError::Store(_)), "expected Store error, got {err:?}");
+
+        // Nothing persisted: no refs.json, no packs, empty object db, and the in-memory
+        // ref snapshot never advanced.
+        assert!(!store.root().join("refs.json").exists(), "refs.json must not be written");
+        assert!(store.refs().is_empty(), "refs must not advance");
+        assert_eq!(store.object_count(), 0, "no objects should be stored");
+        let pack_count = std::fs::read_dir(store.root().join("packs"))
+            .map(|d| d.flatten().filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("pack")).count())
+            .unwrap_or(0);
+        assert_eq!(pack_count, 0, "no pack file should be written");
+    }
+
+    #[test]
+    fn bitflipped_pack_rejected_and_store_untouched() {
+        let (mut pack, _) = sample_pack();
+        // Flip a bit in the compressed object body (not the trailer) — the trailer no
+        // longer matches the recomputed SHA-1.
+        let mid = pack.len() / 2;
+        pack[mid] ^= 0x40;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = RemoteStore::open(tmp.path(), "flip").unwrap();
+        let err = store
+            .record_fetch(&pack, &[("refs/heads/main".into(), "b".repeat(40))])
+            .unwrap_err();
+        assert!(matches!(err, GitBridgeError::Store(_)), "expected Store error, got {err:?}");
+
+        assert!(!store.root().join("refs.json").exists(), "refs.json must not be written");
+        assert!(store.refs().is_empty(), "refs must not advance");
+        assert_eq!(store.object_count(), 0, "no objects should be stored");
+    }
+
+    #[test]
+    fn valid_pack_passes_integrity_check() {
+        let (pack, blob_oid) = sample_pack();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = RemoteStore::open(tmp.path(), "ok").unwrap();
+        store
+            .record_fetch(&pack, &[("refs/heads/main".into(), blob_oid.clone())])
+            .unwrap();
+        assert!(store.has(&blob_oid));
+        assert_eq!(store.refs().get("refs/heads/main"), Some(&blob_oid));
     }
 
     #[test]
