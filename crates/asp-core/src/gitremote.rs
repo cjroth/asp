@@ -29,8 +29,8 @@ use crate::gitbridge::{
 };
 use crate::gitgenesis::{
     git_file_id, git_site_id, synthesize_genesis, synthesize_genesis_with_meta,
-    synthesize_ingest_with_open_branches, DbBlobSource, ImportedBranchSeed, ImportedFile,
-    IngestContext,
+    synthesize_ingest_with_open_branches, DbBlobSource, GitBlobSource, ImportedBranchSeed,
+    ImportedFile, IngestContext,
 };
 use crate::gitimport::{
     no_base_lookup, plan_import, GitImportError, GitObjKind, GitObjectDb, ImportOptions,
@@ -529,11 +529,15 @@ pub async fn pull_once(
         seen,
     };
     let scratch = MemBlobStore::new();
+    // `db` (built by `build_db`) spilled every historical blob to the store's on-disk
+    // scratch; `StoreBlobSource` reads back only the blobs the new commits touch, so the
+    // pull never rehydrates the full history into RAM.
+    let blob_src = StoreBlobSource::new(&db, rstore.spill_store());
     let out = synthesize_ingest_with_open_branches(
         &plan,
         &ctx,
         &imported_lanes,
-        &DbBlobSource::new(&db),
+        &blob_src,
         &scratch,
     )?;
 
@@ -829,6 +833,35 @@ fn tip_for_ref(refs: &crate::gitbridge::RemoteRefs, remote_ref: &str) -> AspResu
 /// thin incremental pack resolves against the objects that precede it.
 fn load_db_from_store(rstore: &RemoteStore) -> AspResult<GitObjectDb> {
     rstore.build_db().map_err(AspError::from)
+}
+
+/// A [`GitBlobSource`] for the pull's row synthesis that reads a blob's bytes back from
+/// wherever `build_db` put them: a loose/small blob still sits in the db's `objects`; a
+/// **spilled** blob (its bytes streamed to the store's on-disk spill during decode, out of
+/// RAM) is fetched from that spill store via the db locator's `content_hash`. Only the
+/// handful of blobs the newly-ingested commits touch are ever read back — the full history
+/// never lands in memory.
+struct StoreBlobSource<'a> {
+    db: &'a GitObjectDb,
+    spill: &'a dyn BlobStore,
+}
+
+impl<'a> StoreBlobSource<'a> {
+    fn new(db: &'a GitObjectDb, spill: &'a dyn BlobStore) -> Self {
+        StoreBlobSource { db, spill }
+    }
+}
+
+impl GitBlobSource for StoreBlobSource<'_> {
+    fn blob(&self, sha: &str) -> Option<Vec<u8>> {
+        match self.db.get(sha) {
+            Some((GitObjKind::Blob, bytes)) => Some(bytes.to_vec()),
+            _ => {
+                let content_hash = self.db.spilled_content_hash(sha)?;
+                self.spill.get_blob(content_hash).ok().flatten()
+            }
+        }
+    }
 }
 
 /// Is `ancestor` an ancestor of (or equal to) `descendant`, walking commit parents

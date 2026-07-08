@@ -57,6 +57,7 @@ use crate::gitwire::{
     receive_pack_info_refs_url, receive_pack_url, upload_pack_url, FetchRequest,
     FetchResponseParser, GitUrl, GitWireError, Pkt, PktReader, RefInfo,
 };
+use crate::store::BlobStore;
 
 /// `agent=` string for pushes (matches gitwire's private constant format).
 const AGENT: &str = concat!("asp/", env!("CARGO_PKG_VERSION"));
@@ -1148,6 +1149,65 @@ pub struct RemoteStore {
     /// (not a lock): a `RemoteStore` is used single-threaded; it is `Send` (so it may
     /// be held across an `.await` in the push driver) but never `Sync`.
     cache: std::cell::RefCell<Option<crate::gitimport::GitObjectDb>>,
+    /// On-disk content-addressed scratch that [`build_db`](RemoteStore::build_db) spills
+    /// blob bytes into (keyed by `content_hash`), so a full-history pack decode keeps only
+    /// commits/trees + byte-free locators in RAM instead of every decompressed blob (the
+    /// pull/push OOM). A temp dir **on the store's own filesystem** (real disk, not a
+    /// possibly-tmpfs system temp — spilling to RAM would defeat the fix), auto-removed
+    /// when this `RemoteStore` drops. Purely a per-access cache; the packs stay authoritative.
+    _spill_dir: tempfile::TempDir,
+    blob_spill: FsBlobStore,
+}
+
+/// A minimal on-disk, content-addressed [`BlobStore`](crate::store::BlobStore): each blob
+/// is one file at `<root>/<hash[..2]>/<hash[2..]>` (sha256 `content_hash` key, sharded by
+/// the first byte). Used only as the [`RemoteStore`] blob spill target — an idempotent,
+/// dedup-by-existence sink the pack decode streams blobs into so they leave RAM.
+struct FsBlobStore {
+    root: PathBuf,
+}
+
+impl FsBlobStore {
+    fn new(root: PathBuf) -> Self {
+        FsBlobStore { root }
+    }
+
+    fn blob_path(&self, hash: &str) -> PathBuf {
+        if hash.len() >= 2 {
+            self.root.join(&hash[..2]).join(&hash[2..])
+        } else {
+            self.root.join(hash)
+        }
+    }
+}
+
+impl crate::store::BlobStore for FsBlobStore {
+    fn put_blob(&self, bytes: &[u8]) -> crate::error::AspResult<String> {
+        let h = crate::oid::content_hash(bytes);
+        self.put_blob_with_hash(&h, bytes)?;
+        Ok(h)
+    }
+    fn get_blob(&self, hash: &str) -> crate::error::AspResult<Option<Vec<u8>>> {
+        match std::fs::read(self.blob_path(hash)) {
+            Ok(b) => Ok(Some(b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+    fn has_blob(&self, hash: &str) -> crate::error::AspResult<bool> {
+        Ok(self.blob_path(hash).exists())
+    }
+    fn put_blob_with_hash(&self, hash: &str, bytes: &[u8]) -> crate::error::AspResult<()> {
+        let path = self.blob_path(hash);
+        if path.exists() {
+            return Ok(()); // content-addressed: identical bytes, skip the rewrite
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
 }
 
 impl RemoteStore {
@@ -1162,7 +1222,30 @@ impl RemoteStore {
             Err(_) => BTreeMap::new(),
         };
 
-        Ok(Self { root, refs, cache: std::cell::RefCell::new(None) })
+        // Blob spill scratch on the store's own filesystem (see field docs). Created under
+        // `root` so it shares the vault's real disk, and auto-removed on drop.
+        let spill_dir = tempfile::Builder::new()
+            .prefix("blobscratch-")
+            .tempdir_in(&root)?;
+        let blob_spill = FsBlobStore::new(spill_dir.path().to_path_buf());
+
+        Ok(Self {
+            root,
+            refs,
+            cache: std::cell::RefCell::new(None),
+            _spill_dir: spill_dir,
+            blob_spill,
+        })
+    }
+
+    /// The blob spill store `build_db` streams decoded blob bytes into (keyed by
+    /// `content_hash`). A caller that holds the built db can read a spilled blob's bytes
+    /// back through this using [`GitObjectDb::spilled_content_hash`] — the pull driver's
+    /// ingest blob source does exactly that.
+    ///
+    /// [`GitObjectDb::spilled_content_hash`]: crate::gitimport::GitObjectDb::spilled_content_hash
+    pub fn spill_store(&self) -> &dyn crate::store::BlobStore {
+        &self.blob_spill
     }
 
     /// The store's root directory.
@@ -1293,11 +1376,16 @@ impl RemoteStore {
                 }
             }
         }
-        // Packs in fetch order (thin packs resolve against the accumulating db).
+        // Packs in fetch order (thin packs resolve against the accumulating db). Each
+        // pack's bytes move straight into the decoder (no second full-pack copy), and its
+        // blob bodies **spill onto disk** (into `blob_spill`) instead of piling into RAM —
+        // so decoding a full-history store keeps only commits/trees + byte-free blob
+        // locators resident. Consumers that need a blob back (pull's ingest, the unit
+        // `get_object`) read it from `blob_spill` via the locator's `content_hash`.
         for path in self.pack_paths() {
             let bytes = std::fs::read(&path)
                 .map_err(|e| GitBridgeError::Store(format!("reading pack {}: {e}", path.display())))?;
-            if let Err(e) = db.absorb_pack(&bytes, no_base_lookup) {
+            if let Err(e) = db.absorb_pack_spilling(bytes, no_base_lookup, &self.blob_spill) {
                 // Self-heal: a stored pack that passed the fetch-time trailer check but
                 // still fails to decode (a rare semantic corruption a checksum can't
                 // catch) would otherwise wedge every future pull AND push, since build_db
@@ -1332,19 +1420,29 @@ impl RemoteStore {
     /// Total number of objects held across all stored packs + loose objects (used by
     /// tests to check a fetch decoded the expected object set). Builds the lazy db.
     pub fn object_count(&self) -> u32 {
-        self.object_db().map(|db| db.len() as u32).unwrap_or(0)
+        // Spilled blobs live in `blob_meta` (their bytes are on disk), not `objects`, so
+        // count both to report the full object set.
+        self.object_db().map(|db| (db.len() + db.blob_count()) as u32).unwrap_or(0)
     }
 
-    /// Whether object `sha` (40-hex) is present in any stored pack or as loose.
+    /// Whether object `sha` (40-hex) is present in any stored pack or as loose. Counts
+    /// spilled blobs (a byte-free locator in the db, bytes on disk) — push dedup probes
+    /// blob presence here, so a spilled blob must read as present.
     pub fn has(&self, sha: &str) -> bool {
-        sha.len() == 40 && self.object_db().map(|db| db.get(sha).is_some()).unwrap_or(false)
+        sha.len() == 40 && self.object_db().map(|db| db.contains(sha)).unwrap_or(false)
     }
 
-    /// Fetch object `sha` (40-hex): its kind and *content* bytes (unframed).
+    /// Fetch object `sha` (40-hex): its kind and *content* bytes (unframed). A spilled
+    /// blob (bytes not in the db) is read back from the blob spill store via its locator.
     pub fn get_object(&self, sha: &str) -> Option<(GitObjectKind, Vec<u8>)> {
         let db = self.object_db().ok()?;
-        let (kind, body) = db.get(sha)?;
-        Some((export_obj_kind(kind), body.to_vec()))
+        if let Some((kind, body)) = db.get(sha) {
+            return Some((export_obj_kind(kind), body.to_vec()));
+        }
+        // Spilled blob: recover its bytes from the on-disk spill store.
+        let content_hash = db.spilled_content_hash(sha)?;
+        let bytes = self.blob_spill.get_blob(content_hash).ok().flatten()?;
+        Some((GitObjectKind::Blob, bytes))
     }
 
     /// Write a loose object (used by push synthesis to stage authored objects) and
@@ -1631,6 +1729,51 @@ mod tests {
             .unwrap();
         assert!(store.has(&blob_oid));
         assert_eq!(store.refs().get("refs/heads/main"), Some(&blob_oid));
+    }
+
+    #[test]
+    fn build_db_spills_blob_bytes_out_of_ram() {
+        // Memory-boundedness (finding 1), structurally: after build_db, a blob's
+        // decompressed bytes must NOT sit in the in-memory object map — only commits and
+        // trees do; the blob is a byte-free locator whose bytes live on disk. get_object
+        // and has() still recover / report it (read back from the spill).
+        let blob = vec![b'x'; 1 << 16]; // 64 KiB — dwarfs the commit+tree
+        let blob_oid = git_oid_bytes(GitObjectKind::Blob, &blob);
+        let mut tree = Vec::new();
+        tree.extend_from_slice(b"100644 file.bin\0");
+        tree.extend_from_slice(&blob_oid);
+        let tree_oid = git_oid(GitObjectKind::Tree, &tree);
+        let commit = format!(
+            "tree {tree_oid}\nauthor A <a@x> 1700000000 +0000\ncommitter A <a@x> 1700000000 +0000\n\nm\n"
+        )
+        .into_bytes();
+        let commit_oid = git_oid(GitObjectKind::Commit, &commit);
+        let blob_hex = git_oid(GitObjectKind::Blob, &blob);
+
+        let pack = write_pack(&[
+            (GitObjectKind::Commit, commit.clone()),
+            (GitObjectKind::Tree, tree.clone()),
+            (GitObjectKind::Blob, blob.clone()),
+        ]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = RemoteStore::open(tmp.path(), "spill").unwrap();
+        store
+            .record_fetch(&pack, &[("refs/heads/main".into(), commit_oid.clone())])
+            .unwrap();
+
+        let db = store.build_db().unwrap();
+        // Commits + trees stay resident; the blob does not.
+        assert_eq!(db.len(), 2, "only commit + tree should be in the RAM object map");
+        assert_eq!(db.blob_count(), 1, "the blob should be a spilled locator");
+        assert!(db.get(&blob_hex).is_none(), "blob bytes must not be held in RAM");
+        assert!(db.contains(&blob_hex), "blob must still register as present");
+        // …but the bytes are recoverable on demand from the on-disk spill.
+        let (k, got) = store.get_object(&blob_hex).unwrap();
+        assert_eq!(k, GitObjectKind::Blob);
+        assert_eq!(got, blob, "spilled blob round-trips byte-for-byte");
+        assert!(store.has(&blob_hex) && store.has(&tree_oid) && store.has(&commit_oid));
+        assert_eq!(store.object_count(), 3);
     }
 
     #[test]

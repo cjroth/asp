@@ -36,6 +36,9 @@ gix-features.workspace = true
 # surface, which runs iroh-in-wasm (`iroh_wasm`) over a relay instead.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rusqlite.workspace = true
+# RemoteStore blob spill scratch (native git bridge only): an auto-removed on-disk temp
+# dir the pack decode streams blobs into so a full-history pull/push stays memory-bounded.
+tempfile.workspace = true
 sha1.workspace = true
 flate2.workspace = true
 toml.workspace = true

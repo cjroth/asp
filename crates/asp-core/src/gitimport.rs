@@ -306,6 +306,24 @@ impl GitObjectDb {
         self.decode_pack(pack.to_vec(), base_lookup, None, progress)
     }
 
+    /// Like [`absorb_pack`], but **spills blob bytes** into `spill` (content-addressed)
+    /// as it decodes, keeping only a byte-free [`BlobLoc`] per blob — so decoding a big
+    /// pack into an existing db (the pull/push `RemoteStore::build_db` rebuild) never
+    /// piles a full-history repo's decompressed blobs into RAM. Takes the pack **by
+    /// value** so it moves straight into the decoder with no second full copy. Commits,
+    /// trees and tags still accumulate in `objects` (small); thin packs still resolve
+    /// against earlier packs + loose objects already in the db.
+    ///
+    /// [`absorb_pack`]: GitObjectDb::absorb_pack
+    pub fn absorb_pack_spilling(
+        &mut self,
+        pack: Vec<u8>,
+        base_lookup: impl Fn(&str) -> Option<(GitObjKind, Vec<u8>)>,
+        spill: &dyn crate::store::BlobStore,
+    ) -> Result<(), GitImportError> {
+        self.decode_pack(pack, base_lookup, Some(spill), |_, _, _| {})
+    }
+
     /// The single pack-decode implementation, shared by the spilling and non-spilling
     /// entry points. Owns `pack` so it moves into the decoder with no copy. When
     /// `spill` is `Some`, blob bodies stream into it (keyed by `content_hash`) and only
@@ -536,6 +554,21 @@ impl GitObjectDb {
     /// Look up an object body by sha (40-hex).
     pub fn get(&self, sha: &str) -> Option<(GitObjKind, &[u8])> {
         self.objects.get(sha).map(|(k, v)| (*k, v.as_slice()))
+    }
+
+    /// Whether object `sha` is held — either as a live object (commit/tree/tag/loose
+    /// blob) in `objects` or as a **spilled** blob whose bytes live in the spill store.
+    /// Presence probes (e.g. push dedup via `RemoteStore::has`) need the spilled blobs
+    /// counted, which [`get`](GitObjectDb::get) alone (bytes-in-`objects` only) misses.
+    pub fn contains(&self, sha: &str) -> bool {
+        self.objects.contains_key(sha) || self.blob_meta.contains_key(sha)
+    }
+
+    /// The spill-store key (`content_hash`) for a **spilled** blob's git sha, or `None`
+    /// if that sha isn't a spilled blob. Lets a caller that holds the spill store read a
+    /// spilled blob's bytes back on demand (the byte-free db only kept the locator).
+    pub fn spilled_content_hash(&self, sha: &str) -> Option<&str> {
+        self.blob_meta.get(sha).map(|l| l.content_hash.as_str())
     }
 
     /// Number of objects held (commits/trees/tags; spilled blobs are counted in
