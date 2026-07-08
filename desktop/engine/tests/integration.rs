@@ -335,3 +335,54 @@ fn clone_dedups_duplicate_blobs_without_corrupting_content() {
     }
     std::env::remove_var("ASP_RELAY_URL");
 }
+
+/// BUG C regression: a long-running engine op on ONE vault must not block commands
+/// on ANOTHER. The pre-fix commands held the GLOBAL `folders` mutex for the whole
+/// engine op, so a slow fold/read on vault A stalled every command on every vault
+/// (the user saw the same file no matter what they opened). We simulate the slow op
+/// by holding vault A's engine mutex on a thread, then time a command on vault B.
+#[test]
+fn slow_op_on_one_vault_does_not_block_commands_on_another() {
+    let _serial = serial();
+    let root = tempfile::tempdir().unwrap();
+    std::env::set_var("HOME", root.path());
+    let de = DesktopEngine::new(Identity::from_seed(&[42; 32])).unwrap();
+
+    let dir_a = root.path().join("A");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::write(dir_a.join("a.md"), b"a\n").unwrap();
+    let a = de.add_local_folder(&dir_a).unwrap();
+
+    let dir_b = root.path().join("B");
+    std::fs::create_dir_all(&dir_b).unwrap();
+    std::fs::write(dir_b.join("b.md"), b"b\n").unwrap();
+    let b = de.add_local_folder(&dir_b).unwrap();
+
+    // Hold vault A's engine mutex for a while — a stand-in for a long fold/read.
+    let a_engine = de.engine_handle(&a.id).expect("vault A engine handle");
+    let held = std::thread::spawn(move || {
+        let _g = a_engine.lock().unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+    });
+    // Make sure the guard thread has actually taken A's engine lock.
+    std::thread::sleep(Duration::from_millis(150));
+
+    // A command on B must return promptly — it never waits on A's engine op, because
+    // read commands now clone the engine handle under a brief folders lock and drop
+    // it before doing engine work (they no longer hold `folders` across the op).
+    let t0 = Instant::now();
+    let files_b = de.list_files(&b.id).unwrap();
+    let hist_b = de.history(&b.id).unwrap();
+    let read_b = de.read_file_at(&b.id, "b.md", i64::MAX).unwrap();
+    let elapsed = t0.elapsed();
+
+    assert!(files_b.iter().any(|f| f.path == "b.md"), "B's own files are visible");
+    assert!(hist_b.iter().any(|e| e.path == "b.md"), "B's own history is visible");
+    assert!(read_b.exists && read_b.content == "b\n", "B time-travel read returns B's content");
+    assert!(
+        elapsed < Duration::from_millis(600),
+        "commands on vault B blocked on vault A's engine op ({elapsed:?}) — folders held across the op"
+    );
+
+    held.join().unwrap();
+}

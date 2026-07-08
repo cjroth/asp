@@ -23,6 +23,11 @@ export interface LiveEditorProps {
   path: string; // the selected file path (selects code vs markdown rendering)
   readOnly: boolean;
   notExist: boolean;
+  /** Historical read still in flight (time-travel) — show a loading hint. */
+  loading?: boolean;
+  /** File existed at this instant but its content blob isn't on this node — show
+   *  "content unavailable" instead of a blank pane (BUG B). */
+  contentMissing?: boolean;
   accent: string;
   centered: boolean;
   fontFamily: string;
@@ -31,7 +36,7 @@ export interface LiveEditorProps {
 }
 
 export default function LiveEditor(props: LiveEditorProps) {
-  const { source, paintKey, path, readOnly, notExist, accent, centered, fontFamily, frontmatterStyle, onChange } = props;
+  const { source, paintKey, path, readOnly, notExist, loading, contentMissing, accent, centered, fontFamily, frontmatterStyle, onChange } = props;
   const ref = useRef<HTMLDivElement | null>(null);
   const composing = useRef(false);
   const paintedKey = useRef<string>('');
@@ -76,8 +81,12 @@ export default function LiveEditor(props: LiveEditorProps) {
       el.contentEditable = readOnly ? 'false' : 'true';
       el.style.opacity = readOnly ? '0.92' : '1';
       if (rehlTimer.current) clearTimeout(rehlTimer.current);
-      if (notExist) {
+      if (loading) {
+        el.innerHTML = '<div style="color:var(--faint2); font-style:italic">Loading…</div>';
+      } else if (notExist) {
         el.innerHTML = '<div style="color:var(--faint2); font-style:italic">This file did not exist at this point in time.</div>';
+      } else if (contentMissing) {
+        el.innerHTML = '<div style="color:var(--faint2); font-style:italic">Content unavailable at this point in history (not synced to this device).</div>';
       } else {
         el.innerHTML = renderDoc(source, path, accent, frontmatterStyle);
         lineCount.current = source.split('\n').length;
@@ -91,9 +100,9 @@ export default function LiveEditor(props: LiveEditorProps) {
     // SVG renders instead of staying stuck on its <pre> code fallback. It only
     // touches contenteditable=false `.md-diagram` nodes and is a no-op once every
     // diagram is rendered, so the caret and repaint behavior are unaffected.
-    if (!notExist) paintDiagrams(el);
+    if (!notExist && !loading && !contentMissing) paintDiagrams(el);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [paintKey, source, readOnly, notExist, accent, path, frontmatterStyle]);
+  }, [paintKey, source, readOnly, notExist, loading, contentMissing, accent, path, frontmatterStyle]);
 
   // Clean up the pending re-highlight on unmount.
   useEffect(() => () => {

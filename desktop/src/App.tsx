@@ -39,6 +39,11 @@ interface Paint {
   source: string;
   readOnly: boolean;
   notExist: boolean;
+  /** The historical read is still in flight (time-travel) — show a loading hint. */
+  loading?: boolean;
+  /** The file existed at this instant but its content blob isn't on this node —
+   *  show "content unavailable" instead of a blank editable pane (BUG B). */
+  contentMissing?: boolean;
   key: string;
 }
 
@@ -645,14 +650,28 @@ export default function App() {
       // settle (a discrete tick-jump still feels instant at 60ms) so a scrub
       // never queues dozens of backend reads on a large vault.
       ttTimer = setTimeout(() => {
+        if (cancelled || seq !== paintSeq.current) return;
+        // Show a loading hint while the (path-scoped, but still async) history read
+        // is in flight — mirrors the timeline popover's loading state.
+        setDocText('');
+        setPaint({ source: '', readOnly: true, notExist: false, loading: true, key: `${path}#tt-loading${ph}#${seq}` });
         void (async () => {
           try {
             const at = await api.readFileAt(id, path, Math.floor(ph / 1000));
             if (cancelled || seq !== paintSeq.current) return;
-            setDocText(at.exists ? at.content : '');
-            // Time travel is now EDITABLE: the first edit here auto-forks a branch
-            // at this instant (see onEditorChange), so we never overwrite the past.
-            setPaint({ source: at.content, readOnly: false, notExist: !at.exists, key: `${path}#tt${ph}#${seq}` });
+            const missing = !!at.contentMissing;
+            setDocText(missing ? '' : at.exists ? at.content : '');
+            // Time travel is EDITABLE: the first edit here auto-forks a branch at this
+            // instant (see onEditorChange), so we never overwrite the past. But a point
+            // whose content is unavailable must stay read-only — editing it would fork
+            // with an empty body and silently lose the real history.
+            setPaint({
+              source: missing ? '' : at.content,
+              readOnly: missing,
+              notExist: !at.exists,
+              contentMissing: missing,
+              key: `${path}#tt${ph}#${seq}`,
+            });
           } catch {
             if (!cancelled) setPaint(null);
           }
@@ -2125,6 +2144,8 @@ export default function App() {
                       path={selectedPath || ''}
                       readOnly={paint.readOnly}
                       notExist={paint.notExist}
+                      contentMissing={paint.contentMissing}
+                      loading={paint.loading}
                       accent={accent}
                       centered={centered}
                       fontFamily={fontFamily}

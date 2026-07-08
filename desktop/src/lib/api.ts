@@ -42,6 +42,10 @@ export interface HistEvent {
 }
 export interface FileAt {
   exists: boolean;
+  /** The file existed at this instant but its historical content blob is not on
+   *  this node (a partial/thin replica, or a not-yet-synced blob) — show "content
+   *  unavailable" instead of a blank pane. Optional so older shells default false. */
+  contentMissing?: boolean;
   content: string;
 }
 // ---- branches (§2, §7): scoped views over the shared log ----

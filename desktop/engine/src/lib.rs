@@ -18,7 +18,7 @@ use asp_core::gitremote::{self, CloneOptions, PullReport};
 use asp_core::gitwire::parse_git_url;
 use asp_core::iroh_net;
 use asp_core::net::{AuthOpts, EngineRef};
-use asp_core::{Engine, Identity, Msg, VaultConfig, WireRow};
+use asp_core::{Engine, FileAtContent, Identity, Msg, VaultConfig, WireRow};
 pub use asp_core::Graph;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -102,9 +102,14 @@ pub struct TagDto {
 
 /// Content of a file as of a point in time (for read-only time travel).
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FileAt {
     /// Whether the file existed (non-deleted) at the requested instant.
     pub exists: bool,
+    /// True when the file existed then but its historical content blob is not
+    /// present on this node (a partial/thin replica, or a blob that hasn't synced
+    /// yet). The UI shows "content unavailable" instead of a blank pane (BUG B).
+    pub content_missing: bool,
     pub content: String,
 }
 
@@ -942,9 +947,8 @@ impl DesktopEngine {
     /// UI can pre-fill the commit message and show what a push would send. Read-only
     /// — no network, no off-thread drive (mirrors [`Self::git_status`]).
     pub fn git_pending_diff(&self, id: &str) -> Result<PendingDiffDto> {
-        let folders = self.folders.lock().unwrap();
-        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-        let e = f.engine.lock().unwrap();
+        let engine = self.engine_of(id)?;
+        let e = engine.lock().unwrap();
         let remote_id = e
             .store
             .git_remote_list()
@@ -983,9 +987,8 @@ impl DesktopEngine {
     /// git remote configured (so the web `gitStatus` `Promise<GitStatus | null>`
     /// contract holds). Read-only — no network, no off-thread drive.
     pub fn git_status(&self, id: &str) -> Result<Option<GitStatusDto>> {
-        let folders = self.folders.lock().unwrap();
-        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-        let e = f.engine.lock().unwrap();
+        let engine = self.engine_of(id)?;
+        let e = engine.lock().unwrap();
         let Some(r) = e.store.git_remote_list().map_err(|e| anyhow!("{e}"))?.into_iter().next() else {
             return Ok(None);
         };
@@ -1104,38 +1107,29 @@ impl DesktopEngine {
     }
 
     pub fn authorize(&self, id: &str, pubkey: &str) -> Result<()> {
-        let folders = self.folders.lock().unwrap();
-        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-        let eng = f.engine.lock().unwrap();
-        eng.authorize(pubkey, None, false, "cli")?;
+        let engine = self.engine_of(id)?;
+        engine.lock().unwrap().authorize(pubkey, None, false, "cli")?;
         Ok(())
     }
 
     pub fn list_authorized(&self, id: &str) -> Result<Vec<String>> {
-        let folders = self.folders.lock().unwrap();
-        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-        let eng = f.engine.lock().unwrap();
+        let engine = self.engine_of(id)?;
+        let eng = engine.lock().unwrap();
         Ok(eng.store.authkeys()?.into_iter().map(|k| k.node_id).collect())
     }
 
     pub fn snapshot(&self, id: &str, name: &str) -> Result<String> {
-        let folders = self.folders.lock().unwrap();
-        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-        let eng = f.engine.lock().unwrap();
-        Ok(eng.snapshot(name)?)
+        let engine = self.engine_of(id)?;
+        let out = engine.lock().unwrap().snapshot(name)?;
+        Ok(out)
     }
 
     pub fn restore(&self, id: &str, target: &str) -> Result<()> {
         // `restore` authors the rows that revert the vault to the target state;
         // push them live to peers (as write_file/create_dir do) so a connected
         // peer converges instead of silently keeping the pre-restore content.
-        let (conns, rows) = {
-            let folders = self.folders.lock().unwrap();
-            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-            let eng = f.engine.lock().unwrap();
-            let rows = eng.restore(target)?;
-            (f.conns.clone(), rows)
-        };
+        let (engine, conns) = self.engine_and_conns(id)?;
+        let rows = engine.lock().unwrap().restore(target)?;
         for wr in rows {
             self.broadcast(&conns, wr);
         }
@@ -1143,9 +1137,15 @@ impl DesktopEngine {
     }
 
     pub fn status(&self, id: &str) -> Result<VaultStatus> {
-        let folders = self.folders.lock().unwrap();
-        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-        let eng = f.engine.lock().unwrap();
+        // The engine handle (for the cheap store aggregates) + the folder-local
+        // listening ticket, cloned under a brief folders lock so the aggregates below
+        // don't run while holding the global folders mutex (BUG C).
+        let (engine, listening_ticket) = {
+            let folders = self.folders.lock().unwrap();
+            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+            (f.engine.clone(), f.listening_ticket.clone())
+        };
+        let eng = engine.lock().unwrap();
         let vault_id = VaultConfig::new(&eng.store).vault_id().ok().flatten().unwrap_or_default();
         // Cheap aggregates only — the status poll runs periodically on the active
         // vault, so it must never load every row/file (O(N)) just to take a count
@@ -1161,7 +1161,7 @@ impl DesktopEngine {
             rows: eng.store.row_count()?,
             files,
             head,
-            listening_ticket: f.listening_ticket.clone(),
+            listening_ticket,
             peers,
             last_ts,
         })
@@ -1169,11 +1169,39 @@ impl DesktopEngine {
 
     // ---- File surface: thin forwarders to `asp-core` (no protocol logic) ----
 
-    /// List the vault's live files (flat; the UI builds the tree).
-    pub fn list_files(&self, id: &str) -> Result<Vec<FileEntry>> {
+    /// Clone the per-vault engine handle under a BRIEF folders lock, then drop the
+    /// folders guard — so the caller can lock only that vault's engine for the real
+    /// work. Holding the GLOBAL `folders` mutex across an engine op is head-of-line
+    /// blocking: one slow op (a big fold, a time-travel read) stalls EVERY command
+    /// on EVERY vault, because each one must take `folders` just to find its folder
+    /// (BUG C — it's why the desktop showed the same file no matter what you opened).
+    /// This is the read/broadcast analogue of the [`Self::git_pull`] pattern.
+    fn engine_of(&self, id: &str) -> Result<EngineRef> {
         let folders = self.folders.lock().unwrap();
         let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-        let eng = f.engine.lock().unwrap();
+        Ok(f.engine.clone())
+    }
+
+    /// Like [`Self::engine_of`], but also clones the folder's live-peer connection
+    /// set — for commands that broadcast the rows they author.
+    fn engine_and_conns(&self, id: &str) -> Result<(EngineRef, Conns)> {
+        let folders = self.folders.lock().unwrap();
+        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
+        Ok((f.engine.clone(), f.conns.clone()))
+    }
+
+    /// Introspection/test hook: the per-vault engine handle. Lets a harness hold one
+    /// vault's engine mutex to prove a slow op on it can't block commands on another
+    /// vault (the folders-lock head-of-line regression, BUG C). Not a UI command.
+    #[doc(hidden)]
+    pub fn engine_handle(&self, id: &str) -> Option<EngineRef> {
+        self.folders.lock().unwrap().get(id).map(|f| f.engine.clone())
+    }
+
+    /// List the vault's live files (flat; the UI builds the tree).
+    pub fn list_files(&self, id: &str) -> Result<Vec<FileEntry>> {
+        let engine = self.engine_of(id)?;
+        let eng = engine.lock().unwrap();
         Ok(eng
             .store
             .live_files()?
@@ -1204,13 +1232,8 @@ impl DesktopEngine {
     /// via `asp-core` materialize). New paths author a `Create`. The authored row
     /// is pushed live to every connected peer.
     pub fn write_file(&self, id: &str, path: &str, content: &str) -> Result<()> {
-        let (conns, wr) = {
-            let folders = self.folders.lock().unwrap();
-            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-            let eng = f.engine.lock().unwrap();
-            let wr = eng.record_write(path, content.as_bytes())?;
-            (f.conns.clone(), wr)
-        };
+        let (engine, conns) = self.engine_and_conns(id)?;
+        let wr = engine.lock().unwrap().record_write(path, content.as_bytes())?;
         if let Some(wr) = wr {
             self.broadcast(&conns, wr);
         }
@@ -1219,13 +1242,8 @@ impl DesktopEngine {
 
     /// Rename/move a file (preserves its stable `file_id`); pushed live to peers.
     pub fn rename_file(&self, id: &str, old: &str, new: &str) -> Result<()> {
-        let (conns, wr) = {
-            let folders = self.folders.lock().unwrap();
-            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-            let eng = f.engine.lock().unwrap();
-            let wr = eng.record_rename(old, new)?;
-            (f.conns.clone(), wr)
-        };
+        let (engine, conns) = self.engine_and_conns(id)?;
+        let wr = engine.lock().unwrap().record_rename(old, new)?;
         if let Some(wr) = wr {
             self.broadcast(&conns, wr);
         }
@@ -1235,13 +1253,8 @@ impl DesktopEngine {
     /// Delete a file (authors a tombstone; removes it from disk on materialize);
     /// pushed live to peers.
     pub fn delete_file(&self, id: &str, path: &str) -> Result<()> {
-        let (conns, wr) = {
-            let folders = self.folders.lock().unwrap();
-            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-            let eng = f.engine.lock().unwrap();
-            let wr = eng.record_remove(path)?;
-            (f.conns.clone(), wr)
-        };
+        let (engine, conns) = self.engine_and_conns(id)?;
+        let wr = engine.lock().unwrap().record_remove(path)?;
         if let Some(wr) = wr {
             self.broadcast(&conns, wr);
         }
@@ -1253,14 +1266,13 @@ impl DesktopEngine {
     /// `mkdir`), so we `mkdir` then `capture_rescan`, which authors the `Dir`
     /// row(s); each is pushed live to every connected peer.
     pub fn create_dir(&self, id: &str, path: &str) -> Result<()> {
-        let (conns, rows) = {
+        let (engine, conns, dir) = {
             let folders = self.folders.lock().unwrap();
             let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-            std::fs::create_dir_all(f.path.join(path)).with_context(|| format!("mkdir {}", path))?;
-            let eng = f.engine.lock().unwrap();
-            let rows = eng.capture_rescan()?;
-            (f.conns.clone(), rows)
+            (f.engine.clone(), f.conns.clone(), f.path.clone())
         };
+        std::fs::create_dir_all(dir.join(path)).with_context(|| format!("mkdir {}", path))?;
+        let rows = engine.lock().unwrap().capture_rescan()?;
         for wr in rows {
             self.broadcast(&conns, wr);
         }
@@ -1271,9 +1283,8 @@ impl DesktopEngine {
     /// time-travel scrubber. Resolves a path for every row (edits/deletes carry
     /// none, so we track each `file_id`'s latest path in fold order).
     pub fn history(&self, id: &str) -> Result<Vec<HistEvent>> {
-        let folders = self.folders.lock().unwrap();
-        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-        let eng = f.engine.lock().unwrap();
+        let engine = self.engine_of(id)?;
+        let eng = engine.lock().unwrap();
         let mut latest: HashMap<String, String> = HashMap::new();
         let mut out = Vec::new();
         for r in eng.store.all_rows()? {
@@ -1302,9 +1313,8 @@ impl DesktopEngine {
 
     /// All live branches for the switcher (`main` first; HEAD flagged).
     pub fn list_branches(&self, id: &str) -> Result<Vec<BranchDto>> {
-        let folders = self.folders.lock().unwrap();
-        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-        let eng = f.engine.lock().unwrap();
+        let engine = self.engine_of(id)?;
+        let eng = engine.lock().unwrap();
         let head = eng.current_branch();
         Ok(eng
             .branches()?
@@ -1315,30 +1325,23 @@ impl DesktopEngine {
 
     /// The checked-out branch id (HEAD).
     pub fn current_branch(&self, id: &str) -> Result<String> {
-        let folders = self.folders.lock().unwrap();
-        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-        let head = f.engine.lock().unwrap().current_branch();
+        let engine = self.engine_of(id)?;
+        let head = engine.lock().unwrap().current_branch();
         Ok(head)
     }
 
     /// The branch/commit DAG (GitHub-network-style), bounded to `cap` per lane.
     pub fn graph(&self, id: &str, cap: usize) -> Result<asp_core::Graph> {
-        let folders = self.folders.lock().unwrap();
-        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-        let g = f.engine.lock().unwrap().graph(cap)?;
+        let engine = self.engine_of(id)?;
+        let g = engine.lock().unwrap().graph(cap)?;
         Ok(g)
     }
 
     /// Create a branch off HEAD at the current point (does not switch). The branch
     /// record is pushed live to peers so every node learns it.
     pub fn create_branch(&self, id: &str, name: &str) -> Result<String> {
-        let (conns, branch_id, wr) = {
-            let folders = self.folders.lock().unwrap();
-            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-            let eng = f.engine.lock().unwrap();
-            let (bid, wr) = eng.create_branch_here_wire(name)?;
-            (f.conns.clone(), bid, wr)
-        };
+        let (engine, conns) = self.engine_and_conns(id)?;
+        let (branch_id, wr) = engine.lock().unwrap().create_branch_here_wire(name)?;
         self.broadcast(&conns, wr);
         Ok(branch_id)
     }
@@ -1347,26 +1350,24 @@ impl DesktopEngine {
     /// per-device (never synced), so nothing is broadcast; the caller re-reads the
     /// now-switched working tree.
     pub fn checkout_branch(&self, id: &str, branch_id: &str) -> Result<()> {
-        let folders = self.folders.lock().unwrap();
-        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-        f.engine.lock().unwrap().checkout(branch_id)?;
+        let engine = self.engine_of(id)?;
+        engine.lock().unwrap().checkout(branch_id)?;
         Ok(())
     }
 
     /// Edit-in-the-past ⇒ branch (§2.5): fork HEAD at wall-clock `ts` and switch to
     /// the new branch. The record is pushed live to peers.
     pub fn fork_branch_at(&self, id: &str, name: &str, ts: i64) -> Result<String> {
-        let (conns, branch_id, wr) = {
-            let folders = self.folders.lock().unwrap();
-            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-            let eng = f.engine.lock().unwrap();
+        let (engine, conns) = self.engine_and_conns(id)?;
+        let (branch_id, wr) = {
+            let eng = engine.lock().unwrap();
             // Fork at the point in time, then read back the authored branch record to
             // broadcast (it's this site's latest Kind::Branch row).
             let bid = eng.fork_from_time(name, ts)?;
             let wr = eng
                 .branch_record_wire(&bid)
                 .ok_or_else(|| anyhow!("forked branch record missing"))?;
-            (f.conns.clone(), bid, wr)
+            (bid, wr)
         };
         self.broadcast(&conns, wr);
         Ok(branch_id)
@@ -1374,13 +1375,8 @@ impl DesktopEngine {
 
     /// Soft-delete a branch; the tombstone is pushed live to peers.
     pub fn delete_branch(&self, id: &str, branch_id: &str) -> Result<()> {
-        let (conns, wr) = {
-            let folders = self.folders.lock().unwrap();
-            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-            let eng = f.engine.lock().unwrap();
-            let wr = eng.delete_branch(branch_id)?;
-            (f.conns.clone(), wr)
-        };
+        let (engine, conns) = self.engine_and_conns(id)?;
+        let wr = engine.lock().unwrap().delete_branch(branch_id)?;
         self.broadcast(&conns, wr);
         Ok(())
     }
@@ -1389,9 +1385,8 @@ impl DesktopEngine {
 
     /// All live tags on the timeline.
     pub fn list_tags(&self, id: &str) -> Result<Vec<TagDto>> {
-        let folders = self.folders.lock().unwrap();
-        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-        let eng = f.engine.lock().unwrap();
+        let engine = self.engine_of(id)?;
+        let eng = engine.lock().unwrap();
         Ok(eng
             .tags()?
             .into_iter()
@@ -1402,56 +1397,48 @@ impl DesktopEngine {
     /// Tag the point at wall-clock `at_ts` on the current branch. The record is
     /// pushed live to peers so every node learns it.
     pub fn create_tag(&self, id: &str, name: &str, at_ts: i64) -> Result<String> {
-        let (conns, tag_id, wr) = {
-            let folders = self.folders.lock().unwrap();
-            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-            let eng = f.engine.lock().unwrap();
-            let (tid, wr) = eng.create_tag(name, at_ts)?;
-            (f.conns.clone(), tid, wr)
-        };
+        let (engine, conns) = self.engine_and_conns(id)?;
+        let (tag_id, wr) = engine.lock().unwrap().create_tag(name, at_ts)?;
         self.broadcast(&conns, wr);
         Ok(tag_id)
     }
 
     /// Soft-delete a tag; the tombstone is pushed live to peers.
     pub fn delete_tag(&self, id: &str, tag_id: &str) -> Result<()> {
-        let (conns, wr) = {
-            let folders = self.folders.lock().unwrap();
-            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-            let eng = f.engine.lock().unwrap();
-            let wr = eng.delete_tag(tag_id)?;
-            (f.conns.clone(), wr)
-        };
+        let (engine, conns) = self.engine_and_conns(id)?;
+        let wr = engine.lock().unwrap().delete_tag(tag_id)?;
         self.broadcast(&conns, wr);
         Ok(())
     }
 
-    /// Content of a file as the vault was at wall-clock `ts` (read-only; folds
-    /// rows with `ts <= ts` via `asp-core::state_as_of`).
+    /// Content of a file as the vault was at wall-clock `ts` (read-only). Path-scoped
+    /// (folds only the one file, not the whole vault — `Engine::file_at`, BUG A), so
+    /// it stays snappy on a large vault, and it must never hold the global folders
+    /// lock across the fold (BUG C). Reports `contentMissing` when the file existed
+    /// then but its historical blob isn't on this node (BUG B).
     pub fn read_file_at(&self, id: &str, path: &str, ts: i64) -> Result<FileAt> {
-        let folders = self.folders.lock().unwrap();
-        let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-        let eng = f.engine.lock().unwrap();
-        // Reads exactly the one requested blob (not the whole vault) — see
-        // `Engine::file_at`. Keeps the history slider snappy on large vaults.
-        match eng.file_at(path, ts)? {
-            Some(bytes) => Ok(FileAt { exists: true, content: String::from_utf8_lossy(&bytes).into_owned() }),
-            None => Ok(FileAt { exists: false, content: String::new() }),
-        }
+        let engine = self.engine_of(id)?;
+        let outcome = engine.lock().unwrap().file_at(path, ts)?;
+        Ok(match outcome {
+            FileAtContent::Present(bytes) => {
+                FileAt { exists: true, content_missing: false, content: String::from_utf8_lossy(&bytes).into_owned() }
+            }
+            FileAtContent::ContentMissing => FileAt { exists: true, content_missing: true, content: String::new() },
+            FileAtContent::Absent => FileAt { exists: false, content_missing: false, content: String::new() },
+        })
     }
 
     /// Restore one file to its content as of `ts` (records the historical bytes
-    /// as a new edit — the log stays append-only). No-op if it didn't exist then.
+    /// as a new edit — the log stays append-only). No-op if it didn't exist then or
+    /// its historical content isn't available on this node.
     pub fn restore_file_at(&self, id: &str, path: &str, ts: i64) -> Result<()> {
-        let (conns, wr) = {
-            let folders = self.folders.lock().unwrap();
-            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-            let eng = f.engine.lock().unwrap();
-            let wr = match eng.file_at(path, ts)? {
-                Some(bytes) => eng.record_write(path, &bytes)?,
-                None => None,
-            };
-            (f.conns.clone(), wr)
+        let (engine, conns) = self.engine_and_conns(id)?;
+        let wr = {
+            let eng = engine.lock().unwrap();
+            match eng.file_at(path, ts)? {
+                FileAtContent::Present(bytes) => eng.record_write(path, &bytes)?,
+                _ => None,
+            }
         };
         if let Some(wr) = wr {
             self.broadcast(&conns, wr);
@@ -1466,13 +1453,8 @@ impl DesktopEngine {
         // (external editors, git pulls, scripts). Broadcast them live to peers —
         // exactly as create_dir does with its capture_rescan rows — so an external
         // edit + refresh propagates instead of leaving connected peers stale.
-        let (conns, rows) = {
-            let folders = self.folders.lock().unwrap();
-            let f = folders.get(id).ok_or_else(|| anyhow!("no such folder"))?;
-            let eng = f.engine.lock().unwrap();
-            let rows = eng.capture_rescan()?;
-            (f.conns.clone(), rows)
-        };
+        let (engine, conns) = self.engine_and_conns(id)?;
+        let rows = engine.lock().unwrap().capture_rescan()?;
         for wr in rows {
             self.broadcast(&conns, wr);
         }
