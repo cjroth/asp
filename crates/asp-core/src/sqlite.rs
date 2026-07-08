@@ -120,6 +120,24 @@ const LOG_SECONDARY_INDEXES: &[&str] = &[
 const LOG_SECONDARY_INDEX_NAMES: &[&str] =
     &["log_file", "log_site", "log_path", "log_branch", "log_kind_branch", "log_kind_tag"];
 
+/// The four durability/scratch PRAGMAs applied for a bulk load. `synchronous=OFF`
+/// is safe only because a torn clone is discarded (git-bridge §9); the rest give the
+/// insert + index rebuild scratch/cache headroom. `cache_size` negative = KiB;
+/// `mmap_size` = bytes. Shared verbatim by [`SqliteStore::begin_bulk_load`] and
+/// [`SqliteStore::set_bulk_pragmas`].
+const BULK_LOAD_PRAGMAS: &str =
+    "PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-262144; PRAGMA mmap_size=1073741824;";
+
+/// Restore the four bulk PRAGMAs to a freshly-opened connection's values. `init`
+/// only ever sets `synchronous` (→ NORMAL); the other three are never touched there,
+/// so their "normal default" is SQLite's own compile-time default (temp_store DEFAULT
+/// = 0, cache_size = -2000 KiB, mmap_size = 0 = mmap off). Applied by
+/// [`SqliteStore::end_bulk_load`] so a retained connection (CLI `--watch`, desktop
+/// `Folder`) never keeps the bulk ceilings after a clone finishes. The
+/// `bulk_load_restores_all_bulk_pragmas` test pins these against a fresh store.
+const NORMAL_PRAGMAS: &str =
+    "PRAGMA synchronous=NORMAL; PRAGMA temp_store=DEFAULT; PRAGMA cache_size=-2000; PRAGMA mmap_size=0;";
+
 pub struct SqliteStore {
     conn: Connection,
 }
@@ -316,7 +334,9 @@ impl SqliteStore {
     ///   driver (`Engine::set_bulk`) until after this returns and the index is back.
     /// - Durability: a clone is all-or-nothing (git-bridge §9) — a torn clone's
     ///   half-built vault is discarded — so `synchronous=OFF` strictly during the
-    ///   bulk insert is safe. It is restored to `NORMAL` here before returning.
+    ///   bulk insert is safe. `end_bulk_load` restores all four bulk PRAGMAs and forces
+    ///   a durable `wal_checkpoint(TRUNCATE)` before returning, so the finished vault is
+    ///   synced and no bulk ceiling lingers on a retained connection.
     /// - The indexes are rebuilt and PRAGMAs restored even if `f` returns `Err`, so
     ///   a *caught* clone error still leaves a schema-consistent db. (`f`'s error
     ///   takes precedence over a rebuild error in the return.)
@@ -336,33 +356,64 @@ impl SqliteStore {
     /// pristine git clone to cover its pack-decode blob spill (which streams the repo's
     /// blobs onto disk before the `bulk_load` insert window). `synchronous=OFF` is safe
     /// for the same reason as [`bulk_load`](Self::bulk_load): a torn clone is discarded.
-    /// The matching `end_bulk_load` (run after integrate) restores `synchronous=NORMAL`.
+    /// The matching `end_bulk_load` (run after integrate, via `bulk_load`) restores all
+    /// four bulk PRAGMAs and forces a durable WAL checkpoint.
     pub fn set_bulk_pragmas(&self) -> AspResult<()> {
-        self.conn.execute_batch(
-            "PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-262144; PRAGMA mmap_size=1073741824;",
-        )?;
+        self.conn.execute_batch(BULK_LOAD_PRAGMAS)?;
+        Ok(())
+    }
+
+    /// Restore the four bulk-load PRAGMAs to a freshly-opened connection's values
+    /// **without** the WAL checkpoint or index rebuild that [`end_bulk_load`] does —
+    /// the error-path counterpart for a clone that bailed after [`set_bulk_pragmas`]
+    /// but before its `bulk_load` window. Idempotent and cheap; the clone driver arms
+    /// it via an RAII guard so a caught mid-clone error can't leave a (hypothetically
+    /// retained) connection stuck on the bulk ceilings.
+    ///
+    /// [`end_bulk_load`]: Self::end_bulk_load
+    pub fn restore_normal_pragmas(&self) -> AspResult<()> {
+        self.conn.execute_batch(NORMAL_PRAGMAS)?;
         Ok(())
     }
 
     /// Drop the secondary indexes + apply bulk-load PRAGMAs. See [`bulk_load`](Self::bulk_load).
     fn begin_bulk_load(&self) -> AspResult<()> {
         // `synchronous=OFF` (safe: a failed clone is discarded) + more scratch/cache
-        // room for the index rebuild. `cache_size` negative = KiB; `mmap_size` bytes.
-        self.conn.execute_batch(
-            "PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-262144; PRAGMA mmap_size=1073741824;",
-        )?;
+        // room for the index rebuild. See [`BULK_LOAD_PRAGMAS`].
+        self.conn.execute_batch(BULK_LOAD_PRAGMAS)?;
         for name in LOG_SECONDARY_INDEX_NAMES {
             self.conn.execute_batch(&format!("DROP INDEX IF EXISTS {name}"))?;
         }
         Ok(())
     }
 
-    /// Rebuild the exact secondary index set + restore durability. See [`bulk_load`](Self::bulk_load).
+    /// Rebuild the exact secondary index set, restore durability, and force a durable
+    /// WAL checkpoint. See [`bulk_load`](Self::bulk_load). This is the single restore
+    /// point for BOTH [`begin_bulk_load`](Self::begin_bulk_load) and
+    /// [`set_bulk_pragmas`](Self::set_bulk_pragmas) (the clone runs the latter for the
+    /// pack-decode blob spill, then `bulk_load` for the insert — both end here).
     fn end_bulk_load(&self) -> AspResult<()> {
         for stmt in LOG_SECONDARY_INDEXES {
             self.conn.execute_batch(stmt)?;
         }
-        self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        // Restore ALL four bulk PRAGMAs (not just `synchronous`): a clone connection is
+        // retained for the whole session (`--watch`, desktop `Folder`), so a lingering
+        // `mmap_size=1GiB`/`cache_size=256MiB`/`temp_store=MEMORY` would permanently
+        // hold the bulk ceilings on an idle vault.
+        self.conn.execute_batch(NORMAL_PRAGMAS)?;
+        // Force a durable checkpoint now that `synchronous=NORMAL` is back. The whole
+        // clone wrote under `synchronous=OFF`, so without this the vault sits in an
+        // unsynced WAL until some later autocheckpoint — which on a long-lived
+        // connection may be never, and an OFF-window autocheckpoint can even tear the
+        // main db on power loss. TRUNCATE checkpoints and zeroes the WAL file; if a
+        // reader holds it busy (non-zero first column), fall back to a plain FULL
+        // checkpoint. A no-op on a non-WAL (in-memory) db. Best-effort by design — a
+        // checkpoint hiccup must not fail an otherwise-complete clone.
+        let busy: i64 =
+            self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0)).unwrap_or(0);
+        if busy != 0 {
+            let _ = self.conn.query_row("PRAGMA wal_checkpoint(FULL)", [], |r| r.get::<_, i64>(0));
+        }
         Ok(())
     }
 
@@ -1350,6 +1401,48 @@ mod tests {
         // synchronous restored to NORMAL (1), not left OFF (0).
         let sync: i64 = s.conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
         assert_eq!(sync, 1, "synchronous must be restored to NORMAL after bulk_load");
+    }
+
+    #[test]
+    fn bulk_load_restores_all_bulk_pragmas() {
+        // end_bulk_load must restore ALL FOUR bulk PRAGMAs, not just `synchronous` — a
+        // retained clone connection would otherwise keep the bulk ceilings forever.
+        // Ground-truth check: compare against a freshly-opened store's own values (so
+        // the assert can't drift from SQLite's real defaults). File-backed stores (not
+        // `:memory:`, which has no `mmap_size` to report) mirror a real vault.
+        let dir = tempfile::tempdir().unwrap();
+        let read4 = |s: &SqliteStore| -> (i64, i64, i64, i64) {
+            let q = |p: &str| s.conn.query_row(&format!("PRAGMA {p}"), [], |r| r.get::<_, i64>(0)).unwrap();
+            (q("synchronous"), q("temp_store"), q("cache_size"), q("mmap_size"))
+        };
+        let baseline = read4(&SqliteStore::open(&dir.path().join("base.db")).unwrap());
+
+        let s = SqliteStore::open(&dir.path().join("v.db")).unwrap();
+        // Exercise BOTH entry points: the spill-path pragmas AND the bulk_load window.
+        s.set_bulk_pragmas().unwrap();
+        // Bulk ceilings are actually in effect before end_bulk_load runs.
+        assert_ne!(read4(&s), baseline, "bulk pragmas take effect");
+        s.bulk_load(|| Ok(())).unwrap();
+        assert_eq!(read4(&s), baseline, "all four bulk pragmas restored to fresh-store defaults");
+    }
+
+    #[test]
+    fn bulk_load_truncates_the_wal() {
+        // The whole clone writes under synchronous=OFF; end_bulk_load must force a
+        // durable wal_checkpoint(TRUNCATE) so the vault isn't left in an unsynced WAL.
+        // Assert the WAL file is zeroed after a bulk_load on a file-backed store.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.db");
+        let s = SqliteStore::open(&path).unwrap();
+        // Generate WAL pages (a normal write under WAL journal mode).
+        s.conn.execute_batch("CREATE TABLE scratch(x); INSERT INTO scratch VALUES(1);").unwrap();
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        let grew = std::fs::metadata(&wal).map(|m| m.len() > 0).unwrap_or(false);
+        assert!(grew, "WAL file should hold uncheckpointed pages before bulk_load");
+
+        s.bulk_load(|| Ok(())).unwrap();
+        let after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(after, 0, "wal_checkpoint(TRUNCATE) must zero the WAL after bulk_load");
     }
 
     #[test]
