@@ -725,6 +725,12 @@ impl Engine {
             use std::sync::mpsc::sync_channel;
             use std::sync::Mutex;
 
+            // NOTE: this producer-on-this-thread / bounded-channel / Mutex<rx> / scoped
+            // first-error worker-pool scaffold is shared in shape with
+            // `prewarm_git_blobs`, but the per-item work (differ-check + atomic write +
+            // stat + progress here vs. blob encode there) and the producer bodies differ
+            // enough that the common part is ~10 lines; not worth a generic helper that
+            // would only obscure this hot path. Keep the two in sync by hand.
             const WRITER_THREADS: usize = 4;
             let (tx, rx) = sync_channel::<(String, PathBuf, Vec<u8>, String)>(WRITER_THREADS * 4);
             let rx = Mutex::new(rx);
@@ -791,7 +797,7 @@ impl Engine {
                     match self.store.get_blob(h) {
                         Ok(b) => {
                             if tx.send((path.clone(), abs.clone(), b.unwrap_or_default(), h.clone())).is_err() {
-                                break; // all writers gone (they only exit on error)
+                                break; // all writers gone (they only exit on channel close)
                             }
                             done += 1;
                             if let Some(p) = progress {
